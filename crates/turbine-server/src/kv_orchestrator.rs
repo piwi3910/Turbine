@@ -2248,6 +2248,8 @@ impl CopyStreamBackend {
                 let l1: Arc<dyn KvTier> = self.l1.clone().ok_or(TierError::Missing)?;
                 if req.path == TransferPath::L0ToL1 {
                     self.start_write(t, l1)
+                } else if let Some(job) = self.start_l1_decode(t)? {
+                    Ok(job)
                 } else {
                     self.start_read(t, l1)
                 }
@@ -2418,6 +2420,55 @@ impl CopyStreamBackend {
                     l1.record_copy_error(0);
                 }
                 Err(e)
+            }
+        }
+    }
+
+    /// L1 → L0 of a block stored encoded in a format the device transcode serves: its bytes go
+    /// from the pinned L1 slot straight into a device staging slot on the copy stream, then
+    /// decode into the L0 pages (perf-log 6b "TurboQuant promotion path"). Reading the slot on
+    /// the I/O pool first queued promotions behind the pool's demotion writes. `None` when this
+    /// path does not apply (no copy stream, several shards, no free staging slot, a slot of
+    /// another size): the caller takes [`start_read`](Self::start_read).
+    fn start_l1_decode(&mut self, t: &TransferTicket) -> Result<Option<Job>, TierError> {
+        let req = &t.req;
+        let (Some(l1), [shard]) = (self.l1.clone(), self.shards.as_slice()) else {
+            return Ok(None);
+        };
+        let CopyDevice::Stream { engine, .. } = &shard.device else {
+            return Ok(None);
+        };
+        let Some((buffer_id, offset, len)) = l1.locate_len(&req.key) else {
+            return Ok(None);
+        };
+        if len as u64 != req.codec.from_bytes {
+            return Ok(None);
+        }
+        let engine = Arc::clone(engine);
+        let Some(slot) = self.gpu_slot(req.codec.from) else {
+            return Ok(None);
+        };
+        let dst = CopyTarget::Device(
+            self.gpu
+                .as_ref()
+                .expect("a slot came from it")
+                .slot_ptr(slot),
+        );
+        let src = CopyTarget::Pinned { buffer_id, offset };
+        match engine.copy_async(dst, src, len) {
+            Ok(ticket) => Ok(Some(Job::Copies {
+                copies: vec![(0, ticket)],
+                then: AfterCopies::Decode {
+                    block: req.dst_slot,
+                    bufs: Staged::new(),
+                    gpu_slot: slot,
+                    format: req.codec.from,
+                },
+            })),
+            Err(e) => {
+                self.gpu_give(Some(slot));
+                l1.record_copy_error(0);
+                Err(TierError::Io(format!("copy stream: {e}")))
             }
         }
     }
@@ -2856,15 +2907,14 @@ mod tests {
     }
 
     /// [`run`] with the copy's formats.
-    fn run_as(
-        o: &mut KvOrchestrator,
+    fn ticket(
         id: u64,
         path: TransferPath,
         key: KvKey,
         (src_slot, dst_slot): (u64, u64),
         codec: TransferCodec,
-    ) -> Result<TierSlot, TierError> {
-        let t = TransferTicket {
+    ) -> TransferTicket {
+        TransferTicket {
             id,
             req: TransferRequest {
                 path,
@@ -2876,16 +2926,36 @@ mod tests {
                 dst_slot,
                 codec,
             },
-        };
-        o.backend.start(&t)?;
+        }
+    }
+
+    /// Polls the started ticket `t` until it completes.
+    fn finish(o: &mut KvOrchestrator, t: &TransferTicket) -> Result<TierSlot, TierError> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(slot) = o.backend.poll(&t)? {
+            if let Some(slot) = o.backend.poll(t)? {
                 return Ok(slot);
             }
-            assert!(Instant::now() < deadline, "copy {path:?} did not complete");
+            assert!(
+                Instant::now() < deadline,
+                "copy {:?} did not complete",
+                t.req.path
+            );
             std::thread::yield_now();
         }
+    }
+
+    fn run_as(
+        o: &mut KvOrchestrator,
+        id: u64,
+        path: TransferPath,
+        key: KvKey,
+        slots: (u64, u64),
+        codec: TransferCodec,
+    ) -> Result<TierSlot, TierError> {
+        let t = ticket(id, path, key, slots, codec);
+        o.backend.start(&t)?;
+        finish(o, &t)
     }
 
     struct Started {
@@ -3138,8 +3208,10 @@ mod tests {
     /// codec table) into a device staging slot, its small bytes cross the copy stream into L1
     /// and L2, and promotions decode from a slot into the L0 pages. The bytes stored and the
     /// pages decoded equal the host path's (`encode_cpu` / `decode_cpu`), and every staging slot
-    /// is back afterwards. Breaks if a slot leaks, an encoded length is wrong (the tier would
-    /// store L0-sized blocks) or the device path differs from the codec.
+    /// is back afterwards; an L1 promotion on the device path starts on the copy stream (the
+    /// encoded L1 slot straight into a staging slot), not on the I/O pool. Breaks if a slot
+    /// leaks, an encoded length is wrong (the tier would store L0-sized blocks), the device path
+    /// differs from the codec, or an L1 promotion queues on the I/O pool again.
     #[test]
     fn device_transcode_matches_the_host_codec_through_l1_and_l2() {
         let fp8 = turbine_kv::codec::registry().get("fp8_e4m3").unwrap();
@@ -3225,7 +3297,22 @@ mod tests {
                 stored, want_enc,
                 "L1 holds the encoded block (device {device_path})"
             );
-            run_as(&mut o, 2, TransferPath::L1ToL0, key, (0, 9), up).unwrap();
+            let promote = ticket(2, TransferPath::L1ToL0, key, (0, 9), up);
+            o.backend.start(&promote).unwrap();
+            // The device path copies the encoded L1 slot on the copy stream; it never waits for
+            // the I/O pool (perf-log 6b "TurboQuant promotion path").
+            assert_eq!(
+                matches!(
+                    o.backend.jobs.get(&2),
+                    Some(Job::Copies {
+                        then: AfterCopies::Decode { .. },
+                        ..
+                    })
+                ),
+                device_path,
+                "an L1 promotion through the device transcode starts on the copy stream"
+            );
+            finish(&mut o, &promote).unwrap();
             assert_eq!(
                 read_block(&r, 9),
                 want_dec,

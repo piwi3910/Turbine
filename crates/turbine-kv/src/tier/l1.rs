@@ -163,6 +163,15 @@ impl L1PinnedTier {
         self.address(&s, loc)
     }
 
+    /// [`locate`](Self::locate) plus the slot's bytes: the size of the block as stored (its
+    /// codec's, or the L0 format's), for a copy-stream read of an encoded block.
+    pub fn locate_len(&self, key: &KvKey) -> Option<(u64, usize, usize)> {
+        let s = self.lock();
+        let loc = *s.index.get(key)?;
+        let (id, off) = self.address(&s, loc)?;
+        Some((id, off, s.slabs[loc.0].as_ref()?.slot_bytes))
+    }
+
     /// Takes a free slot for `key`, invisible until [`commit`](Self::commit); returns the buffer id
     /// and offset the copy stream writes to.
     pub fn reserve(&self, key: KvKey) -> Result<(u64, usize), TierError> {
