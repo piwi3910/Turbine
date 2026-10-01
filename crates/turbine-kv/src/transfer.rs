@@ -190,9 +190,9 @@ pub enum CopyTime {
     Exact(Duration),
     /// Completed somewhere in `at_least..=at_most` after its start: the copy was seen running
     /// `at_least` in and done only at a poll `at_most` in. A poll-bounded copy says the path is
-    /// not slower than `at_most` and not faster than `at_least`, nothing in between, so the
-    /// estimate learns only when it falls outside (decision "6b Task 6", point 3: copy-stream
-    /// copies polled once per iteration had priced a 1.4 ms block at ~25–100 ms).
+    /// not slower than `at_most` and not faster than `at_least`, nothing in between (decision
+    /// "6b Task 6", point 3: copy-stream copies polled once per iteration had priced a 1.4 ms
+    /// block at ~25–100 ms).
     Within {
         at_least: Duration,
         at_most: Duration,
@@ -247,6 +247,9 @@ pub struct TransferEngine {
     /// Queued or in-flight copies per key.
     busy: HashMap<KvKey, u32>,
     estimates: [PathCost; 6],
+    /// Each path's cost without load: the startup calibration (`seed`), else the fallback. A
+    /// poll-bounded copy is read as this cost clamped to its bounds.
+    seeded: [PathCost; 6],
 }
 
 impl TransferEngine {
@@ -263,6 +266,7 @@ impl TransferEngine {
             cancelled: HashSet::new(),
             busy: HashMap::new(),
             estimates: TransferPath::ALL.map(TransferPath::fallback),
+            seeded: TransferPath::ALL.map(TransferPath::fallback),
         }
     }
 
@@ -379,6 +383,7 @@ impl TransferEngine {
     /// Replaces a path estimate (startup calibration).
     pub fn seed(&mut self, p: TransferPath, c: PathCost) {
         self.estimates[p.index()] = c;
+        self.seeded[p.index()] = c;
     }
 
     pub fn estimate(&self, p: TransferPath) -> PathCost {
@@ -418,16 +423,19 @@ impl TransferEngine {
     /// (a latency-bound copy says little about the rate), and latency is what the duration
     /// leaves beyond the current bandwidth estimate.
     ///
-    /// A poll-bounded copy ([`CopyTime::Within`]) is folded in as the current estimate clamped
-    /// to its bounds: inside them it changes nothing, outside it moves the estimate to the
-    /// nearer bound. Returns the duration folded in.
+    /// A poll-bounded copy ([`CopyTime::Within`]) is folded in as the path's unloaded cost
+    /// (calibration or fallback) clamped to its bounds: a copy seen running longer than that
+    /// raises the estimate, and one done within a poll that the unloaded cost fits pulls it back
+    /// (polls of 25 ms or more cannot resolve a 1.4 ms copy, so the current estimate cannot be
+    /// the prior: one slow burst would hold it at the poll interval). Returns the duration
+    /// folded in.
     fn observe(&mut self, path: TransferPath, bytes: u64, took: CopyTime) -> Duration {
         let took = match took {
             CopyTime::Exact(d) => d,
             CopyTime::Within { at_least, at_most } => {
-                let predicted =
-                    Duration::from_secs_f64(self.estimates[path.index()].block_seconds(bytes));
-                predicted.min(at_most).max(at_least)
+                let unloaded =
+                    Duration::from_secs_f64(self.seeded[path.index()].block_seconds(bytes));
+                unloaded.min(at_most).max(at_least)
             }
         };
         let secs = took.as_secs_f64().max(1e-9);
@@ -897,6 +905,27 @@ mod tests {
         assert!(
             got > 0.045,
             "copies seen in flight at 50 ms price at least that: {got} s"
+        );
+
+        // When the path is fast again, poll-bounded copies (done by the next 25 ms poll) cannot
+        // show it: a bound that holds the inflated estimate says nothing. They are read as the
+        // calibrated cost clamped to their bounds, so the estimate returns to it (on the server
+        // one slow burst had held L1 -> L0 at 18-29 ms for the rest of the run).
+        let mut backend = PollTimed({
+            let mut sim = SimTransferBackend::new(fake_clock(&fake), None, None, 0);
+            sim.set_cost(path, calibrated);
+            sim
+        });
+        for i in 0..64u8 {
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(iteration);
+            assert_eq!(engine.pump(&mut backend).len(), 1);
+        }
+        let got = engine.estimate(path).block_seconds(bytes);
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "back to the calibrated {want} s per block: {got} s"
         );
     }
 
