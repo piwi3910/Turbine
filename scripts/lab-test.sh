@@ -110,6 +110,8 @@ SLOW_TESTS=(
 	decode_attention_timings
 	# crates/turbine-kernels/tests/hip_ops.rs (P6b Task 12)
 	paged_mixed_timings
+	# crates/turbine-model/tests/tq_loss.rs (P6b Task 9: TurboQuant loss on real K/V, minutes of host math)
+	tq_loss_on_real_kv
 )
 
 DRY_RUN=0
