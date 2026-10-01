@@ -80,13 +80,13 @@ sides. Everything below is provisional until the first run shows the real token 
 ## Measured by p6b-copyahead (2026-10-01; `.procoder/handoff/p6b-copyahead.md`)
 
 - With `--filler-requests 32` (and `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`, c16) the prefix leaves L0 before the other 198
-  items arrive: allocation reclaims the head items' own blocks, then the prefix (copied ahead into L1 at GREEN since a8c3b7c) is freed
-  from L0 with no further copy and promoted back once. FP8 L1: lossy cached ratio 0.927. The base commit e02e8c2 gets there too with 32
-  fillers (through the YELLOW reclaim), so 8 or 16 fillers were simply too few.
-- Llama gate pair committed: `tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp.json` 0.775 and `turbine-l1-fp8-sp.json` 0.775,
-  `eval-compare --max-drop 0.01` PASS. Use the same 32 fillers for every later `-sp` pair (`eval-compare` refuses mixed fillers), so new
-  pairs compare against this baseline.
-- The eval client: nothing is built on the Mac; build `turbine-golden` with `scripts/remote-cargo.sh build --release -p turbine-bench
+  items arrive. Allocation reclaims the head items' own blocks first. Since a8c3b7c the prefix has been copied ahead into L1 at GREEN, so
+  it is then freed from L0 with no further copy and promoted back once. FP8 L1: lossy cached ratio 0.927. The base commit e02e8c2 gets
+  there too with 32 fillers (through a real demotion once the children are gone), so 8 or 16 fillers were simply too few.
+- Llama gate pair committed: `tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp.json` 0.780 and `turbine-l1-fp8-sp.json` 0.770.
+  `eval-compare --max-drop 0.01` PASSes at the bound (drop 0.010). Use the same 32 fillers for every later `-sp` pair (`eval-compare`
+  refuses mixed fillers).
+- Check that each run's server served only the eval: `turbine_kv_prompt_tokens_total` must be 726,723 for this recipe. A shared lab port
+  can bring foreign traffic (an overload soak did on 2026-10-01).
+- The eval client: nothing is built on the Mac. Build `turbine-golden` with `scripts/remote-cargo.sh build --release -p turbine-bench
 --bin turbine-golden` and run it over ssh from the remote workspace against `http://127.0.0.1:18000`.
-- 2 of 4 fp8 serve runs got 503 at filler 2–3, with L0 RED and only 5–7 of 292 blocks used (the early pressure trip under
-  investigation elsewhere). Rerun such a run rather than reading it as a quality result.
