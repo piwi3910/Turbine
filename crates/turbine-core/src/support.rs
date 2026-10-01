@@ -514,7 +514,10 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         SupportStatus::Experimental,
     ),
     // TurboQuant L0 pages on gfx1201 (P6b S-5, Task 12 mixed-format attention + the tables the
-    // server uploads): `experimental` until the Task 13 proof (S-8 gate) turns them `supported`.
+    // server uploads): `experimental`. The Task 13 proof (S-8 gate, 2026-10-02) failed golden
+    // under the batched bounds for all four (Llama tq4 0/16, tq2 1/16; OLMoE tq4 8/16, tq2 1/16);
+    // shared-prefix GSM8K medians against BF16 KV: Llama tq4 0.785 (0.780) PASS, tq2 0.195 FAIL;
+    // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0").
     row(
         Some("amd"),
         Some("gfx1201"),

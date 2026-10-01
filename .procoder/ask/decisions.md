@@ -2880,3 +2880,26 @@ recomputed. Both formats stay `experimental` (one row per format, no per-model s
    - B) Define another
 
 **Decision (user, 2026-10-01): 1 A, 2 A, 3 A.** Speed up the tq4 promotion path and rerun the multi-turn A/B before flipping; tq2 stays an `experimental` capacity tier; the OLMoE multi-turn workload above is the spec's OLMoE variant.
+
+## 6b Task 13: TurboQuant in L0 — gate results, prefill profile (2026-10-02)
+
+From `p6b-t13` (`.procoder/handoff/p6b-t13.md`, perf log 6b "TurboQuant in L0"). Golden under the batched bounds fails all four cells at c1 and c16: Llama tq4 0/16, tq2 1/16; OLMoE tq4 8/16, tq2 1/16. Tokens mostly match, but the logprob error is too large: Llama tq4 likely |Δ| 0.26–1.65 against 0.25. Shared-prefix GSM8K medians, 3 + 3 runs (BF16 in brackets): Llama tq4 0.785 (0.780) PASS, McNemar n.s.; Llama tq2 0.195 FAIL; OLMoE tq4 0.615 (0.635) FAIL by 0.020, McNemar p 0.61; OLMoE tq2 0.170 FAIL. L0 capacity is 3.56× / 6.40× (targets met). c16 ITL p50 vs BF16: Llama 1.03× / 1.01×, OLMoE 0.94× / 0.92×. c1: 0.99–1.03×. TTFT p50: Llama 1.16× / 1.12×, OLMoE 1.55× / 1.16×. All four rows stay `experimental`.
+
+1. L0 `tq4` (fails golden on both models, and fails GSM8K on OLMoE):
+   - A) Keep it `experimental`; L0 TurboQuant is then reached only through the ladder's L0 step (S-7) for cold, unreferenced blocks
+   - B) Add an emulated-TurboQuant golden reference (transformers with the codec's quantize-dequantize on K/V, as 6a did for FP8 KV with the `-fp8kv` slugs), so implementation error and codec loss are judged apart; a spec change
+   - C) Keep a lossless recent window in L0 (the sequence's newest block or blocks at BF16, older blocks TurboQuant; the mixed-format attention already reads mixed tables), then gate again; a spec change
+   - Recommendation: A now, C as the follow-up (the newest tokens carry most of the attention mass), B if C still misses
+2. L0 `tq2` (GSM8K collapses to 0.15–0.20 on both models):
+   - A) Keep it `experimental`
+   - B) Refuse `kv.dtype: tq2` (unsupported, with a reason code) and keep `tq2` only as a lower-tier rung
+   - Recommendation: B
+3. Staged prefill (measure-only decision 1 A). Per Llama tq4 request, TTFT is +33.7 ms. Encode `mixed_append_tq` accounts for 19.6 ms, a post-CK single-query `turbine_hip_mixed` pass for 12.3 ms, staging for 3.0 ms, and CK is unchanged. OLMoE: +21.4 ms = 14.7 / 4.5 / 2.2. The post-CK pass in `run_mixed_staged` launches on every layer and chunk even when no `q_len` 1 row exists:
+   - A) Skip that pass when the batch has no single-query row (a host-side check in `paged_attention.cpp`)
+   - B) Speed up the encode kernel (about 30 GB/s effective, 21× the BF16 append), in the transcode builder's area
+   - C) Both
+   - Recommendation: C, A first (small and safe)
+4. `usage.prompt_tokens_details.lossy_cached_tokens` is 0 when the cached blocks are L0 TurboQuant pages:
+   - A) Count them as lossy (S-3 reads "served from lossy blocks")
+   - B) Leave it (`kv.dtype` already says every block is lossy)
+   - Recommendation: A

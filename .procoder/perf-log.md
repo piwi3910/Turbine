@@ -444,3 +444,44 @@ Later-turn TTFT p50 is equal or better with TurboQuant (fewer bytes over the lin
 `kv_gpu` (job 1001170002-222ba975, e88c333): 12 passed, 0 failed. `lossy_tier_reuse_tq4` is now held to (0.25, 0.75, 0.9): the first 8 tokens within 0.25 of cold, 90 % of 64 positions within 0.75. These bounds are golden's Llama batched bounds, which the tq4 golden16 run passed, and the GSM8K gate showed that reuse at that level costs no accuracy. Measured: first-8 worst 0.242, 0.98 of positions within 0.75, worst position 0.979.
 
 Result: `tq2` fails the GSM8K gate on both models. `tq4` passes golden and GSM8K on both, but misses the multi-turn ratio criterion (Llama by 0.020, from slow promotions; OLMoE by 0.003). Both stay `experimental` in `TIER_FORMAT_REFUSALS`. Options are in `.procoder/handoff/p6b-t9.md`. Labbook set `phase-6b-kv-compression`: the 4 lab-bench runs, 18 multi-turn runs and the kv_gpu run.
+
+### TurboQuant in L0 (Task 13, `kv.dtype=tq4` / `tq2`; branch `p6b-t13`)
+
+Tree 427f6f2 (`p6b-stack` 3349b4a plus `lab-bench --batched-bounds`). `scripts/lab-bench.sh --model <m> --golden16 --batched-bounds --c1 -- --set kv.dtype=<f>`: GPU 0, 200 requests at c16, client on novanas. The c1 leg is lab-bench's (10 requests, 128 tokens, `--ignore-eos`), not the plan's 32 × 256. Golden is judged by the batched bounds at c1 and c16; the strict c1 verdict is noted too. Labbook set `phase-6b-kv-compression`: cad82a75, 72719594, f5e74f28, 1f2126fd, 4ab782a0, 3aadbc6b.
+
+| Model | KV     | tok/s (vs BF16) | ITL p50 c16 (ms) | ITL p50 c1 (ms) | TTFT p50 (ms) | golden c1 / c16 (batched) | L0 blocks (vs BF16) |
+| ----- | ------ | --------------- | ---------------- | --------------- | ------------- | ------------------------- | ------------------- |
+| Llama | `bf16` | 849.5           | 15.5             | 12.32           | 207           | PASS / PASS               | 585                 |
+| Llama | `tq4`  | 806.8 (0.950×)  | 16.0 (1.03×)     | 12.69 (1.03×)   | 240 (1.16×)   | FAIL 0/16 / FAIL 0/16     | 2080 (3.56×)        |
+| Llama | `tq2`  | 828.5 (0.975×)  | 15.6 (1.01×)     | 12.61 (1.02×)   | 231 (1.12×)   | FAIL 1/16 / FAIL 1/16     | 3744 (6.40×)        |
+| OLMoE | `bf16` | 610.1           | 24.5             | 7.48            | 119           | PASS / PASS               | 512                 |
+| OLMoE | `tq4`  | 590.1 (0.967×)  | 23.0 (0.94×)     | 7.44 (0.99×)    | 184 (1.55×)   | FAIL 8/16 / FAIL 8/16     | 1820 (3.55×)        |
+| OLMoE | `tq2`  | 646.2 (1.059×)  | 22.6 (0.92×)     | 7.52 (1.01×)    | 138 (1.16×)   | FAIL 1/16 / FAIL 1/16     | 3276 (6.40×)        |
+
+- L0 blocks come from `/turbine/v1/kv` in the same 8 GiB L0. Block bytes: Llama 14,680,064 / 4,128,768 / 2,293,760; OLMoE 16,777,216 / 4,718,592 / 2,621,440. The measured ratios match the codec's (3.56× / 6.40×), so the ≥ 3.5× / ≥ 6× targets hold.
+- Golden: the token rule mostly holds (Llama tq4 has 10 of 16 prompts with an identical 32-token prefix). What fails is the logprob bound: Llama tq4 likely |Δ| 0.26–1.65 against 0.25, tail up to 2.36 against 0.75. Every block, including the newest tokens, is lossy, so the error is larger than the lossy-prefix reuse of Task 9 (first-8 worst 0.242).
+
+Shared-prefix GSM8K-200 (`p6b-eval-prefix.md` recipe: c16, 32 fillers, `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`, `kv.cpu.format=l0`, `--min-cached-ratio 0.5`, plus `kv.dtype=<f>` for the candidate). Each run had a fresh `lab-serve` Job, and each server counted only its eval (`turbine_kv_prompt_tokens_total` 726,723 Llama, 762,875 OLMoE). Llama got three fresh BF16 baselines on this tree (`turbine-bf16-sp-r{4,5,6}.json`), because queued-prefix demotion landed after r1–r3. OLMoE's fresh BF16 run was bit-identical to `turbine-bf16-sp-r1.json`, so its r1–r3 stand. Pairs: `scripts/eval/paired_compare.py --max-drop 0.01`, committed as `turbine-l0-<f>-sp-r<i>-paired.json` (Llama r_i against BF16 r_(i+3)). `lossy_cached_tokens` is 0 throughout: L0 TurboQuant reuse is not counted as lossy reuse.
+
+| Model | Arm  | r1    | r2    | r3    | Median | Drop   | McNemar exact p (9 pairs) | Gate |
+| ----- | ---- | ----- | ----- | ----- | ------ | ------ | ------------------------- | ---- |
+| Llama | BF16 | 0.770 | 0.780 | 0.780 | 0.780  |        |                           |      |
+| Llama | tq4  | 0.785 | 0.765 | 0.790 | 0.785  | −0.005 | 0.59–1.0                  | PASS |
+| Llama | tq2  | 0.195 | 0.195 | 0.150 | 0.195  | 0.585  | ≤ 6e-33                   | FAIL |
+| OLMoE | BF16 | 0.635 | 0.635 | 0.635 | 0.635  |        |                           |      |
+| OLMoE | tq4  | 0.615 | 0.615 | 0.615 | 0.615  | 0.020  | 0.61 (lost 19, gained 15) | FAIL |
+| OLMoE | tq2  | 0.170 | 0.170 | 0.170 | 0.170  | 0.465  | 5e-25                     | FAIL |
+
+Staged-prefill profile (decision "6b Task 12: follow-ups", 1 A; measure only). Method: `rocprofv3 --kernel-trace` around a native server on GPU 0 under `bench.lock`, `phase2c` config, 20 requests at c1, `--max-tokens 1`, kernels summed inside the bench window. Llama prompts were 2000 words (≈ 2,950 tokens, two prefill chunks); OLMoE prompts were 1500 words. Per request:
+
+| Model, KV  | TTFT p50 (ms) | + vs BF16 | encode `mixed_append_tq` | post-CK `mixed_attn` (+ prep, combine) | staging `mixed_stage` | CK fmha |
+| ---------- | ------------- | --------- | ------------------------ | -------------------------------------- | --------------------- | ------- |
+| Llama bf16 | 198.7         |           | (BF16 append 0.9)        |                                        |                       | 20.9    |
+| Llama tq4  | 232.4         | +33.7     | 19.6                     | 12.3                                   | 3.0                   | 20.4    |
+| Llama tq2  | 225.4         | +26.7     | 11.9                     | 12.2                                   | 3.0                   | 20.5    |
+| OLMoE bf16 | 95.3          |           | (BF16 append 0.7)        |                                        |                       | 5.5     |
+| OLMoE tq4  | 116.7         | +21.4     | 14.7                     | 4.5                                    | 2.2                   | 5.4     |
+
+- Encode dominates: 58 % of the Llama tq4 increase and 69 % of OLMoE's. That is 0.35 ms per 2048-row layer chunk on Llama, about 30 GB/s effective and 21× the BF16 append.
+- Second is the single-query `turbine_hip_mixed` pass that `run_mixed_staged` launches after CK on every layer and chunk: 7 + 4 full-grid launches per layer per Llama request. It runs even when the batch has no `q_len` 1 row, and this workload has none.
+- Staging decode is small, and CK is unchanged.
