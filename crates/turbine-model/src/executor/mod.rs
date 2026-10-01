@@ -491,6 +491,13 @@ pub trait ModelExecutor: Send {
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
         let _ = graphs;
     }
+    /// TurboQuant L0 pages (P6b S-5): the device copy of the model's TurboQuant tables a GPU
+    /// provider's paged attention reads, set before the first forward (decode graphs capture
+    /// the pointers). Executors without TurboQuant pages ignore the call.
+    fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
+        let _ = tables;
+        Ok(())
+    }
     /// Tensor-parallel prefill overlap (P5 Task 32, `parallel.tp_prefill_overlap`): prefills of
     /// at least `min_tokens` rows (`None`: off; the server passes
     /// [`decoder::PREFILL_OVERLAP_MIN_TOKENS`]) split in two halves whose all-reduces overlap

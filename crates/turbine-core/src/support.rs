@@ -513,6 +513,44 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
+    // TurboQuant L0 pages on gfx1201 (P6b S-5, Task 12 mixed-format attention + the tables the
+    // server uploads): `experimental` until the Task 13 proof (S-8 gate) turns them `supported`.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Tq4),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Tq2),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("OlmoeForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Tq4),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("OlmoeForCausalLM"),
+        BF16,
+        Some(KvFormatColumn::Tq2),
+        NO_SPEC,
+        SupportStatus::Experimental,
+    ),
     // Reserved for the tracks; each track replaces its refusal with validated rows.
     family_row("amd", "Qwen3ForCausalLM"),
     family_row("amd", "Qwen3MoeForCausalLM"),
@@ -894,12 +932,10 @@ pub struct TierFormatRefusal {
     pub status: SupportStatus,
 }
 
-const TQ_TIER_REASON: &str =
-    "TurboQuant lower-tier KV is not validated yet (track phase-6b-kv-compression)";
-
 /// Lower-tier formats that are not `supported`: `fp8_e4m3` is `experimental` from the ABI v2.11
-/// transcode (P6b Task 5) until its lab proof (Task 6); TurboQuant is refused until its codec
-/// lands (P6b Tasks 7–9), then `experimental` until the S-8 gate passes.
+/// transcode (P6b Task 5) until its lab proof (Task 6); `tq4` and `tq2` are `experimental` from
+/// the TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until the S-8 gate
+/// (Task 9) passes.
 pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
     TierFormatRefusal {
         format: "fp8_e4m3",
@@ -907,11 +943,11 @@ pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
     },
     TierFormatRefusal {
         format: "tq4",
-        status: unsupported(TQ_TIER_REASON),
+        status: SupportStatus::Experimental,
     },
     TierFormatRefusal {
         format: "tq2",
-        status: unsupported(TQ_TIER_REASON),
+        status: SupportStatus::Experimental,
     },
 ];
 
@@ -1298,36 +1334,37 @@ mod tests {
             status.reason().unwrap().contains("phase-6a-quantization"),
             "{status:?}"
         );
-        // TurboQuant L0 pages (P6b S-5): `experimental` on the CPU reference provider (BF16
-        // weights), refused naming the track on every other vendor, blaming kv.dtype; the
-        // lower-tier formats resolve through TIER_FORMAT_REFUSALS.
+        // TurboQuant L0 pages (P6b S-5): `experimental` on the CPU reference provider and on
+        // gfx1201 Llama / OLMoE (BF16 weights; Task 12 attention, Task 8 tables) until the S-8
+        // gate; refused naming the track on any other arch, weight format or vendor, blaming
+        // kv.dtype. The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
         for kv in [K::Tq4, K::Tq2] {
             for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
                 let k = key("cpu", "cpu", architecture, W::Bf16, kv, S::None);
                 assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
                 let k = key("cpu", "cpu", architecture, W::Fp8, kv, S::None);
                 assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
-            }
-            for (vendor, arch, architecture) in [
-                ("amd", "gfx1201", "LlamaForCausalLM"),
-                ("amd", "gfx1201", "OlmoeForCausalLM"),
-            ] {
-                let k = key(vendor, arch, architecture, W::Bf16, kv, S::None);
-                let status = resolve(&k);
-                assert_eq!(status.as_str(), "unsupported", "{k}");
-                assert!(
-                    status.reason().unwrap().contains("phase-6b-kv-compression"),
-                    "{k}: {status:?}"
-                );
-                assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
+                let k = key("amd", "gfx1201", architecture, W::Bf16, kv, S::None);
+                assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+                assert!(check(k).is_ok());
+                for (arch, weights) in [("gfx942", W::Bf16), ("gfx1201", W::Fp8)] {
+                    let k = key("amd", arch, architecture, weights, kv, S::None);
+                    let status = resolve(&k);
+                    assert_eq!(status.as_str(), "unsupported", "{k}");
+                    assert!(
+                        status.reason().unwrap().contains("phase-6b-kv-compression"),
+                        "{k}: {status:?}"
+                    );
+                    assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
+                }
             }
         }
         for format in ["tq4", "tq2"] {
-            let err = check_tier_format("kv.nvme.format", format).unwrap_err();
-            assert_eq!(err.key(), Some("kv.nvme.format"));
-            let msg = err.to_string();
-            assert!(msg.contains("phase-6b-kv-compression"), "{msg}");
-            assert!(msg.contains(&format!("tier format {format}")), "{msg}");
+            assert_eq!(
+                check_tier_format("kv.nvme.format", format).unwrap(),
+                SupportStatus::Experimental,
+                "{format}"
+            );
         }
         // `fp8_e4m3` is experimental from the ABI v2.11 transcode (P6b Task 5) until its lab
         // proof (Task 6); `l0` is always supported.

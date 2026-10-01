@@ -965,7 +965,14 @@ fn tq_kv_serves_on_cpu() {
     let server = TinyServer::launch(&Setup {
         kv_extra: "  dtype: tq4\n",
         head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
         ..Setup::default()
+    });
+    // P6b Task 8: the executor got the device copy of the tables before its first forward.
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the tq_tables log line", || {
+        logs.lock().unwrap().contains(r#""event":"tq_tables""#)
     });
     for _ in 0..2 {
         let resp = server.post(
@@ -1599,6 +1606,116 @@ fn transcode_staging_is_in_the_workspace_pool() {
         staged > plain,
         "workspace {plain} bytes with l0 tiers, {staged} with an fp8 tier"
     );
+}
+
+/// A tiny Llama with head_dim 128 (the TurboQuant codecs' only head dimension) in `dir`:
+/// `(path, layers, KV heads)`.
+fn write_tiny_llama_128(dir: &TempDir) -> (PathBuf, u64, u64) {
+    let path = dir.path().join("tiny128");
+    let spec = write_tiny_llama_with(
+        &path,
+        7,
+        &TinyOptions {
+            head_dim: 128,
+            ..TinyOptions::default()
+        },
+    );
+    (
+        path,
+        u64::from(spec.config.num_layers),
+        u64::from(spec.config.num_kv_heads),
+    )
+}
+
+/// P6b Task 8: the TurboQuant tables are a fixed cost in the workspace pool, counted before the
+/// KV pool is sized, whichever TurboQuant format needs them. The budget is too small to start,
+/// so the refusal (exit 1, the pools named) shows the workspace each configuration reserves:
+/// `kv.dtype: tq4` pages reserve exactly the tables over BF16 pages (no tier, same executor
+/// workspace), a `tq4` NVMe tier those plus its staging slots over `l0` tiers, and no TurboQuant
+/// format nothing. Breaks if the tables are uploaded outside the budget (a model that fits
+/// without them starts and then runs out of memory) or counted for a configuration that does not
+/// upload them.
+#[test]
+fn tq_tables_are_in_the_workspace_pool() {
+    let dir = TempDir::new("turbine-tq-budget");
+    let (tiny, layers, heads) = write_tiny_llama_128(&dir);
+    // layers x KV heads x (K signs + V signs + S) F32, and the four codebooks.
+    let tables = 4 * (layers * heads * (2 * 128 + 128 * 128) + 2 + 4 + 8 + 16);
+    let workspace = |kv: &str| -> u64 {
+        let addr = free_addr();
+        let yaml = format!(
+            "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+             kv:\n{kv}reliability:\n  memory:\n    workspace_bytes: 1KiB\n    \
+             device_budget_bytes: 1KiB\n",
+            tiny.display(),
+        );
+        let (code, stderr) = run_failing(&dir, &yaml);
+        assert_eq!(code, Some(1), "{kv}: stderr:\n{stderr}");
+        let at = stderr
+            .find("workspace=")
+            .unwrap_or_else(|| panic!("{kv}: no pool named:\n{stderr}"));
+        stderr[at + "workspace=".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{kv}: unreadable workspace:\n{stderr}"))
+    };
+    let plain = workspace("  dtype: bf16\n");
+    assert_eq!(workspace("  dtype: tq4\n"), plain + tables, "tq4 pages");
+    assert_eq!(workspace("  dtype: tq2\n"), plain + tables, "tq2 pages");
+    let nvme = |format: &str| {
+        format!(
+            "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    format: {format}\n",
+            dir.path().join("kv").display()
+        )
+    };
+    let l0_tier = workspace(&nvme("l0"));
+    assert_eq!(l0_tier, plain, "l0 tiers reserve nothing");
+    let tq_tier = workspace(&nvme("tq4"));
+    assert!(
+        tq_tier >= l0_tier + tables,
+        "a tq4 tier reserves {tq_tier} bytes, l0 tiers {l0_tier}, the tables are {tables}"
+    );
+    // The staging slots differ by format, the tables do not: the formats' difference is only
+    // the staging.
+    let fp8_tier = workspace(&nvme("fp8_e4m3"));
+    let tq2_tier = workspace(&nvme("tq2"));
+    assert!(fp8_tier > l0_tier && tq2_tier >= l0_tier + tables);
+}
+
+/// P6b Task 8: a `tq4` NVMe tier below BF16 pages starts on the cpu backend (the tier format is
+/// `experimental`, no longer refused), uploads the TurboQuant tables for the transcode and runs
+/// its copies on it (`kv_transcode_device` names `tq4`), and the server answers. Breaks if the
+/// startup still refuses lower-tier `tq4`, the tables are not built for the transcode, or the
+/// device path does not take the format.
+#[test]
+fn tq_tier_transcodes_on_the_device_path() {
+    let kv_dir = TempDir::new("turbine-tq-tier");
+    let nvme = format!(
+        "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 64MiB\n    slab_bytes: 8MiB\n    \
+         format: tq4\n",
+        kv_dir.path().join("kv").display()
+    );
+    let server = TinyServer::launch(&Setup {
+        kv_extra: &nvme,
+        head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the transcode log line", || {
+        logs.lock()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains(r#""event":"kv_transcode_device""#) && l.contains("tq4"))
+    });
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 4,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
 }
 
 #[test]

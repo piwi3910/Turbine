@@ -17,6 +17,7 @@ mod replicas;
 mod startup;
 mod support_matrix;
 mod support_startup;
+mod tq_device;
 
 use clap::Parser;
 
