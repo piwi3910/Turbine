@@ -173,12 +173,39 @@ pub trait TransferBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError>;
     /// `Ok(Some(destination slot))` once the copy has completed, `Ok(None)` while it runs.
     fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError>;
-    /// How long the copy `poll` just completed took, when the backend measured it itself (a
-    /// copy some of whose parts run elsewhere, P5 Task 30); `None`: the time from its start to
-    /// the `poll` that saw it complete.
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+    /// How long the copy `poll` just completed took, as far as the backend knows it (a copy
+    /// some of whose parts run elsewhere, P5 Task 30; a copy that ends on a GPU copy stream,
+    /// whose completion is seen only at a poll). `None`: the engine bounds it itself, from the
+    /// last poll that saw it running to the poll that saw it complete.
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
         let _ = t;
         None
+    }
+}
+
+/// How long a completed copy took ([`TransferBackend::took`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyTime {
+    /// Measured from its start to its completion.
+    Exact(Duration),
+    /// Completed somewhere in `at_least..=at_most` after its start: the copy was seen running
+    /// `at_least` in and done only at a poll `at_most` in. A poll-bounded copy says the path is
+    /// not slower than `at_most` and not faster than `at_least`, nothing in between, so the
+    /// estimate learns only when it falls outside (decision "6b Task 6", point 3: copy-stream
+    /// copies polled once per iteration had priced a 1.4 ms block at ~25–100 ms).
+    Within {
+        at_least: Duration,
+        at_most: Duration,
+    },
+}
+
+impl CopyTime {
+    /// The duration reported for the copy (metrics): the measured one, or the poll bound.
+    pub fn reported(self) -> Duration {
+        match self {
+            CopyTime::Exact(d) => d,
+            CopyTime::Within { at_most, .. } => at_most,
+        }
     }
 }
 
@@ -211,8 +238,8 @@ pub struct TransferEngine {
     clock: Arc<dyn Clock>,
     next_id: u64,
     queued: VecDeque<TransferTicket>,
-    /// In-flight tickets with their start time.
-    inflight: Vec<(TransferTicket, Duration)>,
+    /// In-flight tickets with their start time and the last poll that saw them running.
+    inflight: Vec<(TransferTicket, Duration, Option<Duration>)>,
     inflight_bytes: u64,
     peak_inflight_bytes: u64,
     /// Owners cancelled while one of their copies is still in flight.
@@ -260,17 +287,17 @@ impl TransferEngine {
         let now = self.clock.now_mono();
         let mut out = Vec::new();
         let mut running = Vec::with_capacity(self.inflight.len());
-        for (ticket, started) in std::mem::take(&mut self.inflight) {
-            let mut timed_by = "backend";
+        for (ticket, started, seen_running) in std::mem::take(&mut self.inflight) {
+            let last_running = seen_running.unwrap_or(started);
             let result = match b.poll(&ticket) {
                 Ok(None) => {
-                    running.push((ticket, started));
+                    running.push((ticket, started, Some(now)));
                     continue;
                 }
                 Ok(Some(slot)) => Ok((
-                    b.took(&ticket).unwrap_or_else(|| {
-                        timed_by = "poll";
-                        now.saturating_sub(started)
+                    b.took(&ticket).unwrap_or(CopyTime::Within {
+                        at_least: last_running.saturating_sub(started),
+                        at_most: now.saturating_sub(started),
                     }),
                     slot,
                 )),
@@ -283,19 +310,21 @@ impl TransferEngine {
                 // Estimates are rates per encoded byte, the bytes the copy moved (the smaller
                 // end's, `req.bytes`): the planner and the eviction score price a copy at its
                 // encoded size (P6b S-3, decision A), so the compression saving counts once.
-                self.observe(ticket.req.path, ticket.req.bytes, *took);
+                let sample = self.observe(ticket.req.path, ticket.req.bytes, *took);
                 let e = self.estimates[ticket.req.path.index()];
                 tracing::debug!(
                     event = "kv_copy_timed",
                     path = ticket.req.path.as_str(),
                     purpose = ticket.req.purpose.as_str(),
                     bytes = ticket.req.bytes,
-                    took_s = took.as_secs_f64(),
-                    timed_by,
+                    took_s = took.reported().as_secs_f64(),
+                    exact = matches!(took, CopyTime::Exact(_)),
+                    sample_s = sample.as_secs_f64(),
                     est_latency_s = e.latency_s,
                     est_bandwidth_bps = e.bandwidth_bps,
                 );
             }
+            let result = result.map(|(took, slot)| (took.reported(), slot));
             let owner_cancelled = ticket
                 .req
                 .owner
@@ -305,7 +334,7 @@ impl TransferEngine {
         self.inflight = running;
         let inflight = &self.inflight;
         self.cancelled
-            .retain(|o| inflight.iter().any(|(t, _)| t.req.owner == Some(*o)));
+            .retain(|o| inflight.iter().any(|(t, _, _)| t.req.owner == Some(*o)));
 
         while let Some(front) = self.queued.front() {
             let fits = self.inflight.is_empty()
@@ -318,7 +347,7 @@ impl TransferEngine {
                 Ok(()) => {
                     self.inflight_bytes += ticket.req.bytes;
                     self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
-                    self.inflight.push((ticket, now));
+                    self.inflight.push((ticket, now, None));
                 }
                 Err(e) => self.finish(ticket, Err(e), false, &mut out),
             }
@@ -340,7 +369,7 @@ impl TransferEngine {
         if self
             .inflight
             .iter()
-            .any(|(t, _)| t.req.owner == Some(owner))
+            .any(|(t, _, _)| t.req.owner == Some(owner))
         {
             self.cancelled.insert(owner);
         }
@@ -388,7 +417,19 @@ impl TransferEngine {
     /// the current latency estimate leaves, taken only when that is at least half the copy
     /// (a latency-bound copy says little about the rate), and latency is what the duration
     /// leaves beyond the current bandwidth estimate.
-    fn observe(&mut self, path: TransferPath, bytes: u64, took: Duration) {
+    ///
+    /// A poll-bounded copy ([`CopyTime::Within`]) is folded in as the current estimate clamped
+    /// to its bounds: inside them it changes nothing, outside it moves the estimate to the
+    /// nearer bound. Returns the duration folded in.
+    fn observe(&mut self, path: TransferPath, bytes: u64, took: CopyTime) -> Duration {
+        let took = match took {
+            CopyTime::Exact(d) => d,
+            CopyTime::Within { at_least, at_most } => {
+                let predicted =
+                    Duration::from_secs_f64(self.estimates[path.index()].block_seconds(bytes));
+                predicted.min(at_most).max(at_least)
+            }
+        };
         let secs = took.as_secs_f64().max(1e-9);
         let e = &mut self.estimates[path.index()];
         let moving = secs - e.latency_s.clamp(0.0, secs);
@@ -397,6 +438,7 @@ impl TransferEngine {
         }
         let latency = (secs - bytes as f64 / e.bandwidth_bps.max(1.0)).clamp(0.0, secs);
         e.latency_s = (1.0 - ALPHA) * e.latency_s + ALPHA * latency;
+        took
     }
 
     fn finish(
@@ -547,8 +589,8 @@ impl TransferBackend for SimTransferBackend {
         result.map(Some)
     }
 
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
-        self.took.remove(&t.id)
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
+        self.took.remove(&t.id).map(CopyTime::Exact)
     }
 }
 
@@ -754,6 +796,112 @@ mod tests {
                 "{bytes} B: {got} s vs {want} s ({est:?})"
             );
         }
+    }
+
+    /// A backend that cannot time its own copies (a copy that ends on a GPU copy stream: the
+    /// ABI has no event timestamps), so the engine sees each one done only at the next poll.
+    struct PollTimed(SimTransferBackend);
+
+    impl TransferBackend for PollTimed {
+        fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
+            self.0.start(t)
+        }
+        fn poll(&mut self, t: &TransferTicket) -> Result<Option<TierSlot>, TierError> {
+            let r = self.0.poll(t);
+            self.0.took(t);
+            r
+        }
+    }
+
+    /// The server's stressed multi-turn run (decision "6b Task 6", point 3): L1 → L0 copies of
+    /// 14.7 MB take 1.4 ms (10.45 GB/s calibrated) but end on the copy stream, which is polled
+    /// once per iteration (25–200 ms at c32), so each was observed at ~25 ms; the latency
+    /// estimate climbed to 63 ms and every L1 block priced above recomputing its 128 tokens. A
+    /// copy seen done at a poll only bounds its duration from above: it says the estimate is
+    /// not too fast, nothing more. Breaks if a poll-bounded completion is folded in as the copy's
+    /// duration.
+    #[test]
+    fn poll_bounded_copies_do_not_drag_the_estimate() {
+        use crate::planner::{PlanInputs, PlanReason, plan_prefix};
+        use turbine_core::types::PressureState;
+
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let path = TransferPath::L1ToL0;
+        let calibrated = PathCost {
+            latency_s: 100e-6,
+            bandwidth_bps: 10.45e9,
+        };
+        engine.seed(path, calibrated);
+        let mut sim = SimTransferBackend::new(clock, None, None, 0);
+        sim.set_cost(path, calibrated);
+        let mut backend = PollTimed(sim);
+        let bytes = 14_680_064u64;
+        let iteration = Duration::from_millis(25);
+        for i in 0..64u8 {
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            fake.advance(iteration);
+            assert_eq!(engine.pump(&mut backend).len(), 1, "done by the next poll");
+        }
+        let est = engine.estimate(path);
+        let (want, got) = (calibrated.block_seconds(bytes), est.block_seconds(bytes));
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "poll-bounded copies keep the calibrated {want} s per block: {got} s ({est:?})"
+        );
+        // The planner then retrieves an L1 block rather than recomputing its 128 tokens at the
+        // run's 9,000 tok/s.
+        let matched = [TierId::L0, TierId::L1];
+        let plan = plan_prefix(&PlanInputs {
+            matched: &matched,
+            prompt_tokens: 2 * 128 + 2,
+            block_tokens: 128,
+            block_bytes: bytes,
+            prefill_tps: 9_000.0,
+            l1_to_l0: Some(est),
+            l2_to_l0: None,
+            l0_state: PressureState::Green,
+            l1_degraded: false,
+            l2_degraded: false,
+            copy_bytes: &[],
+            lossy_penalty: &[],
+            allow_lossy: true,
+        });
+        assert_eq!(
+            (plan.cutoff_blocks(), plan.reason),
+            (2, PlanReason::RetrieveCheaper)
+        );
+
+        // A copy still running at a poll did take at least that long: copies that stay in flight
+        // for three iterations make the path slower.
+        let mut slow = SimTransferBackend::new(fake_clock(&fake), None, None, 0);
+        slow.set_cost(
+            path,
+            PathCost {
+                latency_s: 0.06,
+                bandwidth_bps: 10.45e9,
+            },
+        );
+        let mut backend = PollTimed(slow);
+        for i in 0..32u8 {
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut backend);
+            let mut done = 0;
+            while done == 0 {
+                fake.advance(iteration);
+                done = engine.pump(&mut backend).len();
+            }
+        }
+        let got = engine.estimate(path).block_seconds(bytes);
+        assert!(
+            got > 0.045,
+            "copies seen in flight at 50 ms price at least that: {got} s"
+        );
+    }
+
+    fn fake_clock(fake: &Arc<FakeClock>) -> Arc<dyn Clock> {
+        fake.clone()
     }
 
     #[test]
