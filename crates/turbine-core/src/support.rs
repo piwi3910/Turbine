@@ -938,8 +938,10 @@ pub struct TierFormatRefusal {
 /// 2026-10-01: golden c1 / c16 PASS for both formats and models. Shared-prefix GSM8K-200 medians
 /// of 3 against BF16 KV: `tq4` Llama 0.775 vs 0.780, OLMoE 0.665 vs 0.635 (PASS); `tq2` Llama
 /// 0.720, OLMoE 0.610 (FAIL). `tq4` still misses the multi-turn criterion (cached-token ratio at
-/// least the `l0` run's): Llama 0.885 vs 0.905, from slow promotions the planner recomputes
-/// instead; OLMoE 0.858 vs 0.861. `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
+/// least the `l0` run's) on OLMoE: after lossy L1 promotions stopped queueing on the I/O pool
+/// (2026-10-02, perf-log 6b "TurboQuant promotion path"; promotions 245–289 → 50–63 ms) Llama
+/// passes, 0.9047 vs 0.9016 (medians of 3), and OLMoE gives 0.8591 vs 0.8626 with no recomputes.
+/// `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
 /// the shared-prefix GSM8K-200 gate on Llama-3.2-3B-Instruct (FP8 L1, lossy cached ratio 0.927,
 /// c16, 32 fillers) gave three BF16-KV runs 0.780 / 0.785 / 0.770 and three FP8-L1 runs
 /// 0.775 / 0.775 / 0.770: median drop 0.005 (max 0.01), paired exact McNemar p >= 0.55 on all

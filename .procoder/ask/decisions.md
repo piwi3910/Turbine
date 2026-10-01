@@ -2445,6 +2445,16 @@ TurboQuant encode (F64 sequential norms and the 128 × 128 QJL projection per K 
 demotion's rate (≈ 1,500 blocks/s); decode (promotion) is ≈ 0.25 ms a block. Not optimised further here (no target in
 the spec); the headroom is in the per-thread F64 norm loops and the S · r dot products.
 
+Remeasured after K became MSE-only (2026-10-02, `p6b-tqspeed` b6c8e11, kernels unchanged since 2c3c1f0; lab job
+`turbine-lab-test-1001211526-3189c413`, k3s card, `kv_transcode_matches_cpu` and `paged_mixed_matches_cpu` PASS), the same
+32-block Llama batch: `tq4` encode 22,387 µs (0.70 ms a block), decode 1,299 µs (0.04 ms a block, 362 GB/s of pages; the
+QJL residual is gone); `tq2` encode 12,586 µs, decode 1,164 µs; FP8 2,449 / 1,576 µs. The decode is not on the critical
+path of a promotion. The `tq4` promotions of 245–289 ms (Task 9) were spent waiting in the I/O pool queue behind
+host-codec demotion encodes, which ran when the 32 device staging slots were taken. The fix is in the server
+(perf-log 6b "TurboQuant promotion path"): a lossy L1 promotion now copies the pinned L1 slot on the copy stream. No
+kernel changed, so no kernel before/after pair. The encode (0.70 ms a block, the F64 per-vector norm loop) still sets
+how fast `tq4` demotions can go.
+
 ## 6b Task 8: TurboQuant tables through the transcode descriptor (2026-09-30)
 
 Found by the Task 8 builder (`p6b-t8`, c3839c9). `turbine_kv_transcode_desc` carries only `seed`. The K/V signs are
