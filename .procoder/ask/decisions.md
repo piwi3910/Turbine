@@ -2818,3 +2818,20 @@ ratio 0.927. Paired flips 8 vs 6; exact-KV runs vary 0.755–0.790 at c16. (The 
 - C) Accept the pass at the bound
 
 **Decision (user, 2026-10-01): A.** Three baseline and three candidate runs, judged on the medians plus the paired McNemar test; the same method applies to the TurboQuant tier gates (Task 9).
+
+## 6b: queued-prefix demotion — granularity and scope (2026-10-01)
+
+From `p6b-queued-demote` (design in `.procoder/handoff/p6b-queued-demote.md`, after decision "after the held-prefix
+ledger fix", 1 B): at YELLOW/ORANGE the reclaim's shortfall becomes a demand (≤ 32 blocks per tick); the last-queued
+requests release their prefixes first (the head keeps its own); released blocks drop from `held` and the normal
+reclaim demotes them (free if copy-ahead already copied them); on admission the request re-attaches through the
+planner. No new config key.
+
+1. Granularity:
+   - A) Release whole prefixes (simple re-attach)
+   - B) Release only a prefix's tail blocks
+2. Scope:
+   - A) Only requests in the admission (gate) queue
+   - B) Also admitted-but-unstarted requests in the scheduler queue
+
+**Decision (user, 2026-10-01): 1 A, 2 A.** Whole prefixes; admission queue only.
