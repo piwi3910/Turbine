@@ -933,8 +933,13 @@ pub struct TierFormatRefusal {
 }
 
 /// Lower-tier formats that are not `supported`: `tq4` and `tq2` are `experimental` from the
-/// TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until the S-8 gate
-/// (Task 9) passes. `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
+/// TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until every Task 9 gate
+/// passes for Llama and OLMoE (this table has one row per format, not per model). Task 9 lab,
+/// 2026-10-01: golden c1 / c16 PASS for both formats and models. Shared-prefix GSM8K-200 medians
+/// of 3 against BF16 KV: `tq4` Llama 0.775 vs 0.780, OLMoE 0.665 vs 0.635 (PASS); `tq2` Llama
+/// 0.720, OLMoE 0.610 (FAIL). `tq4` still misses the multi-turn criterion (cached-token ratio at
+/// least the `l0` run's): Llama 0.885 vs 0.905, from slow promotions the planner recomputes
+/// instead; OLMoE 0.858 vs 0.861. `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
 /// the shared-prefix GSM8K-200 gate on Llama-3.2-3B-Instruct (FP8 L1, lossy cached ratio 0.927,
 /// c16, 32 fillers) gave three BF16-KV runs 0.780 / 0.785 / 0.770 and three FP8-L1 runs
 /// 0.775 / 0.775 / 0.770: median drop 0.005 (max 0.01), paired exact McNemar p >= 0.55 on all

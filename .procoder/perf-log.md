@@ -384,3 +384,63 @@ What the first lab runs found (each fixed with a test, commits on the branch):
 Reading: the headroom fix alone (control) keeps 24 sessions at ORANGE and halves its p99 (28 → 10 s); queued-prefix release adds little there. At 32 sessions the release matters: p50 1.4–2.0 s → 0.4–0.8 s and p99 27–52 s → 18–27 s against the control, every run ORANGE, no failure (before: 7–11 `queue_timeout` in 2 of 3, p99 42–60 s). The released blocks (600–700 per run) mostly come back from L1 (cached ratio 0.76, against 0.80 for the control and 0.75–0.78 before).
 
 10-minute overload soak on 9d4cf27 (`SOAK_BENCH` an ssh wrapper running the bench on novanas; serve 1001172949-2621fd90, `target/soak/novanas-20261001T172949Z`): PASS, all 8 checks true; ITL p99 210.7 ms (calibration 174.0 ms), GREEN 30 s into the cool-down, 4259 × 200, 71 × 503 `overloaded`, 2282 `queue_timeout` (the p6b-survival soak: 4385 / 72 / 2421).
+
+### TurboQuant lower-tier gates (Task 9, `tq4` / `tq2` MSE-only K; branch `p6b-t9`)
+
+Trees f7bcebb (Llama) and e88c333 / 4a8469c (OLMoE; test and eval-data commits only, same server). Every serve Job of ours ran alone under the bench lock. `lab-bench` ran on GPU 0, the k3s serve Jobs on whichever card was free.
+
+`scripts/lab-bench.sh --model <m> --golden16 -- --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB` (200 requests, client novanas; labbook 0949307a, d7c0d5a0, defe0be9, 87aba952):
+
+| Model | L1 format | tok/s | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 (batched) |
+| ----- | --------- | ----- | ------------ | ------------- | ------------------------- |
+| Llama | `tq4`     | 850.3 | 15.4         | 207           | PASS / PASS (16/16)       |
+| Llama | `tq2`     | 844.4 | 15.6         | 208           | PASS / PASS (16/16)       |
+| OLMoE | `tq4`     | 607.4 | 24.6         | 119           | PASS / PASS (15/16)       |
+| OLMoE | `tq2`     | 606.7 | 24.6         | 119           | PASS / PASS (15/16)       |
+
+The golden and bench prompts share no full block, so no lossy block is read here. These runs show that the tier configuration does not disturb serving. They do not show the codec's quality.
+
+Shared-prefix GSM8K-200 (`p6b-eval-prefix.md` recipe: c16, 32 fillers, `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`; Llama `phase6-novanas-llama.yaml`, OLMoE `phase2c-novanas-olmoe.yaml`):
+
+- Candidates ran with `--min-lossy-cached-ratio 0.5` and baselines with `--min-cached-ratio 0.5`. Every guard passed.
+- Every server counted only its eval's prompt tokens: 726,723 for Llama, 762,875 for OLMoE (OLMoE's tokenizer; its prefix is 25 blocks).
+- Lossy cached ratio: 0.927 (Llama), 0.960 (OLMoE).
+- The Llama baselines are `turbine-bf16-sp-r{1,2,3}.json` from f9a4c91. Since that commit only TurboQuant code changed (codec, transcode, mixed attention, tables), and the recipe and eval runner are unchanged.
+- The OLMoE runs are bit-identical across repeats (each arm's three reports are equal).
+- Pairs are judged with `scripts/eval/paired_compare.py --max-drop 0.01` and committed as `turbine-l1-<f>-sp-r<i>-paired.json`.
+
+| Model | Arm  | r1    | r2    | r3    | Median | Drop   | McNemar exact p (9 pairs)      | Gate |
+| ----- | ---- | ----- | ----- | ----- | ------ | ------ | ------------------------------ | ---- |
+| Llama | BF16 | 0.780 | 0.785 | 0.770 | 0.780  |        |                                |      |
+| Llama | tq4  | 0.775 | 0.760 | 0.790 | 0.775  | 0.005  | 0.23–1.0                       | PASS |
+| Llama | tq2  | 0.730 | 0.720 | 0.705 | 0.720  | 0.060  | 0.011–0.24 (3 of 9 below 0.05) | FAIL |
+| OLMoE | BF16 | 0.635 | 0.635 | 0.635 | 0.635  |        |                                |      |
+| OLMoE | tq4  | 0.665 | 0.665 | 0.665 | 0.665  | −0.030 | 0.24 (lost 6, gained 12)       | PASS |
+| OLMoE | tq2  | 0.610 | 0.610 | 0.610 | 0.610  | 0.025  | 0.53 (lost 23, gained 18)      | FAIL |
+
+Multi-turn A/B against `l0`, 16 sessions, c16, `--think-time 1..4 --session-hints`, a fresh server per run, medians of 3:
+
+- Llama: `phase2c-novanas-llama.yaml --set kv.cpu.format=<f> --set kv.cpu.max_bytes=4GiB`, `--shared-prefix-words 2000`.
+- OLMoE: its 4,096-token context cannot hold the spec workload (2,000 words is already ~4,100 tokens at turn 1; the first attempt answered 112 of 128 requests with 400 `context_length_exceeded` and was discarded). It ran `--shared-prefix-words 600 --prompt-words 128 --max-tokens 64` with `--set kv.gpu.max_bytes=4GiB` (256 L0 blocks, below the ~430 the live histories need), so L1 serves 190–260 lookups per run.
+- Capacity is from `/turbine/v1/kv` L1 `formats`. Blocks per GiB of filled L1 include the lossless-tail `l0` blocks. Pure-codec block bytes are 4,128,768 for `tq4` (Llama), 3.56× fewer than BF16's 14,680,064.
+
+| Model | L1 format | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | L1 blocks per GiB (vs `l0`) | lossless-tail share | recompute / retrieve plans | mean L1→L0 promotion (ms) |
+| ----- | --------- | ------------------- | ------------------------------ | --------------------------- | ------------------- | -------------------------- | ------------------------- |
+| Llama | `l0`      | 0.9052              | 78.5 / 356                     | 73.1                        | none                | 0 / 29                     | 42 / 41 / 61              |
+| Llama | `tq4`     | 0.8854              | 75.5 / 1754                    | 216.3 (2.96×)               | 0.079               | 11 / 9                     | 245 / 289 / 85            |
+| Llama | `tq2`     | 0.9048              | 73.8 / 316                     | 380.6 (5.21×)               | 0.043               | 0 / 15                     | 97 / 108 / 96             |
+| OLMoE | `l0`      | 0.8607              | 53.2 / 243                     | 64.0                        | none                | 0 / 45                     | 29–45                     |
+| OLMoE | `tq4`     | 0.8581              | 48.8 / 180                     | 185.8 (2.90×)               | 0.088               | 0 / 25                     | 63–70                     |
+| OLMoE | `tq2`     | 0.8583              | 49.2 / 195                     | 302.9 (4.73×)               | 0.065               | 0 / 27                     | 57–74                     |
+
+The spec criterion "`cached_tokens_ratio` ≥ the `l0` run" fails on medians for every TurboQuant cell:
+
+- Llama `tq4`: −0.020. Runs 1 and 2 recomputed 17 and 11 plans (`recompute_cheaper`); run 3 (0.905) did not. Their promotions averaged 245–289 ms against 41–61 ms at `l0`, which also shows in the later-turn p99 (1.8–2.1 s). The planner priced the slow `tq4` retrieves above recomputing.
+- OLMoE `tq4` and `tq2`: −0.003. There were no recomputes, but all six runs are at or below the lowest `l0` run.
+- Llama `tq2`: −0.0004, within the `l0` spread.
+
+Later-turn TTFT p50 is equal or better with TurboQuant (fewer bytes over the link).
+
+`kv_gpu` (job 1001170002-222ba975, e88c333): 12 passed, 0 failed. `lossy_tier_reuse_tq4` is now held to (0.25, 0.75, 0.9): the first 8 tokens within 0.25 of cold, 90 % of 64 positions within 0.75. These bounds are golden's Llama batched bounds, which the tq4 golden16 run passed, and the GSM8K gate showed that reuse at that level costs no accuracy. Measured: first-8 worst 0.242, 0.98 of positions within 0.75, worst position 0.979.
+
+Result: `tq2` fails the GSM8K gate on both models. `tq4` passes golden and GSM8K on both, but misses the multi-turn ratio criterion (Llama by 0.020, from slow promotions; OLMoE by 0.003). Both stay `experimental` in `TIER_FORMAT_REFUSALS`. Options are in `.procoder/handoff/p6b-t9.md`. Labbook set `phase-6b-kv-compression`: the 4 lab-bench runs, 18 multi-turn runs and the kv_gpu run.

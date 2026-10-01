@@ -911,9 +911,10 @@ fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (
         .collect();
     let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
     let within = diff.iter().filter(|d| **d <= pos_bound).count() as f64 / diff.len().max(1) as f64;
+    let worst = diff.iter().cloned().fold(0.0, f64::max);
     println!(
-        "{label}: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within 0.5 \
-         (cached {}, lossy cached {})",
+        "{label}: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within {pos_bound}, \
+         worst {worst:.3} (cached {}, lossy cached {})",
         warm.cached_tokens, warm.lossy_cached_tokens
     );
     assert!(head <= head_bound, "first tokens differ by {head}");
@@ -932,16 +933,27 @@ fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse() {
-    lossy_tier_reuse_with("fp8_e4m3", Some((0.3, 0.5, 0.9)));
+    lossy_tier_reuse_with("fp8_e4m3", (0.3, 0.5, 0.9));
 }
 
 /// [`lossy_tier_reuse`] with L1 at TurboQuant 4-bit (P6b Task 8: the tables are uploaded and the
-/// transcode runs `turbine_hip_tq`). No quality bound: the mechanism is asserted (device transcode, lossy reuse, no checksum eviction); Task 9 sets the S-8 gate.
+/// transcode runs `turbine_hip_tq`), held to [`TQ4_TIER_BOUNDS`].
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse_tq4() {
-    lossy_tier_reuse_with("tq4", None);
+    lossy_tier_reuse_with("tq4", TQ4_TIER_BOUNDS);
 }
+
+/// The `tq4` tier's bound (P6b Task 9), taken from the gates that judged it: S-8 judges lossy KV by
+/// golden with the slug's batched bounds (Llama `tolerance.json`: 0.25 for a likely token, 0.75
+/// for the tail), and `scripts/lab-bench.sh --golden16` with `kv.cpu.format=tq4` passed them; the
+/// shared-prefix GSM8K gate (lossy cached ratio 0.927) then showed that reuse at that level costs
+/// no accuracy (median 0.775 against BF16 0.780, McNemar n.s.). So the first 8 answer tokens
+/// (greedy, likely) stay within 0.25 of the cold run and 90 % of the 64 positions within 0.75
+/// (a greedy flip later in the answer moves the positions after it; the FP8 tier's 0.3 / 0.5 / 0.9
+/// is tighter because FP8 is). Breaks if the TurboQuant tier perturbs reuse beyond what golden
+/// accepts from batch composition.
+const TQ4_TIER_BOUNDS: (f64, f64, f64) = (0.25, 0.75, 0.9);
 
 /// P6b Task 8 smoke: `kv.dtype: tq4` serves on the GPU (tables uploaded to the executor before
 /// the first forward, the mixed-format attention reads them): a request answers its tokens with
@@ -970,7 +982,7 @@ fn tq_kv_serves_on_the_device() {
     println!("tq_kv_serves_on_the_device ok: {:?}", answer.text);
 }
 
-fn lossy_tier_reuse_with(format: &str, bounds: Option<(f64, f64, f64)>) {
+fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
     if !require_backend("hip") {
         return;
     }
@@ -1020,22 +1032,7 @@ fn lossy_tier_reuse_with(format: &str, bounds: Option<(f64, f64, f64)>) {
         warm.lossy_cached_tokens > 0,
         "no reused block was served from a lossy copy: {warm:?}"
     );
-    match bounds {
-        Some(b) => assert_within_bounds(&cold, &warm, "lossy L1 reuse", b),
-        // The codec's own loss is Task 9's gate: print the spread, assert the mechanism.
-        None => {
-            assert_eq!(warm.completion_tokens, cold.completion_tokens);
-            let worst = cold
-                .logprobs
-                .iter()
-                .zip(&warm.logprobs)
-                .map(|(c, w)| (c - w).abs())
-                .fold(0.0, f64::max);
-            println!(
-                "{format} lossy L1 reuse: worst |Δ logprob| {worst:.3} (no bound until Task 9)"
-            );
-        }
-    }
+    assert_within_bounds(&cold, &warm, &format!("{format} lossy L1 reuse"), bounds);
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
         0.0

@@ -1,0 +1,21 @@
+{
+  "baseline": "tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp-r2.json",
+  "candidate": "tests/eval/llama-3.2-3b-instruct/turbine-l1-tq4-sp-r2.json",
+  "baseline_model": "meta-llama/Llama-3.2-3B-Instruct",
+  "candidate_model": "meta-llama/Llama-3.2-3B-Instruct",
+  "n": 200,
+  "baseline_correct": 157,
+  "candidate_correct": 152,
+  "baseline_accuracy": 0.785,
+  "candidate_accuracy": 0.76,
+  "drop": 0.025,
+  "lost": 8,
+  "gained": 3,
+  "mcnemar_chi2": 1.455,
+  "mcnemar_p": 0.228,
+  "mcnemar_exact_p": 0.227,
+  "drop_ci95": [-0.0073, 0.0573],
+  "max_drop": 0.01,
+  "verdict": "FAIL",
+  "ci_entirely_above_bound": false
+}

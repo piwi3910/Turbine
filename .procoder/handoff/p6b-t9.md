@@ -1,6 +1,6 @@
 # Handoff: p6b-t9 (Task 9 TurboQuant tier proof)
 
-Branch `p6b-t9`. Builder rotated after step 1 (MSE-only K). Steps 2-3 (the Task 9 lab gates and the support rows) are not started.
+Branch `p6b-t9`. Builder rotated after step 1 (MSE-only K). The second builder ran and judged the Task 9 lab gates (below); no row flipped.
 
 ## Done
 
@@ -30,24 +30,42 @@ Branch `p6b-t9`. Builder rotated after step 1 (MSE-only K). Steps 2-3 (the Task 
 | OLMoE tq4 | 0.0089 | 0.0093 | 0.128      | 0.0428  | 0.0297 |
 | OLMoE tq2 | 0.1101 | 0.1152 | 0.512      | 0.2219  | 0.1328 |
 
-## Next (steps 2-3 of the brief, in order; GPU 0, bench lock, every long run with `run_in_background`)
+## Task 9 lab gates (2026-10-01, second builder): run and judged, nothing flipped
 
-1. Merge `p6b-stack` first. It has the three BF16 shared-prefix baselines `tests/eval/<slug>/turbine-bf16-sp-r{1,2,3}.json`, and
-   lower-tier `fp8_e4m3` is `supported` there. Reuse the baselines only if their recipe and BF16 serving path match this tree (the K change
-   touches only TQ paths, so they should, but check their commit); otherwise run your own.
-2. Llama, then OLMoE; `tq4`, then `tq2`:
-   `scripts/lab-bench.sh --model <m> --label p6b-t9-<fmt> --golden16 -- --set kv.cpu.format=<fmt> --set kv.cpu.max_bytes=4GiB`.
-3. Multi-turn A/B against `l0` at 16 sessions and c16. Take the median of 3 runs of `cached_tokens_ratio`, later-turn TTFT, and L1 blocks
-   per GiB (from `/turbine/v1/kv`, with the lossless-tail share).
-4. Shared-prefix GSM8K, 3 candidate runs per format, following the recipe in `.procoder/handoff/p6b-eval-prefix.md`: 32 fillers,
-   `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`, c16, `--min-lossy-cached-ratio 0.5`. Check that `turbine_kv_prompt_tokens_total` is
-   726,723 per server. Judge each pair r_i↔r_i with `scripts/eval/paired_compare.py <baseline> <candidate> --max-drop 0.01 --json`
-   (lead's instruction) and commit the output beside the reports as `turbine-l1-<fmt>-sp-r<i>-paired.json`, following the FP8 example on
-   `p6b-stack`. Judge on medians plus McNemar.
-5. Derive the `kv_gpu lossy_tier_reuse_tq4` bound from those gates. Record the numbers in perf log 6b and in labbook set
-   `phase-6b-kv-compression`.
-6. Flip `TIER_FORMAT_REFUSALS` `tq4` / `tq2` to `supported` only for a codec that passes all its gates. Otherwise keep it `experimental`
-   and report the numbers with options. Expectation from the loss table: tq4 is plausible, and tq2 (out_rel 0.55 on Llama) is likely to fail.
+Numbers and commands: `.procoder/perf-log.md`, Phase 6b, "TurboQuant lower-tier gates". Commits: cb7dd38 (Llama eval reports and pairs),
+e88c333 (`kv_gpu lossy_tier_reuse_tq4` bound), 4a8469c (OLMoE baselines and candidates), then the perf log, the `TIER_FORMAT_REFUSALS` doc
+comment and the AGENTS.md support line. Labbook set `phase-6b-kv-compression`: 4 lab-bench, 18 multi-turn and 1 kv_gpu run. No serve Job of
+this branch is left.
+
+| Model × format | golden c1 / c16 | GSM8K-sp median (BF16) | McNemar (9 pairs) | multi-turn ratio vs `l0` | L1 blocks/GiB vs `l0` (tail share) |
+| -------------- | --------------- | ---------------------- | ----------------- | ------------------------ | ---------------------------------- |
+| Llama `tq4`    | PASS / PASS     | 0.775 (0.780) PASS     | n.s. (p ≥ 0.23)   | 0.885 vs 0.905, miss     | 2.96× (0.079)                      |
+| Llama `tq2`    | PASS / PASS     | 0.720 (0.780) FAIL     | 3 of 9 p < 0.05   | 0.905 vs 0.905, −0.0004  | 5.21× (0.043)                      |
+| OLMoE `tq4`    | PASS / PASS     | 0.665 (0.635) PASS     | n.s. (p 0.24)     | 0.858 vs 0.861, miss     | 2.90× (0.088)                      |
+| OLMoE `tq2`    | PASS / PASS     | 0.610 (0.635) FAIL     | n.s. (p 0.53)     | 0.858 vs 0.861, miss     | 4.73× (0.065)                      |
+
+- The Llama BF16 baselines (`turbine-bf16-sp-r{1,2,3}.json`, f9a4c91) were reused: since then only TurboQuant code changed, and the recipe and
+  runner are the same. OLMoE got its own three; its runs are bit-identical across repeats and its servers count 762,875 prompt tokens.
+- OLMoE multi-turn could not run the spec workload: its 4,096-token context overflows at turn 1. It ran a 600-word prefix, 128-word turns, 64
+  tokens and a 4 GiB L0 instead (perf log). Record this as a spec amendment if the lead accepts it.
+- `kv_gpu` bound `TQ4_TIER_BOUNDS` (0.25, 0.75, 0.9) = golden's Llama batched bounds (likely 0.25, tail 0.75), which the tq4 golden16 run
+  passed, with 90 % of positions as for FP8. Measured 0.242 / 0.98, a thin margin on the first-8 bound. The test is deterministic (one
+  request, greedy).
+- `TIER_FORMAT_REFUSALS` has one row per format, so a per-model status cannot be expressed. Both formats stay `experimental`.
+
+## Open: decisions for the lead / user
+
+1. `tq4` misses only the multi-turn cached-ratio criterion. On Llama the cause is promotion speed, not quality: L1→L0 promotions of `tq4`
+   blocks averaged 245–289 ms in runs 1–2 (`l0` 41–61 ms, `tq2` about 100 ms), so the planner chose `recompute_cheaper` (17 and 11 plans) and
+   later-turn p99 rose to 1.8–2.1 s. On OLMoE the shortfall is −0.003 with no recomputes.
+   - A) Profile the `tq4` promotion path (device decode transcode plus copy) and rerun the multi-turn A/B; flip `tq4` if it then passes.
+     Recommended: it is a real latency defect, and `tq2` with half the bytes promotes faster, which points at a fixed or per-bit cost in
+     the decode.
+   - B) Treat the ratio criterion as met within run-to-run noise (Llama r3 0.905; OLMoE −0.003) and flip `tq4` now.
+   - C) Amend the criterion (for example ratio within 0.01 of `l0`, or later-turn TTFT not worse) and judge again.
+2. `tq2` fails the eval on both models (drops 0.060 / 0.025). It stays `experimental`. Options: A) keep it as an experimental capacity tier
+   (5.2× / 4.7× per GiB); B) mixed widths (e.g. K 4-bit, V 2-bit) as a new format, a spec change; C) drop it from the lower tiers.
+3. OLMoE multi-turn workload amendment (above): accept it, or define another OLMoE workload.
 
 ## Former QJL K measurements (pre-decision; for the record)
 
