@@ -2857,3 +2857,26 @@ planner. No new config key.
    - B) Also admitted-but-unstarted requests in the scheduler queue
 
 **Decision (user, 2026-10-01): 1 A, 2 A.** Whole prefixes; admission queue only.
+
+## 6b Task 9: TurboQuant lower-tier gate results — tq4 flip, tq2, OLMoE workload (2026-10-01)
+
+From `p6b-t9` (merged; `.procoder/handoff/p6b-t9.md`, perf log 6b). Golden c1/c16 PASS for all four. Shared-prefix
+GSM8K medians (BF16 in brackets): Llama tq4 0.775 (0.780) PASS, tq2 0.720 FAIL; OLMoE tq4 0.665 (0.635) PASS, tq2
+0.610 FAIL. Multi-turn cached ratio vs `l0`: Llama tq4 0.885 vs 0.905 (miss), OLMoE tq4 0.858 vs 0.861 (miss). Llama
+tq4 L1→L0 promotions averaged 245–289 ms in two of three runs vs 41–61 ms for `l0` (~100 ms tq2), so the planner
+recomputed. Both formats stay `experimental` (one row per format, no per-model status).
+
+1. tq4:
+   - A) Profile and speed up the tq4 promotion path (TQ decode transcode), rerun the multi-turn A/B, flip if it holds
+   - B) Accept the shortfall as noise and flip now
+   - C) Amend the criterion (e.g. ratio within 0.01 of `l0`)
+2. tq2 (fails quality on both models):
+   - A) Keep it as an `experimental` capacity tier
+   - B) Add a mixed-width format later (spec change)
+   - C) Drop it
+3. OLMoE multi-turn workload (its 4,096-token context overflows on the spec workload at turn 1; the builder ran a
+   600-word prefix, 128-word turns, 64 tokens, 4 GiB L0):
+   - A) Accept that workload as the OLMoE variant (spec amendment)
+   - B) Define another
+
+**Decision (user, 2026-10-01): 1 A, 2 A, 3 A.** Speed up the tq4 promotion path and rerun the multi-turn A/B before flipping; tq2 stays an `experimental` capacity tier; the OLMoE multi-turn workload above is the spec's OLMoE variant.
