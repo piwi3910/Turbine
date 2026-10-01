@@ -1,0 +1,21 @@
+{
+  "baseline": "tests/eval/olmoe-1b-7b-0125-instruct/turbine-bf16-sp-r1.json",
+  "candidate": "tests/eval/olmoe-1b-7b-0125-instruct/turbine-l1-tq2-sp-r1.json",
+  "baseline_model": "allenai/OLMoE-1B-7B-0125-Instruct",
+  "candidate_model": "allenai/OLMoE-1B-7B-0125-Instruct",
+  "n": 200,
+  "baseline_correct": 127,
+  "candidate_correct": 122,
+  "baseline_accuracy": 0.635,
+  "candidate_accuracy": 0.61,
+  "drop": 0.025,
+  "lost": 23,
+  "gained": 18,
+  "mcnemar_chi2": 0.39,
+  "mcnemar_p": 0.532,
+  "mcnemar_exact_p": 0.533,
+  "drop_ci95": [-0.0377, 0.0877],
+  "max_drop": 0.01,
+  "verdict": "FAIL",
+  "ci_entirely_above_bound": false
+}
