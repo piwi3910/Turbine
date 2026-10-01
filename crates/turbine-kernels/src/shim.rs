@@ -4009,6 +4009,95 @@ pub(crate) mod tests {
         assert_eq!(stub_count(&lib, "stub_live_streams"), 0);
     }
 
+    /// A batch of copies (the scattered device segments of one KV block) fences the compute
+    /// stream once and records one event: one ticket of the batch's bytes, complete only once
+    /// that event signals, every segment landing at its offset; a batch with a bad end is
+    /// refused before anything is enqueued. Breaks if each copy gets its own fence or event
+    /// (pinned D2H on the R9700 drops from ~11 to ~4.5 GB/s at 512 KiB segments, perf-log
+    /// "Pinned D2H") or a refused batch leaves a copy in flight.
+    #[test]
+    fn a_copy_batch_fences_and_signals_once() {
+        use turbine_tensor::{CopyEngine, CopyOp, CopyTarget, PinnedMemory};
+
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V25")), "hip")
+            .expect("load v2.5");
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let hold = |on: bool| {
+            stub_hook(&lib, "stub_hold_events", |f: unsafe extern "C" fn(i32)| {
+                // SAFETY: the stub defines `void stub_hold_events(int32_t)`; the library is
+                // loaded.
+                unsafe { f(i32::from(on)) }
+            })
+        };
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let mut dev = DeviceBuffer::alloc(&mem, 256).expect("device buffer");
+        let pattern: Vec<u8> = (0..=255u8).map(|i| i.wrapping_mul(11)).collect();
+        dev.copy_from_host(0, &pattern).expect("seed");
+        mem.synchronize().expect("seeded");
+        let host = ctx.alloc_pinned(128).expect("pinned buffer");
+        // Four 32-byte segments scattered on the device (every other 32 bytes), packed on the
+        // host: the layout of a block's layers.
+        let seg = |i: usize| CopyOp {
+            dst: CopyTarget::Pinned {
+                buffer_id: host.id(),
+                offset: 32 * i,
+            },
+            src: CopyTarget::Device(dev.ptr().offset(64 * i as u64)),
+            bytes: 32,
+        };
+        let ops: Vec<CopyOp> = (0..4).map(seg).collect();
+
+        let waits = stub_count(&lib, "stub_stream_waits");
+        let events = stub_count(&lib, "stub_live_events");
+        hold(true);
+        let tickets = ctx.copy_async_batch(&ops).expect("batch");
+        assert_eq!(tickets.len(), 1, "one ticket per batch: {tickets:?}");
+        assert_eq!(tickets[0].bytes, 128);
+        assert_eq!(
+            stub_count(&lib, "stub_stream_waits"),
+            waits + 1,
+            "one compute fence per batch"
+        );
+        assert!(
+            stub_count(&lib, "stub_live_events") <= events + 1,
+            "at most the ticket's event outlives the enqueue"
+        );
+        assert!(!ctx.poll(&tickets[0]).expect("poll"), "event held");
+        hold(false);
+        ctx.wait(&tickets[0]).expect("wait");
+        host.with_bytes(|b| {
+            for i in 0..4 {
+                assert_eq!(
+                    &b[32 * i..32 * (i + 1)],
+                    &pattern[64 * i..64 * i + 32],
+                    "segment {i}"
+                );
+            }
+        });
+
+        // A bad end anywhere in the batch: refused before any copy is enqueued.
+        host.with_bytes_mut(|b| b.fill(0));
+        let mut bad = ops.clone();
+        bad[2].dst = CopyTarget::Pinned {
+            buffer_id: host.id(),
+            offset: 120,
+        };
+        let waits = stub_count(&lib, "stub_stream_waits");
+        let err = ctx.copy_async_batch(&bad).expect_err("past the end");
+        assert!(matches!(err, MemoryError::InvalidArgument(_)), "{err:?}");
+        assert_eq!(
+            stub_count(&lib, "stub_stream_waits"),
+            waits,
+            "nothing fenced"
+        );
+        host.with_bytes(|b| assert!(b.iter().all(|&x| x == 0), "nothing copied"));
+        assert!(ctx.copy_async_batch(&[]).expect("empty batch").is_empty());
+        drop((host, dev, mem, ctx));
+    }
+
     /// ABI v2.9 (Phase 6a Task 7): a v2.8 library has no quantized GEMM and no activation
     /// quantization, is not asked for their op codes, and a quantized config is not supported
     /// by it; the v2.9 stub resolves both trios (named by the library's `_impl`, unsupported

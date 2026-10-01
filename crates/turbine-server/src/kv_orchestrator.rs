@@ -28,8 +28,9 @@
 //!
 //! Calibration (P4 S-6): at startup one 64 MiB copy (in whole blocks, through the production
 //! copy paths) per enabled path seeds the transfer estimates and the L2 slow-tier baseline; it
-//! is logged as `kv_calibration`. A failed calibration keeps `TransferPath::fallback` with a
-//! WARN.
+//! is logged as `kv_calibration`. The L0 <-> L1 copies run once untimed each way first (a fresh
+//! copy stream's first copies are slow). A failed calibration keeps `TransferPath::fallback`
+//! with a WARN.
 //!
 //! Phase 3 wiring: the L0 pressure state the planner and prefetch see is the pressure
 //! controller's (`before_plan` takes it from the engine's snapshot), the controller's reclaim
@@ -73,7 +74,7 @@ use turbine_kv::transfer::{
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
-    CopyEngine, CopyTarget, CopyTicket, DeviceBuffer, DeviceMemory, DevicePtr, MemoryError,
+    CopyEngine, CopyOp, CopyTarget, CopyTicket, DeviceBuffer, DeviceMemory, DevicePtr, MemoryError,
     PinnedBuffer, PinnedMemory,
 };
 
@@ -904,6 +905,10 @@ impl KvOrchestrator {
                 }
                 Ok(cost_of(started.elapsed(), u64::from(n) * bb, n))
             };
+            // The first copies on a fresh copy stream run at ~60 % speed (perf-log "Pinned
+            // D2H"): one untimed pass each way first, so the estimate is the serving rate.
+            timed(true)?;
+            timed(false)?;
             let down = timed(true)?;
             let up = timed(false)?;
             Ok([(TransferPath::L0ToL1, down), (TransferPath::L1ToL0, up)])
@@ -1978,7 +1983,7 @@ impl CopyStreamBackend {
     }
 
     /// Enqueues the per-layer copies of shard `shard` of L0 block `block` into (`to_device`
-    /// false) or out of pinned buffer `buffer_id` starting at byte `offset`.
+    /// false) or out of pinned buffer `buffer_id` starting at byte `offset`, as one batch.
     fn stream_copies(
         &self,
         shard: usize,
@@ -1988,7 +1993,9 @@ impl CopyStreamBackend {
         offset: usize,
         to_device: bool,
     ) -> Result<Vec<CopyTicket>, TierError> {
-        let mut tickets = Vec::new();
+        // One batch per block: the copy stream fences the compute stream and signals once for
+        // all the block's layer segments (perf-log "Pinned D2H").
+        let mut ops = SmallVec::<[CopyOp; 32]>::new();
         let mut acc = 0usize;
         for &(ptr, len) in self.shards[shard].addresses.segments(BlockId(block as u32)) {
             let pinned = CopyTarget::Pinned {
@@ -2000,19 +2007,17 @@ impl CopyStreamBackend {
             } else {
                 (pinned, CopyTarget::Device(ptr))
             };
-            match engine.copy_async(dst, src, len) {
-                Ok(t) => tickets.push(t),
-                Err(e) => {
-                    // Nothing may still write the destination when the caller releases it.
-                    for t in &tickets {
-                        let _ = engine.wait(t);
-                    }
-                    return Err(TierError::Io(format!("copy stream: {e}")));
-                }
-            }
+            ops.push(CopyOp {
+                dst,
+                src,
+                bytes: len,
+            });
             acc += len;
         }
-        Ok(tickets)
+        // On an error no copy of the batch is in flight (the `copy_async_batch` contract).
+        engine
+            .copy_async_batch(&ops)
+            .map_err(|e| TierError::Io(format!("copy stream: {e}")))
     }
 
     /// Synchronous copy of shard `shard` of L0 block `block` into (`to_device` false) or from
@@ -3269,6 +3274,72 @@ mod tests {
         assert_eq!(read_block(&r, 6), pattern(3, 5, bb), "L1 → L0 landed");
     }
 
+    /// Perf-log "Pinned D2H": the L0 <-> L1 copies of one block go to the copy stream as one
+    /// batch per shard (one compute fence and one completion event for all its layer segments,
+    /// not one per segment: per-segment fences halved pinned D2H on the R9700), and the startup
+    /// calibration copies its blocks once each way untimed before timing them (the first copies
+    /// on a fresh copy stream run at ~60 % speed). Breaks if `stream_copies` goes back to one
+    /// `copy_async` per segment or the calibration times its cold first pass.
+    #[test]
+    fn block_copies_are_one_batch_and_calibration_is_warm() {
+        let dir = TempDir::new("turbine-kv-copy-batch");
+        let kv = kv_config(&dir, true);
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let (mem, mut pool) = rank(0);
+        let ctx = FakeCtx::new(&mem, 0);
+        let free = u64::from(pool.free_blocks());
+        let segments = pool.block_segments(BlockId(0)).len() as u64;
+        assert!(
+            segments > 1,
+            "the test layout has several segments per block"
+        );
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: CopyDevice::Stream {
+                    engine: Arc::clone(&ctx) as _,
+                    pinned: Arc::clone(&ctx) as _,
+                },
+                shards: Vec::new(),
+                l2: None,
+                clock: Arc::new(SystemClock::new()),
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        assert!(o.h.l1_enabled(), "L1 calibrated");
+        // Calibration: every free block (the 64 MiB bound is larger), down and up, warm-up
+        // pass then timed pass, one batch per block.
+        let blocks = free.min(CALIBRATION_BYTES / layout().block_bytes());
+        assert_eq!(ctx.batches.load(Ordering::Relaxed), 4 * blocks);
+        assert_eq!(ctx.copies.load(Ordering::Relaxed), 4 * blocks * segments);
+
+        let r = (mem, pool);
+        let bb = layout().block_bytes() as usize;
+        let want = pattern(1, 3, bb);
+        write_block(&r, 3, &want);
+        let (b0, c0) = (
+            ctx.batches.load(Ordering::Relaxed),
+            ctx.copies.load(Ordering::Relaxed),
+        );
+        let key = KvKey([12; 16]);
+        run(&mut o, 1, TransferPath::L0ToL1, key, 3, 0).unwrap();
+        run(&mut o, 2, TransferPath::L1ToL0, key, 0, 9).unwrap();
+        assert_eq!(read_block(&r, 9), want, "the block came back whole");
+        assert_eq!(
+            ctx.batches.load(Ordering::Relaxed) - b0,
+            2,
+            "one batch per block copy"
+        );
+        assert_eq!(ctx.copies.load(Ordering::Relaxed) - c0, 2 * segments);
+    }
+
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
     /// is only a copy target on the context that allocated it (buffer ids never overlap
     /// between contexts, so a cross-rank copy fails).
@@ -3276,6 +3347,8 @@ mod tests {
         mem: Arc<dyn DeviceMemory>,
         inner: Arc<FakeInner>,
         copies: AtomicU64,
+        /// `copy_async_batch` calls (each one compute fence and one event on a real stream).
+        batches: AtomicU64,
     }
 
     /// A pinned buffer with a lock of its own.
@@ -3295,6 +3368,7 @@ mod tests {
                     next: AtomicU64::new(1 + rank * 1_000_000),
                 }),
                 copies: AtomicU64::new(0),
+                batches: AtomicU64::new(0),
             })
         }
     }
@@ -3348,6 +3422,13 @@ mod tests {
             }
             let id = self.copies.fetch_add(1, Ordering::Relaxed);
             Ok(CopyTicket { id, bytes })
+        }
+
+        fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            ops.iter()
+                .map(|op| self.copy_async(op.dst, op.src, op.bytes))
+                .collect()
         }
 
         fn poll(&self, _t: &CopyTicket) -> Result<bool, MemoryError> {
