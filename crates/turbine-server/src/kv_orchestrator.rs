@@ -3271,6 +3271,7 @@ mod tests {
 
         let dir = TempDir::new("turbine-kv-tq-transcode");
         let mut kv = kv_config(&dir, false);
+        kv.block_tokens = l.block_tokens;
         kv.nvme.max_bytes = ByteSize(256 << 20);
         kv.nvme.slab_bytes = ByteSize(16 << 20);
         kv.nvme.format = ModuleName::new(name).unwrap();
