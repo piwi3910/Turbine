@@ -1,72 +1,48 @@
-# Handoff: p6b-queued-demote (decision "6b: after the held-prefix ledger fix — tail latency and queued prefixes", 1 B, 2 A)
+# Handoff: p6b-queued-demote (decisions "6b: after the held-prefix ledger fix", 1 B, and "6b: queued-prefix demotion — granularity and scope", 1 A, 2 A)
 
-Branch `p6b-queued-demote` from `p6b-stack` f9a4c91. The lead paused the work during the design step. No code, no tests and no lab
-runs exist yet, and this builder started no serve or lab Job. This file is the only commit.
+Branch `p6b-queued-demote` from `p6b-stack` f9a4c91 (tip before this work 76af3cb). Implementation commit `c96a07a`
+passed `scripts/gate.sh --base 76af3cb` → `gate: ok` (822 passed). Numbers: `.procoder/perf-log.md`, Phase 6b, "Queued-prefix
+demotion".
 
-## Where the queued prefixes live (read, verified)
+## What landed (c96a07a)
 
-- `turbine-server` `engine/loop.rs` `submit` → `attach` (`KvOrchestrator::attach` → `KvHierarchy::attach_prefix`) references the
-  prefix blocks in the pool (`incref`), then `admit_submission` → `SchedRequest::attach_prefix` → `Scheduler::submit` →
-  `AdmissionGate::offer`. A queued request waits in the gate's `AdmissionQueue<Waiting, AdmissionKey>`, holding
-  `SchedRequest.cached_prefix` (one pool reference per block). `sync_kv_held` reports `pool.referenced_blocks()` to the ledger.
-- `Scheduler::plan` pumps the gate (`gate.pump`, which reserves `q.estimate.projected_kv_blocks` = `reserved_kv_blocks`, request minus
-  the attached prefix) into the scheduler's queue, then `admit` hands `cached_prefix.blocks` to seq 0's table in the same `plan`.
-- `attach_prefix` registers the blocks this request will compute as `pending` in the directory (`register_pending`), and only
-  `request_done` clears them. A second `attach_prefix` for the same id would see its own pending key and return `WaitForPrefix`
-  until `PENDING_WAIT`, so a re-attach needs those keys cleared first.
-- Reclaim: the controller's throttle plan calls `KvReclaimHandle::demote(yellow threshold)` at YELLOW, and `free_unreferenced` +
-  `demote(orange threshold)` at ORANGE. `KvHierarchy::apply_reclaim` (engine `end_turn`) → `pressure_reclaim(target)`:
-  `need = used − leaving − target·total`, `victims` are unreferenced blocks only (leaf-first, policy score), and at most
-  `DEMOTION_INFLIGHT` (32) copies are in flight; an already-copied block (copy ahead) is freed with no copy.
+- `turbine-kv` `hierarchy.rs`: `pressure_reclaim` records `need − victims.len()` as the queued-prefix demand, only while
+  `l0_state` is YELLOW or ORANGE (max over the tick's calls; reset in `apply_reclaim`; `take_queued_prefix_demand()`). Only
+  with a lower tier: without one `pressure_reclaim` is `demote_to` and records nothing (a release would only recompute).
+  `detach_prefix(pool, request, &attach, alone)` releases the references, clears the request's pending keys past
+  `committed` (the PENDING_WAIT trap), resets `keys`/`used`/`committed`/`lineage`/`lossy_from` and marks `detached_tokens`;
+  the next `attach_prefix` counts lookups and the plan but not the prompt or cached tokens again (only the shortfall as
+  recompute). Metric `turbine_kv_queued_prefix_detached_blocks_total`, `KvStats.queued_prefix_detached`, DEBUG
+  `kv_queued_prefix_detach` (reason `queued_prefix`).
+- `turbine-reliability` `AdmissionQueue::behind_head_rev_mut` (entries behind the head, last first; keys and order fixed).
+- `turbine-scheduler`: `AdmissionGate::detach_prefixes` (refcount-1 count, whole prefixes, stops at `want`, head skipped,
+  `projected_kv_blocks` back to `request_kv_blocks` in the request and the queue copy, `reattach = true`);
+  `Scheduler::{detach_queued_prefixes, awaiting_reattach, reattach -> Option<PrefixAttach>}`; `admissible` is false while
+  `reattach`.
+- `turbine-server`: `EngineLoop::release_queued_prefixes` after `kv.end_turn` (want capped at `CAPACITY_BATCH`),
+  `reattach_released` in `kv_before_plan` (`Ready` → `sched.reattach`, `Promoting` → `reattaching` set completed from
+  `kv.poll`, `WaitForPrefix` → next turn), `usage.cached_tokens` from the new attach; `KvOrchestrator::{attach_again,
+detach_prefix, take_queued_prefix_demand}`. Test scaffolding: `engine_full` (reliability config), `TestEngine.{pressure,
+clock}`.
+- Spec 6b S-8 sentence, observability line and AC line; contract paragraph "Queued-prefix demotion".
 
-## Proposed design (not implemented)
+## Tests and mutations (all 12 caught)
 
-1. Demand: `pressure_reclaim` records `queued_prefix_demand = need − victims.len()` (blocks it wanted and found no unreferenced
-   candidate for), only when `l0_state` is YELLOW or ORANGE, as the max over the tick's calls. The engine reads it with
-   `take_queued_prefix_demand()` and caps it at `CAPACITY_BATCH` (32) per controller tick. At GREEN, RED and SURVIVAL the demand
-   stays 0, so the existing rules apply.
-2. Choice: `Scheduler::detach_queued_prefixes(&BlockPool, want)` walks the gate queue in reverse admission order (last to be
-   admitted goes first, the head keeps its prefix). It counts only blocks with pool refcount 1 (held by that queued request alone)
-   and detaches whole prefixes until the count reaches `want`; a request that holds nothing alone is skipped. On detach,
-   `cached_prefix` goes to `None`, `reattach = true`, and `projected_kv_blocks` grows back to the full `request_kv_blocks` in both
-   `SchedRequest.estimate` and the `Queued.estimate` copy. That copy needs an `iter_mut` (or a `rekey`) on `AdmissionQueue` in
-   `turbine-reliability`. `new_prefill_tokens` / `cached_prefix_tokens` keep the claim, so ORANGE's `ExpensiveQueued` does not
-   start treating it as expensive.
-3. Release: the engine releases the blocks and calls a new `KvHierarchy::detach_prefix(request)`. That clears the request's
-   pending keys past `committed`, sets `committed = 0` and resets `keys` / `used` / `lineage`. It also marks the `RequestKv` so the
-   re-attach does not count `prompt_tokens` again. Then: metric `turbine_kv_queued_prefix_detached_blocks_total`, log event
-   `kv_queued_prefix_detach` (reason `queued_prefix`), and `sync_kv_held`. `held` drops at detach, because unreferenced cached
-   blocks already count as available, as for every cached block. The next `demote` tick copies the blocks to the next tier
-   (they have the hit evidence from the first attach) and frees L0, or frees them at once if copy ahead already put a copy down.
-4. Re-attach: a pumped request with `reattach` is not `admissible` (head-of-line, about one iteration). Before the plan, the engine
-   attaches each `sched.awaiting_reattach()` request again. `Ready(a)` → `sched.reattach(id, a)`, and `ActiveRequest.cached_tokens`
-   is updated. `Promoting` → a `reattaching` set, completed from the `kv.poll` loop's `None` branch. `WaitForPrefix` → retried next
-   turn. Its reservation stays full size (safe if the planner then recomputes; the ledger takes max(in-use, reserved)).
-   Cancellation and SURVIVAL requeue need no new path (no prefix held; `request_done(cancelled)` drops a pending promotion).
+`turbine-kv hierarchy::tests::{queued_prefix_demand_only_at_yellow_and_orange, detached_prefix_attaches_again_through_the_planner}`,
+`turbine-scheduler scheduler::tests::queued_prefix::{released_last_queued_first_up_to_the_demand,
+released_request_waits_for_its_reattach}`, `turbine-server engine::r#loop::tests::yellow_releases_queued_prefixes_and_they_reattach`
+(cpu backend, L2, the test ticks the controller: GREEN releases nothing; YELLOW releases Q's 6 blocks, which are demoted to L2;
+Q then yields the cold run's tokens). Mutations: no YELLOW/ORANGE gate; demand ignores victims; no pending clear; re-attach
+counts the prompt; demand not reset; forward walk; head released; shared blocks counted; queue estimate not updated;
+`admissible` ignores `reattach`; engine never re-attaches; engine never releases. Each made a test fail.
 
-## Tests to write first (then mutation-check)
+## Lab
 
-- `turbine-kv`: demand recorded only at YELLOW/ORANGE; `detach_prefix` then `attach_prefix` gives `Ready`/`Promoting`, not
-  `WaitForPrefix`.
-- `turbine-scheduler`: reverse-order choice with the refcount-1 count and the bound; the estimate and the `Queued` copy updated; a
-  `reattach` request is not admitted until `reattach`.
-- Engine (cpu backend, `engine.turn()` stepping): keep `parts.controller` in `TestEngine` and tick it with a sample
-  (`at_mono_ns` from the engine clock) under `kv_utilization` thresholds of about `[0.1, 0.9, 0.95, 0.99]`. Use
-  `max_running_requests` 1, the L2 tier as in `l2_round_trip_matches_cold`, and run a 100-token prompt cold. Then: R running, Q
-  queued with the same prompt (6 blocks attached). At GREEN, a direct `reclaim.demote(0.1)` detaches nothing. At YELLOW, Q's 6
-  blocks are detached, demoted to L2 and leave L0, and the referenced blocks drop by 6. Q is then admitted, re-attaches from L2
-  (or recomputes, per the planner) and yields the cold tokens. Mutations to check: no YELLOW gate, a GREEN detach, no re-attach,
-  forward order, no pending clear.
+See the perf log entry. The before rows ran from a detached worktree of 76af3cb in the scratchpad; the multi-turn tools are in
+`/home/piwi/turbine-ci/remote/agent-p6b-queued-demote/runs/` on novanas (`sweep.sh`, `poll.py`, `bin/turbine-bench` copied
+from the survival builder's release build).
 
-## Open questions (none blocking; recommendation first)
+## Open
 
-- Detach granularity: whole prefixes (recommended, simple re-attach) vs tail blocks only.
-- Only the gate queue (recommended) vs also admitted-but-unstarted requests in the scheduler queue (they start within a few turns).
-- No new config key is proposed. Lazy attach for queued requests (attach at pump only) is the alternative, and it would also
-  answer 2 B, which the user did not choose.
-
-## Next steps
-
-Implement points 1–4 test first, run `scripts/gate.sh`, then the lab: 24 and 32 sessions before and after
-(`.procoder/handoff/p6b-survival.md` commands, `kv.cpu.max_bytes=4GiB`, `kv.cpu.format=l0`, GPU 0, one fresh server per count), then
-`scripts/overload-soak.sh novanas --duration 10m`, then the perf-log 6b entry.
+- Design choice not in the decision: no release without a lower tier (L0-only servers keep the old behaviour).
+- The `kv_utilization`-driven tail latency is still admission queueing; see the perf log for whether the release moved it.
