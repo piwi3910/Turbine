@@ -450,6 +450,18 @@ impl KvDirectory {
             })
     }
 
+    /// True when a child of `key` has a copy in `tier` (a parent the leaf-first rule holds
+    /// there while that child stays).
+    pub fn has_child_in(&self, key: &KvKey, tier: TierId) -> bool {
+        self.children.get(key).is_some_and(|kids| {
+            kids.iter().any(|k| {
+                self.blocks
+                    .get(k)
+                    .is_some_and(|c| c.location(tier).is_some())
+            })
+        })
+    }
+
     /// A location found pointing at a freed slot: logged, removed; debug builds assert.
     pub fn stale_location(&mut self, key: &KvKey, tier: TierId) {
         tracing::error!(

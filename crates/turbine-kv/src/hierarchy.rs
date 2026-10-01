@@ -203,6 +203,8 @@ struct Demoting {
     to: TierId,
     /// Bytes of the destination copy (its format's).
     bytes: u64,
+    /// A copy ahead ([`KvHierarchy::copy_ahead`]): the source copy stays when it lands.
+    keep_source: bool,
 }
 
 /// What one admission sees of its cached prefix (the scheduler's `SchedRequest.cached_prefix`).
@@ -259,6 +261,9 @@ pub struct KvStats {
     pub compressions: u64,
     /// Ladder ticks run (each ≥ [`LADDER_TICK_INTERVAL`] after the previous one).
     pub ladder_ticks: u64,
+    /// Copy-ahead copies landed: a shared parent copied down while its L0 copy stays
+    /// ([`KvHierarchy::copy_ahead`]).
+    pub copy_aheads: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -362,6 +367,13 @@ pub const CAPACITY_BATCH: usize = 32;
 /// until the copy completes, and each costs the engine thread one enqueue per layer and one
 /// poll per layer and turn, so new copies start only as earlier ones finish.
 pub const DEMOTION_INFLIGHT: usize = 32;
+
+/// Copy ahead fills a lower tier only up to this share of its capacity (P6b S-8, decision "6b:
+/// shared-prefix eval never demotes the prefix to L1", A). A copied-ahead parent's lower copy
+/// is held there by the leaf-first rule while its children stay in L0, so the rest is left for
+/// demotions that free L0. Debt: a constant, not measured; revisit with a real shared-prompt
+/// workload.
+pub const COPY_AHEAD_MAX_FILL: f64 = 0.5;
 
 /// Evidence that a cached block will be read again, the precondition for spending a copy on
 /// it: it was attached at least once since it was written (a hit), it belongs to a session
@@ -659,6 +671,14 @@ impl KvHierarchy {
         self.demoting
             .values()
             .filter(|d| d.from == TierId::L0)
+            .count()
+    }
+
+    /// L0 blocks being copied down that leave L0 when the copy lands (copies ahead keep theirs).
+    fn l0_leaving(&self) -> usize {
+        self.demoting
+            .values()
+            .filter(|d| d.from == TierId::L0 && !d.keep_source)
             .count()
     }
 
@@ -1307,7 +1327,10 @@ impl KvHierarchy {
         let (from, to) = (req.path.from(), req.path.to());
         match req.purpose {
             TransferPurpose::Demote => {
-                self.demoting.remove(&req.key);
+                let keep = self
+                    .demoting
+                    .remove(&req.key)
+                    .is_some_and(|d| d.keep_source);
                 if from == TierId::L0 {
                     pool.release(&[BlockId(req.src_slot as u32)]);
                 }
@@ -1326,8 +1349,13 @@ impl KvHierarchy {
                         format: req.codec.to,
                     },
                 );
-                self.metrics.demotion(from, to);
-                self.stats.demotions += 1;
+                if keep {
+                    self.metrics.copy_ahead(to);
+                    self.stats.copy_aheads += 1;
+                } else {
+                    self.metrics.demotion(from, to);
+                    self.stats.demotions += 1;
+                }
                 // Stored at the tier's ladder rung, lossier than its own format would make it.
                 let unladdered = crate::codec::lossier(req.codec.from, self.tier_format(to));
                 if self.ladder.is_some() && req.codec.to != unladdered {
@@ -1338,7 +1366,9 @@ impl KvHierarchy {
                         LadderReason::NewDemotion,
                     );
                 }
-                self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
+                if !keep {
+                    self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
+                }
             }
             TransferPurpose::Compress => {
                 self.compressing.remove(&req.key);
@@ -1780,7 +1810,7 @@ impl KvHierarchy {
             return self.demote_to(pool, target, EvictReason::Pressure);
         };
         let total = f64::from(pool.total_blocks());
-        let leaving = self.l0_demotions_in_flight() as f64;
+        let leaving = self.l0_leaving() as f64;
         let need = (f64::from(pool.used_blocks()) - leaving - target * total)
             .ceil()
             .max(0.0) as usize;
@@ -1862,6 +1892,7 @@ impl KvHierarchy {
         if wanted > 0 {
             self.record_demand(to, wanted as u64);
         }
+        self.copy_ahead(pool, to, budget.min(CAPACITY_BATCH));
         bytes
     }
 
@@ -1888,7 +1919,7 @@ impl KvHierarchy {
     /// [`KvHierarchy::pressure_reclaim`].
     pub fn demote_to(&mut self, pool: &mut BlockPool, target: f64, reason: EvictReason) -> u64 {
         let total = f64::from(pool.total_blocks());
-        let leaving = self.l0_demotions_in_flight() as f64;
+        let leaving = self.l0_leaving() as f64;
         let need = (f64::from(pool.used_blocks()) - leaving - target * total)
             .ceil()
             .max(0.0) as usize;
@@ -1910,6 +1941,7 @@ impl KvHierarchy {
         let mut room = to.map_or(0, |t| self.make_room(pool, t, victims.len()));
         let bb = self.cfg.block_bytes;
         let mut bytes = 0;
+        let mut started = 0;
         for (key, value) in victims {
             let Some(to) = to.filter(|_| value >= self.cfg.demote_min_value) else {
                 let why = if value < self.cfg.demote_min_value {
@@ -1936,7 +1968,11 @@ impl KvHierarchy {
             if room >= units && self.submit_demotion(pool, key, TierId::L0, to) {
                 room -= units;
                 bytes += bb;
+                started += 1;
             }
+        }
+        if capacity && let Some(to) = to {
+            self.copy_ahead(pool, to, CAPACITY_BATCH.saturating_sub(started));
         }
         bytes
     }
@@ -2020,6 +2056,19 @@ impl KvHierarchy {
         from: TierId,
         to: TierId,
     ) -> bool {
+        self.submit_copy(pool, key, from, to, false)
+    }
+
+    /// [`KvHierarchy::submit_demotion`]; with `keep_source` the source copy stays (a copy
+    /// ahead).
+    fn submit_copy(
+        &mut self,
+        pool: &mut BlockPool,
+        key: KvKey,
+        from: TierId,
+        to: TierId,
+        keep_source: bool,
+    ) -> bool {
         let Some(src_slot) = self
             .dir
             .get(&key)
@@ -2040,8 +2089,114 @@ impl KvHierarchy {
         if from == TierId::L0 {
             pool.incref(BlockId(src_slot as u32));
         }
-        self.demoting.insert(key, Demoting { from, to, bytes });
+        self.demoting.insert(
+            key,
+            Demoting {
+                from,
+                to,
+                bytes,
+                keep_source,
+            },
+        );
         true
+    }
+
+    /// Copy ahead (P6b S-8; decision "6b: shared-prefix eval never demotes the prefix to L1",
+    /// A): while the pressure controller is GREEN or YELLOW, when the reclaim would demote, the
+    /// blocks of shared prefixes that the leaf-first rule holds in L0 — unreferenced blocks with
+    /// two or more children (or an ancestor of one), reuse evidence, a child resident in L0 and
+    /// the L0 copy as their only one — are copied into `to` while their L0 copy stays, lowest
+    /// value first (the policy's score; the likeliest to leave next), at most `limit` per call
+    /// within [`DEMOTION_INFLIGHT`] and only into `to`'s free room up to [`COPY_AHEAD_MAX_FILL`]
+    /// of its capacity (nothing is evicted for them). A linear re-used chain (a session's
+    /// history) is left to the leaf-first demotion. The L0 copy then leaves by the normal rules
+    /// (once its children have left, or under higher pressure) at no copy cost: every reclaim
+    /// path frees a copy that already has a lower one. Into a lossy tier the copy is one more
+    /// location of the exact entry (S-3). From ORANGE on nothing is copied ahead: freeing L0
+    /// comes first, and the copies in flight it needs are the same [`DEMOTION_INFLIGHT`].
+    /// Returns the copies started.
+    fn copy_ahead(&mut self, pool: &mut BlockPool, to: TierId, limit: usize) -> usize {
+        if self.l0_state >= PressureState::Orange {
+            return 0;
+        }
+        let limit = limit.min(self.demotion_budget());
+        let Some(tier) = self.tier(to).cloned() else {
+            return 0;
+        };
+        if limit == 0 {
+            return 0;
+        }
+        let ceiling = (tier.capacity_bytes() as f64 * COPY_AHEAD_MAX_FILL) as u64;
+        let mut used = tier.used_bytes() + self.inflight_into(to);
+        if used >= ceiling {
+            return 0;
+        }
+        // Shared prefixes: L0 blocks with two or more children, and their ancestors.
+        let mut shared: HashSet<KvKey> = HashSet::new();
+        for key in self.l0_keys.values() {
+            let mut next = self
+                .dir
+                .get(key)
+                .filter(|b| b.child_count >= 2)
+                .map(|b| b.key);
+            while let Some(k) = next.take() {
+                if !shared.insert(k) {
+                    break;
+                }
+                next = self.dir.get(&k).and_then(|b| b.parent);
+            }
+        }
+        let now = self.now();
+        let mut order: Vec<Victim> = self
+            .l0_keys
+            .iter()
+            .filter_map(|(block, key)| {
+                let b = self.dir.get(key)?;
+                let qualifies = pool.refcount(*block) == 0
+                    && b.locations.len() == 1
+                    && shared.contains(key)
+                    && has_reuse_evidence(b)
+                    && !self.demoting.contains_key(key)
+                    && !self.transfer.is_busy_with(key)
+                    && self.dir.has_child_in(key, TierId::L0);
+                qualifies.then(|| Victim {
+                    value: self
+                        .policy
+                        .score(&self.score_one(b, TierId::L0, pool, now), now),
+                    last_access: b.last_access,
+                    depth: b.token_range.end,
+                    key: *key,
+                })
+            })
+            .filter(|v| v.value >= self.cfg.demote_min_value)
+            .collect();
+        order.sort();
+        let mut started = 0;
+        for v in order {
+            if started == limit {
+                break;
+            }
+            let bytes = self
+                .copy_codec(&v.key, TierId::L0, to)
+                .map_or(self.cfg.block_bytes, |c| c.to_bytes);
+            if used + bytes > ceiling {
+                break;
+            }
+            if self.submit_copy(pool, v.key, TierId::L0, to, true) {
+                used += bytes;
+                started += 1;
+            }
+        }
+        if started > 0 {
+            tracing::debug!(
+                event = "kv_copy_ahead",
+                reason = "copy_ahead",
+                to = to.as_str(),
+                blocks = started,
+                "shared-prefix KV blocks copied down while their L0 copies stay"
+            );
+        }
+        started
     }
 
     /// Makes room for up to `n` more blocks of `tier`'s format in `tier` and returns how many
@@ -3375,5 +3530,240 @@ pub(crate) mod tests {
             3,
             "only the first run's blocks 1-3 are keyed"
         );
+    }
+
+    /// The shared-prefix eval shape (decision "6b: shared-prefix eval never demotes the prefix
+    /// to L1", A): a two-block prefix `P` shared by two finished items whose own blocks have no
+    /// reuse evidence, plus one-off fillers, fill L0 past the capacity threshold. Leaf-first, `P`
+    /// cannot leave L0 while the items' blocks stay, so capacity demotion has no victim.
+    fn shared_prefix_rig(l1_format: &'static str, lower: bool) -> (Rig, Option<Arc<MemTier>>) {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = lower.then(|| Arc::new(MemTier::new(TierId::L1, 16 * bb, arc)));
+        let mut r = rig(16, l1.clone(), None, clock);
+        r.h.cfg.l1_format = l1_format;
+        r.h.cfg.allow_lossy = true;
+        // Two items behind the prefix: the second's attach is the prefix's hit.
+        run(&mut r, &item(100));
+        assert_eq!(run(&mut r, &item(200)).cached_tokens, 32);
+        // Two one-off fillers: 4 + 8 = 12 of 16 L0 blocks, past the 0.7 threshold.
+        run(&mut r, &(5000..5066).collect::<Vec<u32>>());
+        run(&mut r, &(6000..6066).collect::<Vec<u32>>());
+        assert_eq!(r.pool.cached_unreferenced(), 12);
+        (r, l1)
+    }
+
+    /// The shared prefix (tokens 0..32) followed by one item block and two more tokens.
+    fn item(start: u32) -> Vec<u32> {
+        (0..32).chain(start..start + 18).collect()
+    }
+
+    fn settle(r: &mut Rig) {
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+    }
+
+    fn prefix_keys_of(r: &mut Rig) -> Vec<KvKey> {
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        prefix_keys(&hasher, &(0..32).collect::<Vec<u32>>(), 16)
+    }
+
+    /// Copy ahead (decision A): under capacity pressure a shared parent held in L0 by its
+    /// children is copied down while its L0 copy stays (`copy_ahead`), only once; the L0 copy
+    /// later leaves by the normal rules (here the controller's `free_unreferenced`, which drops
+    /// the evidence-free children first) without a new transfer, and the next sharer promotes
+    /// the prefix from L1. Breaks if the copy frees the L0 copy, if a shared parent gets no
+    /// lower copy, if a second pass copies it again, if the later L0 drop copies it again, or if
+    /// it copies ahead from ORANGE on.
+    #[test]
+    fn copy_ahead_keeps_a_shared_prefix_in_l0() {
+        let (mut r, l1) = shared_prefix_rig(L0_FORMAT, true);
+        let l1 = l1.expect("an L1");
+        let keys = prefix_keys_of(&mut r);
+        // ORANGE: freeing comes first, nothing is copied ahead.
+        r.h.set_l0_state(PressureState::Orange);
+        r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+        settle(&mut r);
+        assert_eq!(r.h.stats().copy_aheads, 0, "no copy ahead at ORANGE");
+        assert!(l1.is_empty());
+        r.h.set_l0_state(PressureState::Green);
+        assert_eq!(
+            r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity),
+            0,
+            "a copy ahead frees no L0 block"
+        );
+        settle(&mut r);
+        assert_eq!(l1.len(), 2, "both prefix blocks copied down");
+        assert_eq!(r.h.stats().copy_aheads, 2);
+        assert_eq!(r.h.stats().demotions, 0, "nothing left L0");
+        assert_eq!(r.h.metrics.copy_ahead_value(TierId::L1), 2);
+        for k in &keys {
+            let b = r.h.directory().get(k).expect("the prefix entry");
+            assert!(b.location(TierId::L0).is_some(), "the L0 copy stays");
+            assert_eq!(b.location(TierId::L1).map(|l| l.format), Some(L0_FORMAT));
+        }
+        assert_eq!(r.pool.used_blocks(), 12);
+        assert_eq!(r.pool.cached_unreferenced(), 12, "no copy pins a block");
+
+        // A second pass has nothing left to copy ahead.
+        let moved = r.h.stats().transfer_bytes;
+        r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+        settle(&mut r);
+        assert_eq!(r.h.stats().transfer_bytes, moved, "copied once");
+
+        // Higher pressure: the children are dropped, then the prefix's L0 copies are freed at
+        // once (their L1 copies exist), with no new copy.
+        let handle = r.h.reclaimer();
+        handle.free_unreferenced(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        assert_eq!(r.h.l0_demotions_in_flight(), 0, "no demotion copy started");
+        settle(&mut r);
+        assert_eq!(r.h.stats().transfer_bytes, moved, "the L0 drop is free");
+        assert_eq!(r.pool.used_blocks(), 0);
+        for k in &keys {
+            let b = r.h.directory().get(k).expect("kept in L1");
+            assert_eq!(b.fastest(), Some(TierId::L1));
+        }
+
+        // The next sharer promotes the prefix from L1.
+        let id = RequestId::new_v4();
+        assert_eq!(attach(&mut r, id, &item(300)), AttachOutcome::Promoting);
+        let mut ready = Vec::new();
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            ready.extend(r.h.poll(&mut r.pool, &mut r.backend));
+        }
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1.cached_tokens, 32);
+        assert_eq!(ready[0].1.plan.promote, vec![(TierId::L1, 2)]);
+    }
+
+    /// Copy ahead into a lossy tier (P6b S-3, decision "6b Task 4" item 2): the fp8 copy of an
+    /// exact block is one more location on the exact entry, so while the L0 copy exists the
+    /// prefix is served exact; once that L0 copy is gone it is served lossy. Breaks if the copy
+    /// ahead is filed under a lossy key, stored at the L0 format, or served lossy while the
+    /// exact L0 copy exists.
+    #[test]
+    fn copy_ahead_into_a_lossy_tier_keeps_the_exact_entry() {
+        let (mut r, l1) = shared_prefix_rig("fp8_e4m3", true);
+        let l1 = l1.expect("an L1");
+        let keys = prefix_keys_of(&mut r);
+        r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+        settle(&mut r);
+        assert_eq!(l1.len(), 2);
+        for k in &keys {
+            let b = r.h.directory().get(k).expect("the exact entry");
+            assert_eq!(b.lineage, Lineage::Exact);
+            assert!(b.location(TierId::L0).is_some());
+            assert_eq!(b.location(TierId::L1).map(|l| l.format), Some("fp8_e4m3"));
+            for c in crate::codec::registry().iter() {
+                let lk = lossy_key(*k, c.name(), r.h.lossy_seed);
+                assert!(r.h.directory().get(&lk).is_none(), "no lossy entry");
+            }
+        }
+        // Exact while the L0 copy exists.
+        let id = RequestId::new_v4();
+        let a = match attach(&mut r, id, &item(400)) {
+            AttachOutcome::Ready(a) => a,
+            other => panic!("the prefix is in L0: Ready, got {other:?}"),
+        };
+        assert_eq!((a.cached_tokens, a.lossy_tokens), (32, 0));
+        prefill_and_finish(&mut r, id, &item(400), &a);
+
+        // Lossy once the L0 copy is gone.
+        r.h.reclaimer().free_unreferenced(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        settle(&mut r);
+        assert_eq!(r.pool.used_blocks(), 0);
+        let id = RequestId::new_v4();
+        assert_eq!(attach(&mut r, id, &item(500)), AttachOutcome::Promoting);
+        let mut ready = Vec::new();
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            ready.extend(r.h.poll(&mut r.pool, &mut r.backend));
+        }
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            (ready[0].1.cached_tokens, ready[0].1.lossy_tokens),
+            (32, 32)
+        );
+    }
+
+    /// No lower tier, no copy ahead: capacity demotion leaves the shared prefix exactly as
+    /// Phase 4 did. Breaks if a copy is attempted without a tier to hold it.
+    #[test]
+    fn copy_ahead_needs_a_lower_tier() {
+        let (mut r, _) = shared_prefix_rig(L0_FORMAT, false);
+        assert_eq!(r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity), 0);
+        settle(&mut r);
+        assert_eq!(r.h.stats().copy_aheads, 0);
+        assert_eq!(r.h.stats().transfer_bytes, 0);
+        assert_eq!(r.pool.cached_unreferenced(), 12);
+    }
+
+    /// The eval's path at GREEN (P6b S-8): after the copy ahead, one-off fillers keep arriving;
+    /// allocation reclaims cached L0 blocks in the published leaf-first order, so the shared
+    /// prefix's evidence-free children go first, and then capacity demotion frees the prefix's
+    /// L0 copies at no copy cost. Breaks if the prefix never leaves L0 once its children are
+    /// gone, or if it is copied again when it does.
+    #[test]
+    fn copied_ahead_prefix_leaves_l0_once_its_children_are_reclaimed() {
+        let (mut r, _) = shared_prefix_rig(L0_FORMAT, true);
+        let keys = prefix_keys_of(&mut r);
+        r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+        settle(&mut r);
+        assert_eq!(r.h.stats().copy_aheads, 2);
+        let moved = r.h.stats().transfer_bytes;
+        for i in 0..6u32 {
+            r.h.refresh_reclaim_order(&mut r.pool);
+            let filler: Vec<u32> = (10_000 + i * 100..10_066 + i * 100).collect();
+            let id = RequestId::new_v4();
+            let AttachOutcome::Ready(a) = attach(&mut r, id, &filler) else {
+                panic!("a filler misses");
+            };
+            let table: Vec<BlockId> = r.pool.allocate(5).expect("reclaimable").to_vec();
+            r.h.after_plan(&mut r.pool);
+            assert!(a.blocks.is_empty());
+            r.h.commit_progress(&mut r.pool, id, &table, &filler);
+            r.pool.release(&table);
+            r.h.request_done(&mut r.pool, id, false);
+            r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+            settle(&mut r);
+        }
+        for k in &keys {
+            let b = r.h.directory().get(k).expect("kept in L1");
+            assert!(b.location(TierId::L0).is_none(), "the prefix left L0");
+            assert!(b.location(TierId::L1).is_some());
+        }
+        assert_eq!(r.h.stats().transfer_bytes, moved, "no second copy");
+    }
+
+    /// Only shared prefixes are copied ahead: a re-used chain whose blocks each have one child (a
+    /// session's history, a prompt sent twice) waits for the leaf-first demotion, so its copies
+    /// do not take lower-tier room the leaf-first rule would hold while its leaf stays in L0.
+    /// Breaks if a block without a shared descendant is copied ahead.
+    #[test]
+    fn copy_ahead_skips_unshared_chains() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(16, Some(l1.clone()), None, clock);
+        // A 66-token prompt sent twice: four blocks with a hit each, one child each.
+        let chain: Vec<u32> = (0..66).collect();
+        run(&mut r, &chain);
+        assert_eq!(run(&mut r, &chain).cached_tokens, 64);
+        run(&mut r, &(5000..5066).collect::<Vec<u32>>());
+        run(&mut r, &(6000..6066).collect::<Vec<u32>>());
+        assert_eq!(r.pool.cached_unreferenced(), 12);
+        // The chain's leaf is a capacity victim (copied, then freed); its parents are not
+        // copied ahead.
+        r.h.demote_to(&mut r.pool, 0.7, EvictReason::Capacity);
+        settle(&mut r);
+        assert_eq!(r.h.stats().copy_aheads, 0);
+        assert_eq!(l1.len(), r.h.stats().demotions as usize);
     }
 }
