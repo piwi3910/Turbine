@@ -176,6 +176,7 @@ set(TURBINE_SOURCES
   src/paged_attention.cpp
   src/paged_attention_splitkv.cpp
   src/paged_attention.hip
+  src/paged_attention_mixed.hip
   src/copy_blocks.cpp
   src/moe.cpp
   src/moe.hip

@@ -358,7 +358,12 @@ enum class PagedPath {
   Turbine,
   CkPagedkvFp8Staged,
   TurbineFp8Decode,
-  TurbineFp8
+  TurbineFp8,
+  // Mixed-format pages (ABI v2.11, Phase 6b S-5): TurboQuant dtypes or a
+  // block_formats table; the others refuse them.
+  CkPagedkvMixedStaged,
+  TurbineMixedStaged,
+  TurbineMixed
 };
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,

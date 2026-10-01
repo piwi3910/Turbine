@@ -457,7 +457,8 @@ fn header_declares_the_v29_quantization_group() {
         "int32_t turbine_quantize_act(turbine_ctx *ctx, const turbine_quantize_act_desc *d);",
         "int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);",
         "const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);",
-        "int32_t causal, dtype; float k_scale, v_scale; } turbine_attention_paged_desc;",
+        // v2.11 appends block_formats and tq_params after the v2.9 scales.
+        "int32_t causal, dtype; float k_scale, v_scale; const uint8_t *block_formats;",
     ] {
         assert!(
             flat.contains(decl),
@@ -537,4 +538,31 @@ fn header_declares_the_v211_kv_transcode_group() {
             "turbine_kernels.h lacks the v2.11 {decl}"
         );
     }
+}
+
+/// Kernel ABI v2.11 mixed-format paged attention (P6b Task 12): the paged attention descriptor
+/// ends with the device `block_formats` table and the layer's `tq_params` (after the v2.9 FP8
+/// scales), and the TurboQuant page dtypes keep the codes of `DType::{Tq4, Tq2}`. Breaks if the
+/// fields move (a library would read a block format as a pointer) or a dtype code drifts.
+#[test]
+fn header_declares_the_v211_mixed_paged_attention_fields() {
+    use turbine_core::types::DType;
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_TQ4"),
+        DType::Tq4.abi_code().to_string()
+    );
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_TQ2"),
+        DType::Tq2.abi_code().to_string()
+    );
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = "float scale; int32_t causal, dtype; float k_scale, v_scale; \
+                const uint8_t *block_formats; const struct turbine_tq_params *tq_params; \
+                } turbine_attention_paged_desc;";
+    let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&decl),
+        "turbine_kernels.h lacks the v2.11 paged attention fields {decl}"
+    );
 }

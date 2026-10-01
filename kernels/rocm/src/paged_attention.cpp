@@ -43,6 +43,23 @@
 //   bytes;
 // - "turbine_hip_fp8" (any page size): the Turbine kernel reading FP8 pages.
 //
+// Mixed-format pages (ABI v2.11, Phase 6b S-5): a descriptor whose dtype is
+// TURBINE_DTYPE_TQ4 / _TQ2 or whose block_formats is not NULL. Only the
+// mixed implementations take it (the ones above refuse it), and they append
+// each row in its block's format (paged_attention_mixed.hip). Decision "P6b:
+// mixed-format / TurboQuant paged attention -- provider evaluation":
+// - "turbine_hip_mixed" (decode, and prefill of any page size): the own
+//   kernel, TurboQuant blocks read in the rotated domain without materialising
+//   K or V;
+// - "ck_tile_fmha_pagedkv_mixed_staged" (prefill, pages of a multiple of 128;
+//   user decision "6b Task 10: TurboQuant prefill attention", A): the batch's
+//   blocks decoded by their formats into a BF16 staging pool, then CK
+//   fmha_fwd_pagedkv over it, as the FP8 staged prefill; decode rows riding
+//   along run turbine_hip_mixed after, so their result does not depend on
+//   the batch; a sequence alone over kStagedMaxBytes runs turbine_hip_mixed;
+// - "turbine_hip_mixed_staged" (prefill, any page size): the same staging with
+//   the Turbine BF16 kernel attending.
+//
 // The device arrays (block_table, q_indptr, kv_lens) are trusted: the host
 // cannot read them without a synchronisation. The Turbine kernels skip pages
 // outside the pool instead of faulting.
@@ -53,6 +70,7 @@
 
 #include "fmha_fwd.hpp"
 #include "paged_fp8.hpp"
+#include "paged_mixed.hpp"
 #include "turbine_hip.hpp"
 
 using turbine_hip::check_hip;
@@ -67,6 +85,11 @@ constexpr const char *kImplTurbine = "turbine_hip";
 constexpr const char *kImplCkFp8Staged = "ck_tile_fmha_pagedkv_fp8_staged";
 constexpr const char *kImplTurbineFp8Decode = "turbine_hip_fp8_decode";
 constexpr const char *kImplTurbineFp8 = "turbine_hip_fp8";
+constexpr const char *kImplCkMixedStaged = "ck_tile_fmha_pagedkv_mixed_staged";
+constexpr const char *kImplTurbineMixedStaged = "turbine_hip_mixed_staged";
+constexpr const char *kImplTurbineMixed = "turbine_hip_mixed";
+// Page sizes the mixed-format kernels take are multiples of this.
+constexpr int32_t kMixedPageMultiple = 16;
 // Bytes of BF16 staged pages (plus their table) one CK call of the staged FP8
 // prefill may use: sequences are staged in groups that fit.
 constexpr int64_t kStagedMaxBytes = int64_t{256} << 20;
@@ -78,11 +101,25 @@ constexpr int32_t kCkPagedkvPage = 128;
 // Grid y (sequences) and z (KV heads) limits of the Turbine kernel.
 constexpr int32_t kMaxGridYZ = 65535;
 
+// A descriptor only the mixed-format implementations take: TurboQuant pages
+// or a block_formats table (ABI v2.11).
+bool mixed(const turbine_attention_paged_desc *d) {
+  return d->dtype == TURBINE_DTYPE_TQ4 || d->dtype == TURBINE_DTYPE_TQ2 ||
+         d->block_formats != nullptr;
+}
+
 bool supported(const turbine_attention_paged_desc *d) {
   if (d == nullptr)
     return false;
-  if ((d->dtype != TURBINE_DTYPE_BF16 && d->dtype != TURBINE_DTYPE_F8E4M3) ||
+  if ((d->dtype != TURBINE_DTYPE_BF16 && d->dtype != TURBINE_DTYPE_F8E4M3 &&
+       d->dtype != TURBINE_DTYPE_TQ4 && d->dtype != TURBINE_DTYPE_TQ2) ||
       d->head_dim != kHeadDim) {
+    return false;
+  }
+  if (mixed(d) &&
+      (d->block_tokens % kMixedPageMultiple != 0 || d->num_q_heads < 1 ||
+       d->num_kv_heads < 1 ||
+       d->num_q_heads / d->num_kv_heads > turbine_hip::kPagedMixedMaxGroup)) {
     return false;
   }
   if (d->causal != 0 && d->causal != 1)
@@ -249,7 +286,22 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 bool path_serves(const turbine_attention_paged_desc *d,
                  turbine_hip::PagedPath path) {
   const bool fp8 = d->dtype == TURBINE_DTYPE_F8E4M3;
+  if (mixed(d)) {
+    switch (path) {
+    case turbine_hip::PagedPath::CkPagedkvMixedStaged:
+      return ck_serves(d);
+    case turbine_hip::PagedPath::TurbineMixedStaged:
+    case turbine_hip::PagedPath::TurbineMixed:
+      return true;
+    default:
+      return false;
+    }
+  }
   switch (path) {
+  case turbine_hip::PagedPath::CkPagedkvMixedStaged:
+  case turbine_hip::PagedPath::TurbineMixedStaged:
+  case turbine_hip::PagedPath::TurbineMixed:
+    return false;
   case turbine_hip::PagedPath::CkPagedkv:
     return !fp8 && ck_serves(d);
   case turbine_hip::PagedPath::CkSplitkv:
@@ -285,6 +337,12 @@ const char *path_name(turbine_hip::PagedPath path) {
     return kImplTurbineFp8Decode;
   case turbine_hip::PagedPath::TurbineFp8:
     return kImplTurbineFp8;
+  case turbine_hip::PagedPath::CkPagedkvMixedStaged:
+    return kImplCkMixedStaged;
+  case turbine_hip::PagedPath::TurbineMixedStaged:
+    return kImplTurbineMixedStaged;
+  case turbine_hip::PagedPath::TurbineMixed:
+    return kImplTurbineMixed;
   case turbine_hip::PagedPath::Turbine:
     break;
   }
@@ -344,6 +402,94 @@ int32_t run_ck_fp8_staged(turbine_ctx *ctx,
   return turbine_hip::launch_paged_decode_fp8(ctx, d);
 }
 
+// The staged mixed-format prefill: groups of sequences whose pages, decoded to
+// BF16, fit kStagedMaxBytes, each staged into the attention scratch and
+// attended by CK (use_ck) or the Turbine BF16 kernel; turbine_hip_mixed when
+// one sequence alone does not fit, and for the single-query rows after.
+int32_t run_mixed_staged(turbine_ctx *ctx,
+                         const turbine_attention_paged_desc *d,
+                         const std::string &entry, bool use_ck) {
+  const int64_t token_elems = static_cast<int64_t>(d->num_kv_heads) * kHeadDim;
+  const int64_t block_bytes =
+      2 * static_cast<int64_t>(d->block_tokens) * token_elems * 2;
+  const int64_t pages =
+      (static_cast<int64_t>(d->max_kv_len) + d->block_tokens - 1) /
+      d->block_tokens;
+  if (pages < 1)
+    return TURBINE_OK;
+  const int64_t per_seq = pages * (block_bytes + 4) + 4;
+  if (per_seq > kStagedMaxBytes || pages > d->max_blocks_per_seq)
+    return turbine_hip::run_paged_mixed_attention(ctx, d, false);
+  const int64_t group =
+      std::min<int64_t>(kStagedMaxBytes / per_seq, d->num_seqs);
+  const int64_t pool_bytes = group * pages * block_bytes;
+  void *scratch = nullptr;
+  if (int32_t rc = turbine_hip::attention_scratch(
+          ctx, static_cast<size_t>(pool_bytes + group * (pages + 1) * 4),
+          &scratch);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  auto *staged = static_cast<uint16_t *>(scratch);
+  auto *table =
+      reinterpret_cast<int32_t *>(static_cast<char *>(scratch) + pool_bytes);
+  int32_t *staged_kv_lens = table + group * pages;
+  for (int64_t g0 = 0; g0 < d->num_seqs; g0 += group) {
+    const auto count =
+        static_cast<int32_t>(std::min<int64_t>(group, d->num_seqs - g0));
+    if (int32_t rc = turbine_hip::launch_paged_stage_mixed(
+            ctx, d, staged, table, staged_kv_lens, static_cast<int32_t>(g0),
+            count, static_cast<int32_t>(pages));
+        rc != TURBINE_OK) {
+      return rc;
+    }
+    int32_t rc = TURBINE_OK;
+    if (use_ck) {
+      rc = run_ck_pages(ctx, d, entry,
+                        CkPages{staged, table, static_cast<int32_t>(pages),
+                                staged_kv_lens, static_cast<int32_t>(g0),
+                                count});
+    } else {
+      // The Turbine BF16 kernel over the group's staged pages.
+      turbine_attention_paged_desc sd = *d;
+      sd.dtype = TURBINE_DTYPE_BF16;
+      sd.kv_layer = staged;
+      sd.block_table = table;
+      sd.q_indptr = d->q_indptr + g0;
+      sd.kv_lens = staged_kv_lens;
+      sd.num_seqs = count;
+      sd.max_blocks_per_seq = static_cast<int32_t>(pages);
+      sd.num_blocks = static_cast<int32_t>(count * pages);
+      sd.block_formats = nullptr;
+      sd.tq_params = nullptr;
+      rc = turbine_hip::launch_paged_attention(ctx, &sd);
+    }
+    if (rc != TURBINE_OK)
+      return rc;
+  }
+  // The single-query rows the BF16 kernel only saw one unconverted key for
+  // (after every group, so they overwrite its rows).
+  return turbine_hip::run_paged_mixed_attention(ctx, d, true);
+}
+
+// The v2.11 operands of a mixed-format call: the TurboQuant tables (whenever
+// a block can be TurboQuant) and the 16-byte alignment the kernels' vector
+// loads need.
+std::string mixed_operand_error(const turbine_attention_paged_desc *d) {
+  const turbine_tq_params *tq = d->tq_params;
+  if (tq == nullptr || tq->tables == nullptr)
+    return "TurboQuant pages or a block_formats table need tq_params with the "
+           "layer's tables";
+  for (int bits = 1; bits <= 4; ++bits)
+    if (tq->codebooks[bits - 1] == nullptr)
+      return "NULL " + std::to_string(bits) + "-bit TurboQuant codebook";
+  if (reinterpret_cast<uintptr_t>(tq->tables) % 16 != 0)
+    return "TurboQuant tables are not 16-byte aligned";
+  if (reinterpret_cast<uintptr_t>(d->kv_layer) % 16 != 0)
+    return "kv_layer is not 16-byte aligned";
+  return {};
+}
+
 int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
             const char *entry_name, turbine_hip::PagedPath path) {
   const std::string entry(entry_name);
@@ -372,7 +518,11 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
       d->kv_lens == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, entry + ": NULL operand");
   }
-  if (d->dtype == TURBINE_DTYPE_F8E4M3 &&
+  if (mixed(d)) {
+    if (const std::string why = mixed_operand_error(d); !why.empty())
+      return fail(ctx, TURBINE_E_ARGUMENT, entry + ": " + why);
+  }
+  if ((d->dtype == TURBINE_DTYPE_F8E4M3 || d->block_formats != nullptr) &&
       !(std::isfinite(d->k_scale) && d->k_scale > 0.0f &&
         std::isfinite(d->v_scale) && d->v_scale > 0.0f)) {
     return fail(ctx, TURBINE_E_ARGUMENT,
@@ -384,9 +534,17 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  if (int32_t rc = turbine_hip::launch_paged_append(ctx, d); rc != TURBINE_OK)
+  if (int32_t rc = mixed(d) ? turbine_hip::launch_paged_append_mixed(ctx, d)
+                            : turbine_hip::launch_paged_append(ctx, d);
+      rc != TURBINE_OK)
     return rc;
   switch (path) {
+  case turbine_hip::PagedPath::CkPagedkvMixedStaged:
+    return run_mixed_staged(ctx, d, entry, true);
+  case turbine_hip::PagedPath::TurbineMixedStaged:
+    return run_mixed_staged(ctx, d, entry, false);
+  case turbine_hip::PagedPath::TurbineMixed:
+    return turbine_hip::run_paged_mixed_attention(ctx, d, false);
   case turbine_hip::PagedPath::CkPagedkv:
     return run_ck(ctx, d, entry);
   case turbine_hip::PagedPath::CkSplitkv:

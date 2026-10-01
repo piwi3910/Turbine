@@ -853,17 +853,22 @@ pub struct PagedAttentionContext<'a> {
     /// convention) for BF16 / F16 / F32 pages.
     pub k_scale: f32,
     pub v_scale: f32,
-    /// P6b S-5: one format code per `block_table` entry ([`KV_FMT_BF16`], [`KV_FMT_FP8_E4M3`],
-    /// [`KV_FMT_TQ4`], [`KV_FMT_TQ2`]), host memory; empty = every block in `cfg.dtype`. A
-    /// block's bytes are the first page bytes of its format in slot `b` of `kv_layer` (slots
-    /// of `cfg.dtype`'s page; the ladder's L0 step, S-7, adds class-page addressing).
-    pub block_formats: &'a [u8],
+    /// P6b S-5 (ABI v2.11): `[num_seqs, max_blocks_per_seq]` U8 in the provider's memory
+    /// (device memory on a GPU, so a decode graph can capture the call), laid out like
+    /// `block_table`: one format code per entry ([`KV_FMT_BF16`], [`KV_FMT_FP8_E4M3`],
+    /// [`KV_FMT_TQ4`], [`KV_FMT_TQ2`]); `None` = every block in `cfg.dtype`. A block's bytes are
+    /// the first page bytes of its format in slot `b` of `kv_layer` (slots of `cfg.dtype`'s
+    /// page; the ladder's L0 step, S-7, adds class-page addressing). A table is passed only
+    /// when it can hold a block of another format: a GPU provider cannot read it on the host,
+    /// so `Some` always takes the mixed-format implementations.
+    pub block_formats: Option<TensorView<'a>>,
     /// TurboQuant tables of this layer and the codec that encodes appended rows; required
-    /// when `cfg.dtype` or a block's format is TurboQuant.
+    /// when `cfg.dtype` is TurboQuant or `block_formats` is `Some` (on a GPU provider with
+    /// [`TqPaged::device`]).
     pub tq: Option<TqPaged<'a>>,
 }
 
-/// Block format code of a BF16 page (the v2.10 `block_formats` byte).
+/// Block format code of a BF16 page (the v2.11 `block_formats` byte).
 pub const KV_FMT_BF16: u8 = 0;
 /// Block format code of an FP8 e4m3 page.
 pub const KV_FMT_FP8_E4M3: u8 = 1;
@@ -894,7 +899,7 @@ pub struct TqHeadTables {
     pub qjl: Vec<f32>,
 }
 
-/// TurboQuant parameters of one layer (P6b S-5; the v2.10 `tq_params`).
+/// TurboQuant parameters of one layer (P6b S-5; the host side of the v2.11 `tq_params`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TqParams {
     /// Per KV head of the layer.
@@ -910,10 +915,19 @@ pub struct TqParams {
 pub type TqEncodeFn = fn(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]);
 
 /// The TurboQuant side of a paged attention call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TqPaged<'a> {
+    /// Host tables of the layer (the CPU provider reads these).
     pub params: &'a TqParams,
     pub encode: TqEncodeFn,
+    /// The rotation seed the tables were built from.
+    pub seed: u64,
+    /// The same tables in device memory, for a GPU provider (ABI v2.11 `tq_params`):
+    /// `codebooks` as for the transcode and `tables` THIS layer's `[num_kv_heads, head_elems]`
+    /// slice of the model's tables (the caller offsets it, user decision 2026-10-01 "6b Task
+    /// 12: how per-layer TurboQuant tables reach the paged-attention call", A). `None` on the
+    /// CPU provider.
+    pub device: Option<KvTranscodeTables<'a>>,
 }
 
 /// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.

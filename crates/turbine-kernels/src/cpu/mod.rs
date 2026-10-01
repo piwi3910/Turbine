@@ -118,7 +118,7 @@ fn invalid(message: String) -> KernelError {
 
 /// Byte offsets of every logical element of `v` in row-major order, after checking that the
 /// view's strides stay inside its slice.
-fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
+pub(super) fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
     if v.strides.len() != v.shape.len() {
         return Err(invalid(format!(
             "view has shape {:?} but strides {:?}",
