@@ -234,6 +234,13 @@ const ALPHA: f64 = 0.2;
 /// iterations of the stressed multi-turn run (decision "6b planner follow-ups", 1 A).
 pub const BACKGROUND_WINDOW_MAX: Duration = Duration::from_millis(250);
 
+/// Half-life over which a path estimate slower than its unloaded cost decays back toward it
+/// while no copy samples the path (decision "6b planner follow-ups", 2 A). debt: a constant,
+/// set from the stressed multi-turn run: sessions think for 1–4 s between turns, so a slow
+/// burst still prices the next turn of the sessions it hit, and is mostly forgotten (1/4 left)
+/// ten seconds later.
+pub const ESTIMATE_RECOVERY_HALF_LIFE: Duration = Duration::from_secs(5);
+
 /// Whether a copy is background work (it serves no waiting request), started after the queued
 /// promotions and prefetches.
 fn is_background(r: &TransferRequest) -> bool {
@@ -290,6 +297,8 @@ pub struct TransferEngine {
     /// Each path's cost without load: the startup calibration (`seed`), else the fallback. A
     /// poll-bounded copy is read as this cost clamped to its bounds.
     seeded: [PathCost; 6],
+    /// When each path's estimate last took a sample (`None`: never, it is the seed).
+    sampled_at: [Option<Duration>; 6],
 }
 
 impl TransferEngine {
@@ -310,6 +319,7 @@ impl TransferEngine {
             busy: HashMap::new(),
             estimates: TransferPath::ALL.map(TransferPath::fallback),
             seeded: TransferPath::ALL.map(TransferPath::fallback),
+            sampled_at: [None; 6],
         }
     }
 
@@ -486,10 +496,35 @@ impl TransferEngine {
     pub fn seed(&mut self, p: TransferPath, c: PathCost) {
         self.estimates[p.index()] = c;
         self.seeded[p.index()] = c;
+        self.sampled_at[p.index()] = None;
     }
 
+    /// The path's estimate now: the EWMA of its copies, with any part slower than the unloaded
+    /// cost decayed toward it by the time since the last sample (half-life
+    /// [`ESTIMATE_RECOVERY_HALF_LIFE`]).
     pub fn estimate(&self, p: TransferPath) -> PathCost {
-        self.estimates[p.index()]
+        self.decayed(p, self.clock.now_mono())
+    }
+
+    /// Decision "6b planner follow-ups", 2 A: a path that looked slow is not promoted over, so
+    /// without the decay its estimate would never see another sample. Latency and time per
+    /// byte each move toward the unloaded cost when above it; a faster estimate stays.
+    fn decayed(&self, p: TransferPath, now: Duration) -> PathCost {
+        let (e, seed) = (self.estimates[p.index()], self.seeded[p.index()]);
+        let Some(at) = self.sampled_at[p.index()] else {
+            return e;
+        };
+        let elapsed = now.saturating_sub(at).as_secs_f64();
+        let keep = 0.5f64.powf(elapsed / ESTIMATE_RECOVERY_HALF_LIFE.as_secs_f64());
+        let toward = |v: f64, to: f64| if v > to { to + (v - to) * keep } else { v };
+        let per_byte = toward(
+            1.0 / e.bandwidth_bps.max(1.0),
+            1.0 / seed.bandwidth_bps.max(1.0),
+        );
+        PathCost {
+            latency_s: toward(e.latency_s, seed.latency_s),
+            bandwidth_bps: 1.0 / per_byte,
+        }
     }
 
     pub fn inflight_bytes(&self) -> u64 {
@@ -541,6 +576,10 @@ impl TransferEngine {
             }
         };
         let secs = took.as_secs_f64().max(1e-9);
+        // The sample folds onto the estimate as it stands now, decay included.
+        let now = self.clock.now_mono();
+        self.estimates[path.index()] = self.decayed(path, now);
+        self.sampled_at[path.index()] = Some(now);
         let e = &mut self.estimates[path.index()];
         let moving = secs - e.latency_s.clamp(0.0, secs);
         if moving >= secs / 2.0 {
@@ -1217,6 +1256,95 @@ mod tests {
             assert!(engine.inflight_bytes() <= 2 * block);
         }
         assert!(done, "promotions starved the demotion");
+    }
+
+    /// Decision "6b planner follow-ups", 2 A: an estimate that looks slow decays toward the
+    /// path's calibrated cost while no copy samples it. On the server a slow burst priced L1
+    /// above recomputing, so nothing was promoted any more and the estimate never saw another
+    /// sample (v2-fp8: 33 plans with L1 hits after its 64-block burst, all recomputed). Breaks
+    /// if the estimate does not recover without samples, if it recovers at another rate than
+    /// `ESTIMATE_RECOVERY_HALF_LIFE`, or if a new sample folds onto the stale slow value.
+    #[test]
+    fn slow_estimates_recover_without_samples() {
+        let (fake, clock) = fake();
+        let mut engine = TransferEngine::new(GIB, 16, clock.clone());
+        let path = TransferPath::L1ToL0;
+        let calibrated = PathCost {
+            latency_s: 100e-6,
+            bandwidth_bps: 10.45e9,
+        };
+        engine.seed(path, calibrated);
+        let bytes = 14_680_064u64;
+        let mut slow = SimTransferBackend::new(clock.clone(), None, None, 0);
+        slow.set_cost(
+            path,
+            PathCost {
+                latency_s: 0.06,
+                bandwidth_bps: 2e9,
+            },
+        );
+        for i in 0..32u8 {
+            engine.submit(request(path, i, bytes, None)).unwrap();
+            engine.pump(&mut slow);
+            fake.advance(Duration::from_millis(100));
+            assert_eq!(engine.pump(&mut slow).len(), 1);
+        }
+        let want = calibrated.block_seconds(bytes);
+        let slow_s = engine.estimate(path).block_seconds(bytes);
+        assert!(slow_s > 0.05, "the burst made the path slow: {slow_s} s");
+        assert_eq!(
+            engine.estimate(path).block_seconds(bytes),
+            slow_s,
+            "no time passed, no decay"
+        );
+
+        // One half-life later the excess over the calibrated cost has halved.
+        fake.advance(ESTIMATE_RECOVERY_HALF_LIFE);
+        let half = engine.estimate(path).block_seconds(bytes);
+        let expect = want + (slow_s - want) / 2.0;
+        assert!(
+            (half - expect).abs() < (slow_s - want) * 0.1,
+            "one half-life: {half} s, expected about {expect} s"
+        );
+        // Ten half-lives: back at the calibrated cost, and an L1 block is retrieved again.
+        fake.advance(ESTIMATE_RECOVERY_HALF_LIFE * 9);
+        let est = engine.estimate(path);
+        let got = est.block_seconds(bytes);
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "recovered to the calibrated {want} s: {got} s ({est:?})"
+        );
+        use crate::planner::{PlanInputs, PlanReason, plan_prefix};
+        let matched = [TierId::L1, TierId::L1];
+        let plan = plan_prefix(&PlanInputs {
+            matched: &matched,
+            prompt_tokens: 2 * 128 + 2,
+            block_tokens: 128,
+            block_bytes: bytes,
+            prefill_tps: 9_000.0,
+            l1_to_l0: Some(est),
+            l2_to_l0: None,
+            l0_state: turbine_core::types::PressureState::Green,
+            l1_degraded: false,
+            l2_degraded: false,
+            copy_bytes: &[],
+            lossy_penalty: &[],
+            allow_lossy: true,
+        });
+        assert_eq!(plan.reason, PlanReason::RetrieveCheaper);
+
+        // A copy at the calibrated cost now folds onto the recovered estimate, not the stale one.
+        let mut fast = SimTransferBackend::new(clock, None, None, 0);
+        fast.set_cost(path, calibrated);
+        engine.submit(request(path, 99, bytes, None)).unwrap();
+        engine.pump(&mut fast);
+        fake.advance(Duration::from_millis(5));
+        assert_eq!(engine.pump(&mut fast).len(), 1);
+        let got = engine.estimate(path).block_seconds(bytes);
+        assert!(
+            (got - want).abs() < want * 0.05,
+            "the new sample keeps the recovered {want} s: {got} s"
+        );
     }
 
     fn fake_clock(fake: &Arc<FakeClock>) -> Arc<dyn Clock> {
