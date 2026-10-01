@@ -1,7 +1,7 @@
 //! TurboQuant tables in device memory for the paged attention over TurboQuant L0 pages (P6b
 //! S-5, kernel ABI v2.11 `tq_params`).
 //!
-//! A GPU provider reads the rotation signs, the QJL projection and the codebooks from device
+//! A GPU provider reads the rotation signs and the codebooks from device
 //! memory; the host tables ([`crate::kv_scales::TqKv`]) serve the CPU provider. The executor
 //! holds one copy of every model layer's tables in the transcode's layout and hands each
 //! attention call its layer's slice (the caller offsets `tables`, user decision 2026-10-01 "6b
@@ -22,8 +22,8 @@ use crate::kv_scales::TqKv;
 
 /// Every model layer's TurboQuant tables in device memory: `codebooks[bits − 1]` F32
 /// `[2^bits]` (the unit-variance Lloyd–Max centroids) and `tables` F32
-/// `[layers · num_kv_heads · head_elems]`, per (layer, KV head) the K rotation signs, the V
-/// rotation signs and the QJL projection `S` row-major — the layout of
+/// `[layers · num_kv_heads · head_elems]`, per (layer, KV head) the K rotation signs then the V
+/// rotation signs — the layout of
 /// [`KvTranscodeTables`], so one upload can serve the transcode and the attention.
 pub struct TqDeviceTables {
     pub codebooks: [Tensor; 4],
@@ -52,12 +52,12 @@ impl TqDeviceTables {
                 )));
             }
             for h in &layer.heads {
-                if h.k_signs.len() != dim || h.v_signs.len() != dim || h.qjl.len() != dim * dim {
+                if h.k_signs.len() != dim || h.v_signs.len() != dim {
                     return Err(invalid(format!(
                         "TurboQuant tables of layer {l} are not of head_dim {dim}"
                     )));
                 }
-                for v in h.k_signs.iter().chain(&h.v_signs).chain(&h.qjl) {
+                for v in h.k_signs.iter().chain(&h.v_signs) {
                     flat.extend_from_slice(&v.to_le_bytes());
                 }
             }

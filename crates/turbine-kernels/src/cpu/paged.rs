@@ -905,22 +905,14 @@ mod tests {
     fn mixed_formats_append_and_read_by_tag() {
         use turbine_kv::codec::turboquant::codebook::codebook;
         use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
-        use turbine_kv::codec::turboquant::{Tq4Codec, encode_record, qjl};
+        use turbine_kv::codec::turboquant::{Tq4Codec, encode_record};
 
         use crate::cpu::tq_attention::{self, Formulation, MixedPagedLayer};
 
         const SEED: u64 = 0x0123_4567_89ab_cdef;
         fn encode(fmt: u8, k: &[f32], v: &[f32], h: &TqHeadTables, record: &mut [u8]) {
             assert_eq!(fmt, KV_FMT_TQ4);
-            encode_record(
-                Tq4Codec::WIDTHS,
-                k,
-                v,
-                &h.k_signs,
-                &h.v_signs,
-                &h.qjl,
-                record,
-            );
+            encode_record(Tq4Codec::WIDTHS, k, v, &h.k_signs, &h.v_signs, record);
         }
         let mem = HostMemory::new(DeviceId(0), 1 << 24) as Arc<dyn DeviceMemory>;
         let (hq, hkv, d, bt, t) = (4usize, 2usize, 128usize, 16usize, 40usize);
@@ -930,7 +922,6 @@ mod tests {
                 .map(|h| TqHeadTables {
                     k_signs: rademacher(SEED, 0, h, SignKind::K, d),
                     v_signs: rademacher(SEED, 0, h, SignKind::V, d),
-                    qjl: qjl::projection(SEED, 0, h, d),
                 })
                 .collect(),
             codebooks: [codebook(1), codebook(2), codebook(3), codebook(4)].map(<[f32]>::to_vec),

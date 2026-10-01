@@ -5,8 +5,8 @@
 //! Sign derivation (part of the codec, versioned by its name): the signs of (seed, layer, head,
 //! kind) are the bits of successive SplitMix64 outputs, least-significant bit first, of the
 //! stream started at `splitmix64(seed ^ splitmix64(layer << 24 | head << 8 | kind))`; bit 1 is
-//! −1. `kind` separates the K rotation (0) and the V rotation (1); 2 tags the QJL projection
-//! of the K residual ([`super::qjl::projection`]). The signs depend only on the namespace seed, the layer and the head, so one
+//! −1. `kind` separates the K rotation (0) and the V rotation (1) (2 tagged the QJL projection of
+//! the former inner-product K and stays unused). The signs depend only on the namespace seed, the layer and the head, so one
 //! rotation of q serves every TurboQuant block of a sequence (S-5).
 
 /// Which rotation of a (layer, head) the signs are for.

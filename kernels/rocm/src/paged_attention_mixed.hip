@@ -20,17 +20,17 @@
 // the evaluation's own_rot prototype; llama.cpp's dequantize-on-load loop is
 // the reused pattern). Three kernels:
 // - prep (TurboQuant tables present): per query row and KV head, q of each
-//   query head of the group rotated once, Rq = H (s_k . q) / sqrt(128), and
-//   projected once for the QJL residual, S Rq, into the scratch;
+//   query head of the group rotated once, Rq = H (s_k . q) / sqrt(128), into
+//   the scratch;
 // - attention: grid (rows, KV heads, splits). A row's keys are cut into at
 //   most kMaxSplits splits of a length fixed by its own visible key count (a
 //   multiple of kSplitMin), so a row's result does not depend on its batch,
 //   and a small batch still fills the device (the evaluation's Llama b1 case:
 //   8 workgroups without a split). Every query head of the group in one
 //   workgroup, chunks of 32 keys round the waves, each lane one key: BF16 / FP8
-//   keys q . k in F32; TurboQuant keys norm / sqrt(d) * <Rq, c[codes]> plus
-//   sqrt(pi / 2) / d * |r| * <S Rq, z>, the QJL sum read from a per-workgroup
-//   table of nibble sums (32 lookups for the 128 signs instead of 128 adds).
+//   keys q . k in F32; TurboQuant keys norm / sqrt(d) * <Rq, c[codes]>, the
+//   rotated-domain MSE reconstruction (K is TurboQuant_mse like V, decision
+//   "6b Task 9: TurboQuant K quantizer" A).
 //   Online softmax in F32 (P not rounded); V accumulated in a plain and a
 //   rotated accumulator (TurboQuant: norm / sqrt(d) * c[codes]); at the end
 //   the rotated one is rotated back once (s_v . H acc / sqrt(d)) and added; the
@@ -87,8 +87,6 @@ constexpr int kMaxSplits = 16;
 // Scratch bytes the partial outputs of one launch may use; rows beyond are
 // launched in further passes.
 constexpr int64_t kPartialMaxBytes = int64_t{64} << 20;
-// The nibbles of the 128 QJL signs.
-constexpr int kNibbles = kD / 4;
 
 // The four codebook pointers of tq_params (1 .. 4 bits), passed to the kernels
 // by value (a decode graph captures them with the launch).
@@ -96,9 +94,8 @@ struct CodebookPtrs {
   const float *p[4];
 };
 
-// 1 / sqrt(128) and sqrt(pi / 2) / 128 in F32.
+// 1 / sqrt(128) in F32.
 constexpr float kInvSd = 0x1.6a09e6p-4f;
-constexpr float kQjlC = 0x1.40d932p-7f;
 
 __host__ __device__ inline int64_t page_bytes_of(int fmt, int32_t bt,
                                                  int32_t hkv) {
@@ -318,7 +315,7 @@ __device__ inline bool row_info(const int32_t *q_indptr, const int32_t *kv_lens,
 }
 
 // Prep: grid (rows of the launch, KV heads), tq::kThreads threads. Writes
-// Rq[g] then S Rq[g] (g < G) to prep[(r * hkv + h) * 2 * G * 128].
+// Rq[g] (g < G) to prep[(r * hkv + h) * G * 128].
 template <int G>
 __global__ void __launch_bounds__(tq::kThreads) mixed_prep_kernel(
     const Bf16 *q, const int32_t *q_indptr, const int32_t *kv_lens,
@@ -353,25 +350,9 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_prep_kernel(
       rq[g][i * tq::kGroup + lane] = y[i] * kInvSd;
   }
   __syncthreads();
-  float *out = prep + (static_cast<int64_t>(r) * hkv + kvh) * 2 * G * kD;
+  float *out = prep + (static_cast<int64_t>(r) * hkv + kvh) * G * kD;
   for (int e = tid; e < G * kD; e += tq::kThreads)
     out[e] = rq[e / kD][e % kD];
-  // S Rq: thread i owns row i of S.
-  const float *srow = tab + 2 * kD + static_cast<int64_t>(tid) * kD;
-  float acc[G];
-#pragma unroll
-  for (int g = 0; g < G; ++g)
-    acc[g] = 0.0f;
-  for (int j = 0; j < kD; j += 4) {
-    const float4 s4 = *reinterpret_cast<const float4 *>(srow + j);
-#pragma unroll
-    for (int g = 0; g < G; ++g)
-      acc[g] += s4.x * rq[g][j] + s4.y * rq[g][j + 1] + s4.z * rq[g][j + 2] +
-                s4.w * rq[g][j + 3];
-  }
-#pragma unroll
-  for (int g = 0; g < G; ++g)
-    out[G * kD + g * kD + tid] = acc[g];
 }
 
 __device__ inline float lane_max(float v) {
@@ -397,9 +378,6 @@ __device__ inline void wave_sync() {
 template <int G> struct AttnLds {
   float q[G][kD];
   float rq[G][kD];
-  // QJL nibble sums: nib[g][n][v] = sum over set bits j of v of S Rq[g][4n+j].
-  float nib[G][kNibbles][16];
-  float sq_sum[G];
   float cb[4][16];
   float vs[kD];
   union {
@@ -409,7 +387,6 @@ template <int G> struct AttnLds {
       float vmul[kWaves][kLanes];
       int32_t vfmt[kWaves][kLanes];
     } loop;
-    float sq[G][kD];           // before the loop
     float o[kWaves][G][kD];    // after it: the waves' partial outputs
   };
   float max[kWaves][G];
@@ -419,24 +396,21 @@ template <int G> struct AttnLds {
 };
 
 // The scores of one TurboQuant key (record rec) for G query heads, the softmax
-// scale folded into c_mse / c_qjl. The 128 codes go in four steps of 32 (KB
+// scale folded into c_mse. The 128 codes go in four steps of 32 (KB
 // words each, read as dwords); each step's centroids are looked up once and
 // dotted with every head's Rq, so few Rq values are live at once (a full
 // unroll over the 128 coordinates hoists them all into registers and spills).
 template <int G, int KB>
 __device__ inline void tq_score(const uint8_t *rec, const AttnLds<G> &lds,
-                                float c_mse, float c_qjl, float *s) {
-  using R = tq::Record<KB, KB == 3 ? 4 : 2>;
+                                float c_mse, float *s) {
+  using R = tq::Record<KB, KB>;
   const auto *rw = reinterpret_cast<const uint32_t *>(rec);
   const float kn = __uint_as_float(
       static_cast<uint32_t>(rec[R::kKNorm] | rec[R::kKNorm + 1] << 8) << 16);
-  const float rn = __uint_as_float(
-      static_cast<uint32_t>(rec[R::kRNorm] | rec[R::kRNorm + 1] << 8) << 16);
   float mse[G];
-  float qj[G];
 #pragma unroll
   for (int g = 0; g < G; ++g)
-    mse[g] = qj[g] = 0.0f;
+    mse[g] = 0.0f;
 #pragma unroll 1
   for (int c = 0; c < kD / 32; ++c) {
     uint32_t w[KB];
@@ -463,22 +437,9 @@ __device__ inline void tq_score(const uint8_t *rec, const AttnLds<G> &lds,
       mse[g] += acc;
     }
   }
-  // The QJL signs, 16 bits at a time (the field is 2-byte aligned).
-  const auto *q16 = reinterpret_cast<const uint16_t *>(rec + R::kQjl);
-#pragma unroll 2
-  for (int h = 0; h < kNibbles / 4; ++h) {
-    const uint32_t v = q16[h];
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-#pragma unroll
-      for (int g = 0; g < G; ++g)
-        qj[g] += lds.nib[g][4 * h + k][(v >> (4 * k)) & 15u];
-    }
-  }
 #pragma unroll
   for (int g = 0; g < G; ++g)
-    s[g] = c_mse * kn * mse[g] +
-           c_qjl * rn * (2.0f * qj[g] - lds.sq_sum[g]);
+    s[g] = c_mse * kn * mse[g];
 }
 
 // Attention: grid (rows of the launch, KV heads, splits), kThreads threads.
@@ -523,11 +484,9 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
     lds.q[g][d] = v;
   }
   if (has_tq) {
-    const float *pr = prep + (static_cast<int64_t>(r) * hkv + kvh) * 2 * G * kD;
-    for (int e = tid; e < G * kD; e += kThreads) {
+    const float *pr = prep + (static_cast<int64_t>(r) * hkv + kvh) * G * kD;
+    for (int e = tid; e < G * kD; e += kThreads)
       lds.rq[e / kD][e % kD] = pr[e];
-      lds.sq[e / kD][e % kD] = pr[G * kD + e];
-    }
     if (tid < 64)
       lds.cb[tid / 16][tid % 16] =
           tid % 16 < (2 << (tid / 16)) ? codebooks.p[tid / 16][tid % 16] : 0.0f;
@@ -535,28 +494,7 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
     lds.vs[tid] = tab[kD + tid];
   }
   __syncthreads();
-  if (has_tq) {
-    for (int e = tid; e < G * kNibbles * 16; e += kThreads) {
-      const int g = e / (kNibbles * 16);
-      const int n = (e / 16) % kNibbles;
-      const int v = e % 16;
-      float acc = 0.0f;
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        if ((v >> j) & 1)
-          acc += lds.sq[g][4 * n + j];
-      lds.nib[g][n][v] = acc;
-    }
-    if (tid < G) {
-      float t = 0.0f;
-      for (int i = 0; i < kD; ++i)
-        t += lds.sq[tid][i];
-      lds.sq_sum[tid] = t;
-    }
-    __syncthreads();
-  }
   const float c_mse = scale * kInvSd;
-  const float c_qjl = scale * kQjlC;
 
   float m[G];
   float sum[G];
@@ -637,7 +575,7 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
         if (fmt == kFmtTq4) {
           const uint8_t *rec =
               kv + w.base + (static_cast<int64_t>(kvh) * bt + t) * tq::Tq4::kBytes;
-          tq_score<G, 3>(rec, lds, c_mse, c_qjl, s);
+          tq_score<G, 4>(rec, lds, c_mse, s);
           voff = (rec - kv) + tq::Tq4::kVCodes;
           vmul = __uint_as_float(static_cast<uint32_t>(
                                      rec[tq::Tq4::kVNorm] |
@@ -647,7 +585,7 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
         } else {
           const uint8_t *rec =
               kv + w.base + (static_cast<int64_t>(kvh) * bt + t) * tq::Tq2::kBytes;
-          tq_score<G, 1>(rec, lds, c_mse, c_qjl, s);
+          tq_score<G, 2>(rec, lds, c_mse, s);
           voff = (rec - kv) + tq::Tq2::kVCodes;
           vmul = __uint_as_float(static_cast<uint32_t>(
                                      rec[tq::Tq2::kVNorm] |
@@ -879,8 +817,8 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_stage_kernel(
     int32_t bt, int32_t hkv, float k_scale, float v_scale,
     const float *tables, CodebookPtrs codebooks) {
   __shared__ union {
-    tq::DecodeLds<3, 4> tq4;
-    tq::DecodeLds<1, 2> tq2;
+    tq::DecodeLds<4, 4> tq4;
+    tq::DecodeLds<2, 2> tq2;
   } lds;
   const int32_t p = blockIdx.x;
   const int32_t y = blockIdx.y;
@@ -917,11 +855,11 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_stage_kernel(
   }
   const float *head_tables = tables + static_cast<int64_t>(h) * tq::kHeadElems;
   if (w.fmt == kFmtTq4)
-    StageTq<3, 4>::run(lds.tq4,
+    StageTq<4, 4>::run(lds.tq4,
                        page + static_cast<int64_t>(h) * bt * tq::Tq4::kBytes,
                        out, bt, hkv, h, head_tables, codebooks);
   else
-    StageTq<1, 2>::run(lds.tq2,
+    StageTq<2, 2>::run(lds.tq2,
                        page + static_cast<int64_t>(h) * bt * tq::Tq2::kBytes,
                        out, bt, hkv, h, head_tables, codebooks);
 }
@@ -1013,12 +951,12 @@ int32_t launch_paged_append_mixed(turbine_ctx *ctx,
                      "paged TurboQuant append kernel launch");
   };
   if (formats != nullptr || base == kFmtTq4) {
-    if (int32_t rc = encode(mixed_append_tq_kernel<3, 4, kFmtTq4>, 3, 4);
+    if (int32_t rc = encode(mixed_append_tq_kernel<4, 4, kFmtTq4>, 4, 4);
         rc != TURBINE_OK)
       return rc;
   }
   if (formats != nullptr || base == kFmtTq2) {
-    if (int32_t rc = encode(mixed_append_tq_kernel<1, 2, kFmtTq2>, 1, 2);
+    if (int32_t rc = encode(mixed_append_tq_kernel<2, 2, kFmtTq2>, 2, 2);
         rc != TURBINE_OK)
       return rc;
   }
@@ -1040,7 +978,7 @@ int32_t run_paged_mixed_attention(turbine_ctx *ctx,
   const int64_t part_row = static_cast<int64_t>(hq) * kMaxSplits *
                            (kD * sizeof(float) + sizeof(float2));
   const int64_t prep_row =
-      tq_on ? static_cast<int64_t>(hkv) * 2 * g_bound * kD * sizeof(float) : 0;
+      tq_on ? static_cast<int64_t>(hkv) * g_bound * kD * sizeof(float) : 0;
   const int64_t per_row = part_row + prep_row;
   const int32_t rows = d->total_q;
   const int64_t fit = std::max<int64_t>(1, kPartialMaxBytes / per_row);

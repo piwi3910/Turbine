@@ -6244,7 +6244,7 @@ fn kv_transcode_matches_cpu() {
 }
 
 /// The TurboQuant tables of `seed` in `mem`, built from the codec as the server builds them
-/// (`turbine_kv::codec::turboquant`: rotation signs, QJL projection, codebooks).
+/// (`turbine_kv::codec::turboquant`: rotation signs, codebooks).
 struct TqTables {
     codebooks: Vec<Tensor>,
     tables: Tensor,
@@ -6252,7 +6252,7 @@ struct TqTables {
 
 impl TqTables {
     fn new(mem: &Arc<dyn DeviceMemory>, seed: u64, layers: u32, heads: u32) -> Self {
-        use turbine_kv::codec::turboquant::{codebook, hadamard, qjl};
+        use turbine_kv::codec::turboquant::{codebook, hadamard};
         let d = codebook::TQ_DIM;
         let mut flat =
             Vec::with_capacity((layers * heads) as usize * KvTranscodeTables::head_elems(d as u32));
@@ -6261,7 +6261,6 @@ impl TqTables {
                 for kind in [hadamard::SignKind::K, hadamard::SignKind::V] {
                     flat.extend(hadamard::rademacher(seed, layer, head, kind, d));
                 }
-                flat.extend(qjl::projection(seed, layer, head, d));
             }
         }
         let upload = |v: &[f32]| {
@@ -6326,8 +6325,8 @@ fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8
 /// Which field of a TurboQuant record byte `at` of a slot falls in (`record` bytes per record).
 fn tq_field(fmt: KvTranscodeFormat, at: usize) -> (&'static str, usize) {
     let (k_bits, v_bits, record) = match fmt {
-        KvTranscodeFormat::Tq4 => (3, 4, 144),
-        _ => (1, 2, 80),
+        KvTranscodeFormat::Tq4 => (4, 4, 144),
+        _ => (2, 2, 80),
     };
     let (kc, vc) = (128 * k_bits / 8, 128 * v_bits / 8);
     let o = at % record;
@@ -6335,13 +6334,9 @@ fn tq_field(fmt: KvTranscodeFormat, at: usize) -> (&'static str, usize) {
         "k codes"
     } else if o < kc + 2 {
         "k norm"
-    } else if o < kc + 18 {
-        "k qjl"
-    } else if o < kc + 20 {
-        "k residual norm"
-    } else if o < kc + 20 + vc {
+    } else if o < kc + 2 + vc {
         "v codes"
-    } else if o < kc + 22 + vc {
+    } else if o < kc + 4 + vc {
         "v norm"
     } else {
         "padding"
@@ -6356,7 +6351,7 @@ fn tq_field(fmt: KvTranscodeFormat, at: usize) -> (&'static str, usize) {
 /// field, printed, and bounded (none are expected — every step is the codec's own F32 / F64
 /// operation in its order, with contraction off). The cpu-reference provider agrees on the odd
 /// shape; a call without the tables is refused. Breaks if a sign, a codebook index, the
-/// rotation's scale placement, a norm, the QJL projection or a record offset differs.
+/// rotation's scale placement, a norm or a record offset differs.
 fn tq_transcode_cases(p: &Pair, rng: &mut Rng) {
     let shapes = [
         ("llama-3.2-3b", 28u32, 8u32, 128u32, 4usize),
@@ -6607,19 +6602,18 @@ fn tq_encode_record(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: 
     } else {
         Tq2Codec::WIDTHS
     };
-    encode_record(w, k, v, &head.k_signs, &head.v_signs, &head.qjl, record);
+    encode_record(w, k, v, &head.k_signs, &head.v_signs, record);
 }
 
 /// The host tables of layer `layer` under `seed` (what `TqTables` uploads for it).
 fn tq_host_params(seed: u64, layer: u32, heads: u32) -> TqParams {
-    use turbine_kv::codec::turboquant::{codebook, hadamard, qjl};
+    use turbine_kv::codec::turboquant::{codebook, hadamard};
     let d = codebook::TQ_DIM;
     TqParams {
         heads: (0..heads)
             .map(|h| TqHeadTables {
                 k_signs: hadamard::rademacher(seed, layer, h, hadamard::SignKind::K, d),
                 v_signs: hadamard::rademacher(seed, layer, h, hadamard::SignKind::V, d),
-                qjl: qjl::projection(seed, layer, h, d),
             })
             .collect(),
         codebooks: [1, 2, 3, 4].map(|b| codebook::codebook(b).to_vec()),

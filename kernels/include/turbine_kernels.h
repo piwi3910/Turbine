@@ -303,11 +303,11 @@ typedef struct turbine_attention_paged_desc {
   const uint8_t *block_formats;
   /* v2.11: host pointer, read during the call only (its device pointers are
    * captured with the call): the TurboQuant tables of THIS layer -- tables
-   * points at the layer's [num_kv_heads][2 * head_dim + head_dim * head_dim]
-   * slice of the model's tables (the caller offsets it; there is no layer
-   * field), codebooks and seed as for the transcode. Required when dtype is
-   * TQ4 / TQ2 or block_formats is not NULL (a table may hold TurboQuant
-   * blocks); NULL otherwise and in a _supported / _impl probe. */
+   * points at the layer's [num_kv_heads][2 * head_dim] slice of the model's
+   * tables (the caller offsets it; there is no layer field), codebooks and seed
+   * as for the transcode. Required when dtype is TQ4 / TQ2 or block_formats is
+   * not NULL (a table may hold TurboQuant blocks); NULL otherwise and in a
+   * _supported / _impl probe. */
   const struct turbine_tq_params *tq_params;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
@@ -1028,10 +1028,10 @@ const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
  * nearest even and saturated to +-448, decoded as bf16(e4m3 * scale));
  * TQ4 and TQ2 are the TurboQuant codecs (slot layouts of crates/turbine-kv
  * codec/turboquant: one record per (layer, KV head, token), head_dim 128),
- * which read their rotation signs, codebooks and QJL projection from
- * tq_params (below). Encode equals the CPU codec byte for byte and decode bit
- * for bit, for every format (TurboQuant over finite pages: a NaN's payload is
- * not pinned). */
+ * K and V both TurboQuant_mse (tq4 4 bits each, tq2 2 bits each), which
+ * read their rotation signs and codebooks from tq_params (below). Encode equals
+ * the CPU codec byte for byte and decode bit for bit, for every format
+ * (TurboQuant over finite pages: a NaN's payload is not pinned). */
 #define TURBINE_KVFMT_L0 0
 #define TURBINE_KVFMT_FP8_E4M3 1
 #define TURBINE_KVFMT_TQ4 2
@@ -1050,10 +1050,8 @@ typedef struct turbine_tq_params {
   /* device F32 unit-variance Lloyd-Max codebooks of 1, 2, 3 and 4 bits
    * (index bits - 1), 2, 4, 8 and 16 ascending centroids */
   const float *codebooks[4];
-  /* device F32 [layers][num_kv_heads][2 * head_dim + head_dim * head_dim]:
-   * per (layer, KV head) the K rotation signs (+-1, head_dim), the V rotation
-   * signs, then the QJL projection S of the K residual (head_dim x head_dim,
-   * row-major) */
+  /* device F32 [layers][num_kv_heads][2 * head_dim]: per (layer, KV head)
+   * the K rotation signs (+-1, head_dim), then the V rotation signs */
   const float *tables;
 } turbine_tq_params;
 

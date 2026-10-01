@@ -2,11 +2,12 @@
 //! through the transcode descriptor" A and "6b Task 12: how per-layer TurboQuant tables reach
 //! the paged-attention call" A).
 //!
-//! A GPU kernel library never regenerates the rotation signs, the QJL projection `S` or the
-//! codebooks: the server builds them once on the host, from the CPU codec's own generators
+//! A GPU kernel library never regenerates the rotation signs or the codebooks: the server builds
+//! them once on the host, from the CPU codec's own generators
 //! ([`crate::kv_tq::layer_params`], under the seed of the pool's KV namespace), and uploads them
 //! to the device once per rank, in the layout of `turbine_tq_params` (per layer and KV head the
-//! K signs, the V signs and `S` row-major). Two consumers read that upload:
+//! K signs then the V signs; Llama-3.2-3B: 28 · 8 · 256 F32, 229 KB). Two consumers read that
+//! upload:
 //!
 //! - the KV transcode of a `kv.cpu.format` / `kv.nvme.format` of `tq4` / `tq2` below BF16 pages
 //!   (`CopyStreamBackend::enable_device_transcode`, `KvTranscodeKernel::execute_with_tables`),
@@ -72,7 +73,7 @@ pub fn transcode_view(t: &TqDeviceTables) -> KvTranscodeTables<'_> {
     }
 }
 
-/// Device bytes of one upload for pages of `layout`: `[layers][kv heads][2·d + d²]` F32 plus
+/// Device bytes of one upload for pages of `layout`: `[layers][kv heads][2·d]` F32 plus
 /// the four codebooks.
 pub fn table_bytes(layout: &KvLayout) -> u64 {
     let per_head = KvTranscodeTables::head_elems(layout.head_dim) as u64;
@@ -129,12 +130,11 @@ pub fn install(
 }
 
 /// The bytes `turbine_tq_params.tables` must hold per layer, straight from the codec's
-/// generators (not through [`host_tables`]): per KV head the K signs, the V signs and `S`
-/// row-major. The reference the upload tests compare against.
+/// generators (not through [`host_tables`]): per KV head the K signs then the V signs. The
+/// reference the upload tests compare against.
 #[cfg(test)]
 pub(crate) fn codec_table_bytes(seed: u64, layers: u32, heads: u32) -> Vec<Vec<u8>> {
     use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
-    use turbine_kv::codec::turboquant::qjl;
     (0..layers)
         .map(|l| {
             let mut bytes = Vec::new();
@@ -142,7 +142,6 @@ pub(crate) fn codec_table_bytes(seed: u64, layers: u32, heads: u32) -> Vec<Vec<u
                 for v in rademacher(seed, l, h, SignKind::K, TQ_DIM)
                     .iter()
                     .chain(&rademacher(seed, l, h, SignKind::V, TQ_DIM))
-                    .chain(&qjl::projection(seed, l, h, TQ_DIM))
                 {
                     bytes.extend_from_slice(&v.to_le_bytes());
                 }
@@ -280,8 +279,8 @@ mod tests {
         assert_eq!(reserved_bytes(&kv, &layout(DType::Tq4)), one);
     }
 
-    /// The sizes the task quotes: about 15 MB for Llama-3.2-3B (28 layers x 8 KV heads) and
-    /// 17 MB for OLMoE-1B-7B (16 x 16).
+    /// The sizes at the served models: 229 KB for Llama-3.2-3B (28 layers x 8 KV heads) and
+    /// 262 KB for OLMoE-1B-7B (16 x 16), the signs and codebooks only (MSE-only K, no QJL `S`).
     #[test]
     fn table_sizes_at_the_served_models() {
         let shape = |layers, heads| KvLayout {
@@ -291,9 +290,9 @@ mod tests {
             dtype: DType::BF16,
             block_tokens: 128,
         };
-        assert_eq!(table_bytes(&shape(28, 8)), 4 * (224 * 16_640 + 30));
-        assert_eq!(table_bytes(&shape(16, 16)), 4 * (256 * 16_640 + 30));
-        assert!((14_000_000..15_000_000).contains(&table_bytes(&shape(28, 8))));
-        assert!((17_000_000..17_100_000).contains(&table_bytes(&shape(16, 16))));
+        assert_eq!(table_bytes(&shape(28, 8)), 4 * (224 * 256 + 30));
+        assert_eq!(table_bytes(&shape(16, 16)), 4 * (256 * 256 + 30));
+        assert_eq!(table_bytes(&shape(28, 8)), 229_496);
+        assert_eq!(table_bytes(&shape(16, 16)), 262_264);
     }
 }

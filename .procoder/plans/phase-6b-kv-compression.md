@@ -132,17 +132,17 @@ Interfaces:
 
 ## Task 7: TurboQuant CPU codec (`tq4`, `tq2`)
 
-Files: `crates/turbine-kv/src/codec/turboquant/mod.rs` (codec, layout), `crates/turbine-kv/src/codec/turboquant/hadamard.rs` (randomized fast Walsh–Hadamard), `crates/turbine-kv/src/codec/turboquant/codebook.rs` (Lloyd–Max codebooks as constants plus the generator used by the test), `crates/turbine-kv/src/codec/turboquant/qjl.rs` (1-bit residual projection through a seeded Gaussian `S`), `crates/turbine-kv/src/codec/mod.rs` (registry adds `tq4`, `tq2`), `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS`: `tq4`/`tq2` `experimental`)
+Files: `crates/turbine-kv/src/codec/turboquant/mod.rs` (codec, layout), `crates/turbine-kv/src/codec/turboquant/hadamard.rs` (randomized fast Walsh–Hadamard), `crates/turbine-kv/src/codec/turboquant/codebook.rs` (Lloyd–Max codebooks as constants plus the generator used by the test) `crates/turbine-kv/src/codec/mod.rs` (registry adds `tq4`, `tq2`), `crates/turbine-core/src/support.rs` (`TIER_FORMAT_REFUSALS`: `tq4`/`tq2` `experimental`)
 Interfaces:
 
-- per token-head vector of 128: signs `s = rademacher(seed, layer, head, kind)`, `y = H·(s ⊙ x) / √128`, `norm = ‖x‖` (BF16), codes = nearest codebook entry of `y_i·√128 / norm`; K residual `r = y − ŷ`, QJL signs of `S·r` with `S` a 128 × 128 Gaussian matrix seeded per (layer, head, kind) (SplitMix64 + Box–Muller in F64 rounded to F32), residual norm (BF16); decode adds the paper's estimate of the residual from the signs and its norm (`p6b-groundwork` `qjl.rs`); decode inverts; `seed` = first 8 bytes of the namespace key
+- per token-head vector of 128: signs `s = rademacher(seed, layer, head, kind)`, `y = H·(s ⊙ x) / √128`, `norm = ‖x‖` (BF16), codes = nearest codebook entry of `y_i·√128 / norm`, K and V alike (TurboQuant_mse; the QJL residual of K of the first build was removed by user decision 2026-10-01 "6b Task 9: TurboQuant K quantizer" A); decode inverts; `seed` = first 8 bytes of the namespace key
   Covers: spec S-4 (CPU); AC `codec::turboquant::tests`
   Depends on: Task 1
 
-- [ ] Write failing tests `codec::turboquant::tests::{hadamard_orthonormal, codebooks_reproduce, k_inner_product_unbiased, v_mse_bound_4bit, v_mse_bound_2bit, layout_round_trip}` and the registry conformance for both codecs. Run: `scripts/remote-cargo.sh test -p turbine-kv codec::turboquant` — expect FAIL
+- [ ] Write failing tests `codec::turboquant::tests::{hadamard_orthonormal, codebooks_reproduce, k_mse_bound_records, v_mse_bound_4bit, v_mse_bound_2bit, layout_round_trip}` and the registry conformance for both codecs. Run: `scripts/remote-cargo.sh test -p turbine-kv codec::turboquant` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` — expect PASS
-- [ ] Mutation check (do not commit): drop the QJL residual term in K decode — expect `k_inner_product_unbiased` to FAIL; revert.
+- [ ] Mutation check (do not commit): code K with one bit fewer — expect `k_mse_bound_records` to FAIL; revert.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): TurboQuant tq4 and tq2 codecs (CPU reference)`
 

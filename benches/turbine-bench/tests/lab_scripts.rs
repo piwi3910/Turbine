@@ -719,6 +719,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "moe_decode_tier_timings",
         "decode_attention_timings",
         "paged_mixed_timings",
+        "tq_loss_on_real_kv",
     ];
 
     let text = dry_run(

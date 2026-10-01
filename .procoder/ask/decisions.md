@@ -2818,3 +2818,25 @@ ratio 0.927. Paired flips 8 vs 6; exact-KV runs vary 0.755–0.790 at c16. (The 
 - C) Accept the pass at the bound
 
 **Decision (user, 2026-10-01): A.** Three baseline and three candidate runs, judged on the medians plus the paired McNemar test; the same method applies to the TurboQuant tier gates (Task 9).
+
+## 6b Task 9: TurboQuant K quantizer — QJL (as specified) or MSE-only (2026-10-01)
+
+From `p6b-t9` (521816e, `tq_loss_on_real_kv`; table in `.procoder/handoff/p6b-t9.md`). No codec defect: tq4 K
+prod·d 0.051 vs the paper's D_prod 0.047, rotations normalised. But on real K/V (one prefill of golden p09, per layer,
+lossy prefix keys, exact last block) spending all bits on the Lloyd–Max stage for K beats the specified 3-bit MSE +
+1-bit QJL K (spec S-4, user decision 2026-09-28 Q12):
+
+| Llama-3.2-3B mean | K nmse | score err SD | attn out rel err | TV |
+| tq4 (3+1 QJL) | 0.051 | 0.64 | 0.145 | 0.081 |
+| tq4 K 4-bit MSE | 0.009 | 0.28 | 0.080 | 0.034 |
+| tq2 (1+1 QJL) | 0.549 | 2.08 | 1.09 | 0.38 |
+| tq2 K 2-bit MSE | 0.112 | 0.96 | 0.55 | 0.21 |
+
+OLMoE: same ordering (tq4 out 0.068 vs 0.043). MSE-only K has a small positive score bias (+0.06 / +0.02 logits).
+
+- A) Switch K to MSE-only (TurboQuant_mse for K and V) for tq4 and tq2: amend S-4; change the CPU codec, the GPU
+  transcode and the mixed attention (its rotated-domain QJL term goes away); same record sizes; then Task 9's gates
+- B) Keep the QJL K as specified and judge it by the gates
+- C) Ship both as separate formats (e.g. `tq4` MSE-only, `tq4q` QJL) and let the gates pick
+
+**Decision (user, 2026-10-01): A.** K becomes MSE-only (TurboQuant_mse for K and V) in tq4 and tq2; S-4 amended; codec, GPU transcode and mixed attention follow; then Task 9's gates.

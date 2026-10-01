@@ -1,6 +1,12 @@
 // turbine_attn_eval: the mixed-format / TurboQuant paged attention provider
 // evaluation (Phase 6b Task 10, kernel reuse rule) on the current device.
 //
+// Frozen at the evaluation: it builds the former tq4 / tq2 records (K = MSE
+// stage + 1-bit QJL residual, tables with the QJL matrix S). Since decision
+// "6b Task 9: TurboQuant K quantizer" A, K is TurboQuant_mse and the library's
+// records and tables differ, so the tqN:staged_ck leg no longer matches this
+// file's pages; rerun the evaluation at its own commit (git log of this file).
+//
 // One layer of a ragged batch over 128-token pages, Llama-3.2-3B (24 query /
 // 8 KV heads) and OLMoE-1B-7B (16 / 16) head layouts, head_dim 128. For each
 // shape it builds pages in every KV format -- bf16, fp8_e4m3 (per-layer

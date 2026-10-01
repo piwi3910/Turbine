@@ -54,9 +54,9 @@ pub enum DType {
     /// meaning a quantization scheme describes (Phase 6a).
     U8,
     /// TurboQuant `tq4` KV pages (P6b S-5): one 144-byte record per (token, KV head) of
-    /// head_dim 128, K 3 + 1 bits and V 4 bits. Byte storage; [`KvLayout`] sizes the pages.
+    /// head_dim 128, K and V 4 bits. Byte storage; [`KvLayout`] sizes the pages.
     Tq4,
-    /// TurboQuant `tq2` KV pages (P6b S-5): 80-byte records, K 1 + 1 bits and V 2 bits.
+    /// TurboQuant `tq2` KV pages (P6b S-5): 80-byte records, K and V 2 bits.
     Tq2,
 }
 
@@ -100,7 +100,7 @@ impl DType {
         matches!(self, DType::U8)
     }
     /// The TurboQuant record bytes of one (token, KV head) of head_dim 128 (P6b S-5): K codes,
-    /// K norm, QJL signs, residual norm, V codes, V norm, padded to 16 bytes; `None` for every
+    /// K norm, V codes, V norm, padded to 16 bytes; `None` for every
     /// other dtype.
     pub fn tq_record_bytes(self) -> Option<u64> {
         match self {
