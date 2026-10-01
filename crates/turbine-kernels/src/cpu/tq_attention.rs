@@ -10,7 +10,8 @@
 //!
 //! Page bytes of one layer of one block, by format:
 //! - `bf16`: `[2, block_tokens, kv_heads, head_dim]` BF16, K before V (the L0 page layout);
-//! - `fp8_e4m3`: the same elements as OCP e4m3 bytes, value = e4m3 × the layer's K / V scale;
+//! - `fp8_e4m3`: the same elements as OCP e4m3 bytes, read as `bf16(e4m3 × scale)` with the
+//!   layer's K / V scale (the 6a FP8 page contract, as the GPU kernels read them);
 //! - `tq4` / `tq2`: `kv_heads × block_tokens` records of the `turbine-kv` TurboQuant codec
 //!   (record `head·block_tokens + token`; K codes, K norm, QJL signs, residual norm, V codes,
 //!   V norm, padded to 16 bytes; `tq4` 144 bytes, `tq2` 80).
@@ -329,13 +330,19 @@ fn gather<'p>(l: &MixedPagedLayer<'p>, seq: &Seq, g: usize) -> Vec<Entry<'p>> {
                 (base..base + d)
                     .map(|e| match fmt {
                         FMT_BF16 => get_bf16(page, 2 * e),
-                        _ => fp8_e4m3_value(page[e]) * if h == 0 { l.k_scale } else { l.v_scale },
+                        _ => fp8_read(page[e], if h == 0 { l.k_scale } else { l.v_scale }),
                     })
                     .collect()
             };
             Entry::Plain([half(0), half(1)])
         })
         .collect()
+}
+
+/// An FP8 page element as attention reads it: `bf16(e4m3 × scale)`, the 6a contract every GPU
+/// paged attention follows (`phase-6a-quantization` S-13).
+fn fp8_read(byte: u8, scale: f32) -> f32 {
+    bf16::from_f32(fp8_e4m3_value(byte) * scale).to_f32()
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
@@ -616,7 +623,7 @@ mod tests {
                     let s = if h == 0 { K_SCALE } else { V_SCALE };
                     for e in h * n / 2..(h + 1) * n / 2 {
                         page[e] = fp8_e4m3_round(x[e] / s);
-                        seen[e] = fp8_e4m3_value(page[e]) * s;
+                        seen[e] = bf16::from_f32(fp8_e4m3_value(page[e]) * s).to_f32();
                     }
                 }
                 Block { fmt, page, seen }
@@ -832,6 +839,47 @@ mod tests {
             );
             let diff = max_diff(&rot, &dta);
             assert!(diff <= TOL, "q {q_lens:?} kv {kv_lens:?}: max |Δ| {diff}");
+        }
+    }
+
+    /// FP8 blocks are read as `bf16(e4m3 × scale)` (the 6a contract the GPU kernels follow),
+    /// not as the unrounded F32 product: the output equals exact attention over the rounded
+    /// values, and exact attention over the unrounded ones is measurably different (so the
+    /// case discriminates). Breaks if the reference drops the BF16 rounding of FP8 elements.
+    #[test]
+    fn fp8_blocks_read_as_bf16() {
+        let blocks: Vec<Block> = (0..2).map(|i| block(FMT_FP8_E4M3, 300 + i)).collect();
+        let t = vec![vec![0, 1]];
+        for (q_lens, kv_lens, dec) in [(vec![1], vec![29], true), (vec![12], vec![32], false)] {
+            let (got, want) = case(&blocks, &t, &q_lens, &kv_lens, Formulation::Rotated, dec);
+            let diff = max_diff(&got, &want);
+            assert!(diff <= TOL, "q {q_lens:?} kv {kv_lens:?}: max |Δ| {diff}");
+            let unrounded: Vec<Block> = blocks
+                .iter()
+                .map(|b| Block {
+                    fmt: b.fmt,
+                    page: b.page.clone(),
+                    seen: b
+                        .page
+                        .iter()
+                        .enumerate()
+                        .map(|(e, &x)| {
+                            let s = if e < b.page.len() / 2 {
+                                K_SCALE
+                            } else {
+                                V_SCALE
+                            };
+                            fp8_e4m3_value(x) * s
+                        })
+                        .collect(),
+                })
+                .collect();
+            let (_, off) = case(&unrounded, &t, &q_lens, &kv_lens, Formulation::Rotated, dec);
+            assert!(
+                max_diff(&got, &off) > 10.0 * TOL,
+                "q {q_lens:?}: the unrounded reading is indistinguishable ({})",
+                max_diff(&got, &off)
+            );
         }
     }
 
