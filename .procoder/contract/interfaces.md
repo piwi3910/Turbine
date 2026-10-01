@@ -753,7 +753,9 @@ pub trait CopyEngine: Send + Sync {                                             
     fn copy_async(&self, dst: CopyTarget, src: CopySource, bytes: usize) -> Result<CopyTicket, MemoryError>;
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>;      // event query
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>;
+    fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError>;  // P6b: one block's segments; the shim fences and signals once (one ticket); default: copy_async each
 }
+pub struct CopyOp { pub dst: CopyTarget, pub src: CopySource, pub bytes: usize }   // P6b
 pub enum CopyTarget { Device(DevicePtr), Pinned { buffer_id: u64, offset: usize } }
 pub type CopySource = CopyTarget;
 

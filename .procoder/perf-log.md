@@ -232,3 +232,28 @@ Fix: 69769e2 (a copy seen done only at a poll is `CopyTime::Within { at_least, a
 Retrievals rose from 2–6 to 29–48 plans and lossy reuse from 768 to 44k–87k tokens, but the comparison is confounded: the workload sits at the overload edge and a run that trips SURVIVAL (`exhaustion_horizon`, 10 s of 503 `overloaded`) loses its later turns, which raises the ratio over the requests that succeed. The fp8 arm tripped it in 3 of 3 runs after the fix (once right after a 64-block promotion burst), against 0 of 1 before (Task 6 also lost one earlier fp8 run to it); `l0` 1 of 3 after, 1 of 1 before. `cached_tokens_ratio` across arms is not comparable until the runs are clean.
 
 Remaining `recompute_cheaper` plans (35–111 per run): every one ran while the L1 → L0 latency estimate was above 1 ms after a genuinely slow burst. Each slow burst (promotions seen running 33–255 ms) coincided with 250–800 MB of pressure demotions (L0 → L1, calibrated at only 1.6 GB/s device-to-host) on the same FIFO copy stream: the promotions really waited, but the planner sums that shared wait once per block (`k × latency`).
+
+### Pinned D2H (decision "6b Task 6" follow-up 4, A; branch `p6b-d2h`)
+
+Question: startup calibration priced L0 → L1 (pinned device-to-host) at 4.16 GB/s (6a log, 2026-09-30) or 1.6 GB/s (6b planner runs) against ~10.6 GB/s host-to-device on GPU 0. Both cards sit behind a Gen5 x8 root port (`00:01.0` / `00:01.1`, 32 GT/s x8; the x16 links are the card's own switch).
+
+Cause (Turbine usage): `ShimContext::copy_async` fenced the compute stream (event create + record + `hipStreamWaitEvent`) and recorded a completion event for every device-source copy, and the KV orchestrator issued one copy per 512 KiB layer segment (28 per Llama block). Host-to-device copies have no fence, hence the asymmetry. The calibration also timed the first copies on a fresh copy stream, D2H first.
+
+Plain-HIP microbenchmark (`hipHostMalloc` default, non-blocking streams, GPU 0 under `bench.lock`, 64 MiB in 256 KiB segments scattered like the pool's layers; cold = first pass on a new stream):
+
+| Variant                                       | D2H cold | D2H warm  | H2D warm  |
+| --------------------------------------------- | -------- | --------- | --------- |
+| fence + event per segment (Turbine before)    | 3.1–3.5  | 4.4       | 9.5       |
+| no fence, event per segment                   | 6.1–6.5  | 10.3      | 9.5       |
+| one fence + one event per block (56 segments) | 6.6–6.9  | 11.1–11.5 | 10.2–10.4 |
+| one 64 MiB copy (SDMA ceiling)                | —        | 12.5      | 12.7      |
+
+GB/s. Not the cause: pinned vs registered memory (`hipHostMalloc` throughout), slab size (64 MiB vs 1 GiB), device stride, host first touch, NUMA (one node). `HSA_ENABLE_SDMA=0` (blit kernels) reaches 18.5 GB/s H2D on one large copy but is slower at segment sizes, so SDMA's ~12.5 GB/s is the practical ceiling of this path.
+
+Fix (6be446b): `CopyEngine::copy_async_batch` — the shim resolves every end, fences once, enqueues the segments and records one event (one ticket per block per shard); `stream_copies` uses it; `calibrate_l1` runs one untimed pass each way before timing.
+
+| Measure (GPU 0 unless noted)                                    | Before                   | After                                                   |
+| --------------------------------------------------------------- | ------------------------ | ------------------------------------------------------- |
+| `kv_calibration` l0_to_l1 / l1_to_l0 (GB/s)                     | 4.16 / 10.63             | 11.57 / 11.52                                           |
+| lab `pinned_block_batches_d2h_keeps_up_with_h2d` (k3s Job card) | per segment 5.21 / 8.80  | batched 9.42 / 9.22 (ratio 1.02)                        |
+| `lab-bench --quick` (golden c1, tok/s, ITL p50, TTFT p50)       | 854.2 (6a exit, 200 req) | PASS, 863.7, 15.4 ms, 225 ms (64 req; labbook 71350afa) |

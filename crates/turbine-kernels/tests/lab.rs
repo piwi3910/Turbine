@@ -219,6 +219,101 @@ fn demotion_host_cost() {
     );
 }
 
+/// Perf-log "Pinned D2H": Llama-3.2-3B blocks of the serving default (28 layer segments of
+/// 512 KiB, scattered on the device like the KV pool's layers) through `copy_async_batch`, one
+/// batch per block as the KV orchestrator issues them, after one untimed pass. Device-to-host
+/// must reach at least 75 % of host-to-device on the same card (2026-10-01, GPU 0: ~11 vs
+/// ~10 GB/s batched; one fence and one event per segment gave ~4.5 vs ~9.5, ratio 0.45); the
+/// per-segment rate is printed for comparison. A ratio, not an absolute rate, so the shared
+/// card's load and its slot do not flake it. Breaks if the batch fences or signals per segment
+/// again, or a copy lands in the wrong place.
+#[test]
+#[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn pinned_block_batches_d2h_keeps_up_with_h2d() {
+    use turbine_tensor::CopyOp;
+    const LAYERS: usize = 28;
+    const SEG: usize = 524_288;
+    const N: usize = 32;
+    const BLOCK_BYTES: usize = LAYERS * SEG;
+    if !require_backend("hip") {
+        return;
+    }
+    let ctx = open_context("hip");
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let host = ctx.alloc_pinned(N * BLOCK_BYTES).expect("pinned slab");
+    let mut gpu = DeviceBuffer::alloc(&mem, N * BLOCK_BYTES).expect("GPU blocks");
+    let mut layer = vec![0u8; N * SEG];
+    for l in 0..LAYERS {
+        fill(l as u64, &mut layer);
+        gpu.copy_from_host(l * N * SEG, &layer).expect("seed layer");
+        mem.synchronize().expect("seeded");
+    }
+    // Layer-major on the device (layer l of block b at (l * N + b) * SEG), block-major on the
+    // host: the pool's and an L1 slot's layouts.
+    let ops = |b: usize, d2h: bool| -> Vec<CopyOp> {
+        (0..LAYERS)
+            .map(|l| {
+                let dev = CopyTarget::Device(gpu.ptr().offset(((l * N + b) * SEG) as u64));
+                let pinned = CopyTarget::Pinned {
+                    buffer_id: host.id(),
+                    offset: b * BLOCK_BYTES + l * SEG,
+                };
+                let (dst, src) = if d2h { (pinned, dev) } else { (dev, pinned) };
+                CopyOp {
+                    dst,
+                    src,
+                    bytes: SEG,
+                }
+            })
+            .collect()
+    };
+    let run = |d2h: bool, batched: bool| -> f64 {
+        let started = Instant::now();
+        let mut tickets = Vec::new();
+        for b in 0..N {
+            let ops = ops(b, d2h);
+            if batched {
+                tickets.extend(ctx.copy_async_batch(&ops).expect("batch"));
+            } else {
+                for op in &ops {
+                    tickets.push(ctx.copy_async(op.dst, op.src, op.bytes).expect("copy"));
+                }
+            }
+        }
+        for t in &tickets {
+            ctx.wait(t).expect("wait");
+        }
+        (N * BLOCK_BYTES) as f64 / started.elapsed().as_secs_f64() / 1e9
+    };
+    run(true, true);
+    run(false, true);
+    let d2h = run(true, true);
+    host.with_bytes(|h| {
+        for l in 0..LAYERS {
+            fill(l as u64, &mut layer);
+            for b in [0, N / 2, N - 1] {
+                let got = &h[b * BLOCK_BYTES + l * SEG..b * BLOCK_BYTES + (l + 1) * SEG];
+                assert!(
+                    got == &layer[b * SEG..(b + 1) * SEG],
+                    "block {b} layer {l} differs"
+                );
+            }
+        }
+    });
+    let h2d = run(false, true);
+    let d2h_seg = run(true, false);
+    let h2d_seg = run(false, false);
+    println!(
+        "pinned_block_batches batched d2h_gbps={d2h:.2} h2d_gbps={h2d:.2} ratio={:.2} \
+         per_segment d2h_gbps={d2h_seg:.2} h2d_gbps={h2d_seg:.2}",
+        d2h / h2d
+    );
+    assert!(
+        d2h >= 0.75 * h2d,
+        "batched D2H {d2h:.2} GB/s is below 75 % of H2D {h2d:.2} GB/s"
+    );
+}
+
 /// P5 S-13: the startup host-link probe on every visible GPU of the backend's vendor, printed as
 /// `host_link device=<i> h2d_gbps=… d2h_gbps=…`; each direction must measure > 1 GB/s. With
 /// `TURBINE_EXPECT_AMD=2` (a `--gpus 2` run on novanas) GPU0's slot (Gen5 x8) must measure no
