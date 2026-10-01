@@ -108,8 +108,8 @@ fn ratio(part: u64, whole: u64) -> f64 {
     }
 }
 
-/// Unrelated requests sent between the first item and the rest (`--filler-requests`): they
-/// fill L0 so the first item's shared prefix is demoted to the lower KV tier before the other
+/// Unrelated requests sent between the first two items and the rest (`--filler-requests`):
+/// they fill L0 so the first items' shared prefix is demoted to the lower KV tier before the other
 /// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fillers {
@@ -452,9 +452,14 @@ async fn run_task(
 /// Runs every task, up to `concurrency` requests in flight at once (`0` counts as 1, capped at
 /// 256 by the caller); results are reported in task-file order whatever order the replies
 /// arrive in. The first failed request aborts the run (no partial report). With
-/// `fillers.requests` > 0 the first task runs alone, then the fillers one after another, then
-/// the rest at `concurrency`: the first task publishes the shared prefix, the fillers push it
-/// out of L0, and the rest read it back from the lower tier.
+/// `fillers.requests` > 0 the first [`FILLER_HEAD`] tasks run alone, one after the other, then
+/// the fillers one after another, then the rest at `concurrency`: the first task publishes the
+/// shared prefix, the second hits it (the reuse evidence a server needs before it copies a
+/// block down rather than dropping it), the fillers push it out of L0, and the rest read it
+/// back from the lower tier.
+/// Tasks run alone before the fillers (see [`run_eval`]).
+pub const FILLER_HEAD: usize = 2;
+
 pub async fn run_eval(
     base: &str,
     model: Option<&str>,
@@ -476,7 +481,7 @@ pub async fn run_eval(
     let model = &model;
     let client = &client;
     let (head, rest) = if fillers.requests > 0 {
-        tasks.split_at(tasks.len().min(1))
+        tasks.split_at(tasks.len().min(FILLER_HEAD))
     } else {
         tasks.split_at(0)
     };

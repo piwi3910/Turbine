@@ -1203,10 +1203,13 @@ mod phase8_eval {
         )
     }
 
-    /// With fillers the first item runs alone, then the fillers, then the other items, so those
-    /// are served from the lossy tier; the report carries the token usage and the guard passes.
-    /// This is the test the mutation check breaks: send the fillers after the whole set (or not
-    /// at all) and no item reports lossy-cached tokens, so the guard fails.
+    /// With fillers the first two items run alone, one after the other (the second hits the
+    /// prefix the first published: the reuse evidence a demotion needs, without which a server
+    /// drops the prefix instead of copying it down), then the fillers, then the other items, so
+    /// those are served from the lossy tier; the report carries the token usage and the guard
+    /// passes. This is the test the mutation check breaks: send the fillers after the whole set
+    /// (or not at all) and no item reports lossy-cached tokens, so the guard fails; send them
+    /// after the first item only and the prefix has no hit before it is pushed out.
     #[tokio::test(flavor = "multi_thread")]
     async fn eval_fillers_push_the_prefix_to_the_lossy_tier_before_the_rest() {
         let (code, stdout, stderr, log) = eval_with_usage_mock(&[
@@ -1221,8 +1224,12 @@ mod phase8_eval {
         ])
         .await;
         assert_eq!(code, Some(0), "{stderr}");
-        assert_eq!(&log[..4], ["q0", "filler", "filler", "filler"], "{log:?}");
-        assert_eq!(log.len(), 4 + 19);
+        assert_eq!(
+            &log[..5],
+            ["q0", "q1", "filler", "filler", "filler"],
+            "{log:?}"
+        );
+        assert_eq!(log.len(), 3 + 20);
         let report: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(report["filler_requests"], 3);
         assert_eq!(report["filler_words"], 50);
@@ -1230,7 +1237,12 @@ mod phase8_eval {
         let results = report["results"].as_array().unwrap();
         assert_eq!(results[0]["id"], "t0", "task-file order");
         assert_eq!(results[0]["cached_tokens"], 0);
-        assert_eq!(results[1]["lossy_cached_tokens"], 896);
+        assert_eq!(
+            results[1]["cached_tokens"], 896,
+            "the hit before the fillers"
+        );
+        assert_eq!(results[1]["lossy_cached_tokens"], 0);
+        assert_eq!(results[2]["lossy_cached_tokens"], 896);
         assert_eq!(results[19]["prompt_tokens"], 1000);
     }
 
