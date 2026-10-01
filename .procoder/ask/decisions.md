@@ -2840,3 +2840,20 @@ OLMoE: same ordering (tq4 out 0.068 vs 0.043). MSE-only K has a small positive s
 - C) Ship both as separate formats (e.g. `tq4` MSE-only, `tq4q` QJL) and let the gates pick
 
 **Decision (user, 2026-10-01): A.** K becomes MSE-only (TurboQuant_mse for K and V) in tq4 and tq2; S-4 amended; codec, GPU transcode and mixed attention follow; then Task 9's gates.
+
+## 6b: queued-prefix demotion — granularity and scope (2026-10-01)
+
+From `p6b-queued-demote` (design in `.procoder/handoff/p6b-queued-demote.md`, after decision "after the held-prefix
+ledger fix", 1 B): at YELLOW/ORANGE the reclaim's shortfall becomes a demand (≤ 32 blocks per tick); the last-queued
+requests release their prefixes first (the head keeps its own); released blocks drop from `held` and the normal
+reclaim demotes them (free if copy-ahead already copied them); on admission the request re-attaches through the
+planner. No new config key.
+
+1. Granularity:
+   - A) Release whole prefixes (simple re-attach)
+   - B) Release only a prefix's tail blocks
+2. Scope:
+   - A) Only requests in the admission (gate) queue
+   - B) Also admitted-but-unstarted requests in the scheduler queue
+
+**Decision (user, 2026-10-01): 1 A, 2 A.** Whole prefixes; admission queue only.

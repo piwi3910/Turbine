@@ -35,6 +35,7 @@ use turbine_core::clock::Clock;
 use turbine_core::config::Config;
 use turbine_core::request::FinishReason;
 use turbine_core::types::{BlockId, PressureState, RequestId, SeqId};
+use turbine_kv::hierarchy::PrefixAttach;
 use turbine_kv::{BlockPool, BlockTable, PoolError, blocks_for_tokens};
 use turbine_reliability::admission::RejectionReason;
 use turbine_reliability::ledger::Reservation;
@@ -735,6 +736,77 @@ impl Scheduler {
                 self.prefix_release.push(a.blocks);
             }
         }
+    }
+
+    /// Queued requests release their attached prefixes for pressure reclaim
+    /// ([`AdmissionGate::detach_prefixes`]; the engine caps `want` per controller tick and gives
+    /// the references back). Without a gate nothing is released.
+    pub fn detach_queued_prefixes(
+        &mut self,
+        pool: &BlockPool,
+        want: usize,
+    ) -> Vec<(RequestId, PrefixAttach, usize)> {
+        let bt = self.params.block_tokens;
+        match self.gate.as_mut() {
+            Some(g) if want > 0 => g.detach_prefixes(pool, want, |r| {
+                u32::try_from(request_kv_blocks(r, bt)).unwrap_or(u32::MAX)
+            }),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Admitted requests that released their prefix in the admission queue and wait for the
+    /// engine to attach it again before they start.
+    pub fn awaiting_reattach(&self) -> Vec<RequestId> {
+        self.queue
+            .iter()
+            .filter(|id| self.requests.get(id).is_some_and(|r| r.req.reattach))
+            .collect()
+    }
+
+    /// The prefix a released request attached again (or an empty attach: recompute). Its KV
+    /// reservation keeps covering the whole request, and the attached blocks are committed
+    /// against it (`block_bytes` each): they are referenced, so the ledger's `held` counts them,
+    /// and an uncommitted reservation would count them a second time (on the lab, 1.6 GB of such
+    /// double counting pushed `kv_utilization` from 0.58 to 0.99 and into SURVIVAL). Returns the
+    /// attach when `id` is not waiting for one (cancelled meanwhile): the caller releases the
+    /// blocks.
+    pub fn reattach(
+        &mut self,
+        id: RequestId,
+        attach: PrefixAttach,
+        block_bytes: u64,
+    ) -> Option<PrefixAttach> {
+        if !self.requests.get(&id).is_some_and(|r| r.req.reattach) {
+            return Some(attach);
+        }
+        self.commit_reattached(id, attach.blocks.len(), block_bytes);
+        let r = self.requests.get_mut(&id).expect("checked above");
+        let cached = attach.cached_tokens;
+        let e = &mut r.req.estimate;
+        e.cached_prefix_tokens = cached;
+        e.new_prefill_tokens = r.req.prompt_len - cached.min(r.req.prompt_len);
+        r.req.reattach = false;
+        r.req.cached_prefix = (!attach.blocks.is_empty()).then_some(attach);
+        None
+    }
+
+    /// A released request's new attach holds `blocks` L0 blocks (also while its promotions are
+    /// in flight: their targets are allocated and referenced at once): its reservation has
+    /// `blocks × block_bytes` committed in all, so the ledger counts them once (as committed, not
+    /// also as `held`). Nothing else has committed against the reservation of a request that
+    /// has not started.
+    pub fn commit_reattached(&mut self, id: RequestId, blocks: usize, block_bytes: u64) {
+        let Some(res) = self
+            .requests
+            .get_mut(&id)
+            .filter(|r| r.req.reattach)
+            .and_then(|r| r.reservation.as_mut())
+        else {
+            return;
+        };
+        let target = (blocks as u64).saturating_mul(block_bytes);
+        res.commit_bytes(target.saturating_sub(res.committed()));
     }
 
     /// The client's output channel is full: stop decoding `seq`, keep its KV.
@@ -1656,6 +1728,10 @@ impl Scheduler {
         let Some(r) = self.requests.get(&id) else {
             return false;
         };
+        // It released its prefix while queued: it starts once the engine attached it again.
+        if r.req.reattach {
+            return false;
+        }
         let first = r.req.seqs.iter().find_map(|s| {
             let e = self.seqs.get(s)?;
             let forking = !r.shared_prefill_done && Some(s) != r.req.seqs.first();
@@ -2726,5 +2802,228 @@ mod tests {
         let h = s.plan(&mut p, &lim);
         assert_eq!(h.preempted, [(SeqId(1), PreemptReason::KvExhausted)]);
         assert_eq!(kinds(&h), [(2, BatchKind::Decode)]);
+    }
+
+    mod queued_prefix {
+        use turbine_core::config::{ByteSize, ReliabilityConfig};
+        use turbine_core::types::MemoryKind;
+        use turbine_kv::L0Reclaimer;
+        use turbine_kv::planner::{KvPlan, PlanReason};
+        use turbine_reliability::admission::{
+            Admission, AdmissionParams, AdmissionQueue, Calibration,
+        };
+        use turbine_reliability::budget::{DeviceBudget, PoolKind};
+        use turbine_reliability::controller::PressureController;
+        use turbine_reliability::ledger::Ledger;
+        use turbine_reliability::metrics::ReliabilityMetrics;
+        use turbine_reliability::reserve::{EmergencyReserve, ReserveAllocator};
+        use turbine_reliability::throttle::SchedulerLimits;
+
+        use super::*;
+
+        struct NoReserve;
+
+        impl ReserveAllocator for NoReserve {
+            fn allocate(&mut self, _bytes: u64) -> Result<(), String> {
+                Ok(())
+            }
+            fn free(&mut self) {}
+        }
+
+        /// A scheduler behind an admission gate (GREEN, one running slot) whose ledger counts
+        /// one byte per reserved block, so `reserved` reads the pumped estimates.
+        fn gated() -> (Scheduler, Arc<Ledger>, PressureController) {
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(Duration::ZERO));
+            let kv_bytes = 1 << 20;
+            let budget = DeviceBudget {
+                device: DeviceId(0),
+                memory_kind: MemoryKind::Dedicated,
+                budget_bytes: kv_bytes,
+                pools: vec![(PoolKind::Kv, kv_bytes), (PoolKind::Reserve, 0)],
+            };
+            let metrics = ReliabilityMetrics::unregistered();
+            let ledger = Ledger::new(&budget);
+            let reserve = EmergencyReserve::acquire(
+                DeviceId(0),
+                0,
+                &ledger,
+                Box::new(NoReserve),
+                metrics.clone(),
+            )
+            .unwrap();
+            let cfg = ReliabilityConfig {
+                emergency_vram_reserve: ByteSize(0),
+                ..ReliabilityConfig::default()
+            };
+            let (controller, handle) = PressureController::new(
+                &cfg,
+                SchedulerLimits {
+                    prefill_chunk_tokens: 32,
+                    block_tokens: 16,
+                },
+                budget,
+                Arc::clone(&ledger),
+                reserve,
+                Arc::new(L0Reclaimer),
+                metrics.clone(),
+                Arc::clone(&clock),
+            );
+            let admission = Admission::new(
+                AdmissionParams {
+                    device: DeviceId(0),
+                    adaptive: true,
+                    max_queue: 16,
+                    large_prefill_tokens: 1 << 20,
+                    block_bytes: 1,
+                    prefill_chunk_tokens: 32,
+                    workspace_bytes_per_token: 0,
+                    calibration: Calibration {
+                        prefill_tokens_per_s: 1000.0,
+                        decode_step_s: 0.01,
+                    },
+                },
+                Arc::clone(&ledger),
+                metrics,
+            );
+            let queue = AdmissionQueue::new(16, Duration::from_secs(60), 0);
+            let gate = AdmissionGate::new(admission, queue, handle, Arc::clone(&clock), 1);
+            let mut p = params();
+            p.max_running_requests = 1;
+            (Scheduler::new(p, clock).with_gate(gate), ledger, controller)
+        }
+
+        /// `blocks` attached as a cached prefix (one reference each, taken by the caller).
+        fn attached(blocks: &[BlockId]) -> PrefixAttach {
+            PrefixAttach {
+                blocks: blocks.iter().copied().collect(),
+                cached_tokens: blocks.len() as u32 * 16,
+                lossy_tokens: 0,
+                plan: KvPlan {
+                    reuse_l0: blocks.len() as u32,
+                    promote: Vec::new(),
+                    recompute_tokens: 0,
+                    reason: PlanReason::AllL0,
+                },
+            }
+        }
+
+        fn with_prefix(n: u128, prompt: u32, blocks: &[BlockId]) -> SchedRequest {
+            let mut r = request(n, n as u64, prompt, 8);
+            r.attach_prefix(attached(blocks), 16);
+            r
+        }
+
+        fn id(n: u128) -> RequestId {
+            RequestId(uuid::Uuid::from_u128(n))
+        }
+
+        /// The queued-prefix release (decision "6b: queued-prefix demotion — granularity and
+        /// scope", 1 A, 2 A): requests behind the admission queue's head release whole prefixes,
+        /// the last to be admitted first, until the blocks only they hold reach the demand; a
+        /// request holding nothing alone is skipped and the head keeps its prefix. Breaks if the
+        /// walk runs head first, releases the head, counts shared blocks, overshoots the demand,
+        /// or releases tail blocks only.
+        #[test]
+        fn released_last_queued_first_up_to_the_demand() {
+            let (mut s, _ledger, _c) = gated();
+            let mut p = pool(64);
+            s.submit(request(1, 1, 16, 8), 64).unwrap();
+            assert_eq!(kinds(&s.plan(&mut p, &IterationLimits::default())).len(), 1);
+            let b = p.allocate(8).unwrap();
+            // Head Q2 (2 alone), Q3 [b2 shared, b3 b4 alone], Q4 [b2 shared, b5 alone], Q5 [b6
+            // shared with a running holder].
+            p.incref(b[2]);
+            p.incref(b[6]);
+            s.submit(with_prefix(2, 40, &b[0..2]), 64).unwrap();
+            s.submit(with_prefix(3, 60, &b[2..5]), 64).unwrap();
+            s.submit(with_prefix(4, 40, &[b[2], b[5]]), 64).unwrap();
+            s.submit(with_prefix(5, 30, &b[6..7]), 64).unwrap();
+            assert_eq!(s.queued_ids(), [id(2), id(3), id(4), id(5)]);
+
+            assert!(s.detach_queued_prefixes(&p, 0).is_empty(), "no demand");
+            let first = s.detach_queued_prefixes(&p, 1);
+            let got: Vec<(RequestId, usize, usize)> = first
+                .iter()
+                .map(|(i, a, alone)| (*i, a.blocks.len(), *alone))
+                .collect();
+            assert_eq!(got, [(id(4), 2, 1)], "Q5 holds nothing alone; Q4 covers 1");
+            p.release(&first[0].1.blocks);
+            // b2 is now Q3's alone: Q3's whole prefix (3 blocks) covers the demand of 3.
+            let second = s.detach_queued_prefixes(&p, 3);
+            let got: Vec<(RequestId, usize, usize)> = second
+                .iter()
+                .map(|(i, a, alone)| (*i, a.blocks.len(), *alone))
+                .collect();
+            assert_eq!(got, [(id(3), 3, 3)]);
+            p.release(&second[0].1.blocks);
+            assert!(
+                s.detach_queued_prefixes(&p, 32).is_empty(),
+                "the head keeps its prefix"
+            );
+        }
+
+        /// A released request covers its whole KV again (the pump reserves the queue's copy of
+        /// its estimate) and, once admitted, does not start until the engine attached its prefix
+        /// again; it then prefills after the re-attached blocks, which are committed against its
+        /// reservation. Breaks if the queue's estimate keeps the prefix discount, a released
+        /// request starts without `reattach`, the re-attached prefix is not used, or its blocks
+        /// stay reserved (counted twice with the ledger's `held`).
+        #[test]
+        fn released_request_waits_for_its_reattach() {
+            let (mut s, ledger, _c) = gated();
+            let mut p = pool(64);
+            let lim = IterationLimits::default();
+            s.submit(request(1, 1, 16, 8), 64).unwrap();
+            let r = s.plan(&mut p, &lim);
+            complete_all(&mut s, &mut p, &r, &[]);
+            let b = p.allocate(2).unwrap();
+            s.submit(request(2, 2, 16, 8), 64).unwrap();
+            // 40 prompt + 8 new = 3 blocks; the 2 attached ones are left out until released.
+            s.submit(with_prefix(3, 40, &b), 64).unwrap();
+            let released = s.detach_queued_prefixes(&p, 2);
+            assert_eq!(released.len(), 1);
+            p.release(&released[0].1.blocks);
+            assert!(
+                s.awaiting_reattach().is_empty(),
+                "still in the gate's queue"
+            );
+
+            // R and then Q2 finish; Q3 is pumped with a 3-block reservation.
+            let r = s.plan(&mut p, &lim);
+            complete_all(&mut s, &mut p, &r, &[1]);
+            for _ in 0..4 {
+                let r = s.plan(&mut p, &lim);
+                complete_all(&mut s, &mut p, &r, &[2]);
+            }
+            let plan = s.plan(&mut p, &lim);
+            assert!(plan.items.is_empty(), "Q3 waits for its prefix");
+            assert_eq!(s.awaiting_reattach(), [id(3)]);
+            assert_eq!(ledger.usage(DeviceId(0), PoolKind::Kv).reserved, 3);
+            complete_all(&mut s, &mut p, &plan, &[]);
+
+            let again = p.allocate(2).unwrap();
+            assert!(
+                s.reattach(id(9), attached(&again), 1).is_some(),
+                "not waiting"
+            );
+            // While its promotions are in flight their targets are already held (here 1 of the
+            // 2 blocks: a block reused from L0 needs none); the landed attach commits the rest.
+            s.commit_reattached(id(3), 1, 1);
+            let kv = ledger.usage(DeviceId(0), PoolKind::Kv);
+            assert_eq!((kv.reserved, kv.used), (2, 1));
+            assert!(s.reattach(id(3), attached(&again), 1).is_none());
+            // The re-attached blocks are committed against the reservation (the ledger's `held`
+            // counts them as referenced blocks; reserved would count them again).
+            let kv = ledger.usage(DeviceId(0), PoolKind::Kv);
+            assert_eq!((kv.reserved, kv.used), (1, 2));
+            assert!(s.awaiting_reattach().is_empty());
+            let plan = s.plan(&mut p, &lim);
+            assert_eq!(
+                kinds(&plan),
+                [(3, BatchKind::Prefill { start: 32, len: 8 })],
+                "prefill starts after the re-attached blocks"
+            );
+            assert_eq!(&plan.items[0].block_table.blocks[..2], &again[..]);
+        }
     }
 }

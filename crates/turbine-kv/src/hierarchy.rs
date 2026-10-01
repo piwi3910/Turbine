@@ -264,6 +264,9 @@ pub struct KvStats {
     /// Copy-ahead copies landed: a shared parent copied down while its L0 copy stays
     /// ([`KvHierarchy::copy_ahead`]).
     pub copy_aheads: u64,
+    /// Blocks queued requests released for pressure reclaim and held by no other request
+    /// ([`KvHierarchy::detach_prefix`]).
+    pub queued_prefix_detached: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -472,6 +475,10 @@ struct RequestKv {
     /// With a lossy lineage: the first lossy attached block and the prompt's exact keys, to
     /// fall back to when a failed promotion cuts the prefix before it.
     lossy_from: Option<(usize, Vec<KvKey>)>,
+    /// `Some(cached tokens)` after a queued request released its prefix
+    /// ([`KvHierarchy::detach_prefix`]) until it attaches again: that attach is not a new
+    /// prompt (its tokens are not counted twice).
+    detached_tokens: Option<u32>,
 }
 
 impl RequestKv {
@@ -537,6 +544,9 @@ pub struct KvHierarchy {
     compressing: HashMap<KvKey, Compressing>,
     /// Bytes the last pressure reclaim wanted to demote into L1 and L2 (the ladder's demand).
     ladder_demand: [u64; 2],
+    /// Blocks the last pressure reclaim at YELLOW or ORANGE wanted and found no unreferenced
+    /// block for: what queued requests' prefixes may cover ([`Self::take_queued_prefix_demand`]).
+    queued_prefix_demand: usize,
 }
 
 impl KvHierarchy {
@@ -610,6 +620,7 @@ impl KvHierarchy {
             ladder,
             compressing: HashMap::new(),
             ladder_demand: [0; 2],
+            queued_prefix_demand: 0,
             layout: format.layout,
             shards: format.shards.max(1),
             tail: HashSet::new(),
@@ -842,9 +853,14 @@ impl KvHierarchy {
                     lineage: Lineage::Exact,
                     used: Vec::new(),
                     lossy_from: None,
+                    detached_tokens: None,
                 },
             );
         }
+        let detached = self
+            .requests
+            .get(&req.request)
+            .and_then(|r| r.detached_tokens);
         let allow_lossy = req.allow_lossy.unwrap_or(self.cfg.allow_lossy);
         let hasher = Blake3Hasher(self.namespaces.get(req.cache_salt));
         let m = if self.cfg.prefix_sharing {
@@ -999,9 +1015,11 @@ impl KvHierarchy {
             .collect();
         let cached_tokens = blocks.len() as u32 * bt;
         let lossy_tokens = lossy.iter().filter(|l| **l).count() as u32 * bt;
-        self.metrics
-            .lossy_cached_tokens
-            .inc_by(u64::from(lossy_tokens));
+        if detached.is_none() {
+            self.metrics
+                .lossy_cached_tokens
+                .inc_by(u64::from(lossy_tokens));
+        }
         if m.denied {
             self.metrics.lossy_denied.inc();
         }
@@ -1016,14 +1034,25 @@ impl KvHierarchy {
                 denied = m.denied,
             );
         }
-        self.metrics.plan(plan.reason, plan.recompute_tokens);
-        self.metrics.prompt_tokens.inc_by(req.prompt.len() as u64);
-        self.metrics
-            .prefix_cached_tokens
-            .inc_by(u64::from(cached_tokens));
-        self.stats.prompt_tokens += req.prompt.len() as u64;
-        self.stats.cached_tokens += u64::from(cached_tokens);
-        self.stats.recompute_tokens += u64::from(plan.recompute_tokens);
+        match detached {
+            None => {
+                self.metrics.plan(plan.reason, plan.recompute_tokens);
+                self.metrics.prompt_tokens.inc_by(req.prompt.len() as u64);
+                self.metrics
+                    .prefix_cached_tokens
+                    .inc_by(u64::from(cached_tokens));
+                self.stats.prompt_tokens += req.prompt.len() as u64;
+                self.stats.cached_tokens += u64::from(cached_tokens);
+                self.stats.recompute_tokens += u64::from(plan.recompute_tokens);
+            }
+            // The attach after a queued request released its prefix: its prompt and cached
+            // tokens were counted by the first attach; only what it now recomputes of them is new.
+            Some(before) => {
+                let extra = before.saturating_sub(cached_tokens);
+                self.metrics.plan(plan.reason, extra);
+                self.stats.recompute_tokens += u64::from(extra);
+            }
+        }
         tracing::debug!(
             event = "kv_plan",
             request_id = ?req.request,
@@ -1051,6 +1080,7 @@ impl KvHierarchy {
             r.keys = keys;
             r.lineage = lineage;
             r.used = used;
+            r.detached_tokens = None;
         }
         let attach = PrefixAttach {
             blocks,
@@ -1071,6 +1101,62 @@ impl KvHierarchy {
             );
             AttachOutcome::Promoting
         }
+    }
+
+    /// A request waiting in the admission queue gives its attached prefix back for pressure
+    /// reclaim (decision "6b: queued-prefix demotion — granularity and scope", 1 A, 2 A): its
+    /// references to `attach.blocks` are released, so the blocks it alone held turn cached and
+    /// unreferenced and the next reclaim demotes them (or frees them at once when copy ahead
+    /// already put a lower copy down). The blocks it registered as pending are cleared, or its
+    /// own next attach would wait on them for `PENDING_WAIT`; that attach goes through the
+    /// planner again. `alone` (blocks no other request held) is counted in
+    /// `turbine_kv_queued_prefix_detached_blocks_total`; DEBUG event `kv_queued_prefix_detach`
+    /// with reason `queued_prefix`.
+    pub fn detach_prefix(
+        &mut self,
+        pool: &mut BlockPool,
+        request: RequestId,
+        attach: &PrefixAttach,
+        alone: usize,
+    ) {
+        pool.release(&attach.blocks);
+        if let Some(r) = self.requests.get_mut(&request) {
+            for key in r.keys.iter().skip(r.committed) {
+                self.dir.clear_pending(key);
+            }
+            r.keys.clear();
+            r.used.clear();
+            r.committed = 0;
+            r.lineage = Lineage::Exact;
+            r.lossy_from = None;
+            r.detached_tokens = Some(attach.cached_tokens);
+        }
+        self.metrics
+            .queued_prefix_detached_blocks
+            .inc_by(alone as u64);
+        self.stats.queued_prefix_detached += alone as u64;
+        tracing::debug!(
+            event = "kv_queued_prefix_detach",
+            reason = "queued_prefix",
+            request_id = ?request,
+            blocks = attach.blocks.len(),
+            alone,
+            cached_tokens = attach.cached_tokens,
+        );
+    }
+
+    /// L0 blocks the pending attach of `request` holds (reused ones and promotion targets), 0
+    /// when none is pending.
+    pub fn pending_blocks(&self, request: RequestId) -> usize {
+        self.pending
+            .get(&request)
+            .map_or(0, |p| p.attach.blocks.len())
+    }
+
+    /// The blocks the last pressure reclaim wanted at YELLOW or ORANGE beyond every
+    /// unreferenced L0 block (0 at GREEN, RED and SURVIVAL); taken once.
+    pub fn take_queued_prefix_demand(&mut self) -> usize {
+        std::mem::take(&mut self.queued_prefix_demand)
     }
 
     /// The lossy key and codec a copy of `key` at `loc` promoted into L0 is filed under: a
@@ -1776,6 +1862,7 @@ impl KvHierarchy {
     /// scheduled or freed. See [`KvHierarchy::pressure_reclaim`].
     pub fn apply_reclaim(&mut self, pool: &mut BlockPool) -> u64 {
         self.ladder_demand = [0; 2];
+        self.queued_prefix_demand = 0;
         let mut bytes = 0;
         if let Some(t) = KvReclaimHandle::take(&self.reclaim.free_target) {
             bytes += self.pressure_reclaim(pool, t, true);
@@ -1819,6 +1906,14 @@ impl KvHierarchy {
         }
         self.sync_l0_refs(pool);
         let victims = self.victims(pool, TierId::L0, need);
+        // What no unreferenced block covers: at YELLOW and ORANGE the prefixes queued requests
+        // hold may (decision "6b: after the held-prefix ledger fix", 1 B); RED and SURVIVAL keep
+        // their own rules.
+        if matches!(self.l0_state, PressureState::Yellow | PressureState::Orange) {
+            self.queued_prefix_demand = self
+                .queued_prefix_demand
+                .max(need.saturating_sub(victims.len()));
+        }
         // The ladder's demand: the copies this reclaim wants in the lower tiers and cannot
         // start this tick (recorded below).
         let mut wanted = 0;
@@ -3765,5 +3860,108 @@ pub(crate) mod tests {
         settle(&mut r);
         assert_eq!(r.h.stats().copy_aheads, 0);
         assert_eq!(l1.len(), r.h.stats().demotions as usize);
+    }
+
+    /// Pressure reclaim's shortfall becomes the queued-prefix demand only at YELLOW and ORANGE
+    /// (decision "6b: after the held-prefix ledger fix", 1 B): blocks a request holds are no
+    /// victims, so `need` minus the victims found is what queued requests' prefixes may cover.
+    /// Breaks if the demand is recorded at GREEN, RED or SURVIVAL, ignores the victims found,
+    /// or is not reset once taken.
+    #[test]
+    fn queued_prefix_demand_only_at_yellow_and_orange() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(16, Some(l1), None, clock);
+        let held: Vec<u32> = (0..66).collect();
+        run(&mut r, &held);
+        // A queued request holds the 4 blocks; a one-off prompt leaves 4 unreferenced ones.
+        let id = RequestId::new_v4();
+        let AttachOutcome::Ready(a) = attach(&mut r, id, &held) else {
+            panic!("the prompt is cached in L0");
+        };
+        assert_eq!(a.blocks.len(), 4);
+        run(&mut r, &(7000..7066).collect::<Vec<u32>>());
+        assert_eq!(r.pool.cached_unreferenced(), 4);
+        let handle = r.h.reclaimer();
+        for (state, want) in [
+            (PressureState::Green, 0),
+            (PressureState::Yellow, 4),
+            (PressureState::Orange, 4),
+            (PressureState::Red, 0),
+            (PressureState::Survival, 0),
+        ] {
+            r.h.set_l0_state(state);
+            // `demote` leaves one-off blocks cached: the victims stay and the demand is the same
+            // on every call.
+            handle.demote(0.0);
+            r.h.apply_reclaim(&mut r.pool);
+            assert_eq!(r.h.take_queued_prefix_demand(), want, "{state:?}");
+            assert_eq!(r.h.take_queued_prefix_demand(), 0, "taken once");
+        }
+        r.pool.release(&a.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+    }
+
+    /// A queued request that released its prefix (`detach_prefix`) attaches again through the
+    /// planner: from the lower tier its blocks were demoted to, without waiting on the blocks it
+    /// had registered as pending itself, and without counting its prompt twice. Breaks if the
+    /// detach keeps its pending keys (the re-attach waits `PENDING_WAIT`), keeps its references,
+    /// or counts the re-attach as a new prompt.
+    #[test]
+    fn detached_prefix_attaches_again_through_the_planner() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(16, Some(l1.clone()), None, clock);
+        let base: Vec<u32> = (0..66).collect();
+        run(&mut r, &base);
+        // The queued prompt extends the cached one: 4 blocks attached, 2 pending (its own).
+        let prompt: Vec<u32> = (0..100).collect();
+        let id = RequestId::new_v4();
+        let AttachOutcome::Ready(a) = attach(&mut r, id, &prompt) else {
+            panic!("the first 4 blocks are cached in L0");
+        };
+        assert_eq!(a.cached_tokens, 64);
+        assert_eq!(
+            attach(&mut r, RequestId::new_v4(), &prompt),
+            AttachOutcome::WaitForPrefix,
+            "its uncomputed blocks are pending"
+        );
+        let prompt_tokens = r.h.stats().prompt_tokens;
+        r.h.detach_prefix(&mut r.pool, id, &a, 4);
+        assert_eq!(r.pool.referenced_blocks(), 0, "the references are released");
+        assert_eq!(r.pool.cached_unreferenced(), 4);
+        assert_eq!(r.h.stats().queued_prefix_detached, 4);
+        // The normal reclaim demotes them (they have the first attach's hit).
+        r.h.set_l0_state(PressureState::Yellow);
+        r.h.reclaimer().demote(0.0);
+        r.h.apply_reclaim(&mut r.pool);
+        settle(&mut r);
+        assert_eq!(l1.len(), 4, "the released prefix went down to L1");
+        assert_eq!(r.pool.used_blocks(), 0, "and left L0");
+        let outcome = attach(&mut r, id, &prompt);
+        assert_eq!(outcome, AttachOutcome::Promoting, "back from L1, no wait");
+        assert_eq!(
+            r.h.pending_blocks(id),
+            4,
+            "the promotion targets are held now"
+        );
+        let mut ready = Vec::new();
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            ready.extend(r.h.poll(&mut r.pool, &mut r.backend));
+        }
+        assert_eq!(ready.len(), 1);
+        assert_eq!((ready[0].0, ready[0].1.cached_tokens), (id, 64));
+        assert_eq!(
+            r.h.stats().prompt_tokens,
+            prompt_tokens,
+            "the re-attach is not a new prompt"
+        );
+        r.pool.release(&ready[0].1.blocks);
+        r.h.request_done(&mut r.pool, id, false);
     }
 }

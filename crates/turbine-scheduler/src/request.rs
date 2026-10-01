@@ -146,6 +146,10 @@ pub struct SchedRequest {
     /// reference to each block until admission hands them to its first sequence's table, or
     /// until it is dropped.
     pub cached_prefix: Option<PrefixAttach>,
+    /// The request released its attached prefix while it waited in the admission queue
+    /// (`Scheduler::detach_queued_prefixes`): once admitted it starts only after the engine
+    /// attached it again (`Scheduler::reattach`).
+    pub reattach: bool,
 }
 
 impl SchedRequest {
@@ -169,6 +173,7 @@ impl SchedRequest {
             cancel: CancelFlag::default(),
             constrained: false,
             cached_prefix: None,
+            reattach: false,
         }
     }
 
