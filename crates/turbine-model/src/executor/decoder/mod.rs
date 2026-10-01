@@ -2241,6 +2241,10 @@ impl ModelExecutor for DecoderExecutor {
         Ok(logits)
     }
 
+    fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
+        DecoderExecutor::set_tq_device_tables(self, tables)
+    }
+
     /// Ignored (graphs stay off) for an expert-parallel rank or a pipeline stage. A
     /// tensor-parallel rank captures its collectives with the rest of the step (module docs).
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {

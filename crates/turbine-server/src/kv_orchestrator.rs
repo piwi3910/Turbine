@@ -72,6 +72,7 @@ use turbine_kv::transfer::{
     CopyTime, TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferTicket,
 };
 use turbine_kv::{BlockPool, KvDocument, KvMetrics};
+use turbine_model::executor::TqDeviceTables;
 use turbine_model::kv_scales::KvCache;
 use turbine_tensor::{
     CopyEngine, CopyOp, CopyTarget, CopyTicket, DeviceBuffer, DeviceMemory, DevicePtr, MemoryError,
@@ -1615,7 +1616,7 @@ impl KvCodecFns for CodecTable {
 }
 
 /// The codecs of the enabled lower tiers (`kv.cpu.format`, `kv.nvme.format`).
-fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
+pub(crate) fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
     [
         (cfg.cpu.enabled, cfg.cpu.format.as_str()),
         (cfg.nvme.enabled, cfg.nvme.format.as_str()),
@@ -1659,6 +1660,9 @@ pub struct DeviceTranscode {
     engine: Option<Arc<dyn CopyEngine>>,
     layout: KvLayout,
     seed: u64,
+    /// The TurboQuant tables of the `tq4` / `tq2` transcodes in device memory (P6b Task 8,
+    /// [`crate::tq_device`]); `None` without a TurboQuant tier format.
+    tq: Option<TqDeviceTables>,
     staging: DeviceBuffer,
     slot_bytes: usize,
     free: Vec<usize>,
@@ -1699,6 +1703,10 @@ impl DeviceTranscode {
         let Some(kernel) = self.kernel.kv_transcode() else {
             return false;
         };
+        // A TurboQuant codec needs its uploaded tables.
+        if crate::tq_device::is_tq(name) && self.tq.is_none() {
+            return false;
+        }
         [false, true].into_iter().all(|decode| {
             self.config(name, decode)
                 .is_some_and(|c| kernel.supports(&c))
@@ -1734,17 +1742,25 @@ impl DeviceTranscode {
             .kv_transcode()
             .ok_or_else(|| TierError::Io("the kernel library has no KV transcode".into()))?;
         let codec = encoded_bytes(name, &self.layout)?;
+        let tables = self
+            .tq
+            .as_ref()
+            .filter(|_| crate::tq_device::is_tq(name))
+            .map(crate::tq_device::transcode_view);
         kernel
-            .execute(&mut KvTranscodeContext {
-                cfg,
-                pages,
-                coded: self.staging.slice(slot * self.slot_bytes, codec),
-                coded_block_bytes: codec,
-                seed: self.seed,
-                k_scales: None,
-                v_scales: None,
-                codecs: &CodecTable,
-            })
+            .execute_with_tables(
+                &mut KvTranscodeContext {
+                    cfg,
+                    pages,
+                    coded: self.staging.slice(slot * self.slot_bytes, codec),
+                    coded_block_bytes: codec,
+                    seed: self.seed,
+                    k_scales: None,
+                    v_scales: None,
+                    codecs: &CodecTable,
+                },
+                tables.as_ref(),
+            )
             .map_err(|e| TierError::Io(format!("kv transcode ({name}): {e}")))
     }
 
@@ -1872,6 +1888,7 @@ impl CopyStreamBackend {
             engine,
             layout: host.layout,
             seed: host.params.seed,
+            tq: None,
             // Replaced below once the slot size is known.
             staging: match DeviceBuffer::alloc(mem, 1) {
                 Ok(b) => b,
@@ -1880,11 +1897,27 @@ impl CopyStreamBackend {
             slot_bytes: 0,
             free: Vec::new(),
         };
+        // The tables of a TurboQuant tier format go up once, before `serves` is asked; dropped
+        // again when the library runs none of them. A failed upload keeps the host codec.
+        if crate::tq_device::needs_tables(formats, &dev.layout) {
+            match crate::tq_device::upload(mem, dev.seed, &dev.layout) {
+                Ok(t) => dev.tq = Some(t),
+                Err(e) => tracing::warn!(
+                    event = "kv_transcode_tq_tables_failed",
+                    error = %e,
+                    "the TurboQuant tables could not be uploaded; TurboQuant tier copies use the \
+                     host codec"
+                ),
+            }
+        }
         let served: Vec<&str> = formats
             .iter()
             .copied()
             .filter(|f| *f != L0_FORMAT && dev.serves(f))
             .collect();
+        if !served.iter().any(|f| crate::tq_device::is_tq(f)) {
+            dev.tq = None;
+        }
         let Some(slot_bytes) = served
             .iter()
             .filter_map(|f| encoded_bytes(f, &dev.layout).ok())
@@ -3123,6 +3156,273 @@ mod tests {
                 );
             } else {
                 assert_eq!(slots(&o), None);
+            }
+        }
+    }
+
+    /// The bytes of the whole tables and of the four codebooks one transcode call received.
+    type RecordedTables = (Vec<u8>, Vec<Vec<u8>>);
+
+    /// A kernel library that records the TurboQuant tables each `execute_with_tables` call
+    /// receives (read back from memory), then runs the cpu-reference transcode.
+    struct RecordingProvider {
+        inner: Arc<dyn KernelProvider>,
+        /// Per call: the whole tables' bytes and the four codebooks' (`None`: no tables).
+        calls: Mutex<Vec<Option<RecordedTables>>>,
+    }
+
+    impl KernelProvider for RecordingProvider {
+        fn id(&self) -> turbine_kernels::ProviderId {
+            turbine_kernels::ProviderId("recording")
+        }
+        fn gemm(&self) -> Option<&dyn turbine_kernels::GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn turbine_kernels::AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn turbine_kernels::NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn turbine_kernels::RopeKernel> {
+            None
+        }
+        fn activation(&self) -> Option<&dyn turbine_kernels::ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn turbine_kernels::EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn turbine_kernels::ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn turbine_kernels::KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn turbine_kernels::MoeKernel> {
+            None
+        }
+        fn kv_transcode(&self) -> Option<&dyn turbine_kernels::KvTranscodeKernel> {
+            Some(self)
+        }
+    }
+
+    impl turbine_kernels::KvTranscodeKernel for RecordingProvider {
+        fn supports(&self, cfg: &KvTranscodeConfig) -> bool {
+            self.inner.kv_transcode().unwrap().supports(cfg)
+        }
+        fn implementation(&self, cfg: &KvTranscodeConfig) -> String {
+            self.inner.kv_transcode().unwrap().implementation(cfg)
+        }
+        fn execute(
+            &self,
+            ctx: &mut KvTranscodeContext<'_>,
+        ) -> Result<(), turbine_kernels::KernelError> {
+            self.execute_with_tables(ctx, None)
+        }
+        fn execute_with_tables(
+            &self,
+            ctx: &mut KvTranscodeContext<'_>,
+            tables: Option<&turbine_kernels::KvTranscodeTables<'_>>,
+        ) -> Result<(), turbine_kernels::KernelError> {
+            let read = |v: &turbine_tensor::TensorView<'_>| v.slice.read_bytes().unwrap();
+            self.calls.lock().unwrap().push(tables.map(|t| {
+                (
+                    read(&t.tables),
+                    t.codebooks.iter().map(read).collect::<Vec<_>>(),
+                )
+            }));
+            self.inner
+                .kv_transcode()
+                .unwrap()
+                .execute_with_tables(ctx, tables)
+        }
+    }
+
+    /// Demotes a BF16 block to L2 as `name` and promotes it back through the device transcode
+    /// of `provider` over `mem` (`layout`'s pool): the bytes L2 stores and the pages the
+    /// promotion decodes must equal the host codec's.
+    fn tq_round_trip(
+        mem: Arc<dyn DeviceMemory>,
+        provider: Arc<dyn KernelProvider>,
+        l: KvLayout,
+        name: &'static str,
+        device: impl Fn(&Arc<dyn DeviceMemory>) -> CopyDevice,
+    ) {
+        let format = kv_format(l);
+        let params = HostCodec::of(&identity(), &format).params;
+        let bb = l.block_bytes() as usize;
+        let block: Vec<u8> = (0..bb / 2)
+            .flat_map(|i| {
+                let x = ((i as f32) * 0.37).sin() * (1.0 + (i % 7) as f32);
+                turbine_kv::codec::f32_to_bf16(x).to_le_bytes()
+            })
+            .collect();
+        let codec = turbine_kv::codec::registry().get(name).unwrap();
+        let small = codec.bytes_per_block(&l);
+        let mut want_enc = vec![0u8; small as usize];
+        codec
+            .encode_cpu(&block, &l, &mut want_enc, &params)
+            .unwrap();
+        let mut want_dec = vec![0u8; bb];
+        codec
+            .decode_cpu(&want_enc, &l, &mut want_dec, &params)
+            .unwrap();
+
+        let dir = TempDir::new("turbine-kv-tq-transcode");
+        let mut kv = kv_config(&dir, false);
+        kv.block_tokens = l.block_tokens;
+        kv.nvme.max_bytes = ByteSize(256 << 20);
+        kv.nvme.slab_bytes = ByteSize(16 << 20);
+        kv.nvme.format = ModuleName::new(name).unwrap();
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let mut pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: l,
+                num_blocks: BLOCKS,
+            },
+            Arc::clone(&mem),
+        )
+        .unwrap();
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: device(&mem),
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        assert!(
+            o.enable_device_transcode(&kv, provider, &mem),
+            "the provider serves {name}"
+        );
+        let r = (mem, pool);
+        write_block(&r, 4, &block);
+        let down = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb as u64,
+            to: name,
+            to_bytes: small,
+        };
+        let up = TransferCodec {
+            from: name,
+            from_bytes: small,
+            to: L0_FORMAT,
+            to_bytes: bb as u64,
+        };
+        let key = KvKey([7; 16]);
+        run_as(&mut o, 1, TransferPath::L0ToL2, key, (4, 0), down).unwrap();
+        let mut stored = vec![0u8; small as usize];
+        l2.get(&key, TierBlockMut::Host(&mut stored)).unwrap();
+        assert_eq!(stored, want_enc, "{name}: L2 holds the codec's bytes");
+        run_as(&mut o, 2, TransferPath::L2ToL0, key, (0, 9), up).unwrap();
+        assert_eq!(read_block(&r, 9), want_dec, "{name}: promotion");
+    }
+
+    /// P6b Task 8, the transcode's side: with `kv.nvme.format: tq4` / `tq2` under BF16 pages the
+    /// block is encoded through the kernel library with the TurboQuant tables the server
+    /// uploaded: every `tq` call (demotion and promotion) receives exactly the codec's tables
+    /// for the namespace seed and the four codebooks, an `fp8_e4m3` call none; the bytes L2
+    /// stores and the pages a promotion decodes equal the host codec's. Breaks if a TurboQuant
+    /// transcode runs without the tables (a library refuses it, the copy fails and the hierarchy
+    /// recomputes), with tables of another seed, layer or head, or if a device serves `tq4`
+    /// after its upload failed.
+    #[test]
+    fn tq_transcode_receives_the_codec_tables() {
+        let l = KvLayout {
+            head_dim: 128,
+            ..layout()
+        };
+        let seed = HostCodec::of(&identity(), &kv_format(l)).params.seed;
+        let want_tables = crate::tq_device::codec_table_bytes(seed, l.num_layers, l.num_kv_heads);
+        let want_cbs: Vec<Vec<u8>> = (1..=4_u32)
+            .map(|bits| {
+                turbine_kv::codec::turboquant::codebook::codebook(bits)
+                    .iter()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        for name in ["tq4", "tq2"] {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+            let recorder = Arc::new(RecordingProvider {
+                inner: turbine_kernels::cpu_reference_provider(),
+                calls: Mutex::new(Vec::new()),
+            });
+            tq_round_trip(mem, Arc::clone(&recorder) as _, l, name, |m| stream(m, 0));
+            let calls = recorder.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2, "{name}: an encode and a decode");
+            for call in calls.iter() {
+                let (tables, cbs) = call.as_ref().expect("a TurboQuant call carries tables");
+                assert_eq!(tables, &want_tables.concat(), "{name}: tables");
+                assert_eq!(cbs, &want_cbs, "{name}: codebooks");
+            }
+        }
+    }
+
+    /// Lab, P6b Task 8: the same demotion and promotion through the HIP library with the tables
+    /// the server uploads, at the Llama-3.2-3B and OLMoE-1B-7B shapes: the encoded bytes L2
+    /// stores and the decoded pages equal the host codec's bit for bit. Breaks if the uploaded
+    /// layout, seed or per-layer offsets differ from what `turbine_hip_tq` reads, or the
+    /// orchestrator passes no tables.
+    #[test]
+    #[ignore = "lab: needs the HIP backend and libturbine_hip.so"]
+    fn hip_tq_transcode_with_uploaded_tables_equals_the_host_codec() {
+        use turbine_kernels::test_support::require_backend;
+        if !require_backend("hip") {
+            return;
+        }
+        let inventory = turbine_device::discover(&turbine_device::DiscoveryOptions::from_config(
+            &turbine_core::config::DevicesConfig::default(),
+        ))
+        .expect("discovery");
+        let device = inventory
+            .devices
+            .iter()
+            .find(|d| d.vendor == turbine_core::types::Vendor::Amd)
+            .expect("an AMD device");
+        let path = std::path::PathBuf::from(
+            std::env::var_os("TURBINE_KERNEL_LIBRARY").expect("TURBINE_KERNEL_LIBRARY"),
+        );
+        let lib = turbine_kernels::ShimLibrary::load(&path, "hip").expect("libturbine_hip.so");
+        let ctx = lib.create_context(device).expect("HIP context");
+        for (layers, heads) in [(28, 8), (16, 16)] {
+            let l = KvLayout {
+                num_layers: layers,
+                num_kv_heads: heads,
+                head_dim: 128,
+                dtype: DType::BF16,
+                block_tokens: 128,
+            };
+            for name in ["tq4", "tq2"] {
+                let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                tq_round_trip(
+                    mem,
+                    turbine_kernels::shim_provider(Arc::clone(&ctx)),
+                    l,
+                    name,
+                    |m| CopyDevice::Sync { mem: Arc::clone(m) },
+                );
+                println!("hip tq transcode {name} at {layers}x{heads}: equal to the host codec");
             }
         }
     }

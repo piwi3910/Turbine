@@ -895,6 +895,13 @@ fn nvme_round_trip_fp8_tier() {
 /// the first 8 tokens' logprobs within 0.3 and at least 90 % of all positions within 0.5 (the
 /// FP8 KV golden's bounds are 0.15 / 0.55).
 fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
+    assert_within_bounds(cold, warm, label, (0.3, 0.5, 0.9));
+}
+
+/// [`assert_within_codec_bound`] with explicit bounds: (first 8 tokens' worst |Δ|, per-position
+/// |Δ| limit, share of positions within it).
+fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (f64, f64, f64)) {
+    let (head_bound, pos_bound, share) = bounds;
     assert_eq!(warm.completion_tokens, cold.completion_tokens);
     let diff: Vec<f64> = cold
         .logprobs
@@ -903,16 +910,16 @@ fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
         .map(|(c, w)| (c - w).abs())
         .collect();
     let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
-    let within = diff.iter().filter(|d| **d <= 0.5).count() as f64 / diff.len().max(1) as f64;
+    let within = diff.iter().filter(|d| **d <= pos_bound).count() as f64 / diff.len().max(1) as f64;
     println!(
         "{label}: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within 0.5 \
          (cached {}, lossy cached {})",
         warm.cached_tokens, warm.lossy_cached_tokens
     );
-    assert!(head <= 0.3, "first tokens differ by {head}");
+    assert!(head <= head_bound, "first tokens differ by {head}");
     assert!(
-        within >= 0.9,
-        "only {within} of the positions are within 0.5"
+        within >= share,
+        "only {within} of the positions are within {pos_bound}"
     );
 }
 
@@ -925,6 +932,45 @@ fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse() {
+    lossy_tier_reuse_with("fp8_e4m3", Some((0.3, 0.5, 0.9)));
+}
+
+/// [`lossy_tier_reuse`] with L1 at TurboQuant 4-bit (P6b Task 8: the tables are uploaded and the
+/// transcode runs `turbine_hip_tq`). No quality bound: the mechanism is asserted (device transcode, lossy reuse, no checksum eviction); Task 9 sets the S-8 gate.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn lossy_tier_reuse_tq4() {
+    lossy_tier_reuse_with("tq4", None);
+}
+
+/// P6b Task 8 smoke: `kv.dtype: tq4` serves on the GPU (tables uploaded to the executor before
+/// the first forward, the mixed-format attention reads them): a request answers its tokens with
+/// finite logprobs, and the L0 tier reports TurboQuant pages smaller than BF16's. Task 13 owns
+/// the quality proof.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn tq_kv_serves_on_the_device() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let server = LabServer::start(&model_dir, &["kv.dtype=tq4".to_string()]);
+    let (dtype, block_bytes, blocks) = l0_tier(&server);
+    println!("L0 pages {dtype}: {block_bytes} bytes a block, {blocks} blocks");
+    assert!(
+        dtype.contains("tq4") && block_bytes < 14_680_064,
+        "{dtype} {block_bytes}"
+    );
+    let a = prompt(100, 350);
+    let answer = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    assert_eq!(answer.completion_tokens, ANSWER_TOKENS as u64);
+    assert!(!answer.text.is_empty());
+    assert!(answer.logprobs.iter().all(|l| l.is_finite()), "{answer:?}");
+    println!("tq_kv_serves_on_the_device ok: {:?}", answer.text);
+}
+
+fn lossy_tier_reuse_with(format: &str, bounds: Option<(f64, f64, f64)>) {
     if !require_backend("hip") {
         return;
     }
@@ -933,7 +979,7 @@ fn lossy_tier_reuse() {
     let server = LabServer::start(
         &model_dir,
         &[
-            "kv.cpu.format=fp8_e4m3".to_string(),
+            format!("kv.cpu.format={format}"),
             "kv.cpu.max_bytes=2GiB".to_string(),
             "kv.nvme.enabled=false".to_string(),
         ],
@@ -974,7 +1020,22 @@ fn lossy_tier_reuse() {
         warm.lossy_cached_tokens > 0,
         "no reused block was served from a lossy copy: {warm:?}"
     );
-    assert_within_codec_bound(&cold, &warm, "lossy L1 reuse");
+    match bounds {
+        Some(b) => assert_within_bounds(&cold, &warm, "lossy L1 reuse", b),
+        // The codec's own loss is Task 9's gate: print the spread, assert the mechanism.
+        None => {
+            assert_eq!(warm.completion_tokens, cold.completion_tokens);
+            let worst = cold
+                .logprobs
+                .iter()
+                .zip(&warm.logprobs)
+                .map(|(c, w)| (c - w).abs())
+                .fold(0.0, f64::max);
+            println!(
+                "{format} lossy L1 reuse: worst |Δ logprob| {worst:.3} (no bound until Task 9)"
+            );
+        }
+    }
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
         0.0

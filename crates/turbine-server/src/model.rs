@@ -489,6 +489,9 @@ pub struct PreparedModel {
     /// Device bytes of the KV transcode's staging slots (P6b S-1), 0 when no lower tier needs
     /// them. The workspace pool holds them next to `workspace_bytes`.
     pub transcode_staging_bytes: u64,
+    /// Device bytes of the TurboQuant tables ([`crate::tq_device`], P6b Task 8), 0 when no
+    /// TurboQuant format is configured; counted in the workspace pool next to the staging slots.
+    pub tq_table_bytes: u64,
     /// What the KV cache depends on: the namespace of every cached block (P4 S-1).
     pub identity: ModelIdentity,
     /// The kernel crate's metrics, registered once and shared by every replica (P5).
@@ -815,7 +818,16 @@ fn prepare_with(
     } else {
         0
     };
-    let reliability = reliability_for_workspace(&config.reliability, workspace + transcode_staging);
+    // P6b Task 8: so are the TurboQuant tables a TurboQuant tier or L0 format uploads once.
+    let tq_tables = if shard.is_none() && stage.is_none() && expert.is_none() {
+        crate::tq_device::reserved_bytes(&config.kv, &layout)
+    } else {
+        0
+    };
+    let reliability = reliability_for_workspace(
+        &config.reliability,
+        workspace + transcode_staging + tq_tables,
+    );
     let device = config.execution.device;
     // P3 S-2 pre-check: the budget of the memory free now, before any weight byte is read,
     // must hold the model; the engine re-measures it after the weights load.
@@ -926,6 +938,7 @@ fn prepare_with(
         kv_cap: config.kv.gpu.max_bytes,
         workspace_bytes: workspace,
         transcode_staging_bytes: transcode_staging,
+        tq_table_bytes: tq_tables,
         identity,
         kernel_metrics: kernel_metrics.clone(),
         shard,
@@ -1184,6 +1197,8 @@ pub fn load(
     )
     .map_err(|e| model_error("executor", e))?;
     install_decode_graphs(prepared, executor.as_mut());
+    // P6b Task 8: before the first forward (a warm-up or a decode graph reads the pointers).
+    crate::tq_device::install(arch.kv_cache.tq.as_ref(), mem, executor.as_mut())?;
     let blocks = pool_blocks(prepared, &budget)?;
     let mut pool = allocate_pool(prepared, blocks, &ledger)?;
     let reserve = acquire_reserve(prepared, &ledger, reliability)?;
@@ -1314,7 +1329,7 @@ pub(crate) fn post_load_budget(
         (PoolKind::Weights, weight_bytes),
         (
             PoolKind::Workspace,
-            prepared.workspace_bytes + prepared.transcode_staging_bytes,
+            prepared.workspace_bytes + prepared.transcode_staging_bytes + prepared.tq_table_bytes,
         ),
         (PoolKind::Collective, collective),
     ] {

@@ -237,13 +237,13 @@ pub struct KvFormatUnavailable {
 }
 
 /// Refuses, before binding (exit 1), the KV formats whose kernel group the provider lacks (P6b
-/// S-1, S-5, S-7): TurboQuant L0 pages (`kv.dtype: tq4|tq2`) on a GPU backend and the ladder's
-/// L0 step need the ABI v2.10 mixed-format paged attention, which no GPU provider implements
-/// yet (`kv_tq_unavailable`; plan Task 12 replaces that refusal); a lower tier not stored at
-/// the L0 format needs the ABI v2.11 KV transcode (`kv_transcode_unavailable`). `transcode` is
-/// `library`: whether the loaded kernel library has it (`None` before the library is loaded: the
-/// transcode checks wait for the second call); the ladder's L1/L2 rungs stay refused until
-/// their rewrites run on the device transcode too.
+/// S-1, S-5, S-7): TurboQuant L0 pages (`kv.dtype: tq4|tq2`) on a GPU backend need the loaded
+/// library's ABI v2.11 mixed-format paged attention (`kv_tq_unavailable`), the ladder's L0 step
+/// its per-block format tags, which no provider wires yet (`kv_tq_unavailable`); a lower tier
+/// not stored at the L0 format needs the ABI v2.11 KV transcode (`kv_transcode_unavailable`).
+/// `library`: whether the loaded kernel library has the v2.11 group (`None` before the library
+/// is loaded: those checks wait for the second call); the ladder's L1/L2 rungs stay refused
+/// until their rewrites run on the device transcode too.
 pub fn kv_format_availability(
     cfg: &Config,
     library: Option<bool>,
@@ -253,12 +253,14 @@ pub fn kv_format_availability(
         code: "kv_tq_unavailable",
         message,
     };
-    // The CPU reference provider reads TurboQuant pages (`cpu::tq_attention`, P6b S-5); a GPU
-    // provider needs the v2.10 mixed-format paged attention (plan Task 12).
-    if kv.dtype.is_turboquant() && vendor(cfg) != "cpu" {
+    // TurboQuant L0 pages: the CPU reference provider reads them (`cpu::tq_attention`, P6b S-5);
+    // a GPU library needs the ABI v2.11 mixed-format paged attention (P6b Task 12), which
+    // arrives with the v2.11 group the KV transcode checks (`library`: whether it is there;
+    // unknown before the library is loaded).
+    if kv.dtype.is_turboquant() && vendor(cfg) != "cpu" && library == Some(false) {
         return Err(tq(format!(
-            "kv.dtype {} needs the ABI v2.10 mixed-format paged attention, which no GPU kernel \
-             provider implements yet (the cpu backend runs it)",
+            "kv.dtype {} needs the ABI v2.11 mixed-format paged attention, which the kernel \
+             library does not provide",
             kv.dtype.as_str()
         )));
     }
@@ -574,17 +576,25 @@ mod tests {
         let mut tq = config("hip", llama.path());
         tq.kv.nvme.enabled = true;
         tq.kv.nvme.format = name("tq4");
-        let err = before_discovery(&tq).unwrap_err();
-        assert_eq!(err.key(), Some("kv.nvme.format"), "{err}");
-        assert!(err.to_string().contains("phase-6b-kv-compression"), "{err}");
-        // A disabled tier's format is not in use.
-        tq.kv.nvme.enabled = false;
+        // TurboQuant lower tiers are experimental (tables uploaded by the server, P6b Task 8),
+        // not refused.
         assert!(before_discovery(&tq).is_ok());
+        assert_eq!(
+            tier_formats(&tq).unwrap(),
+            vec![
+                ("kv.cpu.format", "l0", SupportStatus::Supported),
+                ("kv.nvme.format", "tq4", SupportStatus::Experimental)
+            ]
+        );
+        assert_eq!(kv_format_availability(&tq, None), Ok(()));
+        assert_eq!(kv_format_availability(&tq, Some(true)), Ok(()));
+        let err = kv_format_availability(&tq, Some(false)).unwrap_err();
+        assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
 
         let mut ladder = config("hip", llama.path());
         ladder.kv.ladder.enabled = true;
-        let err = before_discovery(&ladder).unwrap_err();
-        assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
+        // The default max_format is a TurboQuant codec: experimental, no longer refused.
+        assert!(before_discovery(&ladder).is_ok());
         ladder.kv.ladder.max_format = name("l0");
         let err = before_discovery(&ladder).unwrap_err();
         assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
@@ -601,9 +611,10 @@ mod tests {
             "kv_transcode_unavailable"
         );
 
-        // TurboQuant L0 pages (P6b S-5): the cpu backend runs them (`experimental`), a GPU
-        // backend is refused (`kv_tq_unavailable`; the support matrix first, naming kv.dtype),
-        // and a lower tier below them stores them as they are.
+        // TurboQuant L0 pages (P6b S-5): the cpu backend and gfx1201 run them
+        // (`experimental`); a GPU library without the ABI v2.11 attention is refused
+        // (`kv_tq_unavailable`, known once the library is loaded); another arch is refused by
+        // the support matrix naming kv.dtype; a lower tier below them stores them as they are.
         for dtype in [KvDtypeChoice::Tq4, KvDtypeChoice::Tq2] {
             let mut l0 = config("cpu", llama.path());
             l0.kv.dtype = dtype;
@@ -617,10 +628,15 @@ mod tests {
 
             let mut hip = config("hip", llama.path());
             hip.kv.dtype = dtype;
-            let err = kv_format_availability(&hip, None).unwrap_err();
+            assert_eq!(kv_format_availability(&hip, None), Ok(()));
+            assert_eq!(kv_format_availability(&hip, Some(true)), Ok(()));
+            let err = kv_format_availability(&hip, Some(false)).unwrap_err();
             assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
-            let err = before_discovery(&hip).unwrap_err();
-            assert_eq!(err.key(), Some("kv.dtype"), "{err}");
+            assert!(err.message.contains("ABI v2.11"), "{err:?}");
+            // The model's arch is not known before discovery: the partial row is the best any
+            // arch could give; gfx1201 Llama is experimental, gfx942 refused.
+            let first = before_discovery(&hip).unwrap();
+            assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
         }
     }
 
