@@ -1225,7 +1225,8 @@ impl EngineLoop {
     /// (cancelled meanwhile) gives the blocks back.
     fn reattached(&mut self, id: RequestId, attach: PrefixAttach) {
         let (cached, lossy) = (attach.cached_tokens, attach.lossy_tokens);
-        match self.sched.reattach(id, attach) {
+        let block_bytes = self.pool.layout().block_bytes();
+        match self.sched.reattach(id, attach, block_bytes) {
             None => {
                 if let Some(r) = self.requests.get_mut(&id) {
                     r.cached_tokens = cached;

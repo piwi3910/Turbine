@@ -765,12 +765,24 @@ impl Scheduler {
     }
 
     /// The prefix a released request attached again (or an empty attach: recompute). Its KV
-    /// reservation keeps covering the whole request. Returns the attach when `id` is not waiting
-    /// for one (cancelled meanwhile): the caller releases the blocks.
-    pub fn reattach(&mut self, id: RequestId, attach: PrefixAttach) -> Option<PrefixAttach> {
+    /// reservation keeps covering the whole request, and the attached blocks are committed
+    /// against it (`block_bytes` each): they are referenced, so the ledger's `held` counts them,
+    /// and an uncommitted reservation would count them a second time (on the lab, 1.6 GB of such
+    /// double counting pushed `kv_utilization` from 0.58 to 0.99 and into SURVIVAL). Returns the
+    /// attach when `id` is not waiting for one (cancelled meanwhile): the caller releases the
+    /// blocks.
+    pub fn reattach(
+        &mut self,
+        id: RequestId,
+        attach: PrefixAttach,
+        block_bytes: u64,
+    ) -> Option<PrefixAttach> {
         let Some(r) = self.requests.get_mut(&id).filter(|r| r.req.reattach) else {
             return Some(attach);
         };
+        if let Some(res) = r.reservation.as_mut() {
+            res.commit_bytes((attach.blocks.len() as u64).saturating_mul(block_bytes));
+        }
         let cached = attach.cached_tokens;
         let e = &mut r.req.estimate;
         e.cached_prefix_tokens = cached;
@@ -2935,9 +2947,10 @@ mod tests {
 
         /// A released request covers its whole KV again (the pump reserves the queue's copy of
         /// its estimate) and, once admitted, does not start until the engine attached its prefix
-        /// again; it then prefills after the re-attached blocks. Breaks if the queue's estimate
-        /// keeps the prefix discount, a released request starts without `reattach`, or the
-        /// re-attached prefix is not used.
+        /// again; it then prefills after the re-attached blocks, which are committed against its
+        /// reservation. Breaks if the queue's estimate keeps the prefix discount, a released
+        /// request starts without `reattach`, the re-attached prefix is not used, or its blocks
+        /// stay reserved (counted twice with the ledger's `held`).
         #[test]
         fn released_request_waits_for_its_reattach() {
             let (mut s, ledger, _c) = gated();
@@ -2972,8 +2985,15 @@ mod tests {
             complete_all(&mut s, &mut p, &plan, &[]);
 
             let again = p.allocate(2).unwrap();
-            assert!(s.reattach(id(9), attached(&again)).is_some(), "not waiting");
-            assert!(s.reattach(id(3), attached(&again)).is_none());
+            assert!(
+                s.reattach(id(9), attached(&again), 1).is_some(),
+                "not waiting"
+            );
+            assert!(s.reattach(id(3), attached(&again), 1).is_none());
+            // The re-attached blocks are committed against the reservation (the ledger's `held`
+            // counts them as referenced blocks; reserved would count them again).
+            let kv = ledger.usage(DeviceId(0), PoolKind::Kv);
+            assert_eq!((kv.reserved, kv.used), (1, 2));
             assert!(s.awaiting_reattach().is_empty());
             let plan = s.plan(&mut p, &lim);
             assert_eq!(
