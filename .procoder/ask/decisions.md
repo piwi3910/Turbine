@@ -2642,3 +2642,17 @@ copies", A), no question.
    - B) Later
 
 **Decision (user, 2026-10-01): 1 A, 2 A, 3 A, 4 A.** Charge a plan's path latency once and promote ahead of demotions; decay a slow estimate toward the calibrated cost; A/B just below SURVIVAL with medians of 3 runs; investigate the slow device-to-host copies now.
+
+## 6b Task 12: how per-layer TurboQuant tables reach the paged-attention call (2026-10-01)
+
+`turbine_tq_params.tables` covers the whole model (`[layers][num_kv_heads][2·head_dim + head_dim²]`, as the
+transcode uses it); `turbine_attention_paged_desc` is otherwise per layer (`kv_layer`, `k_scale`, `v_scale` already
+point at the layer). Rust `ops::TqPaged.params` and `cpu::tq_attention` are already per layer.
+
+- A) Convention, no new field: the caller passes `tq_params` with `tables` pointing at the layer's slice (one small
+  host struct per layer built at load; device tables never move, so decode graphs capture it safely); the shim checks
+  a dense `num_kv_heads × head_elems` F32 array
+- B) Add `int32_t layer` to the descriptor and share one model-wide struct (the shim also needs the layer count to
+  bounds-check: a second field or an unchecked offset)
+
+**Decision (user, 2026-10-01): A.** The caller passes `tq_params` with `tables` at the layer's slice; no new field.
