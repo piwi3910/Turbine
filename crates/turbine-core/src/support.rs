@@ -932,15 +932,14 @@ pub struct TierFormatRefusal {
     pub status: SupportStatus,
 }
 
-/// Lower-tier formats that are not `supported`: `fp8_e4m3` is `experimental` from the ABI v2.11
-/// transcode (P6b Task 5) until its lab proof (Task 6); `tq4` and `tq2` are `experimental` from
-/// the TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until the S-8 gate
-/// (Task 9) passes.
+/// Lower-tier formats that are not `supported`: `tq4` and `tq2` are `experimental` from the
+/// TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until the S-8 gate
+/// (Task 9) passes. `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
+/// the shared-prefix GSM8K-200 gate on Llama-3.2-3B-Instruct (FP8 L1, lossy cached ratio 0.927,
+/// c16, 32 fillers) gave three BF16-KV runs 0.780 / 0.785 / 0.770 and three FP8-L1 runs
+/// 0.775 / 0.775 / 0.770: median drop 0.005 (max 0.01), paired exact McNemar p >= 0.55 on all
+/// nine pairs (p = 1.0 on the median pair); `kv_gpu` green on gfx1201.
 pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
-    TierFormatRefusal {
-        format: "fp8_e4m3",
-        status: SupportStatus::Experimental,
-    },
     TierFormatRefusal {
         format: "tq4",
         status: SupportStatus::Experimental,
@@ -1366,11 +1365,11 @@ mod tests {
                 "{format}"
             );
         }
-        // `fp8_e4m3` is experimental from the ABI v2.11 transcode (P6b Task 5) until its lab
-        // proof (Task 6); `l0` is always supported.
+        // `fp8_e4m3` is supported since its lab proof (P6b Task 6, shared-prefix gate); `l0` is
+        // always supported.
         for (format, want) in [
             ("l0", SupportStatus::Supported),
-            ("fp8_e4m3", SupportStatus::Experimental),
+            ("fp8_e4m3", SupportStatus::Supported),
         ] {
             assert_eq!(
                 check_tier_format("kv.cpu.format", format).unwrap(),
