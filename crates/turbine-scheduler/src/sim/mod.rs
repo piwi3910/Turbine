@@ -512,6 +512,8 @@ struct KvSimRequest {
     stage: KvStage,
     /// `x-turbine-kv-lossy` (P6b S-3); `None` takes `kv.lossy_reuse`.
     allow_lossy: Option<bool>,
+    /// `prompt_cache_key` and the session headers (P4 session hints).
+    session: Option<turbine_core::request::SessionHints>,
 }
 
 /// What one request was attached (P6b S-3 checks): its cached and lossy tokens and, per
@@ -618,9 +620,24 @@ impl KvSimDriver {
                 generated: Vec::new(),
                 stage: KvStage::Attaching,
                 allow_lossy,
+                session: None,
             },
         );
         self.attaching.push(id);
+    }
+
+    /// [`KvSimDriver::submit`] as a turn of a session (`prompt_cache_key` and its headers).
+    pub fn submit_session(
+        &mut self,
+        id: RequestId,
+        prompt: Vec<u32>,
+        max_tokens: u32,
+        session: turbine_core::request::SessionHints,
+    ) {
+        self.submit(id, prompt, max_tokens);
+        if let Some(r) = self.reqs.get_mut(&id) {
+            r.session = Some(session);
+        }
     }
 
     /// The client went away. A request not yet handed to the scheduler releases its KV now;
@@ -778,7 +795,7 @@ impl KvSimDriver {
                 request: id,
                 prompt: &r.prompt,
                 cache_salt: "",
-                session: None,
+                session: r.session.as_ref(),
                 priority: Priority::default(),
                 allow_lossy: r.allow_lossy,
             };

@@ -860,6 +860,90 @@ fn lossy_lineage_never_reaches_opted_out() {
     assert_eq!(metric(&s.reg, "turbine_kv_lossy_cached_tokens_total"), 0.0);
 }
 
+/// Sessions of [`lossy_multi_turn_run`] and their turns.
+const MT_SESSIONS: u32 = 16;
+const MT_TURNS: u32 = 8;
+
+/// The OLMoE multi-turn shape of the 6b lower-tier gate (spec Lab: one shared prefix, short
+/// turns, `--session-hints`), scaled to 16-token blocks: `MT_SESSIONS` sessions behind one
+/// 96-token prefix take seeded turns (each its previous prompt plus 14–33 tokens, with 0–5
+/// idle steps of think time) at YELLOW, over a 64-block L0 too small for their histories and an
+/// L1 in `format` that holds all of them. Idle histories leave L0 leaf-first, a few blocks at a
+/// time. Returns the cached and the lossy-cached prompt tokens over all requests.
+fn lossy_multi_turn_run(format: &str, seed: u64) -> (u64, u64) {
+    let mut kv = KvConfig::default();
+    kv.cpu.format = ModuleName::new(format).unwrap();
+    let mut s = setup(64, 1024, 0, kv, MemoryKind::Dedicated);
+    let d = &mut s.driver;
+    d.set_pressure(PressureState::Yellow);
+    let prefix: Vec<u32> = (0..96).collect();
+    let mut history: Vec<Vec<u32>> = vec![prefix; MT_SESSIONS as usize];
+    let mut turns = vec![0u32; MT_SESSIONS as usize];
+    let (mut cached, mut lossy) = (0u64, 0u64);
+    let mut rng = seed | 1;
+    let mut n = 0u128;
+    while turns.iter().any(|t| *t < MT_TURNS) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let si = (rng % u64::from(MT_SESSIONS)) as usize;
+        if turns[si] >= MT_TURNS {
+            continue;
+        }
+        let t = turns[si];
+        turns[si] += 1;
+        let h = &mut history[si];
+        let len = 14 + (rng >> 20) as u32 % 20;
+        let base = 100_000 + si as u32 * 10_000 + t * 100;
+        h.extend(base..base + len);
+        n += 1;
+        let id = rid(5_000 + n);
+        d.submit_session(
+            id,
+            h.clone(),
+            2,
+            turbine_core::request::SessionHints {
+                session_id: format!("s{si}"),
+                resume_within_secs: Some(60),
+                end: false,
+            },
+        );
+        for _ in 0..((rng >> 40) % 6) {
+            d.step();
+        }
+        drain(d);
+        let rec = d.attached(id).expect("scheduled");
+        cached += u64::from(rec.cached_tokens);
+        lossy += u64::from(rec.lossy_tokens);
+    }
+    assert_eq!(d.violations(), &[] as &[String]);
+    (cached, lossy)
+}
+
+/// The OLMoE multi-turn shortfall of lower-tier `tq4` (decision "6b: lower-tier tq4 after the
+/// promotion fix"): with an L1 that holds every session's history, a lossy L1 caches as many
+/// prompt tokens as an `l0` one. Before the fix tq4 cached 640–1,328 fewer tokens on these
+/// seeds: a session's history leaves L0 leaf-first, so the first lossy block of its prefix
+/// moves earlier from turn to turn, and a lookup whose lossy chain started earlier than the
+/// chain of the turn that computed the later blocks (over a lossy prefix) missed them. Breaks
+/// if a lossy-lineage block is reachable only through the request's own chain.
+#[test]
+fn lossy_multi_turn_matches_l0_reuse() {
+    for seed in [1u64, 2, 4] {
+        let (l0, _) = lossy_multi_turn_run("l0", seed);
+        let (tq4, tq4_lossy) = lossy_multi_turn_run("tq4", seed);
+        eprintln!("seed {seed}: l0 cached {l0}; tq4 cached {tq4} (lossy {tq4_lossy})");
+        assert!(
+            tq4_lossy > 0,
+            "seed {seed}: the tq4 run reused lossy blocks"
+        );
+        assert!(
+            tq4 >= l0,
+            "seed {seed}: tq4 cached {tq4} prompt tokens, l0 {l0}"
+        );
+    }
+}
+
 /// The pinned pressure trace of [`ladder_under_pinned_pressure`]
 /// (`fixtures/ladder_pressure_trace.json`).
 #[derive(serde::Deserialize)]
