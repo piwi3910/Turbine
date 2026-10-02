@@ -6287,7 +6287,9 @@ impl TqTables {
 /// `blocks` blocks of `layers` BF16 pages of seeded, finite KV-like data for TurboQuant: per
 /// (layer, K or V) a different scale, outliers, and per block one all-zero vector (norm 0, the
 /// codec's `inv = 0` branch), one vector of a single non-zero coordinate, one constant vector
-/// (a rotation onto a single coordinate), and one vector of large values. Non-finite values are
+/// (a rotation onto a single coordinate), one vector of large values, and one ordinary vector
+/// holding a 2^-50 and a subnormal element (squares far below the rest of its norm's sum).
+/// Non-finite values are
 /// outside the TurboQuant contract (a NaN's payload is not pinned by either side).
 fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8>> {
     let d = cfg.head_dim as usize;
@@ -6313,6 +6315,11 @@ fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8
                     v[flat..flat + d].fill(0.75);
                     let big = pick(3);
                     v[big..big + d].iter_mut().for_each(|x| *x *= 4096.0);
+                    // A tiny element and a subnormal one among ordinary values: squares far
+                    // below the rest of the F64 sum of squares (the norm's rounding).
+                    let tiny = pick(4) + (b + layer) % (d - 1);
+                    v[tiny] = 2f32.powi(-50);
+                    v[tiny + 1] = 1e-39;
                     values.extend(v);
                 }
                 block.extend(encode(DType::BF16, &values));
@@ -6722,7 +6729,7 @@ fn paged_mixed_case(
     formats: MixedFormats,
     check: MixedCheck,
     impl_name: &str,
-) {
+) -> Vec<f32> {
     const SEED: u64 = 0x5eed_7a5c_0012_0001;
     const LAYER: u32 = 1;
     let (q_heads, kv_heads) = heads;
@@ -6742,6 +6749,10 @@ fn paged_mixed_case(
     let blocks_of: Vec<usize> = kv_lens.iter().map(|&kv| kv.div_ceil(bt)).collect();
     let max_blocks = blocks_of.iter().copied().max().expect("a sequence");
     let num_blocks = blocks_of.iter().sum::<usize>() + 2;
+    // History, q, k and v come from their own streams, drawn in sequence order, so a sequence's
+    // data does not depend on the sequences after it (`paged_mixed_staged_skips_single_pass`).
+    let mut streams: [Rng; 4] = std::array::from_fn(|_| Rng(rng.next_u64()));
+    let [hist_rng, q_rng, k_rng, v_rng] = &mut streams;
     let order = shuffled(rng, num_blocks);
     let mut table = vec![0f32; seqs * max_blocks];
     let mut fmt_table = vec![base_fmt; seqs * max_blocks];
@@ -6761,8 +6772,8 @@ fn paged_mixed_case(
     let params = tq_host_params(SEED, LAYER, hkv as u32);
     let slot = mixed_page_bytes(base_fmt, bt, hkv);
     let mut raw = vec![0u8; num_blocks * slot];
-    for (b, &fmt) in block_fmt.iter().enumerate() {
-        let page = mixed_history(rng, fmt, bt, hkv, &params);
+    for &b in &order {
+        let page = mixed_history(hist_rng, block_fmt[b], bt, hkv, &params);
         raw[b * slot..b * slot + page.len()].copy_from_slice(&page);
     }
     let pool_shape: Vec<usize> = if base.tq_record_bytes().is_some() {
@@ -6792,19 +6803,19 @@ fn paged_mixed_case(
         p,
         &q_shape,
         DType::BF16,
-        &rng.normal(total_q * q_heads * d, 1.0),
+        &q_rng.normal(total_q * q_heads * d, 1.0),
     );
     let (k_hip, k_cpu) = twin(
         p,
         &new_shape,
         DType::BF16,
-        &rng.normal(total_q * hkv * d, 1.0),
+        &k_rng.normal(total_q * hkv * d, 1.0),
     );
     let (v_hip, v_cpu) = twin(
         p,
         &new_shape,
         DType::BF16,
-        &rng.normal(total_q * hkv * d, 1.0),
+        &v_rng.normal(total_q * hkv * d, 1.0),
     );
     let (o_hip, o_cpu) = twin(p, &q_shape, DType::BF16, &vec![0.0; total_q * q_heads * d]);
     let (bt_hip, bt_cpu) = twin(p, &[seqs, max_blocks], DType::I32, &table);
@@ -7010,6 +7021,7 @@ fn paged_mixed_case(
             );
         }
     }
+    got
 }
 
 /// A dense tensor of `data` in `mem`.
@@ -7129,6 +7141,71 @@ fn paged_mixed_matches_cpu() {
                 }
             }
         }
+    }
+}
+
+/// Lab (P6b decision "6b Task 13", 3 C): a staged mixed prefill launches the single-query
+/// `turbine_hip_mixed` pass only when the batch can hold a single-query row. A prefill-only
+/// batch (one 200-row chunk over 300 cached tokens, `tq4` pages: no pass) gives bit for bit the
+/// rows the same chunk gets with a decode row riding along (the pass runs and fixes only that
+/// row), through both staged implementations (CK at 128-token pages, Turbine at 16); each run is
+/// also held to the BF16-rounded reference. Breaks if skipping the pass changes a prefill row,
+/// or the pass rewrites rows it should leave alone.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_mixed_staged_skips_single_pass() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    for (block_tokens, name) in [
+        (128usize, "ck_tile_fmha_pagedkv_mixed_staged"),
+        (16, "turbine_hip_mixed_staged"),
+    ] {
+        let probe = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            num_q_heads: Q_HEADS as u32,
+            num_kv_heads: KV_HEADS as u32,
+            head_dim: HEAD_DIM as u32,
+            dtype: DType::Tq4,
+            block_tokens: Some(block_tokens as u32),
+            causal: true,
+        };
+        let spec = OpConfig::Attention(probe);
+        let info = p
+            .hip
+            .implementations(spec.op())
+            .into_iter()
+            .find(|i| i.name == name)
+            .expect("the staged implementation");
+        let b = bound(&p, &spec, info.index);
+        let run = |batch: &[(usize, usize)]| {
+            let q_lens: Vec<usize> = batch.iter().map(|&(q, _)| q).collect();
+            let kv_lens: Vec<usize> = batch.iter().map(|&(q, c)| q + c).collect();
+            paged_mixed_case(
+                &b,
+                &mut Rng(43),
+                AttentionKind::PrefillPaged,
+                (Q_HEADS, KV_HEADS),
+                block_tokens,
+                &q_lens,
+                &kv_lens,
+                DType::Tq4,
+                MixedFormats::Uniform,
+                MixedCheck::Staged,
+                name,
+            )
+        };
+        let alone = run(&[(200, 300)]);
+        let ridden = run(&[(200, 300), (1, 255)]);
+        assert_eq!(alone.len(), 200 * Q_HEADS * HEAD_DIM);
+        assert_exact(
+            &format!("{name}: prefill rows without and with the single-query pass"),
+            name,
+            &alone,
+            &ridden[..alone.len()],
+        );
     }
 }
 

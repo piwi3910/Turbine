@@ -260,24 +260,57 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_append_tq_kernel(
     lds.cbk[tid] = cb_k[tid];
   if (tid < (1 << VB))
     lds.cbv[tid] = cb_v[tid];
-  for (int i = tid; i < 2 * nt * kD; i += tq::kThreads) {
-    const int kind = i / (nt * kD);
-    const int tok = (i / kD) % nt;
-    const int e = i % kD;
-    float x = 0.0f;
-    if (dst[tok] >= 0) {
-      const Bf16 *src = kind == 0 ? k_new : v_new;
-      x = bf16_to_f32(src[static_cast<int64_t>(r0 + tok) * new_stride +
-                          static_cast<int64_t>(head) * kD + e]);
+  // 16 bytes (8 elements) a thread when every row of K and V starts 16-byte
+  // aligned, else one element.
+  constexpr int kPerLoad = 8;
+  const bool vec_loads =
+      ((reinterpret_cast<uintptr_t>(k_new) | reinterpret_cast<uintptr_t>(v_new)) &
+       15u) == 0 &&
+      new_stride % kPerLoad == 0;
+  if (vec_loads) {
+    for (int i = tid; i < 2 * nt * (kD / kPerLoad); i += tq::kThreads) {
+      const int kind = i / (nt * (kD / kPerLoad));
+      const int tok = (i / (kD / kPerLoad)) % nt;
+      const int e = (i % (kD / kPerLoad)) * kPerLoad;
+      uint32_t words[4] = {0, 0, 0, 0};
+      if (dst[tok] >= 0) {
+        const Bf16 *src = kind == 0 ? k_new : v_new;
+        const uint4 w = *reinterpret_cast<const uint4 *>(
+            src + static_cast<int64_t>(r0 + tok) * new_stride +
+            static_cast<int64_t>(head) * kD + e);
+        words[0] = w.x;
+        words[1] = w.y;
+        words[2] = w.z;
+        words[3] = w.w;
+      }
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        lds.xs[kind][tok][e + 2 * k] =
+            bf16_to_f32(Bf16{static_cast<uint16_t>(words[k] & 0xffffu)});
+        lds.xs[kind][tok][e + 2 * k + 1] =
+            bf16_to_f32(Bf16{static_cast<uint16_t>(words[k] >> 16)});
+      }
     }
-    lds.xs[kind][tok][e] = x;
+  } else {
+    for (int i = tid; i < 2 * nt * kD; i += tq::kThreads) {
+      const int kind = i / (nt * kD);
+      const int tok = (i / kD) % nt;
+      const int e = i % kD;
+      float x = 0.0f;
+      if (dst[tok] >= 0) {
+        const Bf16 *src = kind == 0 ? k_new : v_new;
+        x = bf16_to_f32(src[static_cast<int64_t>(r0 + tok) * new_stride +
+                            static_cast<int64_t>(head) * kD + e]);
+      }
+      lds.xs[kind][tok][e] = x;
+    }
   }
   __syncthreads();
   const float *head_tables = tables + static_cast<int64_t>(head) * tq::kHeadElems;
   tq::encode_chunk<KB, VB>(lds, nt, head_tables,
-                           [&](int tok, int o, uint8_t v) {
+                           [&](int tok, int o, uint32_t word) {
                              if (dst[tok] >= 0)
-                               kv[dst[tok] + o] = v;
+                               tq::store_word(kv + dst[tok] + o, word);
                            });
 }
 

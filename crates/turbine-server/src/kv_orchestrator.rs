@@ -375,6 +375,13 @@ pub struct KvOrchestrator {
     last_housekeeping: Option<Duration>,
     /// `static` rank mode: every copy also runs on the workers (module comment).
     remote: Option<TierDriver>,
+    /// The L0 pages are TurboQuant records (`kv.dtype: tq4`, P6b S-5): every cached token is
+    /// served from a lossy block (user decision 2026-10-02, "6b Task 13", 4 A), so
+    /// [`KvOrchestrator::count_l0_lossy`] reports them in `lossy_cached_tokens`.
+    l0_lossy: Option<KvMetrics>,
+    /// Requests whose second attach ([`KvOrchestrator::attach_again`]) waits for promotions:
+    /// their cached tokens were counted by the first attach.
+    reattaching: std::collections::HashSet<RequestId>,
 }
 
 impl KvOrchestrator {
@@ -563,7 +570,7 @@ impl KvOrchestrator {
             l1_seen,
             l2_seen,
             Arc::clone(&s.clock),
-            s.metrics,
+            s.metrics.clone(),
         );
         let io_threads = s.cfg.nvme.io_threads.max(1) as usize;
         // Every I/O job belongs to an in-flight ticket, so this bound is never reached; the
@@ -587,6 +594,8 @@ impl KvOrchestrator {
             prefill_tps: None,
             last_housekeeping: None,
             remote,
+            l0_lossy: layout.dtype.tq_record_bytes().map(|_| s.metrics),
+            reattaching: Default::default(),
         };
         o.calibrate(
             pool,
@@ -647,18 +656,42 @@ impl KvOrchestrator {
 
     /// Admission-time prefix match of a request (P4 S-3).
     pub fn attach(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome {
-        let outcome = self.h.attach_prefix(pool, req);
-        if let AttachOutcome::Ready(a) = &outcome {
+        let mut outcome = self.h.attach_prefix(pool, req);
+        if let AttachOutcome::Ready(a) = &mut outcome {
+            self.count_l0_lossy(a, true);
             self.record_hit(req.prompt.len(), a);
         }
         outcome
+    }
+
+    /// Over TurboQuant L0 pages every attached block is lossy (P6b S-3, S-5; user decision
+    /// 2026-10-02, "6b Task 13", 4 A): `lossy_tokens` becomes `cached_tokens`, and when `count`
+    /// (a first attach) `turbine_kv_lossy_cached_tokens_total` gains the tokens the hierarchy,
+    /// which tracks lossy lower-tier copies only, did not count.
+    fn count_l0_lossy(&self, a: &mut PrefixAttach, count: bool) {
+        let Some(metrics) = &self.l0_lossy else {
+            return;
+        };
+        let extra = a.cached_tokens.saturating_sub(a.lossy_tokens);
+        a.lossy_tokens = a.cached_tokens;
+        if count {
+            metrics.lossy_cached_tokens.inc_by(u64::from(extra));
+        }
     }
 
     /// The attach of a queued request that released its prefix ([`KvOrchestrator::detach_prefix`])
     /// once it was admitted: the planner decides again; its tokens were already counted in the
     /// hit-rate window by the first attach.
     pub fn attach_again(&mut self, pool: &mut BlockPool, req: &AttachRequest<'_>) -> AttachOutcome {
-        self.h.attach_prefix(pool, req)
+        let mut outcome = self.h.attach_prefix(pool, req);
+        match &mut outcome {
+            AttachOutcome::Ready(a) => self.count_l0_lossy(a, false),
+            AttachOutcome::Promoting if self.l0_lossy.is_some() => {
+                self.reattaching.insert(req.request);
+            }
+            _ => {}
+        }
+        outcome
     }
 
     /// A request in the admission queue released its attached prefix for pressure reclaim
@@ -687,7 +720,7 @@ impl KvOrchestrator {
 
     /// Transfer completions: requests whose promotions all landed, with their prefixes.
     pub fn poll(&mut self, pool: &mut BlockPool) -> Vec<(RequestId, PrefixAttach)> {
-        match &mut self.remote {
+        let mut ready = match &mut self.remote {
             None => self.h.poll(pool, &mut self.backend),
             Some(r) => {
                 let ready = self.h.poll(pool, &mut r.backend(&mut self.backend));
@@ -695,7 +728,14 @@ impl KvOrchestrator {
                 r.flush();
                 ready
             }
+        };
+        if self.l0_lossy.is_some() {
+            for (id, a) in &mut ready {
+                let first = !self.reattaching.remove(id);
+                self.count_l0_lossy(a, first);
+            }
         }
+        ready
     }
 
     /// Counts a request's prompt and cached tokens in the 300 s hit-rate window.
@@ -776,6 +816,7 @@ impl KvOrchestrator {
 
     /// The request finished (`cancelled`: dropped before completing).
     pub fn request_done(&mut self, pool: &mut BlockPool, request: RequestId, cancelled: bool) {
+        self.reattaching.remove(&request);
         self.h.request_done(pool, request, cancelled);
     }
 
