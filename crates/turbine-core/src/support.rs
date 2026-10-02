@@ -911,37 +911,34 @@ pub fn parallel_refusal(architecture: &str, tp: u32, ep: u32) -> Option<&'static
 /// The status of a lower-tier KV format (`kv.cpu.format`, `kv.nvme.format`, the ladder's
 /// `kv.ladder.max_format`; P6b S-2). The support-matrix row keeps naming the L0 format, so the
 /// lower-tier formats are resolved against this table instead; a format it does not list
-/// (`l0`, `fp8_e4m3`) is `supported` here, its availability decided by the kernel library.
+/// (`l0`, `fp8_e4m3`, `tq4`) is `supported` here, its availability decided by the kernel library.
 #[derive(Clone, Debug)]
 pub struct TierFormatRefusal {
     pub format: &'static str,
     pub status: SupportStatus,
 }
 
-/// Lower-tier formats that are not `supported`: `tq4` and `tq2` are `experimental` from the
-/// TurboQuant transcode and the server's table upload (P6b Tasks 7–8) until every Task 9 gate
-/// passes for Llama and OLMoE (this table has one row per format, not per model). Task 9 lab,
-/// 2026-10-01: golden c1 / c16 PASS for both formats and models. Shared-prefix GSM8K-200 medians
-/// of 3 against BF16 KV: `tq4` Llama 0.775 vs 0.780, OLMoE 0.665 vs 0.635 (PASS); `tq2` Llama
-/// 0.720, OLMoE 0.610 (FAIL). `tq4` still misses the multi-turn criterion (cached-token ratio at
-/// least the `l0` run's) on OLMoE: after lossy L1 promotions stopped queueing on the I/O pool
-/// (2026-10-02, perf-log 6b "TurboQuant promotion path"; promotions 245–289 → 50–63 ms) Llama
-/// passes, 0.9047 vs 0.9016 (medians of 3), and OLMoE gives 0.8591 vs 0.8626 with no recomputes.
+/// Lower-tier formats that are not `supported`: `tq2` is `experimental` from the TurboQuant
+/// transcode and the server's table upload (P6b Tasks 7–8) until every Task 9 gate passes for
+/// Llama and OLMoE (this table has one row per format, not per model). Task 9 lab, 2026-10-01:
+/// golden c1 / c16 PASS for both TurboQuant formats and models. Shared-prefix GSM8K-200 medians of
+/// 3 against BF16 KV: `tq4` Llama 0.775 vs 0.780, OLMoE 0.665 vs 0.635 (PASS, paired exact
+/// McNemar p 0.23–1.0 and 0.24); `tq2` Llama 0.720, OLMoE 0.610 (FAIL).
+/// `tq4` is not listed, so it is `supported` (2026-10-02): besides golden and the eval above it
+/// passes the multi-turn criterion (cached-token ratio at least the `l0` run's; 16 sessions × 8
+/// turns, c16, 4 GiB L1, GPU 0, medians of 3, arms interleaved) on both models, measured after the
+/// drift signal stopped judging decode steps that overlap a KV copy (`p6b-copydrift`, perf-log 6b
+/// "KV copies and decode steps"): Llama 0.9075 vs 0.9007, OLMoE 0.8625 vs 0.8624. Every OLMoE run
+/// stayed GREEN; every Llama run of both arms went YELLOW on `kv_utilization` at 29–33 s.
 /// `fp8_e4m3` is not listed, so it is `supported` (P6b Task 6, 2026-10-01):
 /// the shared-prefix GSM8K-200 gate on Llama-3.2-3B-Instruct (FP8 L1, lossy cached ratio 0.927,
 /// c16, 32 fillers) gave three BF16-KV runs 0.780 / 0.785 / 0.770 and three FP8-L1 runs
 /// 0.775 / 0.775 / 0.770: median drop 0.005 (max 0.01), paired exact McNemar p >= 0.55 on all
 /// nine pairs (p = 1.0 on the median pair); `kv_gpu` green on gfx1201.
-pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[
-    TierFormatRefusal {
-        format: "tq4",
-        status: SupportStatus::Experimental,
-    },
-    TierFormatRefusal {
-        format: "tq2",
-        status: SupportStatus::Experimental,
-    },
-];
+pub static TIER_FORMAT_REFUSALS: &[TierFormatRefusal] = &[TierFormatRefusal {
+    format: "tq2",
+    status: SupportStatus::Experimental,
+}];
 
 /// Resolves lower-tier format `format`, configured under `key`, against
 /// [`TIER_FORMAT_REFUSALS`]: `unsupported` is a configuration error naming `key` (exit 2),
@@ -1365,18 +1362,16 @@ mod tests {
                 assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
             }
         }
-        for format in ["tq4", "tq2"] {
-            assert_eq!(
-                check_tier_format("kv.nvme.format", format).unwrap(),
-                SupportStatus::Experimental,
-                "{format}"
-            );
-        }
-        // `fp8_e4m3` is supported since its lab proof (P6b Task 6, shared-prefix gate); `l0` is
-        // always supported.
+        assert_eq!(
+            check_tier_format("kv.nvme.format", "tq2").unwrap(),
+            SupportStatus::Experimental
+        );
+        // `fp8_e4m3` is supported since its lab proof (P6b Task 6, shared-prefix gate), `tq4`
+        // since its multi-turn A/B (2026-10-02); `l0` is always supported.
         for (format, want) in [
             ("l0", SupportStatus::Supported),
             ("fp8_e4m3", SupportStatus::Supported),
+            ("tq4", SupportStatus::Supported),
         ] {
             assert_eq!(
                 check_tier_format("kv.cpu.format", format).unwrap(),

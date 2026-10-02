@@ -566,14 +566,14 @@ mod tests {
         let mut tq = config("hip", llama.path());
         tq.kv.nvme.enabled = true;
         tq.kv.nvme.format = name("tq4");
-        // TurboQuant lower tiers are experimental (tables uploaded by the server, P6b Task 8),
-        // not refused.
+        // A `tq4` lower tier is supported (tables uploaded by the server, P6b Task 8; multi-turn
+        // A/B 2026-10-02), not refused.
         assert!(before_discovery(&tq).is_ok());
         assert_eq!(
             tier_formats(&tq).unwrap(),
             vec![
                 ("kv.cpu.format", "l0", SupportStatus::Supported),
-                ("kv.nvme.format", "tq4", SupportStatus::Experimental)
+                ("kv.nvme.format", "tq4", SupportStatus::Supported)
             ]
         );
         assert_eq!(kv_format_availability(&tq, None), Ok(()));
@@ -583,7 +583,7 @@ mod tests {
 
         let mut ladder = config("hip", llama.path());
         ladder.kv.ladder.enabled = true;
-        // The default max_format (`tq4`) is a TurboQuant codec: experimental, no longer refused.
+        // The default max_format (`tq4`) is a TurboQuant codec: supported, no longer refused.
         assert!(before_discovery(&ladder).is_ok());
         ladder.kv.ladder.max_format = name("l0");
         let err = before_discovery(&ladder).unwrap_err();
