@@ -895,6 +895,7 @@ impl OverloadSim {
                 rows: plan.decode_tokens(),
                 context_tokens: plan.decode_context_tokens(),
                 secs,
+                at: self.clock.now_mono(),
             },
             calm,
         );
@@ -954,7 +955,7 @@ impl OverloadSim {
                 free_kv_blocks: self.pool.free_blocks(),
                 block_tokens: self.cfg.params.block_tokens,
                 decode_tokens_per_s: 1.0 / self.decode_step_s.max(1e-9),
-                step_time_p95: self.decode_steps.p95(),
+                step_time_p95: self.decode_steps.p95(self.clock.now_mono()),
                 queue_len: self.gate_len() as u32,
                 iterations: self.iterations,
             };

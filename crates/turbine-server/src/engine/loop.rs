@@ -841,6 +841,7 @@ impl EngineLoop {
                 rows: decodes,
                 context_tokens,
                 secs,
+                at: self.clock.now_mono(),
             },
             calm,
         );
@@ -900,7 +901,7 @@ impl EngineLoop {
     /// The figures the pressure controller reads on its next tick.
     fn publish_stats(&self) {
         self.sync_kv_held();
-        let p95 = self.decode_steps.p95();
+        let p95 = self.decode_steps.p95(self.clock.now_mono());
         self.rel.publish(EngineStats {
             running_remaining_tokens: self.sched.remaining_tokens(),
             // Phase 4: cached-but-unreferenced L0 blocks (finished prompts kept for prefix reuse)

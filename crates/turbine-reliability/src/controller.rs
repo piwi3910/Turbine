@@ -763,6 +763,64 @@ mod tests {
         assert_eq!(h.circuit(), CircuitState::Degraded, "drift in GREEN");
     }
 
+    /// The 2026-10-02 Llama multi-turn start (p6b-olmoe-tq4 `llama-tq4-r3`): 2.4 s after ready a
+    /// few 16-row decode steps ran 3.4× their calm baseline, pressure went RED on
+    /// `step_time_drift` (3.37) and stayed RED for the whole 4.5 min run. RED is not calm, so no
+    /// shape learned a baseline any more; the one-at-a-time `idle_floor` admissions then decoded
+    /// shapes never seen while calm, which are not judged, so the window kept the spike and its
+    /// p95 held RED while anything ran. Catches: judged steps that no longer describe the
+    /// decoding happening latching a level.
+    #[test]
+    fn a_drift_spike_does_not_latch_once_its_shape_stops_running() {
+        use crate::step_window::{DecodeStepWindow, StepSample};
+        let (mut c, h, clock) = controller(true);
+        let mut w = DecodeStepWindow::new();
+        let mut run = |c: &mut PressureController, secs: f64, rows: u32, ctx: u64, step: f64| {
+            let mut t = 0.0;
+            while t < secs {
+                clock.advance(Duration::from_secs_f64(step));
+                t += step;
+                let calm =
+                    h.state() == PressureState::Green && h.circuit() == CircuitState::Healthy;
+                w.observe(
+                    StepSample {
+                        prefill_tokens: 0,
+                        rows,
+                        context_tokens: ctx,
+                        secs: step,
+                        at: clock.now_mono(),
+                    },
+                    calm,
+                );
+                c.on_circuit_event(CircuitEvent::Iteration);
+                c.tick(
+                    &sample(0.3, 0.0),
+                    &EngineStats {
+                        running_remaining_tokens: vec![100; rows as usize],
+                        block_tokens: 128,
+                        free_kv_blocks: 400,
+                        step_time_p95: w.p95(clock.now_mono()),
+                        ..EngineStats::default()
+                    },
+                );
+            }
+        };
+        // Ten calm 16-row decode steps at 17 ms (the bucket is judged from the ninth), then two
+        // steps of that shape at 4×: in a window this short the p95 is the spike.
+        run(&mut c, 0.17, 16, 55_000, 0.017);
+        assert_eq!(h.state(), PressureState::Green);
+        run(&mut c, 0.136, 16, 55_100, 0.068);
+        assert_eq!(h.state(), PressureState::Red, "4× is RED drift");
+        // The device is fine again, but only one sequence at a time runs, at a context the
+        // calm phase never decoded at.
+        run(&mut c, 60.0, 1, 3_500, 0.015);
+        assert_eq!(
+            h.state(),
+            PressureState::Green,
+            "a spike no current step confirms must not hold RED"
+        );
+    }
+
     #[test]
     fn disabled_stays_green() {
         let (mut c, h, clock) = controller(false);
