@@ -104,6 +104,9 @@ struct L2State {
     calibration_p99: Option<f64>,
     bandwidth: f64,
     direct: bool,
+    /// [`KvTier::room_epoch`]: bumped when a slab's last slot is freed (the slab may take
+    /// another codec).
+    room_epoch: u64,
 }
 
 pub struct L2NvmeTier {
@@ -219,6 +222,7 @@ impl L2NvmeTier {
                 calibration_p99: None,
                 bandwidth: DEFAULT_BANDWIDTH,
                 direct: O_DIRECT.is_some(),
+                room_epoch: 0,
             }),
             queue: (Mutex::new(0), Condvar::new()),
             cfg,
@@ -459,17 +463,17 @@ impl L2NvmeTier {
                 return Err(TierError::Degraded);
             }
             // A replaced block of the same codec is rewritten in its own slot; it is not
-            // readable meanwhile. Another codec's block moves to a slot of its own codec.
-            let old = s.index.remove(&key);
-            if let Some(e) = old {
-                s.used -= e.len as u64;
-            }
+            // readable meanwhile. Another codec's block moves to a slot of its own codec, found
+            // before the old slot is freed: without room (`Full`) the old copy stays, readable
+            // at its old format (P6b S-6 edge case; user decision "6b Task 16: ladder proof
+            // results — four open points", 2 A). The old slot is freed once the new copy is in.
             let fits = |s: &L2State, slab: usize| {
                 s.slabs[slab].format == format && bytes.len() <= s.slabs[slab].slot_bytes
             };
-            let reuse = old.filter(|e| fits(&s, e.slab));
-            if let Some(e) = old.filter(|e| !fits(&s, e.slab)) {
-                self.free_slot(&mut s, e.slab, e.slot);
+            let reuse = s.index.get(&key).copied().filter(|e| fits(&s, e.slab));
+            if let Some(e) = reuse {
+                s.index.remove(&key);
+                s.used -= e.len as u64;
             }
             let (slab, slot) = match reuse {
                 Some(e) => (e.slab, e.slot),
@@ -514,7 +518,11 @@ impl L2NvmeTier {
                     len: bytes.len(),
                 };
                 s.used += bytes.len() as u64;
-                s.index.insert(key, entry);
+                // The replaced copy of another codec (or one a concurrent store left) leaves now.
+                if let Some(old) = s.index.insert(key, entry) {
+                    s.used -= old.len as u64;
+                    self.free_slot(&mut s, old.slab, old.slot);
+                }
                 Ok(TierSlot(((slab as u64) << 32) | slot as u64))
             }
             Err(e) => {
@@ -544,7 +552,11 @@ impl L2NvmeTier {
     fn free_slot(&self, s: &mut L2State, slab: usize, slot: usize) {
         let x = &mut s.slabs[slab];
         x.taken -= 1;
+        let emptied = x.taken == 0;
         let format = x.format;
+        if emptied {
+            s.room_epoch += 1;
+        }
         s.free.entry(format).or_default().push((slab, slot));
     }
 
@@ -697,5 +709,9 @@ impl KvTier for L2NvmeTier {
 
     fn degraded(&self) -> bool {
         self.lock().health.is_degraded()
+    }
+
+    fn room_epoch(&self) -> u64 {
+        self.lock().room_epoch
     }
 }

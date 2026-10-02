@@ -69,6 +69,9 @@ struct L1State {
     bandwidth: f64,
     /// Slot bytes of the stored and reserved blocks.
     used: u64,
+    /// [`KvTier::room_epoch`]: bumped when a slab empties or is released, and when host
+    /// pressure drops below RED (slabs may be allocated again).
+    room_epoch: u64,
 }
 
 pub struct L1PinnedTier {
@@ -115,6 +118,7 @@ impl L1PinnedTier {
                 latency: Duration::from_micros(20),
                 bandwidth: 8e9,
                 used: 0,
+                room_epoch: 0,
             }),
         }
     }
@@ -128,6 +132,9 @@ impl L1PinnedTier {
     /// is released (and further slabs as they empty).
     pub fn set_host_pressure(&self, p: PressureState) {
         let mut s = self.lock();
+        if s.host_pressure >= PressureState::Red && p < PressureState::Red {
+            s.room_epoch += 1;
+        }
         s.host_pressure = p;
         if p >= PressureState::Red {
             let mut released = 0usize;
@@ -138,6 +145,7 @@ impl L1PinnedTier {
                 }
             }
             if released > 0 {
+                s.room_epoch += 1;
                 tracing::info!(
                     event = "kv_l1_slab_released",
                     tier = "l1",
@@ -250,6 +258,9 @@ impl L1PinnedTier {
         let freed = slab.slot_bytes as u64;
         let empty = slab.occupied == 0;
         s.used -= freed;
+        if empty {
+            s.room_epoch += 1;
+        }
         if release && empty {
             s.slabs[slab_idx] = None;
         }
@@ -457,5 +468,9 @@ impl KvTier for L1PinnedTier {
 
     fn degraded(&self) -> bool {
         self.lock().health.is_degraded()
+    }
+
+    fn room_epoch(&self) -> u64 {
+        self.lock().room_epoch
     }
 }

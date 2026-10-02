@@ -4166,12 +4166,14 @@ mod tests {
         o.backend.start(&t).unwrap();
         assert_eq!(finish(&mut o, &t), Err(TierError::Full), "no slab for fp8");
         assert_eq!(no_room(&metrics, "no_room"), 1, "the skip is counted");
-        // L2's store frees a replaced copy's slot before it looks for one of the new size, so
-        // the failed rewrite lost the `l0` copy (the hierarchy's `on_copy_failed` then removes
-        // its location); the other block's copy is untouched.
-        assert!(
-            !l2.contains(&key),
-            "L2 drops the replaced copy before the Full"
+        // L2's store finds a slot of the new size before it frees the replaced one (user
+        // decision "6b Task 16: ladder proof results — four open points", 2 A), so the copy
+        // stays at its old format; the other block's copy is untouched.
+        assert!(l2.contains(&key), "the failed rewrite keeps the l0 copy");
+        assert_eq!(
+            l2.used_bytes(),
+            2 * bb,
+            "both l0 copies are still accounted"
         );
         assert!(l2.contains(&KvKey([7; 16])));
         assert_eq!(

@@ -110,11 +110,19 @@ fn ratio(part: u64, whole: u64) -> f64 {
 
 /// Unrelated requests sent between the first two items and the rest (`--filler-requests`):
 /// they fill L0 so the first items' shared prefix is demoted to the lower KV tier before the other
-/// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates).
+/// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates). Up to
+/// `concurrency` of them are in flight at once (`--filler-concurrency`; 0 counts as 1, one after
+/// another), so together they press on L0 as real load does and the pressure controller leaves
+/// GREEN (the ladder gate, user decision "6b Task 16: ladder proof results — four open points",
+/// 1 A).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fillers {
     pub requests: u32,
     pub words: u32,
+    pub concurrency: u32,
+    /// After the fillers, wait until the server's pressure controller is GREEN again
+    /// ([`settle`]) before the other items go out.
+    pub settle: bool,
 }
 
 /// Seed of the filler prompts (`crate::prompt::prompt(FILLER_SEED, i, words)`), apart from the
@@ -143,6 +151,16 @@ pub struct EvalReport {
     pub filler_requests: u32,
     #[serde(default)]
     pub filler_words: u32,
+    /// `--filler-concurrency` of this run; an older report with no field reads as 1 (the
+    /// fillers one after another). `eval-compare` refuses a pair that differs.
+    #[serde(default = "default_concurrency")]
+    pub filler_concurrency: u32,
+    /// Fillers the server rejected under load and the runner sent again (not compared).
+    #[serde(default)]
+    pub filler_retries: u32,
+    /// `--fillers-settle` of this run. `eval-compare` refuses a pair that differs.
+    #[serde(default)]
+    pub fillers_settle: bool,
     pub results: Vec<TaskResult>,
 }
 
@@ -409,27 +427,93 @@ async fn post_completion(
     Ok((text, Usage::from_response(&v)))
 }
 
+/// Times a filler the server rejects (503, e.g. SURVIVAL's `overloaded`, or 429) is sent again,
+/// [`FILLER_RETRY_DELAY`] apart, before the run fails.
+pub const FILLER_RETRIES: u32 = 120;
+
+/// Pause before a rejected filler is sent again.
+pub const FILLER_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// How long [`settle`] waits for GREEN, and how often it polls.
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+pub const SETTLE_POLL: Duration = Duration::from_millis(250);
+
+/// `--fillers-settle`: polls `<base>/turbine/v1/pressure` until its `state` is GREEN (a server
+/// without the endpoint, 404, has no controller to wait for). The concurrent fillers leave the
+/// controller at ORANGE or above for its de-escalation dwell; an item planned then recomputes
+/// the shared prefix into a fresh exact L0 copy (`l0_pressure`) instead of reading the copy the
+/// fillers pushed down. Fails after [`SETTLE_TIMEOUT`].
+async fn settle(client: &reqwest::Client, base: &str) -> Result<(), EvalError> {
+    let start = std::time::Instant::now();
+    loop {
+        let sent = client
+            .get(format!("{base}/turbine/v1/pressure"))
+            .send()
+            .await;
+        if sent
+            .as_ref()
+            .is_ok_and(|r| r.status() == reqwest::StatusCode::NOT_FOUND)
+        {
+            return Ok(());
+        }
+        let doc = json_body(sent)
+            .await
+            .map_err(|e| EvalError::Server(format!("GET /turbine/v1/pressure: {e}")))?;
+        if doc["state"] == "GREEN" {
+            return Ok(());
+        }
+        if start.elapsed() >= SETTLE_TIMEOUT {
+            return Err(EvalError::Server(format!(
+                "the pressure controller did not return to GREEN within {} s after the fillers (state {})",
+                SETTLE_TIMEOUT.as_secs(),
+                doc["state"]
+            )));
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
 /// One filler request (`--filler-requests`): an unrelated random-word chat prompt, one token.
+/// Fillers exist to load the server, so one it rejects under that load (503 or 429) is sent
+/// again after [`FILLER_RETRY_DELAY`], up to [`FILLER_RETRIES`] times, each counted in
+/// `retries`: every filler is served, whatever the pressure did, on both sides of a pair.
 async fn send_filler(
     client: &reqwest::Client,
     base: &str,
     model: &str,
     index: u32,
     words: u32,
+    retries: &std::sync::atomic::AtomicU32,
 ) -> Result<(), EvalError> {
     let prompt = crate::prompt::prompt(FILLER_SEED, u64::from(index), words);
     let body = serde_json::json!({"model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1, "temperature": 0.0, "stream": false});
-    post_completion(
-        client,
-        base,
-        "/v1/chat/completions",
-        body,
-        &format!("filler-{index}"),
-    )
-    .await
-    .map(|_| ())
+    let id = format!("filler-{index}");
+    for attempt in 0..=FILLER_RETRIES {
+        let sent = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await;
+        let rejected = sent.as_ref().is_ok_and(|r| {
+            matches!(
+                r.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::TOO_MANY_REQUESTS
+            )
+        });
+        if rejected && attempt < FILLER_RETRIES {
+            retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(FILLER_RETRY_DELAY).await;
+            continue;
+        }
+        return json_body(sent)
+            .await
+            .map(|_| ())
+            .map_err(|detail| EvalError::Request { id, detail });
+    }
+    unreachable!("the last attempt returns")
 }
 
 async fn run_task(
@@ -453,7 +537,8 @@ async fn run_task(
 /// 256 by the caller); results are reported in task-file order whatever order the replies
 /// arrive in. The first failed request aborts the run (no partial report). With
 /// `fillers.requests` > 0 the first [`FILLER_HEAD`] tasks run alone, one after the other, then
-/// the fillers one after another, then the rest at `concurrency`: the first task publishes the
+/// the fillers (`fillers.concurrency` in flight at once), with `fillers.settle` a wait for GREEN
+/// and the next task alone, then the rest at `concurrency`: the first task publishes the
 /// shared prefix, the second hits it (the reuse evidence a server needs before it copies a
 /// block down rather than dropping it), the fillers push it out of L0, and the rest read it
 /// back from the lower tier.
@@ -489,11 +574,29 @@ pub async fn run_eval(
     for task in head {
         results.push(run_task(client, base, model, task).await?);
     }
+    let filler_concurrency = fillers.concurrency.max(1);
+    let filler_retries = std::sync::atomic::AtomicU32::new(0);
     if !head.is_empty() {
-        for i in 0..fillers.requests {
-            send_filler(client, base, model, i, fillers.words).await?;
+        let retries = &filler_retries;
+        let mut sent = stream::iter(0..fillers.requests)
+            .map(|i| send_filler(client, base, model, i, fillers.words, retries))
+            .buffer_unordered(filler_concurrency as usize);
+        while let Some(reply) = sent.next().await {
+            reply?;
+        }
+        if fillers.settle {
+            settle(client, base).await?;
         }
     }
+    // After the settle the first remaining item runs alone: it brings the shared prefix back
+    // into L0, so the others plan a hit instead of each reserving a cold prompt at once.
+    let rest = match rest.split_first() {
+        Some((first, more)) if fillers.settle && !head.is_empty() => {
+            results.push(run_task(client, base, model, first).await?);
+            more
+        }
+        _ => rest,
+    };
     let mut replies = stream::iter(rest.iter().enumerate())
         .map(|(index, task)| async move {
             Ok::<_, EvalError>((index, run_task(client, base, model, task).await?))
@@ -520,6 +623,9 @@ pub async fn run_eval(
         concurrency: concurrency as u32,
         filler_requests: fillers.requests,
         filler_words: fillers.words,
+        filler_concurrency,
+        filler_retries: filler_retries.into_inner(),
+        fillers_settle: fillers.settle && !head.is_empty(),
         results,
     })
 }
@@ -665,6 +771,9 @@ mod tests {
             concurrency: 1,
             filler_requests: 0,
             filler_words: 0,
+            filler_concurrency: 1,
+            filler_retries: 0,
+            fillers_settle: false,
             results,
         }
     }
@@ -719,8 +828,13 @@ mod tests {
             "results":[{"id":"x","correct":true,"output":"1"}]}"#;
         let r: EvalReport = serde_json::from_str(json).unwrap();
         assert_eq!(
-            (r.concurrency, r.filler_requests, r.filler_words),
-            (1, 0, 0)
+            (
+                r.concurrency,
+                r.filler_requests,
+                r.filler_words,
+                r.filler_concurrency
+            ),
+            (1, 0, 0, 1)
         );
         assert!(r.token_totals().is_none());
     }

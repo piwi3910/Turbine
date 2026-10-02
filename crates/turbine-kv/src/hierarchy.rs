@@ -43,7 +43,7 @@ use crate::policy::{
 };
 use crate::pool::BlockPool;
 use crate::session::{PrefetchTracker, SessionAction, SessionTable};
-use crate::tier::{KvLocation, KvTier, L0_FORMAT, TierId, demotion_target};
+use crate::tier::{KvLocation, KvTier, L0_FORMAT, TierError, TierId, demotion_target};
 use turbine_reliability::throttle::KvReclaimer;
 
 use crate::transfer::{
@@ -261,6 +261,9 @@ pub struct KvStats {
     pub compressions: u64,
     /// Ladder ticks run (each ≥ [`LADDER_TICK_INTERVAL`] after the previous one).
     pub ladder_ticks: u64,
+    /// Ladder rewrites not submitted because their tier is backed off after a `Full` (user
+    /// decision "6b Task 16: ladder proof results — four open points", 3 A).
+    pub ladder_backoff_skips: u64,
     /// Copy-ahead copies landed: a shared parent copied down while its L0 copy stays
     /// ([`KvHierarchy::copy_ahead`]).
     pub copy_aheads: u64,
@@ -428,6 +431,10 @@ struct TierRung {
     rung: &'static str,
     /// Since when the tier has been below low water (the step-up dwell).
     below_since: Option<Duration>,
+    /// Set after a rewrite into the tier ended `Full`: the tier's `room_epoch` at that
+    /// rewrite's submit. No rewrite is submitted into the tier until the epoch changes (user
+    /// decision "6b Task 16: ladder proof results — four open points", 3 A).
+    backoff: Option<u64>,
 }
 
 /// The ladder's state: per-tier rungs and the current tick window.
@@ -447,6 +454,8 @@ struct Compressing {
     tier: TierId,
     /// Bytes the rewritten copy saves (old format's minus new format's).
     saved: u64,
+    /// The tier's `room_epoch` when the rewrite was submitted (the back-off's mark).
+    epoch: u64,
 }
 
 /// An attach waiting for its promotions; `promotions` are the L0 targets still in flight.
@@ -604,6 +613,7 @@ impl KvHierarchy {
                 base,
                 rung: base,
                 below_since: None,
+                backoff: None,
             })
             .collect(),
             last_tick: None,
@@ -1394,7 +1404,7 @@ impl KvHierarchy {
                         key = %t.req.key,
                         error = %e
                     );
-                    self.on_copy_failed(pool, t.id, &t.req);
+                    self.on_copy_failed(pool, t.id, &t.req, &e);
                 }
             }
         }
@@ -1533,7 +1543,13 @@ impl KvHierarchy {
         }
     }
 
-    fn on_copy_failed(&mut self, pool: &mut BlockPool, ticket: u64, req: &TransferRequest) {
+    fn on_copy_failed(
+        &mut self,
+        pool: &mut BlockPool,
+        ticket: u64,
+        req: &TransferRequest,
+        error: &TierError,
+    ) {
         self.lossy_targets.remove(&ticket);
         for t in [req.path.from(), req.path.to()] {
             if let Some(tier) = self.tier(t)
@@ -1556,8 +1572,13 @@ impl KvHierarchy {
             }
             TransferPurpose::Compress => {
                 // The copy keeps its old format unless the failed rewrite lost it.
-                self.compressing.remove(&req.key);
+                let compressing = self.compressing.remove(&req.key);
                 let tier = req.path.from();
+                if matches!(error, TierError::Full)
+                    && let Some(c) = compressing
+                {
+                    self.ladder_back_off(tier, c.epoch, req.codec);
+                }
                 let lost = self.tier(tier).is_some_and(|t| !t.contains(&req.key));
                 if lost
                     && self
@@ -2435,6 +2456,72 @@ impl KvHierarchy {
         })
     }
 
+    /// Whether rewrites into `tier` wait for room (a rewrite ended `Full` and the tier's
+    /// `room_epoch` has not changed since).
+    fn ladder_backed_off(&self, tier: TierId) -> bool {
+        self.ladder
+            .as_ref()
+            .and_then(|l| l.tiers.iter().find(|t| t.tier == tier))
+            .is_some_and(|t| t.backoff.is_some())
+    }
+
+    /// Backs off rewrites into `tier` after one submitted at `room_epoch` `epoch` found no room
+    /// (`codec` its formats): counted once per back-off as
+    /// `turbine_kv_ladder_actions_total{reason="no_room_backoff"}`.
+    fn ladder_back_off(&mut self, tier: TierId, epoch: u64, codec: TransferCodec) {
+        let Some(t) = self
+            .ladder
+            .as_mut()
+            .and_then(|l| l.tiers.iter_mut().find(|t| t.tier == tier))
+        else {
+            return;
+        };
+        if t.backoff.is_some() {
+            return;
+        }
+        t.backoff = Some(epoch);
+        self.metrics
+            .ladder_action(tier, codec.from, codec.to, LadderReason::NoRoomBackoff);
+        tracing::debug!(
+            event = "kv_ladder",
+            tier = tier.as_str(),
+            from = codec.from,
+            to = codec.to,
+            reason = LadderReason::NoRoomBackoff.as_str(),
+            "no room for ladder rewrites; backing off until a slab frees"
+        );
+    }
+
+    /// Ends the back-off of every tier whose `room_epoch` changed since it started.
+    fn ladder_resume(&mut self) {
+        let epochs: SmallVec<[(TierId, u64); 2]> = self
+            .ladder
+            .as_ref()
+            .map(|l| {
+                l.tiers
+                    .iter()
+                    .filter(|t| t.backoff.is_some())
+                    .map(|t| (t.tier, self.tier(t.tier).map_or(0, |x| x.room_epoch())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (tier, now) in epochs {
+            if let Some(t) = self
+                .ladder
+                .as_mut()
+                .and_then(|l| l.tiers.iter_mut().find(|t| t.tier == tier))
+                && t.backoff.is_some_and(|e| e != now)
+            {
+                t.backoff = None;
+                tracing::debug!(
+                    event = "kv_ladder",
+                    tier = tier.as_str(),
+                    "room freed; ladder rewrites resume"
+                );
+            }
+        }
+    }
+
     /// Sets `tier`'s rung for new demotions and reports the change (`kv_ladder`, the rung gauge
     /// and, for a step up, `rung_step_up`).
     fn set_rung(&mut self, tier: TierId, to: &'static str, reason: LadderReason, now: Duration) {
@@ -2512,6 +2599,7 @@ impl KvHierarchy {
             Compressing {
                 tier,
                 saved: codec.from_bytes.saturating_sub(codec.to_bytes),
+                epoch: self.tier(tier).map_or(0, |t| t.room_epoch()),
             },
         );
         if let Some(l) = self.ladder.as_mut() {
@@ -2542,6 +2630,10 @@ impl KvHierarchy {
         let ctx = self.ladder_context(tier, format, true, self.l0_state)?;
         let inputs = self.score_one(b, tier, pool, self.now());
         match self.policy.policy.action(&inputs, &ctx) {
+            EvictAction::Compress { .. } if self.ladder_backed_off(tier) => {
+                self.stats.ladder_backoff_skips += 1;
+                None
+            }
             EvictAction::Compress { to } => (self.ladder_budget()
                 && self.submit_compress(*key, tier, to, LadderReason::WouldDrop))
             .then_some(false),
@@ -2608,6 +2700,7 @@ impl KvHierarchy {
             return;
         }
         self.sync_l0_refs(pool);
+        self.ladder_resume();
         for t in tiers.iter().rev() {
             if !self.ladder_budget() {
                 break;
@@ -2663,6 +2756,10 @@ impl KvHierarchy {
             };
             let inputs = self.score_one(b, tier, pool, now);
             match self.policy.policy.action(&inputs, &ctx) {
+                // No room for the new format: the copy stays (floor evictions still run).
+                EvictAction::Compress { .. } if self.ladder_backed_off(tier) => {
+                    self.stats.ladder_backoff_skips += 1;
+                }
                 EvictAction::Compress { to } => {
                     if !self.submit_compress(v.key, tier, to, LadderReason::FillHighWater) {
                         return;
@@ -3056,17 +3153,30 @@ pub(crate) mod tests {
         l2: Option<Arc<MemTier>>,
         clock: FakeClock,
     ) -> Rig {
+        rig_kv(policy, l0_blocks, l1, l2, clock, |_| {})
+    }
+
+    /// `rig_with` over the `kv` section `edit` adjusts.
+    pub(crate) fn rig_kv(
+        policy: &str,
+        l0_blocks: u32,
+        l1: Option<Arc<MemTier>>,
+        l2: Option<Arc<MemTier>>,
+        clock: FakeClock,
+        edit: impl FnOnce(&mut KvConfig),
+    ) -> Rig {
         let arc: Arc<dyn Clock> = Arc::new(clock.clone());
         let fmt = fmt16();
         let bb = fmt.layout.block_bytes();
         let l1 = l1.map(|t| t as Arc<dyn KvTier>);
         let l2 = l2.map(|t| t as Arc<dyn KvTier>);
         // The rig pages at 16 tokens (fmt16), not the 128-token default.
-        let kv = KvConfig {
+        let mut kv = KvConfig {
             block_tokens: fmt.layout.block_tokens,
             policy: turbine_core::config::ModuleName::new(policy).expect("a module name"),
             ..KvConfig::default()
         };
+        edit(&mut kv);
         let cfg = HierarchyConfig::from_config(&kv, bb, MemoryKind::Dedicated)
             .expect("a registered eviction policy");
         let model = ModelIdentity {
@@ -3217,6 +3327,84 @@ pub(crate) mod tests {
         assert_eq!(doc["hit_rate"]["cached_tokens"], 64);
         assert_eq!(doc["transfers"]["inflight_bytes"], 0);
         assert_eq!(doc["unified_memory"], false);
+    }
+
+    /// P6b S-6 (user decision "6b Task 16: ladder proof results — four open points", 3 A): once
+    /// a ladder rewrite into a tier ends `Full`, the ladder submits no rewrite into that tier —
+    /// not every tick — until the tier's `room_epoch` changes (a slab freed), counts the back-off
+    /// once (`no_room_backoff`) and every skipped rewrite, and then resumes. Breaks if the
+    /// sweep resubmits while no room freed, or never resumes after it did.
+    #[test]
+    fn ladder_backs_off_a_tier_without_room_until_a_slab_frees() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        // L1 is the lowest tier and full: the four demoted blocks and one block of its own.
+        let l1 = Arc::new(MemTier::new(TierId::L1, 5 * bb, arc));
+        let mut r = rig_kv("cost_aware", 8, Some(l1.clone()), None, clock, |kv| {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+        });
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        run(&mut r, &prompt);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        r.h.poll(&mut r.pool, &mut r.backend);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(l1.len(), 4);
+        let other = KvKey([99; 16]);
+        l1.put(
+            other,
+            crate::tier::TierBlockRef::Host(&vec![0u8; bb as usize]),
+        )
+        .unwrap();
+        l1.inject_full(u32::MAX);
+        let tick = |r: &mut Rig| {
+            r.clock.advance(LADDER_TICK_INTERVAL);
+            let now = r.clock.now_mono();
+            r.h.ladder_tick(&mut r.pool, PressureState::Orange, now);
+            // Every rewrite completes before the next tick.
+            for _ in 0..2 {
+                r.clock.advance(Duration::from_secs(1));
+                r.h.poll(&mut r.pool, &mut r.backend);
+            }
+            assert_eq!(r.h.ladder_in_flight().count(), 0);
+        };
+        tick(&mut r);
+        let first = r.h.stats().compressions;
+        assert_eq!(first, 4, "every copy is rewritten one rung down");
+        assert_eq!(l1.len(), 5, "each failed rewrite keeps its copy");
+        for _ in 0..5 {
+            tick(&mut r);
+        }
+        assert_eq!(
+            r.h.stats().compressions,
+            first,
+            "no resubmission without room"
+        );
+        assert_eq!(r.h.stats().ladder_backoff_skips, 5 * 4);
+        let backoffs =
+            r.h.metrics
+                .ladder_actions
+                .get_or_create(&[
+                    ("tier", "l1"),
+                    ("from", crate::tier::L0_FORMAT),
+                    ("to", "fp8_e4m3"),
+                    ("reason", LadderReason::NoRoomBackoff.as_str()),
+                ])
+                .get();
+        assert_eq!(backoffs, 1, "one back-off, however many rewrites failed");
+        // A copy leaves the tier: room may have freed, the ladder tries again.
+        l1.evict(&other).unwrap();
+        tick(&mut r);
+        assert_eq!(r.h.stats().compressions, first + 4, "rewrites resume");
+        tick(&mut r);
+        assert_eq!(
+            r.h.stats().compressions,
+            first + 4,
+            "and back off again on the next Full"
+        );
     }
 
     /// The reclaim handle answers from the published snapshot and the engine thread applies it.

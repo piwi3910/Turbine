@@ -37,6 +37,10 @@ struct MemState {
     bandwidth: f64,
     fail_reads: u32,
     fail_writes: u32,
+    /// Stores still to refuse with `Full` ([`MemTier::inject_full`]).
+    fail_full: u32,
+    /// [`KvTier::room_epoch`]: bumped whenever stored bytes are released.
+    room_epoch: u64,
     health: TierHealth,
     next_slot: u64,
 }
@@ -76,6 +80,8 @@ impl MemTier {
                 bandwidth: 8e9,
                 fail_reads: 0,
                 fail_writes: 0,
+                fail_full: 0,
+                room_epoch: 0,
                 health: TierHealth::new(None),
                 next_slot: 0,
             }),
@@ -96,6 +102,12 @@ impl MemTier {
     /// The next `n` `put` calls fail with `TierError::Io`.
     pub fn inject_write_errors(&self, n: u32) {
         self.lock().fail_writes = n;
+    }
+
+    /// The next `n` `put` / `put_as` calls find no room (`TierError::Full`), as a slab tier
+    /// without a free slot of the block's size does; the stored copy stays.
+    pub fn inject_full(&self, n: u32) {
+        self.lock().fail_full = n;
     }
 
     pub fn len(&self) -> usize {
@@ -126,6 +138,10 @@ impl MemTier {
             s.health.record_error(now);
             return Err(TierError::Io("injected write error".into()));
         }
+        if s.fail_full > 0 {
+            s.fail_full -= 1;
+            return Err(TierError::Full);
+        }
         let size = match self.nominal_block {
             Some(nominal) => logical.unwrap_or(nominal),
             None => bytes.len() as u64,
@@ -139,6 +155,9 @@ impl MemTier {
         } else {
             bytes.to_vec()
         };
+        if size < replaced {
+            s.room_epoch += 1;
+        }
         s.used = s.used - replaced + size;
         s.blocks.insert(
             key,
@@ -240,10 +259,15 @@ impl KvTier for MemTier {
         let mut s = self.lock();
         let b = s.blocks.remove(key).ok_or(TierError::Missing)?;
         s.used -= b.size;
+        s.room_epoch += 1;
         Ok(())
     }
 
     fn degraded(&self) -> bool {
         self.lock().health.is_degraded()
+    }
+
+    fn room_epoch(&self) -> u64 {
+        self.lock().room_epoch
     }
 }

@@ -1737,11 +1737,69 @@ fn soak_precondition_refuses_busy_gpu() {
         &["novanas", "--model", "/etc"][..],
         &["novanas", "--set"][..],
         &["novanas", "--set", "kv.ladder.enabled"][..],
+        &["novanas", "--shared-prefix-share", "2"][..],
+        &["novanas", "--shared-prefix-share", "half"][..],
+        &["novanas", "--shared-prefixes", "0"][..],
+        &["novanas", "--shared-prefix-words"][..],
     ] {
         let (out, called) = lab_script("overload-soak.sh", "soak-usage", args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
         assert_eq!(called, None, "{args:?}: contacted a host");
     }
+}
+
+/// The soak's workload flags (user decision "6b Task 16: ladder proof results — four open
+/// points", 4 A): share 0 adds nothing, so the Phase 3 soak sends the same requests as before;
+/// a share sends the shared-prefix flags turbine-bench reads, and the script passes the same
+/// list to the calibration and the overload. Breaks if share 0 changes the workload, a share
+/// is dropped, or only one of the two runs gets it.
+#[test]
+fn soak_load_flags_add_a_shared_prefix_share() {
+    let script = repo_root().join("scripts/overload-soak.sh");
+    let flags = |args: &str| {
+        let snippet = format!(
+            "SOAK_SOURCE_ONLY=1 source '{}' && soak_load_flags {args}",
+            script.display()
+        );
+        let (out, called) = bash_with_stubs(&["-c", &snippet], "soak-load-flags");
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(called, None);
+        stdout(&out)
+    };
+    assert_eq!(flags("0 128 1024"), "");
+    assert_eq!(flags("0.0 128 1024"), "");
+    assert_eq!(
+        flags("0.5 128 1024"),
+        "--shared-prefix-share\n0.5\n--shared-prefixes\n128\n--shared-prefix-words\n1024\n"
+    );
+    let text = fs::read_to_string(&script).unwrap();
+    let load = r#"${LOAD[@]+"${LOAD[@]}"}"#;
+    for step in ["calibrate.json", "timeline.jsonl"] {
+        let call = text
+            .split("\nbench ")
+            .skip(1)
+            .find(|c| c.contains(step))
+            .unwrap_or_else(|| panic!("no bench call writes {step}"));
+        assert!(
+            call.contains(load),
+            "the {step} run does not get the load flags"
+        );
+    }
+    // turbine-bench accepts what the script sends.
+    use clap::Parser;
+    let sent = flags("0.5 128 1024");
+    let mut argv = vec!["turbine-bench", "--url", "http://127.0.0.1:1"];
+    argv.extend(sent.lines());
+    let a =
+        turbine_bench::args::BenchArgs::try_parse_from(argv).expect("bench parses the soak flags");
+    assert_eq!(
+        (
+            a.shared_prefix_share,
+            a.shared_prefixes,
+            a.shared_prefix_words
+        ),
+        (0.5, 128, 1024)
+    );
 }
 
 /// P6b (p6b-survival): when `lab-serve.sh` refuses to start because another server already

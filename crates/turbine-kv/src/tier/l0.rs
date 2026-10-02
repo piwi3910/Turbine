@@ -110,4 +110,10 @@ impl KvTier for L0Tier {
     fn degraded(&self) -> bool {
         false
     }
+
+    /// L0 copies are never rewritten through the tier view (the ladder's L0 rung uses page
+    /// classes), so nothing waits on this.
+    fn room_epoch(&self) -> u64 {
+        0
+    }
 }

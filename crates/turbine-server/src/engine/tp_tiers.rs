@@ -697,6 +697,9 @@ impl KvTier for MirroredTier {
     fn degraded(&self) -> bool {
         self.local.degraded()
     }
+    fn room_epoch(&self) -> u64 {
+        self.local.room_epoch()
+    }
 }
 
 /// The transfer backend of one pump in `static` mode (module comment): starts each copy on the

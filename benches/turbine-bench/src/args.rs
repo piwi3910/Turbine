@@ -137,9 +137,21 @@ pub struct BenchArgs {
     /// Multi-turn: requests per session.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..))]
     pub turns: u32,
-    /// Multi-turn: words of the prefix every session shares (the system message).
+    /// Multi-turn: words of the prefix every session shares (the system message). Default
+    /// profile with `--shared-prefix-share`: words of each shared prefix.
     #[arg(long, default_value_t = 512)]
     pub shared_prefix_words: u32,
+    /// Default profile: this share (0..=1) of the requests, drawn per request from its own
+    /// seeded stream, starts with one of `--shared-prefixes` fixed prefixes of
+    /// `--shared-prefix-words` words (drawn uniformly), then `max(<its prompt words> −
+    /// <prefix words>, 16)` words of its own, so the server can reuse and demote the prefixes'
+    /// KV blocks under load (the ladder soak, user decision "6b Task 16: ladder proof results
+    /// — four open points", 4 A). The other requests and every length draw are unchanged.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_share)]
+    pub shared_prefix_share: f64,
+    /// Default profile with `--shared-prefix-share`: distinct shared prefixes.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=65536))]
+    pub shared_prefixes: u32,
     /// Multi-turn: seconds between turns, `<min>..<max>` (default: back to back).
     #[arg(long, default_value = "0..0")]
     pub think_time: ThinkTime,
@@ -156,6 +168,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         return Err(format!("duration must be > 0, got {s:?}"));
     }
     Ok(d)
+}
+
+/// A share between 0 and 1 inclusive.
+pub fn parse_share(s: &str) -> Result<f64, String> {
+    let r: f64 = s.parse().map_err(|e| format!("bad share {s:?}: {e}"))?;
+    if !(0.0..=1.0).contains(&r) {
+        return Err(format!("share must be between 0 and 1, got {s:?}"));
+    }
+    Ok(r)
 }
 
 /// A finite request rate > 0 (req/s).
