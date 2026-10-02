@@ -59,6 +59,15 @@ sides. Everything below is provisional until the first run shows the real token 
    applies; run the same command (the same `--filler-requests 8`, harmless here, so the pair matches) against the `turbine-bf16-sp.json`
    baseline and `eval-compare` it.
 5. Ladder (Tasks 16, 18): use the ladder config's small tiers, the same filler flags, and compare with a BF16-KV run on the same variant.
+   The Task 16 form (spec S-8 "Ladder variant", measured 2026-10-02 on `p6b-t16` 25e8dc2): both sides
+   `scripts/lab/phase6-novanas-ladder.yaml --set kv.gpu.max_bytes=4GiB --set kv.cpu.max_bytes=4GiB --set kv.nvme.enabled=false`, the
+   baseline also `--set kv.ladder.enabled=false`; the eval adds `--filler-concurrency 16 --fillers-settle` (fillers rejected 503 / 429 are
+   resent; after the fillers it waits for GREEN and sends the next item alone). Before the stale-pressure fix (25e8dc2) the first item after
+   GREEN still planned `l0_pressure` and recomputed an exact L0 copy, so nothing lossy was reused. Each server must have served only its eval:
+   the sum of `turbine_requests_total` is 232 + `filler_retries` (resends and SURVIVAL requeues inflate `turbine_kv_prompt_tokens_total`, so
+   the 726,723 check does not apply). Three runs per side, judged over the nine pairs (median drop ≤ 0.01, no McNemar p < 0.05). Reports:
+   `tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp-r<i>.json`, `turbine-ladder-off-sp-r<i>.json`, `turbine-ladder-sp-r<i>-paired.json`
+   and the nine-pair summary `turbine-ladder-sp-paired.json`.
 
 ## Open / for the next builder
 

@@ -1,0 +1,21 @@
+{
+  "baseline": "tests/eval/llama-3.2-3b-instruct/turbine-ladder-off-sp-r2.json",
+  "candidate": "tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp-r2.json",
+  "baseline_model": "meta-llama/Llama-3.2-3B-Instruct",
+  "candidate_model": "meta-llama/Llama-3.2-3B-Instruct",
+  "n": 200,
+  "baseline_correct": 155,
+  "candidate_correct": 153,
+  "baseline_accuracy": 0.775,
+  "candidate_accuracy": 0.765,
+  "drop": 0.01,
+  "lost": 9,
+  "gained": 7,
+  "mcnemar_chi2": 0.062,
+  "mcnemar_p": 0.803,
+  "mcnemar_exact_p": 0.804,
+  "drop_ci95": [-0.0292, 0.0492],
+  "max_drop": 0.01,
+  "verdict": "PASS",
+  "ci_entirely_above_bound": false
+}
