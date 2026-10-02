@@ -1,6 +1,6 @@
-# Draft (not filed): A synchronous hipMemset on one thread invalidates a thread-local capture on a non-blocking stream of another thread
+# Filed: A synchronous hipMemset on one thread invalidates a thread-local capture on a non-blocking stream of another thread
 
-Target: ROCm/rocm-systems (clr / hipamd). Status: draft for review, not filed.
+Target: ROCm/rocm-systems (clr / hipamd). Status: filed 2026-10-02 as https://github.com/ROCm/rocm-systems/issues/12677 (user said file).
 
 ## Environment
 
@@ -48,7 +48,7 @@ a[0] after one replay: 0 (expected 2)
 
 - `projects/clr/hipamd/src/hip_internal.hpp`, `INVALIDATE_ALL_CAPTURING_AND_RETURN` and `CHECK_STREAM_CAPTURING`
   (around line 274): "Sync APIs (hipMemset, hipMemcpy, etc.) cannot be called when stream capture is active for any
-  capture mode (Global, ThreadLocal, or Relaxed)". If `g_allCapturingStreams` is non-empty, the macro marks *every*
+  capture mode (Global, ThreadLocal, or Relaxed)". If `g_allCapturingStreams` is non-empty, the macro marks _every_
   capturing stream of the process invalidated and returns `hipErrorStreamCaptureImplicit`. It does not check the
   calling thread, the capture mode or the stream's non-blocking flag.
 - `projects/clr/hipamd/src/hip_memory.cpp`: `hipMemset_common` (line 3388) and `hipMemcpy_common` (line 868) start

@@ -2974,3 +2974,5 @@ tokens short of `l0`; scoring that block like its history gives exact parity in 
    - B) Rerun and note it; investigate later
 
 **Decision (user, 2026-10-02): 1 A, 2 A.** Score the lossless last block like its history for eviction order, rerun both A/Bs, flip tq4 if they hold; investigate the step-time drift signal at startup now.
+
+**Filed (user, 2026-10-02):** https://github.com/ROCm/rocm-systems/issues/12677 (HIP) and https://github.com/ROCm/rocm-libraries/issues/12895 (hipBLASLt), cross-linked.
