@@ -563,8 +563,9 @@ impl KvOrchestrator {
             l1_seen,
             l2_seen,
             Arc::clone(&s.clock),
-            s.metrics,
+            s.metrics.clone(),
         );
+        let metrics = s.metrics;
         let io_threads = s.cfg.nvme.io_threads.max(1) as usize;
         // Every I/O job belongs to an in-flight ticket, so this bound is never reached; the
         // L2 tier bounds concurrent I/O itself (`kv.nvme.max_queue_depth`).
@@ -577,6 +578,7 @@ impl KvOrchestrator {
             block_bytes as usize,
         );
         backend.set_host_codec(host_codec);
+        backend.set_metrics(metrics);
         let (tx, commands) = mpsc::channel(s.cfg.prefetch.max_queue.max(1) as usize);
         let mut o = KvOrchestrator {
             h,
@@ -1796,6 +1798,11 @@ pub fn transcode_staging_bytes(cfg: &KvConfig, layout: &KvLayout) -> u64 {
 /// copies.
 pub const LADDER_LANES: usize = 2;
 
+/// The `reason` label of a ladder rewrite skipped because its tier had no slot of the new
+/// format (`turbine_kv_ladder_actions_total`, P6b S-6 edge case "`reason = \"no_room\"`"): counted
+/// server-side on the failed store, next to `turbine_kv::metrics::LadderReason`'s labels.
+pub const LADDER_NO_ROOM: &str = "no_room";
+
 /// The kernel library's ABI v2.11 KV transcode for the demotion and promotion paths (P6b S-1):
 /// encodes L0 pages into a device staging slot (one slot per copy in flight,
 /// `DEMOTION_INFLIGHT` of them, each the largest encoded block of the configured tier formats)
@@ -2022,6 +2029,9 @@ pub struct CopyStreamBackend {
     /// The device transcode of lower-tier copies (P6b S-1), when the library has one and the
     /// staging slots could be allocated.
     gpu: Option<DeviceTranscode>,
+    /// Where a ladder rewrite that found no room in its tier is counted (`no_room`, P6b S-6;
+    /// [`CopyStreamBackend::count_no_room`]).
+    metrics: Option<KvMetrics>,
 }
 
 impl CopyStreamBackend {
@@ -2059,6 +2069,7 @@ impl CopyStreamBackend {
             clocks: HashMap::new(),
             took: HashMap::new(),
             gpu: None,
+            metrics: None,
         }
     }
 
@@ -2187,6 +2198,41 @@ impl CopyStreamBackend {
     /// (P6b S-1); without one such copies fail (and the hierarchy recomputes).
     pub fn set_host_codec(&mut self, codec: HostCodec) {
         self.io.host_codec = Some(Arc::new(codec));
+    }
+
+    /// The KV metrics a ladder rewrite's `no_room` skip is counted in.
+    pub fn set_metrics(&mut self, metrics: KvMetrics) {
+        self.metrics = Some(metrics);
+    }
+
+    /// A ladder rewrite (P6b S-6) that completed with `Full`: its tier had no slot of the new
+    /// format's size (a slab still holds blocks of an old size), so the copy keeps its format
+    /// and the rewrite is skipped. Counted as `turbine_kv_ladder_actions_total{reason="no_room"}`
+    /// next to the action the hierarchy counted when it submitted the rewrite (user decision "6b
+    /// Task 16: ladder enablement on the server — four points", 3 A); never a request failure.
+    fn count_no_room(&self, t: &TransferTicket, e: &TierError) {
+        if t.req.purpose != TransferPurpose::Compress || !matches!(e, TierError::Full) {
+            return;
+        }
+        let tier = t.req.path.from();
+        if let Some(m) = &self.metrics {
+            m.ladder_actions
+                .get_or_create(&[
+                    ("tier", tier.as_str()),
+                    ("from", t.req.codec.from),
+                    ("to", t.req.codec.to),
+                    ("reason", LADDER_NO_ROOM),
+                ])
+                .inc();
+        }
+        tracing::debug!(
+            event = "kv_ladder",
+            tier = tier.as_str(),
+            from = t.req.codec.from,
+            to = t.req.codec.to,
+            reason = LADDER_NO_ROOM,
+            "ladder rewrite skipped: no slot of the new format in the tier"
+        );
     }
 
     /// Every shard has a copy stream (L1 needs one on every rank).
@@ -3132,7 +3178,9 @@ impl CopyStreamBackend {
 impl TransferBackend for CopyStreamBackend {
     fn start(&mut self, t: &TransferTicket) -> Result<(), TierError> {
         let mut clock = CopyClock::new(Instant::now());
-        let job = self.start_job(t)?;
+        let job = self
+            .start_job(t)
+            .inspect_err(|e| self.count_no_room(t, e))?;
         if matches!(job, Job::Done(_)) {
             // Synchronous copies: done before `start_job` returned.
             clock.stage_done("sync", Some(Instant::now()), Instant::now());
@@ -3148,11 +3196,15 @@ impl TransferBackend for CopyStreamBackend {
             Ok(job) => job,
             Err(e) => {
                 self.clocks.remove(&t.id);
+                self.count_no_room(t, &e);
                 return Err(e);
             }
         };
         match advanced {
             Job::Done(r) => {
+                if let Err(e) = &r {
+                    self.count_no_room(t, e);
+                }
                 let clock = self.clocks.remove(&t.id);
                 if r.is_ok()
                     && let Some(clock) = clock
@@ -3954,6 +4006,130 @@ mod tests {
         }
         finish(&mut o, &t).unwrap();
         assert_eq!(l2.used_bytes(), codec.to_bytes, "L2 holds the fp8 copy");
+    }
+
+    /// A ladder rewrite whose tier has no room for the new format (P6b S-6 edge case, user
+    /// decision "6b Task 16: ladder enablement on the server — four points", 3 A): the store's
+    /// `Full` completes the ticket with that error, the series
+    /// `turbine_kv_ladder_actions_total{tier,from,to,reason="no_room"}` counts it and every lane
+    /// comes back. Breaks if the skip is not counted, counted under another label, or counted
+    /// for a copy that is not a ladder rewrite.
+    #[test]
+    fn a_rewrite_without_room_counts_no_room() {
+        let dir = TempDir::new("turbine-kv-ladder-no-room");
+        let mut kv = kv_config(&dir, false);
+        // One L2 slab (a slab file is its slots plus a header): once it holds `l0` copies of
+        // other blocks, no slab is left for the `fp8_e4m3` size.
+        kv.nvme.max_bytes = ByteSize(kv.nvme.slab_bytes.0 * 3 / 2);
+        kv.ladder.enabled = true;
+        kv.ladder.l0 = false;
+        kv.ladder.max_format = ModuleName::new("fp8_e4m3").unwrap();
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let format = kv_format(layout());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mem, mut pool) = rank(0);
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem, 0),
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics: metrics.clone(),
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        assert!(o.enable_device_transcode(&kv, turbine_kernels::cpu_reference_provider(), &mem));
+        let r = (mem, pool);
+        let bb = layout().block_bytes();
+        let key = KvKey([5; 16]);
+        let block = pattern(0, 4, bb as usize);
+        write_block(&r, 4, &block);
+        run(&mut o, 1, TransferPath::L0ToL2, key, 4, 0).unwrap();
+        // A second `l0` copy keeps the slab at the `l0` size.
+        write_block(&r, 6, &pattern(0, 6, bb as usize));
+        run(&mut o, 4, TransferPath::L0ToL2, KvKey([7; 16]), 6, 0).unwrap();
+        let no_room = |m: &KvMetrics, reason: &'static str| {
+            m.ladder_actions
+                .get_or_create(&[
+                    ("tier", "l2"),
+                    ("from", L0_FORMAT),
+                    ("to", "fp8_e4m3"),
+                    ("reason", reason),
+                ])
+                .get()
+        };
+        assert_eq!(no_room(&metrics, "no_room"), 0);
+        let codec = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb,
+            to: "fp8_e4m3",
+            to_bytes: encoded_bytes("fp8_e4m3", &layout()).unwrap() as u64,
+        };
+        let mut t = ticket(2, TransferPath::L2ToL0, key, (0, 0), codec);
+        t.req.purpose = TransferPurpose::Compress;
+        o.backend.start(&t).unwrap();
+        assert_eq!(finish(&mut o, &t), Err(TierError::Full), "no slab for fp8");
+        assert_eq!(no_room(&metrics, "no_room"), 1, "the skip is counted");
+        // L2's store frees a replaced copy's slot before it looks for one of the new size, so
+        // the failed rewrite lost the `l0` copy (the hierarchy's `on_copy_failed` then removes
+        // its location); the other block's copy is untouched.
+        assert!(
+            !l2.contains(&key),
+            "L2 drops the replaced copy before the Full"
+        );
+        assert!(l2.contains(&KvKey([7; 16])));
+        assert_eq!(
+            o.backend.gpu.as_ref().map(|g| g.free_lanes.len()),
+            Some(LADDER_LANES),
+            "every lane is back"
+        );
+
+        // A demotion that finds no room is not a ladder skip.
+        write_block(&r, 5, &pattern(0, 5, bb as usize));
+        let demote = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb,
+            ..codec
+        };
+        assert_eq!(
+            run_as(
+                &mut o,
+                3,
+                TransferPath::L0ToL2,
+                KvKey([6; 16]),
+                (5, 0),
+                demote
+            ),
+            Err(TierError::Full),
+            "an fp8 demotion finds no room either"
+        );
+        assert_eq!(no_room(&metrics, "no_room"), 1, "only rewrites count");
+        let from_l0 = metrics
+            .ladder_actions
+            .get_or_create(&[
+                ("tier", "l0"),
+                ("from", L0_FORMAT),
+                ("to", "fp8_e4m3"),
+                ("reason", LADDER_NO_ROOM),
+            ])
+            .get();
+        assert_eq!(from_l0, 0, "a demotion is not a ladder skip");
     }
 
     /// The bytes of the whole tables and of the four codebooks one transcode call received.

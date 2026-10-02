@@ -145,6 +145,7 @@ pub struct KvLadderConfig {
     /// Whether L0 joins the ladder (S-7); false keeps it in L1/L2.
     pub l0: bool,
     /// The lossiest rung: a lossy codec of the `kv_format` registry (checked at startup).
+    /// Default `tq4`: `tq2` failed its lower-tier GSM8K gate (user decision 2026-10-02).
     pub max_format: ModuleName,
     /// Tier fill above which an upper tier compresses (and the floor may drop); 0.5 < v ≤ 1.0.
     pub high_water: f64,
@@ -158,7 +159,7 @@ impl Default for KvLadderConfig {
         KvLadderConfig {
             enabled: false,
             l0: true,
-            max_format: ModuleName::fixed("tq2"),
+            max_format: ModuleName::fixed("tq4"),
             high_water: 0.95,
             low_water: 0.85,
         }

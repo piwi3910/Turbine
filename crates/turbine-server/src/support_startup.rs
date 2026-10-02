@@ -583,7 +583,7 @@ mod tests {
 
         let mut ladder = config("hip", llama.path());
         ladder.kv.ladder.enabled = true;
-        // The default max_format is a TurboQuant codec: experimental, no longer refused.
+        // The default max_format (`tq4`) is a TurboQuant codec: experimental, no longer refused.
         assert!(before_discovery(&ladder).is_ok());
         ladder.kv.ladder.max_format = name("l0");
         let err = before_discovery(&ladder).unwrap_err();

@@ -1385,7 +1385,7 @@ fn phase6_keys() {
     assert_eq!(d.lossy_penalty_override("tq4"), None);
     assert!(!d.ladder.enabled);
     assert!(d.ladder.l0);
-    assert_eq!(d.ladder.max_format.as_str(), "tq2");
+    assert_eq!(d.ladder.max_format.as_str(), "tq4");
     assert_eq!(d.ladder.high_water, 0.95);
     assert_eq!(d.ladder.low_water, 0.85);
 

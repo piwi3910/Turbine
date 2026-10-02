@@ -88,14 +88,15 @@ kv:
   # such as {tq4: 0.7} overrides one codec.
   lossy_penalty: null
   # Pressure-driven compression ladder (l0 -> fp8_e4m3 -> tq4 -> tq2 -> evict), off by default;
-  # needs L1 or L2 enabled. Enabled, it exits 1 until its kernels land: kv_tq_unavailable
-  # with l0: true (6b Task 12), kv_transcode_unavailable with l0: false (6b Task 5).
+  # needs L1 or L2 enabled. With l0: false its L1/L2 rewrites run on the device transcode
+  # (a library without ABI v2.11 exits 1, kv_transcode_unavailable); l0: true exits 1
+  # (kv_tq_unavailable) until the ladder's L0 step (6b Task 17).
   ladder:
     enabled: false
     # true: L0 joins the ladder (needs the v2.10 mixed-format paged attention).
     l0: true
-    # The lossiest rung, a lossy codec.
-    max_format: tq2
+    # The lossiest rung, a lossy codec (tq2 failed its lower-tier quality gate).
+    max_format: tq4
     # An upper tier compresses above this fill (0.5 < high_water <= 1.0).
     high_water: 0.95
     # At YELLOW the lowest tier compresses only until its fill is back to this
