@@ -6288,8 +6288,8 @@ impl TqTables {
 /// (layer, K or V) a different scale, outliers, and per block one all-zero vector (norm 0, the
 /// codec's `inv = 0` branch), one vector of a single non-zero coordinate, one constant vector
 /// (a rotation onto a single coordinate), one vector of large values, and one ordinary vector
-/// holding a 2^-50 and a subnormal element (the device norm's sequential fallback). Non-finite
-/// values are
+/// holding a 2^-50 and a subnormal element (squares far below the rest of its norm's sum).
+/// Non-finite values are
 /// outside the TurboQuant contract (a NaN's payload is not pinned by either side).
 fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8>> {
     let d = cfg.head_dim as usize;
@@ -6315,8 +6315,8 @@ fn tq_pages(rng: &mut Rng, cfg: &KvTranscodeConfig, blocks: usize) -> Vec<Vec<u8
                     v[flat..flat + d].fill(0.75);
                     let big = pick(3);
                     v[big..big + d].iter_mut().for_each(|x| *x *= 4096.0);
-                    // A tiny element and a subnormal one among ordinary values: the device
-                    // norm's fast path refuses them and takes the codec's sequential loop.
+                    // A tiny element and a subnormal one among ordinary values: squares far
+                    // below the rest of the F64 sum of squares (the norm's rounding).
                     let tiny = pick(4) + (b + layer) % (d - 1);
                     v[tiny] = 2f32.powi(-50);
                     v[tiny + 1] = 1e-39;

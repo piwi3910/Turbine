@@ -72,13 +72,16 @@ __device__ inline void fwht(float (&v)[kPer], int lane) {
   }
 }
 
-// sqrt of the F64 sum of squares of row[0 .. 128) in order, to F32.
+// sqrt of the F64 sum of squares of row[0 .. 128) in order, to F32. Each
+// step is one F64 fused multiply-add: the square of an F32 value is exact in
+// F64 (48 significant bits), so fma(v, v, acc) rounds acc + v * v once, as
+// the codec's separate multiply and add do -- bit for bit the same sum, at
+// half the F64 instructions.
 __device__ inline float norm_of(const float *row) {
-#pragma clang fp contract(off)
   double acc = 0.0;
   for (int j = 0; j < kDim; ++j) {
     const double v = static_cast<double>(row[j]);
-    acc = acc + v * v;
+    acc = __builtin_fma(v, v, acc);
   }
   return static_cast<float>(sqrt(acc));
 }
@@ -88,61 +91,6 @@ __device__ inline float norm_of(const float *row) {
 __device__ inline float midpoint(const float *cb, int i) {
 #pragma clang fp contract(off)
   return (cb[i] + cb[i + 1]) * 0.5f;
-}
-
-// norm_of(row) without its 128-step F64 chain wherever that is provably the
-// same F32 (bit for bit): the squares, exact in F32 for BF16 inputs (checked
-// with a fused multiply-add), are summed in double-F32 (TwoSum, then a
-// Fast2Sum renormalisation; relative error <= 128 * 2^-47 = 2^-40), and the
-// codec's sequential F64 sum S_seq lies within 2^-46 of the exact sum. r =
-// f32(sqrt(S)) of that estimate S is taken when every sum within a relative
-// 2^-35 of S rounds to r: when S * (1 - 2^-35) lies above m_lo^2 and S * (1 +
-// 2^-35) below m_hi^2, m_lo and m_hi being the midpoints between r and its F32
-// neighbours (exact in F64, and so are their squares), the double sqrt of any
-// such sum lies strictly between the midpoints, so it rounds to r. Otherwise
-// (about 2^-11 of vectors), a square that is not exact, or an element
-// outside 2^-40 <= |x| < 2^60 other than 0, the sequential loop. A row of
-// zeros gives 0 either way.
-__device__ inline float norm_fast(const float *row) {
-#pragma clang fp contract(off)
-  float hi = 0.0f;
-  float lo = 0.0f;
-  bool exact = true;
-  for (int j = 0; j < kDim; ++j) {
-    const float x = row[j];
-    const float p = x * x;
-    // Exactness is only trusted where neither the square nor its residual
-    // can underflow or overflow: 0, or 2^-40 <= |x| < 2^60 (NaN fails).
-    const float ax = __builtin_fabsf(x);
-    exact = exact && (x == 0.0f || (ax >= 0x1p-40f && ax < 0x1p60f)) &&
-            __builtin_fmaf(x, x, -p) == 0.0f;
-    // (s, e) = TwoSum(hi, p); (hi, lo) = Fast2Sum(s, lo + e).
-    const float s = hi + p;
-    const float bb = s - hi;
-    const float e = (hi - (s - bb)) + (p - bb);
-    const float v = lo + e;
-    hi = s + v;
-    lo = v - (hi - s);
-  }
-  const double sum = static_cast<double>(hi) + static_cast<double>(lo);
-  if (sum == 0.0 && exact)
-    return 0.0f;
-  const float r = static_cast<float>(sqrt(sum));
-  if (exact && sum > 0.0 && __builtin_isfinite(sum) && r > 0.0f &&
-      __builtin_isfinite(r)) {
-    constexpr double kWindow = 0x1p-35;
-    // r's F32 neighbours (r is positive and finite; above the largest F32
-    // comes infinity).
-    const uint32_t bits = __builtin_bit_cast(uint32_t, r);
-    const float below = __builtin_bit_cast(float, bits - 1u);
-    const float above = __builtin_bit_cast(float, bits + 1u);
-    const double m_lo = (static_cast<double>(below) + r) * 0.5;
-    const double m_hi = (static_cast<double>(r) + above) * 0.5;
-    if (__builtin_isfinite(m_hi) && sum * (1.0 - kWindow) > m_lo * m_lo &&
-        sum * (1.0 + kWindow) < m_hi * m_hi)
-      return r;
-  }
-  return norm_of(row);
 }
 
 // Index of the nearest centroid of an ascending codebook of N entries, given
@@ -196,9 +144,10 @@ template <int KB, int VB> struct EncodeLds {
 
 // Encodes nt <= kChunk token vectors of one KV head (head_tables: its K signs
 // then V signs) that the caller staged in lds.xs[kind][tok][0 .. 128) (kind
-// 0 = K, 1 = V), with lds.cbk / lds.cbv loaded, followed by a barrier. Every
-// byte of record tok is passed to put(tok, byte, value), in byte order per
-// token, the threads of the workgroup sharing the bytes. Ends with a barrier.
+// 0 = K, 1 = V), with lds.cbk / lds.cbv loaded, followed by a barrier. Record
+// tok is passed to put(tok, byte, word) four bytes at a time (word holds
+// bytes byte .. byte + 3, the first in its low bits; byte a multiple of 4),
+// the threads of the workgroup sharing the words. Ends with a barrier.
 // blockDim.x == kThreads, every thread calls it.
 template <int KB, int VB, typename Put>
 __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
@@ -212,7 +161,7 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
   if (tid < 2 * kChunk && tid % kChunk < nt) {
     const int kind = tid / kChunk;
     const int tok = tid % kChunk;
-    const float n = norm_fast(lds.xs[kind][tok]);
+    const float n = norm_of(lds.xs[kind][tok]);
     lds.norms[kind][tok] = n;
     lds.norm_bits[kind][tok] = f32_to_bf16(n).bits;
   }
@@ -246,23 +195,42 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
     }
   }
   __syncthreads();
-  __syncthreads();
-  for (int i = tid; i < nt * R::kBytes; i += kThreads) {
-    const int tok = i / R::kBytes;
-    const int o = i % R::kBytes;
-    uint8_t v = 0;
-    if (o < R::kKNorm) {
-      v = packed_byte<KB>(lds.codes[0][tok], o);
-    } else if (o < R::kVCodes) {
-      v = static_cast<uint8_t>(lds.norm_bits[0][tok] >> (8 * (o - R::kKNorm)));
-    } else if (o < R::kVNorm) {
-      v = packed_byte<VB>(lds.codes[1][tok], o - R::kVCodes);
-    } else if (o < R::kVNorm + 2) {
-      v = static_cast<uint8_t>(lds.norm_bits[1][tok] >> (8 * (o - R::kVNorm)));
+  constexpr int kWords = R::kBytes / 4;
+  for (int i = tid; i < nt * kWords; i += kThreads) {
+    const int tok = i / kWords;
+    const int o0 = (i % kWords) * 4;
+    uint32_t word = 0;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+      const int o = o0 + b;
+      uint8_t v = 0;
+      if (o < R::kKNorm) {
+        v = packed_byte<KB>(lds.codes[0][tok], o);
+      } else if (o < R::kVCodes) {
+        v = static_cast<uint8_t>(lds.norm_bits[0][tok] >>
+                                 (8 * (o - R::kKNorm)));
+      } else if (o < R::kVNorm) {
+        v = packed_byte<VB>(lds.codes[1][tok], o - R::kVCodes);
+      } else if (o < R::kVNorm + 2) {
+        v = static_cast<uint8_t>(lds.norm_bits[1][tok] >>
+                                 (8 * (o - R::kVNorm)));
+      }
+      word |= static_cast<uint32_t>(v) << (8 * b);
     }
-    put(tok, o, v);
+    put(tok, o0, word);
   }
   __syncthreads();
+}
+
+// Stores a record word of encode_chunk at dst (4-byte aligned or not).
+__device__ inline void store_word(uint8_t *dst, uint32_t word) {
+  if ((reinterpret_cast<uintptr_t>(dst) & 3u) == 0) {
+    *reinterpret_cast<uint32_t *>(dst) = word;
+  } else {
+#pragma unroll
+    for (int b = 0; b < 4; ++b)
+      dst[b] = static_cast<uint8_t>(word >> (8 * b));
+  }
 }
 
 // LDS of the chunked decode.
