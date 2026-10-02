@@ -871,11 +871,21 @@ const MT_TURNS: u32 = 8;
 /// L1 in `format` that holds all of them. Idle histories leave L0 leaf-first, a few blocks at a
 /// time. Returns the cached and the lossy-cached prompt tokens over all requests.
 fn lossy_multi_turn_run(format: &str, seed: u64) -> (u64, u64) {
+    lossy_multi_turn_run_at(format, seed, 64, PressureState::Yellow)
+}
+
+/// [`lossy_multi_turn_run`] over an `l0_blocks`-block L0 at `pressure`.
+fn lossy_multi_turn_run_at(
+    format: &str,
+    seed: u64,
+    l0_blocks: u32,
+    pressure: PressureState,
+) -> (u64, u64) {
     let mut kv = KvConfig::default();
     kv.cpu.format = ModuleName::new(format).unwrap();
-    let mut s = setup(64, 1024, 0, kv, MemoryKind::Dedicated);
+    let mut s = setup(l0_blocks, 1024, 0, kv, MemoryKind::Dedicated);
     let d = &mut s.driver;
-    d.set_pressure(PressureState::Yellow);
+    d.set_pressure(pressure);
     let prefix: Vec<u32> = (0..96).collect();
     let mut history: Vec<Vec<u32>> = vec![prefix; MT_SESSIONS as usize];
     let mut turns = vec![0u32; MT_SESSIONS as usize];
@@ -941,6 +951,31 @@ fn lossy_multi_turn_matches_l0_reuse() {
             tq4 >= l0,
             "seed {seed}: tq4 cached {tq4} prompt tokens, l0 {l0}"
         );
+    }
+}
+
+/// The OLMoE multi-turn shortfall left after the lossy-chain fix (decision "6b: OLMoE tq4 —
+/// lossless last block in eviction order", 1 A): at GREEN, where L0 is reclaimed only on
+/// demand, a sequence's lossless last block was scored at the L0-format bytes it is demoted at,
+/// about 3.5× its history's `tq4` retrieval cost, so it outranked every history block and whole
+/// histories of other sessions drained first (tq4 up to 944 tokens short of `l0`). Scored like
+/// its history for eviction order, `tq4` caches as many prompt tokens as `l0` on every L0 size
+/// and seed. Breaks if the last block's eviction score prices it at its own L0-format bytes.
+#[test]
+fn lossy_multi_turn_green_matches_l0_reuse() {
+    for l0_blocks in [64u32, 96, 128, 192] {
+        for seed in [1u64, 2, 4] {
+            let (l0, _) = lossy_multi_turn_run_at("l0", seed, l0_blocks, PressureState::Green);
+            let (tq4, tq4_lossy) =
+                lossy_multi_turn_run_at("tq4", seed, l0_blocks, PressureState::Green);
+            eprintln!(
+                "L0 {l0_blocks} seed {seed}: l0 cached {l0}; tq4 cached {tq4} (lossy {tq4_lossy})"
+            );
+            assert!(
+                tq4 >= l0,
+                "L0 {l0_blocks} seed {seed}: tq4 cached {tq4} prompt tokens, l0 {l0}"
+            );
+        }
     }
 }
 
