@@ -788,6 +788,7 @@ mod tests {
                         context_tokens: ctx,
                         secs: step,
                         at: clock.now_mono(),
+                        copy_overlap: false,
                     },
                     calm,
                 );

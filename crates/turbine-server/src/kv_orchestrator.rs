@@ -363,6 +363,25 @@ pub struct KvStart<'a> {
     pub kv_scales: Option<KvScaleHashes>,
 }
 
+/// What the engine knows about KV tier copies at one instant, to tell whether a step overlapped
+/// one (decision "6b: step-time drift during KV promotions", C). Copies start and finish only
+/// in [`KvOrchestrator::poll`] (the transfer pump), so a step overlapped a copy when one was in
+/// flight at its launch or at its collection, or when a poll in between saw one (a short copy
+/// started and finished while an overlapped or pipelined step ran). Every transfer-engine job
+/// counts: promotions, demotions and device rewrites all share the copy stream and PCIe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyMark {
+    busy_polls: u64,
+    in_flight: bool,
+}
+
+impl CopyMark {
+    /// Whether a step launched at `self` and collected at `end` overlapped a copy.
+    pub fn overlapped(self, end: CopyMark) -> bool {
+        self.in_flight || end.in_flight || end.busy_polls != self.busy_polls
+    }
+}
+
 /// Owns the hierarchy and its copy backend on the engine thread (module comment).
 pub struct KvOrchestrator {
     h: KvHierarchy,
@@ -382,6 +401,8 @@ pub struct KvOrchestrator {
     /// Requests whose second attach ([`KvOrchestrator::attach_again`]) waits for promotions:
     /// their cached tokens were counted by the first attach.
     reattaching: std::collections::HashSet<RequestId>,
+    /// Polls that found or left a copy in flight ([`CopyMark`]).
+    busy_polls: u64,
 }
 
 impl KvOrchestrator {
@@ -596,6 +617,7 @@ impl KvOrchestrator {
             remote,
             l0_lossy: layout.dtype.tq_record_bytes().map(|_| s.metrics),
             reattaching: Default::default(),
+            busy_polls: 0,
         };
         o.calibrate(
             pool,
@@ -652,6 +674,19 @@ impl KvOrchestrator {
     /// No copy is queued or in flight.
     pub fn transfers_idle(&self) -> bool {
         self.h.transfer().is_idle()
+    }
+
+    /// Copies in flight now (started, not yet seen complete by a poll).
+    fn copies_in_flight(&self) -> bool {
+        self.h.transfer().inflight_bytes() > 0
+    }
+
+    /// The copy state now, for [`CopyMark::overlapped`].
+    pub fn copy_mark(&self) -> CopyMark {
+        CopyMark {
+            busy_polls: self.busy_polls,
+            in_flight: self.copies_in_flight(),
+        }
     }
 
     /// Admission-time prefix match of a request (P4 S-3).
@@ -720,6 +755,7 @@ impl KvOrchestrator {
 
     /// Transfer completions: requests whose promotions all landed, with their prefixes.
     pub fn poll(&mut self, pool: &mut BlockPool) -> Vec<(RequestId, PrefixAttach)> {
+        let busy_before = self.copies_in_flight();
         let mut ready = match &mut self.remote {
             None => self.h.poll(pool, &mut self.backend),
             Some(r) => {
@@ -729,6 +765,9 @@ impl KvOrchestrator {
                 ready
             }
         };
+        if busy_before || self.copies_in_flight() {
+            self.busy_polls += 1;
+        }
         if self.l0_lossy.is_some() {
             for (id, a) in &mut ready {
                 let first = !self.reattaching.remove(id);
@@ -4768,6 +4807,28 @@ mod tests {
     }
 
     /// A worker pool that differs from the leader's is refused at startup.
+    /// [`CopyMark::overlapped`]: a step overlapped a copy when one was in flight at its launch
+    /// or collection, or a poll between them saw one; not when every poll was idle. Catches a
+    /// test that misses a copy started and finished while an overlapped step ran, or one that
+    /// flags every step.
+    #[test]
+    fn copy_mark_overlap() {
+        let idle = CopyMark::default();
+        let busy = CopyMark {
+            in_flight: true,
+            ..idle
+        };
+        let polled = CopyMark {
+            busy_polls: 1,
+            ..idle
+        };
+        assert!(!idle.overlapped(idle), "no copy anywhere");
+        assert!(busy.overlapped(idle), "in flight at launch");
+        assert!(idle.overlapped(busy), "in flight at collection");
+        assert!(idle.overlapped(polled), "started and finished in between");
+        assert!(!polled.overlapped(polled), "earlier copies, idle since");
+    }
+
     #[test]
     fn mismatched_shard_pool_is_refused() {
         let dir = TempDir::new("turbine-kv-shards-mismatch");

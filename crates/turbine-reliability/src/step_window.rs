@@ -14,6 +14,12 @@
 //! is happening. Above GREEN no shape learns a baseline, so once the judged shapes stop running
 //! (a RED queue admits one request at a time, at contexts never decoded while calm) the window
 //! would otherwise keep its last spike and hold the level for as long as anything runs.
+//!
+//! A decode step that overlapped an in-flight KV tier copy ([`StepSample::copy_overlap`]) is
+//! neither judged nor learned (decision "6b: step-time drift during KV promotions", C): the
+//! hierarchy's own copies slow decode 1.5–2.4× (OLMoE `l0` promotions), and drift is meant to
+//! measure the device, not our transfers. Such steps still count for throughput (the engine's
+//! step EWMAs); the window counts them ([`DecodeStepWindow::kv_copy_excluded`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -41,6 +47,9 @@ pub struct StepSample {
     pub secs: f64,
     /// When the step completed (the engine's monotonic clock).
     pub at: Duration,
+    /// A KV tier copy was in flight at some point while the step ran (the engine's test:
+    /// `CopyMark` in `turbine-server`'s KV orchestrator).
+    pub copy_overlap: bool,
 }
 
 /// (rows, context bucket): context in half-powers of two of 1,024 tokens.
@@ -63,6 +72,7 @@ struct Baseline {
 pub struct DecodeStepWindow {
     steps: VecDeque<(Duration, f64)>,
     baselines: HashMap<Bucket, Baseline>,
+    kv_copy_excluded: u64,
 }
 
 impl DecodeStepWindow {
@@ -70,15 +80,21 @@ impl DecodeStepWindow {
         DecodeStepWindow {
             steps: VecDeque::with_capacity(STEP_WINDOW),
             baselines: HashMap::new(),
+            kv_copy_excluded: 0,
         }
     }
 
     /// One executed iteration. Iterations with a prefill are skipped, so a prefill is not
-    /// mistaken for slowing down. The step is judged against its bucket's baseline (before this
+    /// mistaken for slowing down, and so are decode steps that overlapped a KV tier copy
+    /// (counted in [`DecodeStepWindow::kv_copy_excluded`]). The step is judged against its bucket's baseline (before this
     /// step updates it); `calm` steps then update that baseline. Returns the step's judged ratio
     /// (`None`: skipped or not judged), for the engine's `decode_step` debug trace.
     pub fn observe(&mut self, s: StepSample, calm: bool) -> Option<f64> {
         if s.rows == 0 || s.prefill_tokens > 0 {
+            return None;
+        }
+        if s.copy_overlap {
+            self.kv_copy_excluded += 1;
             return None;
         }
         let key = bucket(s.rows, s.context_tokens);
@@ -102,6 +118,11 @@ impl DecodeStepWindow {
             b.samples = b.samples.saturating_add(1);
         }
         judged
+    }
+
+    /// Pure decode steps not judged (nor learned) because they overlapped a KV tier copy.
+    pub fn kv_copy_excluded(&self) -> u64 {
+        self.kv_copy_excluded
     }
 
     /// Forget every baseline and judged step (the circuit came back from PROBING: the device
@@ -140,6 +161,7 @@ mod tests {
             context_tokens,
             secs,
             at: Duration::ZERO,
+            copy_overlap: false,
         }
     }
 
@@ -269,6 +291,54 @@ mod tests {
             w.observe(at(20, step(16, 55_000, 0.017)), false);
         }
         assert!((w.p95(Duration::from_secs(21)).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    /// A decode step that overlapped an in-flight KV tier copy is neither judged nor learned
+    /// (decision "6b: step-time drift during KV promotions", C): OLMoE `l0` decode steps run
+    /// 1.5–2.4× slower while an L1 → L0 promotion is in flight, and the controller read the
+    /// hierarchy's own copy traffic as device drift (YELLOW 24 s into every A/B run). Catches:
+    /// overlapped steps judged (the p95 reads 2), or calm overlapped steps raising the baseline
+    /// (a later real 2× slowdown then reads under 2), or excluded steps not counted.
+    #[test]
+    fn steps_overlapping_a_kv_copy_are_not_judged() {
+        let mut w = DecodeStepWindow::new();
+        let copy = |mut s: StepSample| {
+            s.copy_overlap = true;
+            s
+        };
+        for _ in 0..MIN_BUCKET_SAMPLES {
+            w.observe(step(16, 55_000, 0.017), true);
+        }
+        // Calm, but each one overlapped a promotion: not learned.
+        for _ in 0..4 * MIN_BUCKET_SAMPLES {
+            assert_eq!(w.observe(copy(step(16, 55_000, 0.034)), true), None);
+        }
+        for _ in 0..STEP_WINDOW {
+            assert_eq!(w.observe(copy(step(16, 55_000, 0.034)), false), None);
+        }
+        assert_eq!(w.p95(Duration::ZERO), None, "no step was judged");
+        assert_eq!(
+            w.kv_copy_excluded(),
+            (4 * MIN_BUCKET_SAMPLES as usize + STEP_WINDOW) as u64
+        );
+        // A prefill that overlapped a copy is skipped as a prefill, not counted as excluded.
+        w.observe(
+            StepSample {
+                prefill_tokens: 512,
+                ..copy(step(16, 55_000, 0.5))
+            },
+            false,
+        );
+        assert_eq!(
+            w.kv_copy_excluded(),
+            (4 * MIN_BUCKET_SAMPLES as usize + STEP_WINDOW) as u64
+        );
+        // The baseline is still the copy-free 0.017 s: a real 2× slowdown reads 2.
+        for _ in 0..MIN_JUDGED_STEPS {
+            let judged = w.observe(step(16, 55_000, 0.034), false);
+            assert!(judged.is_some_and(|r| (r - 2.0).abs() < 1e-9), "{judged:?}");
+        }
+        assert!((w.p95(Duration::ZERO).unwrap() - 2.0).abs() < 1e-9);
     }
 
     /// Context in half-powers of two: 1,100 and 1,300 tokens share a bucket, 1,100 and 3,000 do
