@@ -26,6 +26,9 @@ pub const MIN_BUCKET_SAMPLES: u32 = 8;
 const BASELINE_ALPHA: f64 = 0.1;
 /// How long a judged step stays in the window (the default `deescalate_dwell`).
 pub const STEP_MAX_AGE: Duration = Duration::from_secs(10);
+/// Judged steps (within [`STEP_MAX_AGE`]) the window needs before it has a p95: with 20 the p95
+/// is the second-largest, so one slow step is not drift.
+pub const MIN_JUDGED_STEPS: usize = 20;
 
 /// One executed iteration.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,7 +113,7 @@ impl DecodeStepWindow {
 
     /// The window's p95 of step time over its bucket's baseline (about 1 while the device
     /// performs as in calm steps) over the judged steps of the last [`STEP_MAX_AGE`] before
-    /// `now`; `None` when there are none.
+    /// `now`; `None` with fewer than [`MIN_JUDGED_STEPS`] of them.
     pub fn p95(&self, now: Duration) -> Option<f64> {
         let mut sorted: Vec<f64> = self
             .steps
@@ -118,7 +121,7 @@ impl DecodeStepWindow {
             .filter(|(at, _)| now.saturating_sub(*at) <= STEP_MAX_AGE)
             .map(|&(_, r)| r)
             .collect();
-        if sorted.is_empty() {
+        if sorted.len() < MIN_JUDGED_STEPS {
             return None;
         }
         sorted.sort_by(f64::total_cmp);
@@ -211,9 +214,34 @@ mod tests {
             false,
         );
         assert_eq!(w.p95(Duration::ZERO), None, "prefill skipped");
-        let judged = w.observe(step(2, 1000, 0.02), false);
-        assert!(judged.is_some_and(|r| (r - 2.0).abs() < 1e-9), "{judged:?}");
+        for _ in 0..MIN_JUDGED_STEPS {
+            let judged = w.observe(step(2, 1000, 0.02), false);
+            assert!(judged.is_some_and(|r| (r - 2.0).abs() < 1e-9), "{judged:?}");
+        }
         assert!((w.p95(Duration::ZERO).unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    /// The window's p95 needs [`MIN_JUDGED_STEPS`] judged steps: with fewer it is the window's
+    /// maximum, so one slow step (a first launch, a graph capture; one in ~11,500 Llama
+    /// multi-turn decode steps took 7.3× its baseline) reads as sustained drift. That is how a
+    /// server 2.4 s after ready went RED. Catches: a p95 taken over a handful of steps.
+    #[test]
+    fn one_slow_step_in_a_short_window_is_not_drift() {
+        let mut w = DecodeStepWindow::new();
+        for _ in 0..MIN_BUCKET_SAMPLES {
+            w.observe(step(16, 55_000, 0.017), true);
+        }
+        w.observe(step(16, 55_000, 0.017), true);
+        w.observe(step(16, 55_000, 0.124), true);
+        assert_eq!(w.p95(Duration::ZERO), None, "two judged steps");
+        for _ in 2..MIN_JUDGED_STEPS {
+            w.observe(step(16, 55_000, 0.019), true);
+        }
+        let p95 = w.p95(Duration::ZERO).unwrap();
+        assert!(
+            p95 < 1.5,
+            "one slow step among {MIN_JUDGED_STEPS} reads {p95}"
+        );
     }
 
     /// Catches: a judged step kept past [`STEP_MAX_AGE`], so a spike latches the drift after its
@@ -228,15 +256,18 @@ mod tests {
         for _ in 0..MIN_BUCKET_SAMPLES {
             w.observe(at(0, step(16, 55_000, 0.017)), true);
         }
-        w.observe(at(1, step(16, 55_000, 0.058)), false);
-        let spike = 0.058 / 0.017;
-        assert!((w.p95(Duration::from_secs(1)).unwrap() - spike).abs() < 1e-9);
+        for _ in 0..MIN_JUDGED_STEPS {
+            w.observe(at(1, step(16, 55_000, 0.034)), false);
+        }
+        assert!((w.p95(Duration::from_secs(1)).unwrap() - 2.0).abs() < 1e-9);
         assert!(w.p95(Duration::from_secs(1) + STEP_MAX_AGE).is_some());
         // Unseen shapes are not judged and do not refresh the window.
         w.observe(at(5, step(1, 3_500, 0.015)), false);
         assert_eq!(w.p95(Duration::from_secs(2) + STEP_MAX_AGE), None);
-        // A newer judged step stays.
-        w.observe(at(20, step(16, 55_000, 0.017)), false);
+        // Newer judged steps count.
+        for _ in 0..MIN_JUDGED_STEPS {
+            w.observe(at(20, step(16, 55_000, 0.017)), false);
+        }
         assert!((w.p95(Duration::from_secs(21)).unwrap() - 1.0).abs() < 1e-9);
     }
 

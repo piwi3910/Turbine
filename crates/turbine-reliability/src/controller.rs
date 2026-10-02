@@ -763,9 +763,8 @@ mod tests {
         assert_eq!(h.circuit(), CircuitState::Degraded, "drift in GREEN");
     }
 
-    /// The 2026-10-02 Llama multi-turn start (p6b-olmoe-tq4 `llama-tq4-r3`): 2.4 s after ready a
-    /// few 16-row decode steps ran 3.4× their calm baseline, pressure went RED on
-    /// `step_time_drift` (3.37) and stayed RED for the whole 4.5 min run. RED is not calm, so no
+    /// The 2026-10-02 Llama multi-turn start (p6b-olmoe-tq4 `llama-tq4-r3`): 2.4 s after ready
+    /// pressure went RED on `step_time_drift` (3.37) and stayed RED for the whole 4.5 min run. RED is not calm, so no
     /// shape learned a baseline any more; the one-at-a-time `idle_floor` admissions then decoded
     /// shapes never seen while calm, which are not judged, so the window kept the spike and its
     /// p95 held RED while anything ran. Catches: judged steps that no longer describe the
@@ -805,15 +804,15 @@ mod tests {
                 );
             }
         };
-        // Ten calm 16-row decode steps at 17 ms (the bucket is judged from the ninth), then two
-        // steps of that shape at 4×: in a window this short the p95 is the spike.
-        run(&mut c, 0.17, 16, 55_000, 0.017);
+        // Calm 16-row decode at 17 ms, then a 1 s burst of that shape at 6×.
+        run(&mut c, 1.0, 16, 55_000, 0.017);
         assert_eq!(h.state(), PressureState::Green);
-        run(&mut c, 0.136, 16, 55_100, 0.068);
-        assert_eq!(h.state(), PressureState::Red, "4× is RED drift");
+        run(&mut c, 1.0, 16, 55_100, 0.1);
+        assert!(h.state() >= PressureState::Orange, "{:?}", h.state());
         // The device is fine again, but only one sequence at a time runs, at a context the
-        // calm phase never decoded at.
-        run(&mut c, 60.0, 1, 3_500, 0.015);
+        // calm phase never decoded at. GREEN comes back once the spike aged out, the levels
+        // de-escalated and the circuit's DEGRADED (the spike came in GREEN) served its window.
+        run(&mut c, 90.0, 1, 3_500, 0.015);
         assert_eq!(
             h.state(),
             PressureState::Green,
