@@ -152,6 +152,9 @@ pub struct EvalReport {
     /// fillers one after another). `eval-compare` refuses a pair that differs.
     #[serde(default = "default_concurrency")]
     pub filler_concurrency: u32,
+    /// Fillers the server rejected under load and the runner sent again (not compared).
+    #[serde(default)]
+    pub filler_retries: u32,
     pub results: Vec<TaskResult>,
 }
 
@@ -418,27 +421,54 @@ async fn post_completion(
     Ok((text, Usage::from_response(&v)))
 }
 
+/// Times a filler the server rejects (503, e.g. SURVIVAL's `overloaded`, or 429) is sent again,
+/// [`FILLER_RETRY_DELAY`] apart, before the run fails.
+pub const FILLER_RETRIES: u32 = 120;
+
+/// Pause before a rejected filler is sent again.
+pub const FILLER_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// One filler request (`--filler-requests`): an unrelated random-word chat prompt, one token.
+/// Fillers exist to load the server, so one it rejects under that load (503 or 429) is sent
+/// again after [`FILLER_RETRY_DELAY`], up to [`FILLER_RETRIES`] times, each counted in
+/// `retries`: every filler is served, whatever the pressure did, on both sides of a pair.
 async fn send_filler(
     client: &reqwest::Client,
     base: &str,
     model: &str,
     index: u32,
     words: u32,
+    retries: &std::sync::atomic::AtomicU32,
 ) -> Result<(), EvalError> {
     let prompt = crate::prompt::prompt(FILLER_SEED, u64::from(index), words);
     let body = serde_json::json!({"model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 1, "temperature": 0.0, "stream": false});
-    post_completion(
-        client,
-        base,
-        "/v1/chat/completions",
-        body,
-        &format!("filler-{index}"),
-    )
-    .await
-    .map(|_| ())
+    let id = format!("filler-{index}");
+    for attempt in 0..=FILLER_RETRIES {
+        let sent = client
+            .post(format!("{base}/v1/chat/completions"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+            .send()
+            .await;
+        let rejected = sent.as_ref().is_ok_and(|r| {
+            matches!(
+                r.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::TOO_MANY_REQUESTS
+            )
+        });
+        if rejected && attempt < FILLER_RETRIES {
+            retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(FILLER_RETRY_DELAY).await;
+            continue;
+        }
+        return json_body(sent)
+            .await
+            .map(|_| ())
+            .map_err(|detail| EvalError::Request { id, detail });
+    }
+    unreachable!("the last attempt returns")
 }
 
 async fn run_task(
@@ -500,9 +530,11 @@ pub async fn run_eval(
         results.push(run_task(client, base, model, task).await?);
     }
     let filler_concurrency = fillers.concurrency.max(1);
+    let filler_retries = std::sync::atomic::AtomicU32::new(0);
     if !head.is_empty() {
+        let retries = &filler_retries;
         let mut sent = stream::iter(0..fillers.requests)
-            .map(|i| send_filler(client, base, model, i, fillers.words))
+            .map(|i| send_filler(client, base, model, i, fillers.words, retries))
             .buffer_unordered(filler_concurrency as usize);
         while let Some(reply) = sent.next().await {
             reply?;
@@ -535,6 +567,7 @@ pub async fn run_eval(
         filler_requests: fillers.requests,
         filler_words: fillers.words,
         filler_concurrency,
+        filler_retries: filler_retries.into_inner(),
         results,
     })
 }
@@ -681,6 +714,7 @@ mod tests {
             filler_requests: 0,
             filler_words: 0,
             filler_concurrency: 1,
+            filler_retries: 0,
             results,
         }
     }

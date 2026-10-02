@@ -132,7 +132,9 @@ enum Command {
         filler_words: u32,
         /// Fillers in flight at once (default 1: one after another). Several at once press on
         /// L0 together, as real load does, so the KV pressure controller leaves GREEN and the
-        /// compression ladder acts (the ladder gate). Both sides of a comparison must use the
+        /// compression ladder acts (the ladder gate). A filler the server rejects under that
+        /// load (503 or 429) is sent again after 250 ms (up to 120 times; the report's
+        /// `filler_retries`), so every filler is served. Both sides of a comparison must use the
         /// same value.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
         filler_concurrency: u32,
