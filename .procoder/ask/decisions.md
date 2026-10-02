@@ -3051,3 +3051,18 @@ total cost is per byte (236 → 302–336 ms extra per run), tok/s −1.6 % and 
 - C) Leave it (the drift signal no longer misjudges these steps)
 
 **Decision (user, 2026-10-02): A.** Shim experiment (copy kernel from pinned host memory, or smaller copies); measure the per-MiB slope; default cap unchanged meanwhile.
+
+## 6b: promotion copy kernel — default (2026-10-02)
+
+From `p6b-copykernel` (merged; perf log "Promotion copy kernel"). The stall comes from host-memory reads in flight, not
+SDMA itself: a 2-workgroup copy kernel reading pinned host memory moves 22.3 GB/s (SDMA 12.4) with a decode-slowdown
+slope of 0.003 ms/MiB (SDMA 0.050) in the microbenchmark. OLMoE `l0` multi-turn A/B, 5 runs each: slope 0.064 → 0.000
+ms/MiB, steps ≥ 1.5× 17 → 3, promotion median 30.2 → 19.5 ms, TTFT p99 360 → 288 ms, cached ratio and tok/s unchanged.
+Behind `kv.transfer.promotion_copy: sdma|kernel` (default `sdma`); ABI: additive optional symbol in unshipped v2.11.
+
+- A) Validate first (Llama A/B, `lab-bench --golden16` with the switch on, demotions checked for the same stall), then
+  make `kernel` the default
+- B) Keep `sdma` as default; `kernel` stays opt-in
+- C) Make `kernel` the default now
+
+**Decision (user, 2026-10-02): A.** Validate (Llama A/B, `lab-bench --golden16` with the switch on, demotions checked for the same stall), then make `kernel` the default.
