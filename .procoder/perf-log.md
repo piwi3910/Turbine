@@ -731,3 +731,37 @@ Part 2 (why promotions slow decode), from the `p6b-drift` traces (`scratch/p6b-d
 - A step's extra time is linear in the promotion bytes in flight with it (r 0.98–0.99 for `l0`). The slope is 0.063–0.065 ms/MiB, about 16 GB/s, the order of the copy stream's SDMA rate (≈ 12 GB/s, `p6b-d2h`). So the step waits for a share of the queued copy bytes to drain, and does not slow by a constant factor. HBM contention cannot do that: 12 GB/s is under 2 % of the card's memory bandwidth.
 - `l0` promotions are pure H2D on the copy stream. The copy does no compute-stream fence (`ShimContext::enqueue` fences only device-source copies) and runs no transcode kernel, yet `l0` shows the largest effect. The compute-stream fence and the staging decode kernel are therefore not the mechanism for `l0`. For `tq4`, the decode kernel runs on the compute stream (0.04 ms a block) after the host sees the H2D finish, which is too small to matter.
 - Remaining candidate: the decode step's own transfers on the compute stream (the batch metadata upload through staging, the logits inputs and the reads, `turbine_model::executor::batch` / `logits`) queue on the SDMA engine behind the copy stream's batches, up to `kv.transfer.max_inflight_bytes` (default 1 GiB) ahead of them. 13 × 16 MiB in flight take about 17 ms at 12 GB/s, and the measured extra is 14–16 ms. To be confirmed with rocprofv3 (`--kernel-trace --memory-copy-trace`, `scratch/p6b-copydrift/prof.py`: compute-stream copy durations and gaps inside and outside promotion intervals, against kernel durations).
+
+Part 3 (rocprofv3 and the in-flight cap), tree 108c734 (`p6b-stack` with the drift exclusion), harness `scratch/p6b-copydrift/ab.sh` on novanas, GPU 0, OLMoE `l0` L1, the multi-turn workload of "Lossless last block scored like its history". Results in `scratch/p6b-copydrift/{prof,cap-def,cap-64,kernarg,ab}/`; scripts `corr3.py` (step extra time against L1 → L0 bytes in flight, baseline from the steps that overlap no copy, since overlapped steps are no longer judged), `prof2.py`, `blit.py`, `queue.py` and `align.py` (rocprofv3 `--kernel-trace --memory-copy-trace`).
+
+- The copy stream's promotions run on SDMA as one 1 MiB copy per layer (16 per 16 MiB block), 83 µs each (12.6 GB/s), never two at once. During serving, decode does no SDMA copy at all: the compute stream's 3,320 H2D copies are the weight upload, all in the first 13 s. Decode's batch upload is a `__amd_rocclr_copyBuffer` blit kernel on the compute stream (6,514 of them).
+- While an SDMA copy runs, every compute-stream kernel stretches to about one copy's length. The batch-upload blit takes 83.8 µs (2.5 µs otherwise) and ends a median 18 µs after the SDMA copy that was running when it started. `rmsnorm` takes 79.7 µs (6.4 otherwise), `moe_topk` 80.6 µs (11.0), and the hipBLASLt GEMMs 2.5× longer. Gaps between compute kernels grow to 85 µs (3.6 µs otherwise), and to 397 µs before a blit (7.6 µs otherwise). Kernel occupancy is 0.45 inside promotion intervals against 0.83 in the windows just before them. So decode's small transfers do not queue behind the copy batch: they wait for the one copy in flight. Compute largely stalls for as long as SDMA streams, which gives 61–69 µs lost per MiB promoted against 83 µs per MiB copied.
+- `HIP_FORCE_DEV_KERNARG=1` (diagnostic env only, 2 runs) leaves the slope unchanged at 0.060–0.064 ms/MiB, so kernel arguments in host memory are not the mechanism.
+
+| OLMoE `l0`, 2 runs each              | default (1 GiB cap)        | `kv.transfer.max_inflight_bytes=64MiB` |
+| ------------------------------------ | -------------------------- | -------------------------------------- |
+| decode steps overlapping a promotion | 38 / 36                    | 84 / 83                                |
+| L1 → L0 MiB in flight (mean / max)   | 84 / 304, 83 / 208         | 43 / 64, 45 / 64                       |
+| extra ms per overlapped step (mean)  | 6.2 / 6.5                  | 3.6 / 4.1                              |
+| extra ms at the most bytes in flight | 16.8 (≥ 256 MiB)           | 4.5–4.6 (64 MiB)                       |
+| slope (ms/MiB, r)                    | 0.063 r 0.98, 0.069 r 0.95 | 0.047 r 0.67, 0.042 r 0.53             |
+| total extra over the run (ms)        | 236 / 234                  | 302 / 336                              |
+| decode steps ≥ 1.5× their baseline   | 17 / 14                    | 0 / 0                                  |
+| L1 → L0 latency median / p99 (ms)    | 29.4 / 46.5, 30.1 / 46.7   | 19.1 / 39.5, 20.8 / 41.9               |
+| cached_tokens_ratio                  | 0.8623 / 0.8631            | 0.8613 / 0.8629                        |
+| output tok/s                         | 252.3 / 249.2              | 248.0 / 245.4                          |
+| later-turn TTFT p50 / p99 (ms)       | 52.7 / 127, 54.9 / 204     | 52.8 / 271, 52.7 / 346                 |
+
+- The cap trades a few large stalls for twice as many small ones. The total time lost stays about the same, a little higher (the cost is per byte, not per batch). Promotions finish sooner because they queue less. Reuse is unchanged. tok/s is 1.6 % lower and later-turn TTFT p99 is worse. It is not better on every measure, so the default stays.
+
+Tq4 multi-turn A/B rerun with the drift exclusion (decision "6b: OLMoE tq4 after the last-block change" A), same tree and harness, no debug logging, arms interleaved, results in `scratch/p6b-copydrift/ab/`:
+
+| Model | L1 format | cached_tokens_ratio (runs) | median | output tok/s (runs)   | later-turn TTFT p99 (ms) | pressure                              |
+| ----- | --------- | -------------------------- | ------ | --------------------- | ------------------------ | ------------------------------------- |
+| OLMoE | `l0`      | 0.8625 / 0.8624 / 0.8608   | 0.8624 | 248.6 / 241.8 / 250.0 | 322 / 170 / 328          | GREEN throughout                      |
+| OLMoE | `tq4`     | 0.8625 / 0.8595 / 0.8629   | 0.8625 | 247.8 / 249.1 / 244.0 | 217 / 140 / 275          | GREEN throughout                      |
+| Llama | `l0`      | 0.9007 / 0.9040 / 0.8980   | 0.9007 | 336.5 / 339.8 / 331.6 | 302 / 476 / 376          | YELLOW on `kv_utilization` at 29–33 s |
+| Llama | `tq4`     | 0.9061 / 0.9076 / 0.9075   | 0.9075 | 344.2 / 344.8 / 342.9 | 290 / 312 / 447          | YELLOW on `kv_utilization` at 29–33 s |
+
+- Gate holds on both models: OLMoE `tq4` 0.8625 ≥ `l0` 0.8624 (a 0.0001 margin, inside run-to-run spread), Llama `tq4` 0.9075 ≥ `l0` 0.9007. No run went YELLOW on `step_time_drift`; the drift window left 66–87 (`l0`) and 157–254 (`tq4`) copy-overlapped steps unjudged per run. Both Llama arms leave GREEN the same way (L0 fill reaches 0.71–0.78 against 0.70, a real signal), so the arms run under the same pressure. Llama `l0` drops 90–110 blocks on L1 capacity per run, `tq4` none.
+- Flipped: lower-tier `tq4` is `supported` (`TIER_FORMAT_REFUSALS` keeps only `tq2`).
