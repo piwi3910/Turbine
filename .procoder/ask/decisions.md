@@ -3098,3 +3098,5 @@ L1 137 blocks all `l0`, L0 553/585 at ORANGE; L0→L1 demotions 726 vs 1,567 off
   whether B or C is worth adding after
 - B) A plus emptying a whole slab so it can be re-sized to the new format
 - C) Smaller L1 slabs
+
+**Decision (user, 2026-10-02): A.** Fallback to the tier's own format when no new-size slot is free, then measure whether slab re-sizing or smaller slabs are worth adding.
