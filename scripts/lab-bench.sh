@@ -2,7 +2,7 @@
 # lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
 #
 #   scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests]
-#                         [--golden16] [--c1] [--quality] [--quick] [-- <--set k=v>...]
+#                         [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
 # <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama-gptq-own|llama-gptq-autoround|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv|llama8b-mxfp4-a4
@@ -20,7 +20,9 @@
 #    producing numbers that are not comparable with earlier runs.
 # 3. Under the exclusive benchmark lock: golden at concurrency 1 (the gate; always), golden at 16
 #    only with --golden16 (opt-in: it roughly doubles the golden time for a number this step does
-#    not gate on), and the fixed throughput bench (16 concurrent, 512-word prompts, 256 tokens;
+#    not gate on; --batched-bounds judges golden c1 and c16 by the slug's batched logprob bounds, the
+#    lossy-KV gate of Phase 6b S-8, and keeps the strict c1 verdict as golden1-strict.txt and
+#    golden1_strict= on the BENCH line), and the fixed throughput bench (16 concurrent, 512-word prompts, 256 tokens;
 #    200 requests, or 64 with --quick for a faster read during iteration); with --c1 also the
 #    single-request latency run (10 requests of 128 tokens, --ignore-eos), reported as itl_c1_p50
 #    and tok/s_c1 (Phase 6a targets stated in c1 ITL). With --quality, after the measurement and
@@ -40,12 +42,13 @@ model=llama
 label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
+batched=0
 run_c1=0
 run_quality=0
 quick=0
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--c1] [--quality] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4" >&2
 	exit 2
 }
@@ -74,6 +77,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--golden16)
 		run_golden16=1
+		shift
+		;;
+	--batched-bounds)
+		batched=1
 		shift
 		;;
 	--c1)
@@ -301,14 +308,22 @@ fi
 golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
 ref="tests/golden/$golden_slug/reference.jsonl"
 golden16_cmd=""
-[[ $run_golden16 -eq 1 ]] && golden16_cmd="$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 16 > '$out/golden16.txt' 2>&1"
+bounds=""
+strict_cmd=""
+rm -f "$out/golden1-strict.txt"
+if [[ $batched -eq 1 ]]; then
+	bounds="--batched-bounds"
+	strict_cmd="$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1-strict.txt' 2>&1"
+fi
+[[ $run_golden16 -eq 1 ]] && golden16_cmd="$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 16 $bounds > '$out/golden16.txt' 2>&1"
 # --c1: the single-request decode latency (the Phase 1 baseline workload), for targets stated as
 # c1 ITL (Phase 6a: FP8 <= 0.75x, INT4 / MXFP4 <= 0.6x the BF16 run).
 c1_cmd=""
 rm -f "$out/bench-c1.json"
 [[ $run_c1 -eq 1 ]] && c1_cmd="$bench_cmd --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json > '$out/bench-c1.json' 2> '$out/bench-c1.err'"
 sh -c "
-  $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 > '$out/golden1.txt' 2>&1
+  $golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 $bounds > '$out/golden1.txt' 2>&1
+  $strict_cmd
   $golden16_cmd
   curl -s '$url/metrics' > '$out/metrics-before.txt'
   $bench_cmd --concurrency 16 --requests $requests --prompt-words 512 --max-tokens 256 \
@@ -317,6 +332,7 @@ sh -c "
 " 2>/dev/null
 curl -s "$url/metrics" >"$out/metrics.txt"
 curl -s "$url/turbine/v1/status" >"$out/status.json"
+curl -s "$url/turbine/v1/kv" >"$out/kv.json"
 rm -f "$out/quality.json"
 if [[ $run_quality -eq 1 ]]; then
 	ssh -o BatchMode=yes "$host" "cd '$remote/src' && taskset -c $bench_cpus \
@@ -336,6 +352,10 @@ if run_golden16 == "1":
 else:
     g16 = "SKIP"
 quick_field = (" quick=1" if quick == "1" else "") + f" client={client}"
+try:
+    quick_field += " golden1_strict=" + open(f"{out}/golden1-strict.txt").read().strip().splitlines()[-1][:5]
+except (OSError, IndexError):
+    pass
 try:
     d = json.load(open(f"{out}/bench.json"))
 except Exception as e:
@@ -406,7 +426,7 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 	set_args=()
 	[[ -n "${LABBOOK_SET:-}" ]] && set_args=(--set "$LABBOOK_SET")
 	attach=()
-	for f in bench.json bench-c1.json quality.json golden1.txt golden16.txt metrics.txt status.json; do
+	for f in bench.json bench-c1.json quality.json golden1.txt golden1-strict.txt golden16.txt metrics.txt status.json kv.json; do
 		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
 	done
 	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
