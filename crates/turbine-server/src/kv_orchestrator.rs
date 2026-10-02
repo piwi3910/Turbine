@@ -805,6 +805,13 @@ impl KvOrchestrator {
         }
     }
 
+    /// Hands the planner the pressure controller's current state without the housekeeping of
+    /// [`KvOrchestrator::before_plan`]: an attach between turns (a request arriving at an idle
+    /// engine) plans with it instead of the state of the last busy turn.
+    pub fn set_l0_state(&mut self, state: PressureState) {
+        self.h.set_l0_state(state);
+    }
+
     /// Before `Scheduler::plan`: refreshes the reclaim order when free L0 blocks run short,
     /// hands the planner the pressure controller's state (`l0_pressure` at RED and above,
     /// prefetch only at GREEN/YELLOW) and keeps L0 headroom by capacity (P4 S-8 "an allocation
