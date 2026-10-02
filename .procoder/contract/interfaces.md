@@ -984,7 +984,7 @@ impl Admission {
     pub fn estimate(&self, prompt_tokens: u32, cached_prefix_tokens: u32, max_tokens: Option<u32>, layout: &KvLayout, max_seq_len: u32) -> ResourceEstimate;
     pub fn decide(&mut self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState, queue_len: usize) -> AdmissionDecision;
     pub fn evaluate_refill(&self, est: &ResourceEstimate, state: PressureState, circuit: CircuitState) -> AdmissionDecision;   // RED refills finished slots (2026-09-26)
-    pub fn with_kv_headroom(self, kv: SignalThresholds) -> Self;   // amendment 2026-09-27: in YELLOW/ORANGE/RED an admission never lifts kv_utilization past the next state's threshold (Queue{KvReservation})
+    pub fn with_kv_headroom(self, kv: SignalThresholds) -> Self;   // amendment 2026-09-27: in YELLOW/ORANGE/RED an admission never lifts kv_utilization past the next state's threshold, at GREEN past RED's (amendment 2026-10-02) (Queue{KvReservation})
     pub fn record_requeue(&self, id: RequestId, est: &ResourceEstimate);   // SURVIVAL option A: a `queue` / `survival_requeue` decision
 }
 pub struct AdmissionQueue<T, K = (Priority, u64)> { /* ordered by K: (priority, arrival) by default; the scheduler's gate uses the scheduling policy's AdmissionKey (Phase 2m); max_queue; queue_timeout; max_bypass starvation guard */ }
