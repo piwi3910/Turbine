@@ -585,7 +585,7 @@ impl KvOrchestrator {
             block_bytes as usize,
         );
         backend.set_host_codec(host_codec);
-        backend.set_metrics(metrics);
+        backend.set_metrics(metrics.clone());
         let (tx, commands) = mpsc::channel(s.cfg.prefetch.max_queue.max(1) as usize);
         let mut o = KvOrchestrator {
             h,
@@ -596,7 +596,7 @@ impl KvOrchestrator {
             prefill_tps: None,
             last_housekeeping: None,
             remote,
-            l0_lossy: layout.dtype.tq_record_bytes().map(|_| s.metrics),
+            l0_lossy: layout.dtype.tq_record_bytes().map(|_| metrics.clone()),
             reattaching: Default::default(),
         };
         o.calibrate(
