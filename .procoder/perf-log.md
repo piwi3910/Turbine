@@ -541,3 +541,44 @@ Staged-prefill profile (decision "6b Task 12: follow-ups", 1 A; measure only). M
 - Encode dominates: 58 % of the Llama tq4 increase and 69 % of OLMoE's. That is 0.35 ms per 2048-row layer chunk on Llama, about 30 GB/s effective and 21× the BF16 append.
 - Second is the single-query `turbine_hip_mixed` pass that `run_mixed_staged` launches after CK on every layer and chunk: 7 + 4 full-grid launches per layer per Llama request. It runs even when the batch has no `q_len` 1 row, and this workload has none.
 - Staging decode is small, and CK is unchanged.
+
+### Step-time drift at startup (decision "6b: OLMoE tq4 — lossless last block in eviction order; step-time drift at startup", 2 A; branch `p6b-drift`)
+
+Observation: in the p6b-olmoe-tq4 A/B (novanas `scratch/p6b-olmoe-tq4/ab1/llama-tq4-r3.server.log`) the server went RED on `step_time_drift` 2.4 s after `/ready` (circuit DEGRADED on `latency_drift` at +2.40 s, RED at +2.50 s, value 3.37). It stayed RED for the whole 4.5 min run with no further pressure transition. RED's admission then let one request in at a time (`idle_floor`).
+
+Harness: `scratch/p6b-drift/drift.sh` on novanas, a fresh native server per run on GPU 0 (cores 0-11), under `port18000` and `bench.lock`, client on novanas. The workload is the A/B's Llama multi-turn (16 sessions × 8 turns, c16, `--shared-prefix-words 2000`, think time 1..4 s, session hints, `phase2c-novanas-llama.yaml --set kv.cpu.max_bytes=4GiB`) or its OLMoE variant. `/turbine/v1/pressure` is polled every 100 ms, and the new `decode_step` debug trace (25fc430) logs each pure decode step's rows, context, seconds and judged ratio.
+
+Root cause: two defects in `DecodeStepWindow`, both in the reliability crate.
+
+1. A short window's p95 is its maximum. The p95 index is `round((n − 1) × 0.95)`, so up to 10 judged steps it is the largest one. In the first second after a bucket became judged, one slow step was the drift. The once-off step does happen: 1 of about 11,500 Llama decode steps across six starts took 138 ms, 7.31× its bucket (`burst1/llama-tq4-r1`, +24.3 s, rows 7). That step landed in a full window and did no harm.
+2. The window never forgot. Above GREEN no shape learns a baseline (spec edge case), and shapes never seen while calm are not judged. Once RED let one request in at a time, at contexts the 16-row start never decoded at, no step was judged again. The window kept the spike, and its p95 held RED for as long as anything ran. `controller::tests::a_drift_spike_does_not_latch_once_its_shape_stops_running` replays that trace through the real window and controller.
+
+Ruled out:
+
+- Warm-up, graph capture and autotune baselines. The first step of a new decode shape runs eager and the second captures: 17.5 / 19.4 ms against 17.2 ms replays, so a bucket's first judged steps read 0.98–1.00.
+- A decode-only baseline judging prefills. Prefill iterations are skipped.
+- A unit mismatch.
+- Host CPU contention. 24 spinning processes on cores 0-11 for 2 s, from 1.8 s after ready, left decode at 17.3 ms (`burst1`).
+
+The startup spike did not reproduce in 6 starts on the old window (`r1/` ×5, `burst1/`), and the single 3.37 step of the original run cannot be attributed after the fact.
+
+Fix:
+
+- 5924e3f: judged steps older than `STEP_MAX_AGE` (10 s, the default `deescalate_dwell`) leave the window. `StepSample.at` and `p95(now)`; tests `judged_steps_age_out` and the controller test above.
+- 66994e1: the p95 needs `MIN_JUDGED_STEPS` (20) judged steps inside that age, which makes it at least the second-largest; test `one_slow_step_in_a_short_window_is_not_drift`.
+- Mutations: the age filter off makes both age tests FAIL; the minimum off makes the short-window test FAIL. `scripts/gate.sh --base aa42093`: `gate: ok passed=834`.
+- The spec signal table and the contract §8.3 note are amended.
+
+Re-measured on 66994e1 (`fix/`, Llama `tq4` ×2 and `l0` ×2): none left GREEN in the first 25 s. Later escalations were `kv_utilization` YELLOW at +30 s, plus one `step_time_drift` YELLOW at +34 s (`l0-r2`), which is the late pattern below. The cached_tokens_ratio values were 0.907 / 0.898 / 0.903 / 0.902.
+
+Late-run drift is the signal being right (OLMoE `l0`, lead's report from `scratch/p6b-lastblock/ab1/olmoe-l0-r{1,2,3}`: YELLOW on drift 23–25 s after ready, held to the end of the run):
+
+- From about 17 s on, OLMoE `l0` decode steps run 1.5–2.4× their bucket. With `kv_copy_stages` debug logging (`olmoe-old/`, `olmoe-fix/`), every judged step at ≥ 1.5× and 89–100 % of those at 1.2–1.5× overlapped a KV tier copy in flight, against 2–3 % of normal steps (6–9 % for `tq4`). Mostly they overlapped an L1 → L0 promotion: 16 MiB raw blocks at about 30 ms each in `l0` format (11 of 13 slow steps in `olmoe-fix/olmoe-l0-r2`); `tq4` moves 4.5 MiB blocks and has 1–3 slow steps per run.
+- The window p95 reached 1.50–1.81 in all four `l0` runs here. One went YELLOW on drift; in two, `kv_utilization` had already made the state YELLOW.
+- "Stays YELLOW" is the de-escalation dwell: in `olmoe-fix/olmoe-l0-r2` drift fell under the exit threshold (1.425) at +25.5 s, but the run ended at +33.6 s, before the 10 s dwell ran out. It is not a latch.
+- Llama shows the same late steps (1.5–2.3×, +29–38 s, more under `l0` than `tq4`). Its `fix/` runs have no copy trace.
+- The controller reads the KV hierarchy's own promote traffic as device slowdown, and YELLOW's reclaim then adds copies. The thresholds are unchanged; this needs a decision (handoff `p6b-drift`).
+
+Earlier soaks: the 2026-09-30 10-minute soak timeline (worktree `agent-a4b513efedb95892f-lab`) is RED on `step_time_drift` for its first 13 s of overload and then on `queue_fill`. The 2026-09-27 soak shows 5 such seconds. Neither latched.
+
+Soak: `scripts/overload-soak.sh novanas --duration 10m` on 66994e1 (serve run 1002071230-3f047df9, client on novanas through an ssh `SOAK_BENCH` wrapper) passed 8/8. Calibration ITL p99 was 174 ms and overload 209 ms. Status counts were 4,484 × 200 and 66 × 503 `overloaded`, with 2,835 `queue_timeout` and no client drop. GREEN came 30 s after the cool-down. The timeline has no second dominated by `step_time_drift` (the 2026-09-30 soak had 14).
