@@ -638,25 +638,44 @@ Served prefill TTFT, c1, 20 requests, `--max-tokens 1` (Llama 2,000-word prompts
 - Golden output (`golden1.txt`) is byte-identical across the three runs: the encode is bit-exact and the skipped pass never wrote a prefill row. Golden still fails (decision 1: tq4 stays `experimental`).
 - Not done: a pass over only the single-query rows (a grid over sequences instead of query rows) would remove the pass's cost from mixed c16 batches too; the remaining F64 norm loop (≈ 2 ms of 7.2) and the LDS footprint (≈ 41 KB a workgroup) are the next encode items.
 
-### Compression ladder in L1/L2 on the server (Task 16; branch `p6b-t16`, 4e49409)
+### Compression ladder in L1/L2 on the server (Task 16; branch `p6b-t16`, 4074b5d)
 
-Multi-turn A/B, Llama-3.2-3B, `scripts/lab/phase6-novanas-ladder.yaml` (L0 8 GiB, L1 2 GiB `l0`, L2 4 GiB `l0`, `max_format: tq4`) against the same file with `--set kv.ladder.enabled=false`. A fresh native server per run on GPU 0 (port 18010, under `bench.lock`, fixtures paused), arms interleaved. Workload: `turbine-bench --profile multi-turn --sessions 24 --turns 8 --concurrency 24 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on novanas. Recomputed tokens are `turbine_kv_recompute_tokens_total`; every run went GREEN → YELLOW → ORANGE (on-r3 also RED).
+Multi-turn A/B, Llama-3.2-3B, `scripts/lab/phase6-novanas-ladder.yaml` (L0 8 GiB, L1 2 GiB `l0`, L2 4 GiB `l0`, `max_format: tq4`) against the same file with `--set kv.ladder.enabled=false`. Tree 4074b5d (`p6b-stack` ce42218 and `p6b-drift` merged; no run left GREEN on `step_time_drift`). A fresh native server per run on GPU 0 (port 18010, under `bench.lock`, fixtures paused), arms interleaved. Workload: `turbine-bench --profile multi-turn --sessions 24 --turns 8 --concurrency 24 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on novanas. Recomputed tokens are `turbine_kv_recompute_tokens_total`. Every run went GREEN → YELLOW → ORANGE and served 192 of 192 requests.
 
-| Arm | Run | ok      | recomputed tokens | cached_tokens_ratio | lossy cached tokens | later-turn TTFT p50 / p99 (ms) | L1 rewrites (no_room) | L2 rewrites (no_room) | L2 new demotions |
-| --- | --- | ------- | ----------------- | ------------------- | ------------------- | ------------------------------ | --------------------- | --------------------- | ---------------- |
-| on  | r1  | 192/192 | 149,895           | 0.8515              | 32,640              | 160.5 / 27,758                 | 1,494 (1,483)         | 401 (88)              | 39               |
-| on  | r2  | 192/192 | 155,442           | 0.8453              | 16,896              | 153.1 / 19,277                 | 914 (911)             | 403 (34)              | 12               |
-| on  | r3  | 184/192 | 128,869           | 0.8660              | 8,448               | 129.6 / 61,723                 | 3,360 (3,350)         | 258 (0)               | 41               |
-| off | r1  | 192/192 | 213,207           | 0.7876              | 0                   | 145.4 / 12,871                 |                       |                       |                  |
-| off | r2  | 192/192 | 183,330           | 0.8172              | 0                   | 171.1 / 13,997                 |                       |                       |                  |
-| off | r3  | 192/192 | 206,270           | 0.7939              | 0                   | 138.1 / 14,137                 |                       |                       |                  |
+| Arm | Run | recomputed tokens | cached_tokens_ratio | lossy cached tokens | later-turn TTFT p50 / p99 (ms) | tok/s | L1 rewrites (no_room) | L2 rewrites (no_room) | L2 new demotions |
+| --- | --- | ----------------- | ------------------- | ------------------- | ------------------------------ | ----- | --------------------- | --------------------- | ---------------- |
+| on  | r1  | 163,166           | 0.8365              | 26,624              | 142.7 / 12,288                 | 307.8 | 369 (359)             | 229 (95)              | 73               |
+| on  | r2  | 172,126           | 0.8280              | 0                   | 162.6 / 17,421                 | 327.2 | 562 (550)             | 349 (302)             | 12               |
+| on  | r3  | 149,683           | 0.8507              | 0                   | 132.0 / 49,487                 | 202.2 | 2,290 (2,281)         | 387 (206)             | 20               |
+| off | r1  | 202,388           | 0.7997              | 0                   | 170.1 / 14,640                 | 316.8 |                       |                       |                  |
+| off | r2  | 206,206           | 0.7952              | 0                   | 162.8 / 10,557                 | 321.0 |                       |                       |                  |
+| off | r3  | 194,571           | 0.8058              | 0                   | 150.3 / 10,956                 | 330.6 |                       |                       |                  |
 
-Medians, on against off: recomputed tokens 149,895 against 206,270 (−27 %), `cached_tokens_ratio` 0.8515 against 0.7939, later-turn TTFT p50 153 against 145 ms, p99 27.8 against 14.0 s, output tok/s 249 against 301 (−17 %). Labbook set `phase-6b-kv-compression`: the 6 runs (`p6b-t16:mt:llama:ladder-{on,off}:r{1,2,3}`). Rungs at the end: L1 `fp8_e4m3`, L2 `tq4`. on-r3 lost 8 requests to 503 `queue_timeout` (60 s, RED); no off run lost any.
+Medians, on against off:
 
-- L1 rewrites almost never store: 99.3–99.7 % end `no_room`. L1's two 1 GiB slabs are both `l0`-sized and never empty, so no slot of the `fp8_e4m3` size exists (handoff Open 3, slab fragmentation). The sweep picks the same blocks again every tick, so the ladder spends up to 32 device transcodes per tick for nothing (3,360 submits in on-r3); that load is the likely cause of the doubled later-turn p99 and of on-r3's RED.
-- L2 rewrites mostly store (0–22 % `no_room`). A `no_room` rewrite in L2 loses the copy: `L2NvmeTier::store` frees the replaced slot before it looks for one of the new size, and `on_copy_failed` then evicts the block (`a_rewrite_without_room_counts_no_room` pins this).
+- Recomputed tokens: 163,166 against 202,388 (−19 %).
+- `cached_tokens_ratio`: 0.8365 against 0.7997.
+- Later-turn TTFT p50: 143 against 163 ms.
+- Later-turn TTFT p99: 17.4 against 11.0 s.
+- Output tok/s: 308 against 321.
+
+Rungs at the end: L1 `fp8_e4m3`, L2 `tq4`. Labbook set `phase-6b-kv-compression`, runs `p6b-t16:mt:llama:ladder-{on,off}:r{1,2,3}`.
+
+An earlier pass on 4e49409, before the merge, gave the same direction (recomputed 149,895 against 206,270; cached ratio 0.852 against 0.794; p99 27.8 against 14.0 s; one run lost 8 requests to `queue_timeout` at RED). It was superseded because the drift fixes were missing.
+
+- L1 rewrites almost never store: 97–100 % end `no_room`. L1's two 1 GiB slabs are both `l0`-sized and never empty, so no slot of the `fp8_e4m3` size exists (slab fragmentation). The sweep picks the same blocks again every tick, up to 32 device transcodes per tick for nothing (2,290 submits in on-r3, the run with the 49 s p99 and 202 tok/s). That load is the likely cause of the worse tail.
+- L2 rewrites fail `no_room` in 41–87 % of cases. In L2 that loses the copy: `L2NvmeTier::store` frees the replaced slot before it looks for one of the new size, and `on_copy_failed` then evicts the block. `a_rewrite_without_room_counts_no_room` pins this behaviour.
+- The gain in recomputed tokens therefore comes from the L2 rewrites that do store, plus the `tq4` rung for new demotions into L2.
 
 Shared-prefix GSM8K with the ladder (`p6b-eval-prefix.md` recipe on the ladder config plus `--set kv.gpu.max_bytes=4GiB`, candidate guard `--min-lossy-cached-ratio 0.5`): no usable report, nothing committed.
 
 - Default thresholds: the whole eval stayed GREEN, so the ladder never ran; lossy ratio 0.000 (cached ratio 0.931, 726,723 prompt tokens, accuracy 0.745). The guard exited 1.
 - `reliability.pressure.thresholds.kv_utilization=[0.03,0.06,0.9,0.97]` (decision "6b Task 16 … four points", 4 A): the eval ran at ORANGE from the first item. Still no ladder action: the sweep starts at the lowest tier (L2, which the eval leaves empty), and L1 holds the prefix at `l0` while L2 sits on its base rung. Admission also queued the items on `kv_reservation`, and item 6 got 503 `queue_timeout`, which aborted the run (exit 2). Lowering the thresholds cannot make this eval gate the ladder. Options are in `.procoder/handoff/p6b-t16.md`.
+
+10-minute overload soak with the ladder on 4074b5d. Command: `scripts/overload-soak.sh novanas --duration 10m --set kv.cpu.enabled=true --set kv.cpu.max_bytes=4GiB --set kv.nvme.enabled=true --set kv.nvme.path=/home/piwi/turbine-kv-ladder --set kv.nvme.max_bytes=16GiB --set kv.ladder.enabled=true --set kv.ladder.l0=false --set kv.ladder.max_format=tq4`, wrapped in the `port18000` lock (serve run 1002075609-26334eb5).
+
+- Verdict PASS: all 8 checks true. ITL p99 156 ms against a calibration of 176 ms; GREEN 0 s into the cool-down.
+- Responses: 4709 × 200 and 98 × 429 `queue_full`; 4034 `queue_timeout`.
+- `turbine_kv_ladder_actions_total` is 0, so the S-6 soak criterion ("> 0") is not met. The soak's random prompts share nothing: `turbine_kv_prefix_cached_tokens_total` was 0 and there were no demotions, so L1 and L2 stayed empty and the ladder had nothing to act on.
+- An earlier attempt at 07:13 never started: another builder's soak server held port 18000. A second one, on 4e49409, was stopped during overload because the drift fixes were missing.
+
