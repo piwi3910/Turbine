@@ -716,6 +716,82 @@ Shared-prefix GSM8K with the ladder (`p6b-eval-prefix.md` recipe on the ladder c
 - `turbine_kv_ladder_actions_total` is 0, so the S-6 soak criterion ("> 0") is not met. The soak's random prompts share nothing: `turbine_kv_prefix_cached_tokens_total` was 0 and there were no demotions, so L1 and L2 stayed empty and the ladder had nothing to act on.
 - An earlier attempt at 07:13 never started: another builder's soak server held port 18000. A second one, on 4e49409, was stopped during overload because the drift fixes were missing.
 
+#### Ladder gate, soak and SURVIVAL burst after the fixes (2026-10-02; `p6b-t16` 25e8dc2)
+
+Tree: the L2 copy-loss fix and the no-room back-off (56a2cb3, decision "6b Task 16: ladder proof results — four open points" 2 A, 3 A), the
+eval runner's `--filler-concurrency`, filler resends and `--fillers-settle`, and 25e8dc2 `fix(server)`: an attach plans with the controller's
+current pressure state (before, an idle engine planned a new request with the state of its last busy turn, so the first item after RED →
+GREEN planned `l0_pressure` and recomputed the prefix into an exact L0 copy).
+
+Shared-prefix GSM8K, ladder variant of spec S-8 (both sides `scripts/lab/phase6-novanas-ladder.yaml --set kv.gpu.max_bytes=4GiB --set
+kv.cpu.max_bytes=4GiB --set kv.nvme.enabled=false`, baseline `--set kv.ladder.enabled=false`; c16, 32 fillers of 2000 words 16 at a time,
+`--fillers-settle`). A fresh native server per run on GPU 0 (port 18010, `bench.lock`, fixtures paused), arms interleaved. "Served" is the sum of
+`turbine_requests_total`, which matched 232 + `filler_retries` in every run.
+
+| Arm        | Run | accuracy | lossy cached ratio | cached ratio | filler resends | served |
+| ---------- | --- | -------- | ------------------ | ------------ | -------------- | ------ |
+| ladder     | r1  | 0.750    | 0.927              | 0.931        | 79             | 311    |
+| ladder     | r2  | 0.765    | 0.927              | 0.931        | 80             | 312    |
+| ladder     | r3  | 0.765    | 0.927              | 0.931        | 78             | 310    |
+| ladder off | r1  | 0.770    | 0.000              | 0.931        | 40             | 272    |
+| ladder off | r2  | 0.775    | 0.000              | 0.931        | 40             | 272    |
+| ladder off | r3  | 0.765    | 0.000              | 0.931        | 78             | 310    |
+
+- Nine candidate × baseline pairs (`scripts/eval/paired_compare.py --max-drop 0.01`): drops 0.000–0.025, median 0.010, lowest McNemar p
+  0.302. Gate PASS at the bound (`tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp-paired.json`; per-run pairs r1 0.020 FAIL, r2 0.010, r3
+  0.000).
+- Every candidate rewrote the prefix's 23 L1 blocks `l0 → fp8_e4m3 → tq4` (`fill_high_water` 23 + 23) and served 198 items from them;
+  plans `l0_pressure` 0, `retrieve_cheaper` 1, `all_l0` 198.
+
+SURVIVAL at 12 or more concurrent fillers (diagnosis, nothing changed). `/turbine/v1/pressure` every 0.5 s (`lad-cand-r1`): the only transition
+out of GREEN is `GREEN → SURVIVAL`, signal `kv_utilization` 0.9946 against the SURVIVAL threshold 0.97; `exhaustion_horizon` is null
+throughout. The sample at SURVIVAL has KV `used` 350 MiB and `reserved` 3,724 MiB of 4,096 MiB, with 14 admitted and 4 queued on
+`kv_reservation`: twelve fillers' worst-case reservations (about 310 MiB, 22 blocks each) were admitted within one controller sample. The
+ledger is right (the reservations are real), and the forecast plays no part. The cause is a policy gap: the P3 S-9 headroom rule (an
+admission waits when its reservation would lift `kv_utilization` past the next state's threshold) does not apply at GREEN, so admission at
+GREEN reserves up to the whole pool, past the 0.97 SURVIVAL threshold. SURVIVAL then requeued 10 unstarted requests (`survival_requeue`),
+rejected 79 fillers (`reject.survival`, the client's resends), and stepped down one level per 10 s dwell to GREEN 40 s later.
+
+10-minute overload soak with the ladder and `--shared-prefix-share 0.5` (`scripts/overload-soak.sh novanas --duration 10m --shared-prefix-share
+0.5 --set kv.cpu.enabled=true --set kv.cpu.max_bytes=4GiB --set kv.nvme.enabled=true --set kv.nvme.path=/home/piwi/turbine-kv-ladder --set
+kv.nvme.max_bytes=16GiB --set kv.ladder.enabled=true --set kv.ladder.l0=false --set kv.ladder.max_format=tq4`, client on novanas, serve run
+1002104721-2c9f5e72, `target/soak/novanas-20261002T104721Z`):
+
+- Verdict PASS, all 8 checks true; ITL p99 210 ms against a calibration of 174 ms; GREEN 27 s into the cool-down.
+- Responses: 4,629 × 200, 2,570 `queue_timeout`.
+- `turbine_kv_ladder_actions_total` 169 (S-6 soak criterion met): L2 `l0 → fp8_e4m3` 42 and `fp8_e4m3 → tq4` 42 (`fill_high_water`),
+  `new_demotion` into L2 at `tq4` 41, L1 `l0 → fp8_e4m3` 21 of which 21 `no_room` with one back-off, one L2 `rung_step_up`. Prefix cached
+  tokens 2,167,168; demotions L0 → L1 1,968, L1 → L2 83.
+
+Multi-turn A/B rerun on 25e8dc2 (after the L2 copy-loss fix and the no-room back-off), same workload and harness as the table above
+(`scripts/lab/phase6-novanas-ladder.yaml` against `--set kv.ladder.enabled=false`; 24 sessions × 8 turns, 2000-word shared prefix, think time
+1..4 s, session hints; arms interleaved, runs `target/t16/runs/mt2-{on,off}-r{1,2,3}`). States are the share of 0.5 s `/turbine/v1/pressure`
+samples.
+
+| Arm | Run | ok  | recomputed tokens | cached_tokens_ratio | lossy cached tokens | later-turn TTFT p50 / p99 (ms) | tok/s | L1 rewrites (no_room) | L2 rewrites (no_room) | L2 new demotions | L0→L1 / L1→L2 demotions | GREEN / YELLOW / ORANGE samples |
+| --- | --- | --- | ----------------- | ------------------- | ------------------- | ------------------------------ | ----- | --------------------- | --------------------- | ---------------- | ----------------------- | ------------------------------- |
+| on  | r1  | 192 | 126,856           | 0.8745              | 0                   | 126.4 / 40,453                 | 243.3 | 16 (16)               | 32 (32)               | 0                | 726 / 325               | 50 / 19 / 118                   |
+| on  | r2  | 187 | 132,906           | 0.8643              | 20,096              | 169.5 / 59,668                 | 164.0 | 9 (9)                 | 330 (0)               | 21               | 523 / 186               | 40 / 17 / 219                   |
+| on  | r3  | 192 | 180,486           | 0.8207              | 0                   | 158.5 / 11,615                 | 319.6 | 15 (15)               | 32 (32)               | 0                | 704 / 296               | 52 / 30 / 61                    |
+| off | r1  | 192 | 176,657           | 0.8246              | 0                   | 141.6 / 15,328                 | 336.0 |                       |                       |                  | 1,567 / 820             | 41 / 44 / 52                    |
+| off | r2  | 192 | 218,835           | 0.7834              | 0                   | 135.6 / 14,151                 | 326.6 |                       |                       |                  | 1,770 / 983             | 46 / 76 / 20                    |
+| off | r3  | 192 | 211,884           | 0.7904              | 0                   | 146.5 / 9,233                  | 350.8 |                       |                       |                  | 1,724 / 986             | 41 / 70 / 23                    |
+
+Medians, on against off:
+
+- Recomputed tokens: 132,906 against 211,884 (−37 %; −19 % before the fixes).
+- `cached_tokens_ratio`: 0.8643 against 0.7904.
+- Later-turn TTFT p50: 159 against 142 ms.
+- Later-turn TTFT p99: 40.5 against 14.2 s.
+- Output tok/s: 243 against 336 (−28 %).
+
+- The L1 spin is gone: each L1 no-room is followed by a back-off (`no_room_backoff` 1–2 per run), against 369–2,290 futile L1 submits
+  before. L2 rewrites no longer lose copies; in r1 and r3 all 32 end `no_room` with the copy kept, in r2 all 330 stored.
+- New: the ladder arm demotes less than half as much (L0 → L1 523–726 against 1,567–1,770) and spends longer at ORANGE (median 118 against 23 samples), where
+  admission waits and prefill is throttled; that is where the worse tail, the lower tok/s and on-r2's 5 `queue_timeout` failures come
+  from. Not diagnosed here (open point in `.procoder/handoff/p6b-t16.md`).
+- Labbook set `phase-6b-kv-compression`, runs `p6b-t16:mt2:llama:ladder-{on,off}:r{1,2,3}`.
+
 ### KV copies and decode steps (decision "6b: step-time drift during KV promotions", C; branch `p6b-copydrift`)
 
 Part 1 (signal), commit 05471e6 `fix(reliability)`: the `step_time_drift` window neither judges nor learns a pure decode step that overlapped an in-flight KV tier copy (`StepSample.copy_overlap`, `kv_orchestrator::CopyMark`: a copy in flight at the step's launch or collection, or found or left in flight by a transfer poll in between). They are counted in `turbine_decode_steps_unjudged_total{reason="kv_copy"}` and the `decode_step` trace (`kv_copy`, `kv_copy_excluded`). They still count for throughput.
