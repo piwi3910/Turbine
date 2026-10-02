@@ -3169,6 +3169,175 @@ mod tests {
         handle.join().unwrap().unwrap();
     }
 
+    /// The sum of every Prometheus series starting with `prefix` (labels included).
+    fn metric_sum(reg: &MetricsRegistry, prefix: &str) -> f64 {
+        reg.render()
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with(prefix))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// One run of [`ladder_rewrites_l2_copies_like_a_direct_fp8_tier`]: a prompt's two blocks go
+    /// to L2 at GREEN (stored `l0` with the ladder, `fp8_e4m3` without), the controller is held
+    /// at ORANGE while small requests drive iterations, then the prompt runs again. Returns its
+    /// tokens, its cached tokens, the ladder's l0 → fp8 rewrites in L2 and L2's bytes.
+    fn ladder_run(ladder: bool) -> (Vec<u32>, u32, f64, u64) {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        // Every full block of the prompt is lossy in both runs (no lossless tail at demotion).
+        kv.lossless_tail_blocks = 0;
+        let fp8 = turbine_core::config::ModuleName::new("fp8_e4m3").unwrap();
+        if ladder {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+            kv.ladder.max_format = fp8.clone();
+        } else {
+            kv.nvme.format = fp8;
+        }
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // ORANGE from 2 % KV utilisation: the ladder compresses the lowest tier at ORANGE
+        // whatever its fill; tiny prompts stay cheap enough to be admitted there.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.02), Some(0.95), Some(0.99)],
+        );
+        let l2_tier = Arc::new(std::sync::Mutex::new(None));
+        let opened = Arc::clone(&l2_tier);
+        let mut t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv.clone(),
+            move |cfg, format, metrics| {
+                let l2 = crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory");
+                *opened.lock().unwrap() = l2.clone();
+                l2
+            },
+            None,
+            config,
+        );
+        // As the engine thread does at startup (the cpu backend's transcode is the cpu
+        // reference provider).
+        let mem = pool_mem(&t.engine.pool);
+        kv.block_tokens = BLOCK_TOKENS;
+        assert!(
+            t.engine
+                .kv
+                .enable_device_transcode(&kv, cpu_reference_provider(), &mem),
+            "the fp8 rung runs on the device transcode"
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        let rewrites = r#"turbine_kv_ladder_actions_total{tier="l2",from="l0",to="fp8_e4m3""#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let _ = run_one(&tx, request(&prompt, 8));
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        reclaim.demote(0.0);
+        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, demoted) < 2.0 {
+            assert!(
+                Instant::now() < deadline,
+                "the prompt's blocks never reached L2 (ladder {ladder}): {}",
+                metric(&reg, demoted)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..3 {
+            tick(&ctl, 0.5);
+        }
+        assert_eq!(controller.state(), PressureState::Orange);
+        // Iterations at ORANGE: the ladder rewrites L2's l0 copies (with the ladder on).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for i in 0.. {
+            tick(&ctl, 0.5);
+            let _ = run_one(&tx, request(&[256, 3, 4 + i % 50], 2));
+            if (ladder && metric_sum(&reg, rewrites) >= 2.0) || (!ladder && i >= 5) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the ladder never rewrote the L2 copies: {} rewrites\n{}",
+                metric_sum(&reg, rewrites),
+                reg.render()
+                    .unwrap()
+                    .lines()
+                    .filter(|l| l.contains("ladder")
+                        || l.contains("pressure_state")
+                        || l.contains("tier_blocks")
+                        || l.contains("demotions_total")
+                        || l.contains("evictions_total"))
+                    .filter(|l| !l.starts_with('#') && !l.ends_with(" 0"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        assert_eq!(controller.state(), PressureState::Orange);
+        let (tokens, cached) = run_one(&tx, request(&prompt, 8));
+        let l2_bytes = l2_tier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |t| turbine_kv::tier::KvTier::used_bytes(t.as_ref()));
+        let actions = metric_sum(&reg, rewrites);
+        drop(tx);
+        handle.join().unwrap().unwrap();
+        (tokens, cached, actions, l2_bytes)
+    }
+
+    /// P6b S-6, the L1/L2 ladder on the server (cpu backend): with `kv.ladder.enabled` and an
+    /// `l0` L2, ORANGE pressure rewrites the L2 copies of a prompt's blocks one rung down to
+    /// `fp8_e4m3` through the device transcode (the cpu reference provider here), and the prompt
+    /// sent again reuses them from L2 with exactly the tokens it gets from an L2 that stored them
+    /// as `fp8_e4m3` in the first place (the same bytes), at the same L2 bytes. Breaks if the
+    /// ladder is refused or never acts on the server, a rewrite stores other bytes than a direct
+    /// fp8 demotion (a missing decode, the source's bytes), or a rewritten copy is not reused.
+    #[test]
+    fn ladder_rewrites_l2_copies_like_a_direct_fp8_tier() {
+        let (ladder, cached, rewrites, l2_ladder) = ladder_run(true);
+        let (direct, cached_direct, none, l2_direct) = ladder_run(false);
+        assert!(rewrites >= 2.0, "both blocks were rewritten: {rewrites}");
+        assert_eq!(none, 0.0, "no ladder, no rewrite");
+        assert_eq!(
+            (cached, cached_direct),
+            (32, 32),
+            "both reuse the L2 blocks"
+        );
+        assert_eq!(
+            ladder, direct,
+            "rewritten copies give the direct fp8 copies' tokens"
+        );
+        assert_eq!(l2_ladder, l2_direct, "L2 holds fp8 copies in both runs");
+    }
+
     /// Queues `req` with an output channel of `capacity` events.
     fn submit_with(
         tx: &mpsc::Sender<EngineCommand>,

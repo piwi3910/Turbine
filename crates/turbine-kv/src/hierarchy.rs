@@ -1652,6 +1652,9 @@ impl KvHierarchy {
                 return;
             }
             self.l0_keys.remove(&b);
+            if let Some(e) = self.dir.get_mut(key) {
+                e.ref_count = 0;
+            }
             if self.prefetch.evicted(key) {
                 self.metrics.prefetch_outcome(PrefetchOutcome::Wasted);
             }
@@ -1844,6 +1847,9 @@ impl KvHierarchy {
             let Some(key) = self.l0_keys.remove(&b) else {
                 continue;
             };
+            if let Some(e) = self.dir.get_mut(&key) {
+                e.ref_count = 0;
+            }
             if self.prefetch.evicted(&key) {
                 self.metrics.prefetch_outcome(PrefetchOutcome::Wasted);
             }

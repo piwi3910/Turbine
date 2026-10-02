@@ -271,10 +271,25 @@ impl L1PinnedTier {
             let j = slab.slots.iter().position(|x| *x == SlotState::Free)?;
             Some((i, j))
         });
-        let loc = match free {
+        // At the size limit, an empty slab of another slot size takes this size (P6b S-6: the
+        // ladder rewrites copies into other formats, so a tier's slot sizes change over time;
+        // L2 reformats an empty slab the same way).
+        let live = s.slabs.iter().filter(|x| x.is_some()).count();
+        let empty = (free.is_none() && live >= self.max_slabs)
+            .then(|| {
+                s.slabs
+                    .iter()
+                    .position(|x| x.as_ref().is_some_and(|x| x.occupied == 0))
+            })
+            .flatten();
+        if let Some(i) = empty {
+            let slab = s.slabs[i].as_mut().expect("an empty live slab");
+            slab.slot_bytes = slot_bytes;
+            slab.slots = vec![SlotState::Free; self.cfg.slab_bytes as usize / slot_bytes];
+        }
+        let loc = match free.or(empty.map(|i| (i, 0))) {
             Some(loc) => loc,
             None => {
-                let live = s.slabs.iter().filter(|x| x.is_some()).count();
                 if live >= self.max_slabs || s.host_pressure >= PressureState::Red {
                     return Err(TierError::Full);
                 }

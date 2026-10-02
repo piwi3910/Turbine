@@ -2930,3 +2930,28 @@ From `p6b-t13` (`.procoder/handoff/p6b-t13.md`, perf log 6b "TurboQuant in L0").
    - Recommendation: A
 
 **Decision (user, 2026-10-02): 1 A then C, 2 B, 3 C (skip the pass first), 4 A.** L0 tq4 stays experimental; a BF16 recent window in L0 follows (spec change, together with the L0 ladder step, Task 17); `kv.dtype: tq2` is refused with a reason code (tq2 stays a lower-tier rung); skip the post-CK pass when no row needs it, then speed up the encode kernel; cached L0 TurboQuant blocks count as `lossy_cached_tokens`.
+
+## 6b Task 16: ladder enablement on the server — four points (2026-10-02)
+
+From `p6b-t16` (08cfe57, 9f38494; `.procoder/handoff/p6b-t16.md`). The ladder's L1/L2 rewrites now run on the device in
+two budgeted rewrite lanes (host codec: ~1.3 s per fp8→tq4 rewrite of a Llama block); startup no longer refuses
+`kv.ladder.enabled` (still refused without v2.11, under TurboQuant L0 pages, with TP/PP; `kv.ladder.l0` stays refused).
+
+1. 9f38494 changes `turbine-kv` (owned by the OLMoE-tq4 builder): a block whose L0 copy left kept a stale `ref_count = 1`,
+   so the ladder never picked it (re-pinned `ladder_under_pinned_pressure`: 122,384 vs 147,328 recomputed, S-6 holds);
+   and L1 now reuses an empty slab for a new block size, as L2 already did.
+   - A) Keep it on `p6b-t16`, merge it first, and have the OLMoE-tq4 builder merge it (the stale refcount may matter to
+     its investigation)
+   - B) Hand it to the OLMoE-tq4 builder to land
+2. The ladder lab config uses `kv.ladder.max_format: tq4`, not the spec default `tq2` (tq2 failed its GSM8K gate):
+   - A) Use tq4 for the proof (and make tq4 the spec default)
+   - B) Keep tq2 as specified
+3. Slabs still holding one block of an old format keep that size, so a rewrite can fail with `Full`:
+   - A) Count the skip as `no_room` (reason code), no change to slabs
+   - B) Smaller L1 slabs
+4. If the shared-prefix eval's prefix never reaches a lossy rung (guard fails): lower the KV-pressure thresholds on both
+   sides of the pair so the filler phase runs at ORANGE:
+   - A) Yes
+   - B) Another approach (lead to propose)
+
+**Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Merge the turbine-kv fixes to the stack first and share them; prove the ladder with `max_format: tq4` and make tq4 the spec default; count an unmet rewrite as `no_room`; lower the KV-pressure thresholds on both sides of the eval pair if the guard fails.
