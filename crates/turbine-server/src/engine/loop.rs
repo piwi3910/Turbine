@@ -114,8 +114,8 @@ use super::stages::{Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
-use crate::kv_orchestrator::KvOrchestrator;
-use crate::metrics::{Outcome, TokenKind};
+use crate::kv_orchestrator::{CopyMark, KvOrchestrator};
+use crate::metrics::{Outcome, ReasonLabels, TokenKind};
 use crate::reliability::EngineReliability;
 
 /// Sleep between turns while requests exist but the last plan had nothing to run.
@@ -241,6 +241,8 @@ struct PipeFlight {
     /// Requests of the plan, failed together if its step fails.
     requests: Vec<RequestId>,
     launched: Instant,
+    /// KV copies at launch: the step's drift exclusion ([`CopyMark::overlapped`]).
+    copies: CopyMark,
 }
 
 /// A submission whose cached prefix is on its way to L0.
@@ -303,6 +305,8 @@ struct InFlight {
     phase: ForwardPhase,
     /// Host time of the launch call.
     launch_time: Duration,
+    /// KV copies at launch: the step's drift exclusion ([`CopyMark::overlapped`]).
+    copies: CopyMark,
     /// The full blocks the iteration writes (Phase 4), held (one pool reference each) from its
     /// ahead completion until it is collected: committed on success, then released.
     commits: Vec<KvCommit>,
@@ -461,6 +465,7 @@ impl EngineLoop {
         self.idle_turn = false;
         self.iteration_requests = plan_requests(&plan, &self.seqs);
         let started = Instant::now();
+        let copies = self.kv.copy_mark();
         let outcome = self.execute(&mut plan);
         let failed = outcome.failed.is_some();
         if !failed {
@@ -473,7 +478,7 @@ impl EngineLoop {
         }
         self.sched.complete(&mut self.pool, outcome);
         if !failed {
-            self.observe(&plan, started.elapsed().as_secs_f64());
+            self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
         self.kv_end_turn();
         self.publish(true);
@@ -551,12 +556,14 @@ impl EngineLoop {
         let requests = plan_requests(&plan, &self.seqs);
         self.iteration_requests = requests.clone();
         let launched = Instant::now();
+        let copies = self.kv.copy_mark();
         match self.try_launch(&plan) {
             Ok(Some(built)) => self.pipe.push_back(PipeFlight {
                 plan,
                 built,
                 requests,
                 launched,
+                copies,
             }),
             Ok(None) => self.sched.complete(
                 &mut self.pool,
@@ -651,7 +658,7 @@ impl EngineLoop {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
                 }
                 self.sched.complete(&mut self.pool, outcome);
-                self.observe(&f.plan, cadence.as_secs_f64());
+                self.observe(&f.plan, cadence.as_secs_f64(), f.copies);
             }
             Err(error) => {
                 let outcome = self.pipe_failure(f.plan.iteration, error);
@@ -825,9 +832,10 @@ impl EngineLoop {
         tracing::info!(event = "circuit_probe", request_id = %id.0, "circuit probe started");
     }
 
-    /// One executed iteration of `secs`: the decode step window and estimates, and the
-    /// admission throughput EWMAs.
-    fn observe(&mut self, plan: &IterationPlan, secs: f64) {
+    /// One executed iteration of `secs`, launched at KV copy state `copies`: the decode step
+    /// window and estimates, and the admission throughput EWMAs. A step that overlapped a KV
+    /// tier copy is not judged for drift (it still counts for throughput).
+    fn observe(&mut self, plan: &IterationPlan, secs: f64, copies: CopyMark) {
         self.iterations += 1;
         let prefill = plan.prefill_tokens();
         let decodes = plan.decode_tokens();
@@ -835,6 +843,8 @@ impl EngineLoop {
             && self.snap.circuit == CircuitState::Healthy
             && self.probe.is_none();
         let context_tokens = plan.decode_context_tokens();
+        let kv_copy = copies.overlapped(self.kv.copy_mark());
+        let excluded = self.decode_steps.kv_copy_excluded();
         let judged = self.decode_steps.observe(
             StepSample {
                 prefill_tokens: prefill,
@@ -842,9 +852,17 @@ impl EngineLoop {
                 context_tokens,
                 secs,
                 at: self.clock.now_mono(),
+                copy_overlap: kv_copy,
             },
             calm,
         );
+        if self.decode_steps.kv_copy_excluded() > excluded {
+            self.metrics
+                .server
+                .unjudged_decode_steps
+                .get_or_create(&ReasonLabels { reason: "kv_copy" })
+                .inc();
+        }
         if prefill == 0 && decodes > 0 {
             tracing::debug!(
                 event = "decode_step",
@@ -852,6 +870,8 @@ impl EngineLoop {
                 context_tokens,
                 secs,
                 calm,
+                kv_copy,
+                kv_copy_excluded = self.decode_steps.kv_copy_excluded(),
                 ratio = judged,
                 "decode step against its shape bucket's calm baseline"
             );
@@ -2044,6 +2064,7 @@ impl EngineLoop {
             launched: false,
             phase: ForwardPhase::Decode,
             launch_time: Duration::ZERO,
+            copies: self.kv.copy_mark(),
             commits: Vec::new(),
         };
         next.phase = phase_of(&next.plan);
@@ -2153,6 +2174,7 @@ impl EngineLoop {
         }
         let mut plan = next.plan;
         let started = Instant::now();
+        let copies = self.kv.copy_mark();
         let mut outcome = self.recover_after(&mut plan, error);
         outcome
             .finished
@@ -2160,7 +2182,7 @@ impl EngineLoop {
         let failed = outcome.failed.is_some();
         self.sched.complete(&mut self.pool, outcome);
         if !failed {
-            self.observe(&plan, started.elapsed().as_secs_f64());
+            self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
         Ok(None)
     }
@@ -2265,7 +2287,7 @@ impl EngineLoop {
                 let mut outcome = IterationOutcome::default();
                 self.sample(&p.rows, logits, &mut outcome);
                 self.late_finished.extend(outcome.finished);
-                self.observe(&p.plan, (p.launch_time + waited).as_secs_f64());
+                self.observe(&p.plan, (p.launch_time + waited).as_secs_f64(), p.copies);
                 true
             }
             Err(error) => {
@@ -3180,6 +3202,96 @@ mod tests {
         );
         drop(tx);
         handle.join().unwrap().unwrap();
+    }
+
+    /// Decision "6b: step-time drift during KV promotions" (C) on the cpu backend, serial and
+    /// overlapped: a decode step that runs while a KV tier copy is in flight (here a long
+    /// request decoding while another prompt's blocks come back from L2) is not judged by the
+    /// drift window and is counted in `turbine_decode_steps_unjudged_total{reason="kv_copy"}`;
+    /// with no copy anywhere no step is excluded. Breaks if overlapped steps are judged (the
+    /// count stays 0), or every step is excluded (the copy-free runs count).
+    #[test]
+    fn decode_steps_during_kv_copies_are_not_judged() {
+        let unjudged = r#"turbine_decode_steps_unjudged_total{reason="kv_copy"}"#;
+        for overlap in [false, true] {
+            let (dir, spec, tokenizer) = tiny();
+            let mut kv = KvConfig::default();
+            kv.nvme.enabled = true;
+            kv.nvme.path = dir.path().join("kv");
+            kv.nvme.max_bytes = ByteSize(16 << 20);
+            kv.nvme.slab_bytes = ByteSize(1 << 20);
+            let exec = if overlap {
+                tiny_reducing_executor(&spec, 4)
+            } else {
+                tiny_executor(&spec, 4)
+            };
+            let t = engine_with_kv(
+                exec,
+                Arc::clone(&tokenizer),
+                params(4, 64),
+                overlap,
+                kv,
+                |cfg, format, metrics| {
+                    crate::kv_orchestrator::open_l2(
+                        cfg,
+                        format,
+                        &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                        Arc::new(SystemClock::new()),
+                        metrics,
+                    )
+                    .expect("L2 opens in the temp directory")
+                },
+            );
+            let reclaim = t.engine.kv.reclaimer();
+            let TestEngine {
+                engine, tx, reg, ..
+            } = t;
+            let handle = std::thread::spawn(move || engine.run());
+
+            let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+            let _ = run_one(&tx, request(&prompt, 8));
+            let (_, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 32, "the reuse evidence demotion needs");
+            assert_eq!(
+                metric(&reg, unjudged),
+                0.0,
+                "no copy ran yet (overlap {overlap})"
+            );
+            reclaim.demote(0.0);
+            let _ = run_one(&tx, request(&[256, 1, 2], 2));
+            let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while metric(&reg, demoted) < 2.0 {
+                assert!(Instant::now() < deadline, "the blocks never reached L2");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let before = metric(&reg, unjudged);
+            // A long decode, then the prompt again: its blocks are promoted from L2 while the
+            // long request decodes.
+            let (mut long, admitted) = submit_with(&tx, request(&[256, 5, 6], 100), 256);
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            while !matches!(
+                long.blocking_recv().expect("stream ended early"),
+                GenerationEvent::Token { .. }
+            ) {}
+            let (_, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 32, "both blocks came back from L2");
+            loop {
+                match long.blocking_recv().expect("stream ended early") {
+                    GenerationEvent::Finished { .. } => break,
+                    GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                    _ => {}
+                }
+            }
+            assert!(metric(&reg, r#"turbine_kv_promotions_total{from="l2",to="l0"}"#) >= 2.0);
+            assert!(
+                metric(&reg, unjudged) > before,
+                "a decode step overlapped the promotion (overlap {overlap}): {before} -> {}",
+                metric(&reg, unjudged)
+            );
+            drop(tx);
+            handle.join().unwrap().unwrap();
+        }
     }
 
     /// The sum of every Prometheus series starting with `prefix` (labels included).

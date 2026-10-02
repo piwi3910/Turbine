@@ -896,6 +896,8 @@ impl OverloadSim {
                 context_tokens: plan.decode_context_tokens(),
                 secs,
                 at: self.clock.now_mono(),
+                // The simulator has no KV tier copies.
+                copy_overlap: false,
             },
             calm,
         );

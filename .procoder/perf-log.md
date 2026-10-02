@@ -715,3 +715,19 @@ Shared-prefix GSM8K with the ladder (`p6b-eval-prefix.md` recipe on the ladder c
 - Responses: 4709 × 200 and 98 × 429 `queue_full`; 4034 `queue_timeout`.
 - `turbine_kv_ladder_actions_total` is 0, so the S-6 soak criterion ("> 0") is not met. The soak's random prompts share nothing: `turbine_kv_prefix_cached_tokens_total` was 0 and there were no demotions, so L1 and L2 stayed empty and the ladder had nothing to act on.
 - An earlier attempt at 07:13 never started: another builder's soak server held port 18000. A second one, on 4e49409, was stopped during overload because the drift fixes were missing.
+
+### KV copies and decode steps (decision "6b: step-time drift during KV promotions", C; branch `p6b-copydrift`)
+
+Part 1 (signal), commit 05471e6 `fix(reliability)`: the `step_time_drift` window neither judges nor learns a pure decode step that overlapped an in-flight KV tier copy (`StepSample.copy_overlap`, `kv_orchestrator::CopyMark`: a copy in flight at the step's launch or collection, or found or left in flight by a transfer poll in between). They are counted in `turbine_decode_steps_unjudged_total{reason="kv_copy"}` and the `decode_step` trace (`kv_copy`, `kv_copy_excluded`). They still count for throughput.
+
+Part 2 (why promotions slow decode), from the `p6b-drift` traces (`scratch/p6b-drift/olmoe-fix/*.server.log`, `scratch/p6b-copydrift/corr2.py`; judged decode steps against the `kv_copy_stages` of L1 → L0 copies that overlap them):
+
+| run          | steps ≥ 1.5× | step ms (slow / normal) | extra ms | L1→L0 MiB in flight | extra vs MiB (slope, r) |
+| ------------ | ------------ | ----------------------- | -------- | ------------------- | ----------------------- |
+| OLMoE l0 r1  | 9            | 26.9 / 15.2             | 11.6     | 176                 | 0.065 ms/MiB, r 0.99    |
+| OLMoE l0 r2  | 13           | 30.1 / 14.3             | 11.9     | 192                 | 0.063 ms/MiB, r 0.98    |
+| OLMoE tq4 r1 | 3            | 22.1 / 14.8             | 8.5      | 90                  | 0.084 ms/MiB, r 0.67    |
+
+- A step's extra time is linear in the promotion bytes in flight with it (r 0.98–0.99 for `l0`). The slope is 0.063–0.065 ms/MiB, about 16 GB/s, the order of the copy stream's SDMA rate (≈ 12 GB/s, `p6b-d2h`). So the step waits for a share of the queued copy bytes to drain, and does not slow by a constant factor. HBM contention cannot do that: 12 GB/s is under 2 % of the card's memory bandwidth.
+- `l0` promotions are pure H2D on the copy stream. The copy does no compute-stream fence (`ShimContext::enqueue` fences only device-source copies) and runs no transcode kernel, yet `l0` shows the largest effect. The compute-stream fence and the staging decode kernel are therefore not the mechanism for `l0`. For `tq4`, the decode kernel runs on the compute stream (0.04 ms a block) after the host sees the H2D finish, which is too small to matter.
+- Remaining candidate: the decode step's own transfers on the compute stream (the batch metadata upload through staging, the logits inputs and the reads, `turbine_model::executor::batch` / `logits`) queue on the SDMA engine behind the copy stream's batches, up to `kv.transfer.max_inflight_bytes` (default 1 GiB) ahead of them. 13 × 16 MiB in flight take about 17 ms at 12 GB/s, and the measured extra is 14–16 ms. To be confirmed with rocprofv3 (`--kernel-trace --memory-copy-trace`, `scratch/p6b-copydrift/prof.py`: compute-stream copy durations and gaps inside and outside promotion intervals, against kernel durations).
