@@ -2980,3 +2980,16 @@ tokens short of `l0`; scoring that block like its history gives exact parity in 
 **Filed (user, 2026-10-02):** https://github.com/ROCm/rocm-systems/issues/12677 (HIP) and https://github.com/ROCm/rocm-libraries/issues/12895 (hipBLASLt), cross-linked.
 
 **Upstream fix PRs (user, 2026-10-02): hipBLASLt only.** A builder prepares a fix PR for rocm-libraries#12895 from a fork under the user's account, verified on novanas; the HIP clr change is left to AMD (rocm-systems#12677); our shim lock stays.
+
+## 6b: OLMoE tq4 after the last-block change — the A/B arms ran under different pressure (2026-10-02)
+
+From `p6b-lastblock` (merged): Llama tq4 0.9061 vs `l0` 0.9052 (PASS); OLMoE tq4 0.8609 vs `l0` 0.8627 (FAIL). Every
+OLMoE `l0` run (this A/B and the previous one) went YELLOW on step-time drift 24–25 s after ready and stayed there
+(~15 reclaim events); no tq4 run left GREEN — the same signal the drift builder is investigating. kv_sim shows tq4 ≥ `l0`
+at GREEN in 12/12 after the change.
+
+- A) Rerun the OLMoE A/B after the drift fix lands (both arms under the same pressure), flip tq4 if it holds
+- B) Investigate OLMoE tq4 block loss at GREEN now (per-arm dropped-block counts; kv_sim does not reproduce it)
+- C) Accept the gap and flip now (relaxes the gate)
+
+**Decision (user, 2026-10-02): A.** Rerun the OLMoE A/B after the drift fix lands; flip tq4 if it holds.
