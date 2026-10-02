@@ -43,3 +43,35 @@ passed=924`.
 Results and scripts on novanas: `scratch/copykernel-ab/` (`ab.sh`, `runall.sh`, `runmore.sh`, `corr3.py`, `summ.py`,
 `slow.py`, `stall.py`, `gaps.py`; dirs `sdma`, `kernel`). The microbenchmark scratch dir was removed. The remote workspace
 `remote/agent-p6b-copykernel/` holds `kbuild/` and the release binaries of 314c848.
+
+## Session 2 (2026-10-02, decision "6b: promotion copy kernel — default" A) — PAUSED by the user
+
+Branch `p6b-copykernel` (from `p6b-stack` a4e0941). Not pushed.
+
+### Done
+
+- a43c4f7 `feat(kernels)`: `copy_eval` `CB_DIR=d2h` (device → pinned demotion variant: SDMA, or the copy kernel storing to
+  the mapped host buffer; the bytes are verified). Built in `remote/agent-p6b-copykernel/kbuild/turbine_copy_eval`, not run yet.
+- 4ba941c `feat(kv)`: `kv.transfer.promotion_copy` is now `Option<PromotionCopy>`, unset by default. Unset = `kernel` when
+  every copy-stream library has the v2.11 copy kernel, else `sdma` with WARN `event="kv_promotion_copy"`
+  `reason="promotion_copy_kernel_unavailable"`. Explicit `kernel` on such a library is still refused; explicit `sdma` keeps
+  the copy engine. `set_promotion_copy(Option<PromotionCopy>) -> Result<PromotionCopy, String>`. New test
+  `kv_orchestrator::tests::an_unset_promotion_copy_prefers_the_kernel_and_falls_back`; mutations (unset → sdma; unset and
+  no kernel refused; explicit sdma overridden) each fail it. Config test updated. AGENTS.md, contract (config row, v2.11
+  paragraph) and the 6b spec config table amended. Gate `scripts/gate.sh --base a4e0941`: `gate: ok passed=935`.
+  **The flip is committed ahead of steps 2–3**; if either fails, revert 4ba941c's default (keep the Option) and report.
+- Step 1, Llama A/B, 5 runs per arm: holds (perf log 6b "Promotion copy kernel", Llama table): slope 0.056 → 0.006 ms/MiB,
+  promotion median 41.6 → 24.2 ms, tok/s 331 → 343, TTFT p99 389 → 325 ms, cached ratio 0.9054 → 0.9031 (watch item).
+  Results on novanas `scratch/copykernel-llama/` (`sdma/`, `kernel/`, `summ_llama.py`, `corr3.py`, frozen binaries).
+
+### Next (exact)
+
+1. Step 2: `scripts/lab-bench.sh --golden16 --model llama -- --set kv.transfer.promotion_copy=kernel`, then `--model olmoe`
+   (run with `run_in_background`; clean tree at 4ba941c or later). Compare tok/s with the 6a-exit baseline (Llama 854.2,
+   OLMoE 602.5; bound ≥ 0.98×) and golden c1/c16 PASS.
+2. Step 3: on novanas, `scratch/copykernel-d2h/run.sh` (already written: H2D/D2H × SDMA 64/256/1024 KiB and kernel 1/2/4/16
+   workgroups, 3 runs, plus 11.3 ms-step variants) under `flock -x bench.gate flock -x bench.lock`, detached. If D2H SDMA
+   shows a slope like H2D (~0.05 ms/MiB), also check the A/B traces (`corr3.py` counts only `l1_to_l0`; add `l0_to_l1`)
+   and report the D2H copy-kernel option before implementing anything.
+3. Perf log + labbook set `phase-6b-kv-compression` (the 10 Llama A/B runs, external ids `p6b-copykernel:llama-ab:*`, not
+   submitted yet), then remove `scratch/copykernel-llama` and `scratch/copykernel-d2h`.
