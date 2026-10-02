@@ -3085,3 +3085,16 @@ From `p6b-t16` (merged; perf log "Compression ladder in L1/L2 on the server"). E
    - B) Ship the ladder off by default (it already is) and investigate later
 
 **Decision (user, 2026-10-02): 1 A, 2 A.** Apply the admission headroom rule at GREEN too, capped at the SURVIVAL/RED threshold (Phase 3 spec amendment); investigate the ladder-on throughput and tail regression before Task 17.
+
+## 6b: ladder-on regression — demotions into a tier whose rung changed (2026-10-02)
+
+From `p6b-ladderperf` (handoff + `p6b-ladderperf.patch`). Root cause: ~3 s after YELLOW the ladder switches L1's format
+for new demotions from `l0` to `fp8_e4m3`; L1's two slabs hold only `l0`-size slots and never empty, so every new
+demotion fails `Full` and its L0 block stays → L0 can't drain → ORANGE throttling → the −28 % tok/s and 3× p99 (on-r1:
+L1 137 blocks all `l0`, L0 553/585 at ORANGE; L0→L1 demotions 726 vs 1,567 off). L2 likewise for L1→L2.
+
+- A) Fallback: a new demotion uses the tier's new rung only while the tier has a free slot of that size, else stores at
+  the tier's own format (demotions keep flowing; L1 holds no compressed copies while its slabs stay non-empty); measure
+  whether B or C is worth adding after
+- B) A plus emptying a whole slab so it can be re-sized to the new format
+- C) Smaller L1 slabs
