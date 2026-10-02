@@ -2928,3 +2928,5 @@ From `p6b-t13` (`.procoder/handoff/p6b-t13.md`, perf log 6b "TurboQuant in L0").
    - A) Count them as lossy (S-3 reads "served from lossy blocks")
    - B) Leave it (`kv.dtype` already says every block is lossy)
    - Recommendation: A
+
+**Decision (user, 2026-10-02): 1 A then C, 2 B, 3 C (skip the pass first), 4 A.** L0 tq4 stays experimental; a BF16 recent window in L0 follows (spec change, together with the L0 ladder step, Task 17); `kv.dtype: tq2` is refused with a reason code (tq2 stays a lower-tier rung); skip the post-CK pass when no row needs it, then speed up the encode kernel; cached L0 TurboQuant blocks count as `lossy_cached_tokens`.
