@@ -62,18 +62,22 @@ impl DecodeStepWindow {
 
     /// One executed iteration. Iterations with a prefill are skipped, so a prefill is not
     /// mistaken for slowing down. The step is judged against its bucket's baseline (before this
-    /// step updates it); `calm` steps then update that baseline.
-    pub fn observe(&mut self, s: StepSample, calm: bool) {
+    /// step updates it); `calm` steps then update that baseline. Returns the step's judged ratio
+    /// (`None`: skipped or not judged), for the engine's `decode_step` debug trace.
+    pub fn observe(&mut self, s: StepSample, calm: bool) -> Option<f64> {
         if s.rows == 0 || s.prefill_tokens > 0 {
-            return;
+            return None;
         }
         let key = bucket(s.rows, s.context_tokens);
         let base = self.baselines.get(&key).copied().unwrap_or_default();
+        let mut judged = None;
         if base.samples >= MIN_BUCKET_SAMPLES && base.secs > 0.0 {
             if self.steps.len() == STEP_WINDOW {
                 self.steps.pop_front();
             }
-            self.steps.push_back(s.secs / base.secs);
+            let ratio = s.secs / base.secs;
+            self.steps.push_back(ratio);
+            judged = Some(ratio);
         }
         if calm {
             let b = self.baselines.entry(key).or_default();
@@ -84,6 +88,7 @@ impl DecodeStepWindow {
             };
             b.samples = b.samples.saturating_add(1);
         }
+        judged
     }
 
     /// Forget every baseline and judged step (the circuit came back from PROBING: the device
@@ -168,7 +173,11 @@ mod tests {
         for _ in 0..MIN_BUCKET_SAMPLES - 1 {
             w.observe(step(2, 1000, 0.01), true);
         }
-        w.observe(step(2, 1000, 0.05), false);
+        assert_eq!(
+            w.observe(step(2, 1000, 0.05), false),
+            None,
+            "bucket not ready"
+        );
         assert_eq!(w.p95(), None, "bucket not ready");
         w.observe(step(2, 1000, 0.01), true);
         w.observe(step(23, 92_000, 0.2), false);
@@ -181,8 +190,9 @@ mod tests {
             false,
         );
         assert_eq!(w.p95(), None, "prefill skipped");
-        w.observe(step(2, 1000, 0.01), false);
-        assert!((w.p95().unwrap() - 1.0).abs() < 1e-9);
+        let judged = w.observe(step(2, 1000, 0.02), false);
+        assert!(judged.is_some_and(|r| (r - 2.0).abs() < 1e-9), "{judged:?}");
+        assert!((w.p95().unwrap() - 2.0).abs() < 1e-9);
     }
 
     /// Context in half-powers of two: 1,100 and 1,300 tokens share a bucket, 1,100 and 3,000 do

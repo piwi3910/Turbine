@@ -834,15 +834,27 @@ impl EngineLoop {
         let calm = self.snap.state == PressureState::Green
             && self.snap.circuit == CircuitState::Healthy
             && self.probe.is_none();
-        self.decode_steps.observe(
+        let context_tokens = plan.decode_context_tokens();
+        let judged = self.decode_steps.observe(
             StepSample {
                 prefill_tokens: prefill,
                 rows: decodes,
-                context_tokens: plan.decode_context_tokens(),
+                context_tokens,
                 secs,
             },
             calm,
         );
+        if prefill == 0 && decodes > 0 {
+            tracing::debug!(
+                event = "decode_step",
+                rows = decodes,
+                context_tokens,
+                secs,
+                calm,
+                ratio = judged,
+                "decode step against its shape bucket's calm baseline"
+            );
+        }
         if decodes > 0 {
             self.decode_step_s = if self.decode_step_s > 0.0 {
                 STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s
