@@ -2976,3 +2976,5 @@ tokens short of `l0`; scoring that block like its history gives exact parity in 
 **Decision (user, 2026-10-02): 1 A, 2 A.** Score the lossless last block like its history for eviction order, rerun both A/Bs, flip tq4 if they hold; investigate the step-time drift signal at startup now.
 
 **Filed (user, 2026-10-02):** https://github.com/ROCm/rocm-systems/issues/12677 (HIP) and https://github.com/ROCm/rocm-libraries/issues/12895 (hipBLASLt), cross-linked.
+
+**Upstream fix PRs (user, 2026-10-02): hipBLASLt only.** A builder prepares a fix PR for rocm-libraries#12895 from a fork under the user's account, verified on novanas; the HIP clr change is left to AMD (rocm-systems#12677); our shim lock stays.
