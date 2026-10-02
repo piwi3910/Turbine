@@ -2993,3 +2993,16 @@ at GREEN in 12/12 after the change.
 - C) Accept the gap and flip now (relaxes the gate)
 
 **Decision (user, 2026-10-02): A.** Rerun the OLMoE A/B after the drift fix lands; flip tq4 if it holds.
+
+## 6b: step-time drift during KV promotions (2026-10-02)
+
+From `p6b-drift` (merged): two window defects fixed (p95 needs ≥ 20 judged steps; judged steps age out after 10 s);
+Llama starts no longer go RED early; soak PASS 8/8. The OLMoE `l0` YELLOW is real: from ~17 s decode steps are
+1.5–2.4× slower, and every step ≥ 1.5× overlapped an in-flight KV copy (almost always an L1→L0 promotion; only 2–3 % of
+normal steps did); `l0` copies 16 MiB blocks vs 4.5 MiB for tq4, so `l0` shows it more.
+
+- A) Leave the signal as is (it reports a real slowdown)
+- B) Don't judge decode steps that overlap a KV copy (drift then tracks the model, not copy interference)
+- C) B, plus a perf item: find why promotions slow decode (copy-engine / PCIe contention vs compute-stream fence)
+
+**Decision (user, 2026-10-02): C.** Decode steps overlapping a KV copy are not judged by the drift signal; a perf item finds why promotions slow decode.
