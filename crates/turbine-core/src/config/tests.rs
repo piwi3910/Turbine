@@ -795,6 +795,7 @@ fn kv_config_validation() {
     assert_eq!(d.demote_min_value, 0.0);
     assert!(d.prefix_sharing);
     assert_eq!(d.transfer.max_inflight_bytes, ByteSize::gib(1));
+    assert_eq!(d.transfer.promotion_copy, PromotionCopy::Sdma);
     assert_eq!(d.session.max_sessions, 10_000);
     assert_eq!(d.session.hot_ttl, HumanDuration::from_secs(60));
     assert_eq!(d.session.warm_ttl, HumanDuration::from_secs(600));
@@ -805,6 +806,21 @@ fn kv_config_validation() {
     assert_eq!(d.policy_weights.hit_half_life, HumanDuration::from_secs(60));
 
     let base = "model:\n  path: /m\n";
+    // kv.transfer.promotion_copy: sdma (default) or kernel, nothing else.
+    let kernel = parse(
+        &format!("{base}kv:\n  transfer:\n    promotion_copy: kernel\n"),
+        &[],
+    )
+    .expect("kernel is valid");
+    assert_eq!(kernel.kv.transfer.promotion_copy, PromotionCopy::Kernel);
+    assert_eq!(PromotionCopy::Kernel.as_str(), "kernel");
+    assert!(
+        parse(
+            &format!("{base}kv:\n  transfer:\n    promotion_copy: blit\n"),
+            &[]
+        )
+        .is_err()
+    );
     let lru = parse(&format!("{base}kv:\n  policy: lru\n"), &[]).expect("lru is valid");
     assert_eq!(lru.kv.policy.as_str(), "lru");
     // kv.policy names an `eviction_policy` registry module: an unregistered name is refused

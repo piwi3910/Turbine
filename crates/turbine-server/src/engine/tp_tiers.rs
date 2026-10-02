@@ -288,13 +288,14 @@ impl WorkerTiers {
         }
         let l2 = l2.filter(|t| t.enabled()).map(|t| t as Arc<dyn KvTier>);
         let io_capacity = (kv.transfer.max_inflight_bytes.0 / shard_bytes.max(1)) as usize + 1;
-        let backend = CopyStreamBackend::new(
+        let mut backend = CopyStreamBackend::new(
             vec![KvShard { device, addresses }],
             l1.clone(),
             l2.clone(),
             IoPoolBackend::new(kv.nvme.io_threads.max(1) as usize, io_capacity),
             shard_bytes as usize,
         );
+        backend.set_promotion_copy(kv.transfer.promotion_copy)?;
         Ok(WorkerTiers {
             backend,
             l1,

@@ -167,6 +167,7 @@ set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
   src/copy_stream.cpp
+  src/copy_kernel.hip
   src/graph.cpp
   src/gemm.cpp
   src/gemm_table.cpp
@@ -263,6 +264,14 @@ target_include_directories(turbine_gemm_tune PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(turbine_gemm_tune PRIVATE hip::host roc::hipblaslt)
+
+# The promotion copy evaluation (Phase 6b, decision "6b: KV promotions slow
+# decode — which fix" A): copy-engine and copy-kernel promotions against a
+# decode-like compute loop. A lab tool, not loaded by the server.
+add_executable(turbine_copy_eval tools/copy_eval.cpp)
+set_source_files_properties(tools/copy_eval.cpp PROPERTIES LANGUAGE HIP)
+set_target_properties(turbine_copy_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+target_link_libraries(turbine_copy_eval PRIVATE hip::host)
 
 # The quantized GEMM provider evaluation harness (Phase 6a, decisions "P6: FP8 GEMM — provider
 # evaluation (kernel reuse rule)" and its block-scaled sequel): times and checks the hipBLASLt FP8

@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, oneshot};
 use turbine_core::clock::Clock;
-use turbine_core::config::KvConfig;
+use turbine_core::config::{KvConfig, PromotionCopy};
 use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
     BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
@@ -607,6 +607,9 @@ impl KvOrchestrator {
         );
         backend.set_host_codec(host_codec);
         backend.set_metrics(metrics.clone());
+        backend
+            .set_promotion_copy(s.cfg.transfer.promotion_copy)
+            .map_err(StartupError::new)?;
         let (tx, commands) = mpsc::channel(s.cfg.prefetch.max_queue.max(1) as usize);
         let mut o = KvOrchestrator {
             h,
@@ -2112,6 +2115,8 @@ pub struct CopyStreamBackend {
     /// Where a ladder rewrite that found no room in its tier is counted (`no_room`, P6b S-6;
     /// [`CopyStreamBackend::count_no_room`]).
     metrics: Option<KvMetrics>,
+    /// `kv.transfer.promotion_copy: kernel`: pinned → L0 batches run on the copy kernel.
+    kernel_promotions: bool,
 }
 
 impl CopyStreamBackend {
@@ -2150,6 +2155,7 @@ impl CopyStreamBackend {
             took: HashMap::new(),
             gpu: None,
             metrics: None,
+            kernel_promotions: false,
         }
     }
 
@@ -2285,6 +2291,33 @@ impl CopyStreamBackend {
         self.metrics = Some(metrics);
     }
 
+    /// `kv.transfer.promotion_copy` (P6b, decision "6b: KV promotions slow decode — which fix"
+    /// A): with `kernel` every pinned → L0 batch of a copy-stream shard runs on its library's
+    /// copy kernel instead of the copy engine. Refused (`promotion_copy_kernel_unavailable`)
+    /// when a copy-stream shard's library has none.
+    pub fn set_promotion_copy(&mut self, copy: PromotionCopy) -> Result<(), String> {
+        let kernel = copy == PromotionCopy::Kernel;
+        let lacking = self.shards.iter().position(
+            |s| matches!(&s.device, CopyDevice::Stream { engine, .. } if !engine.has_copy_kernel()),
+        );
+        if let (true, Some(shard)) = (kernel, lacking) {
+            return Err(format!(
+                "kv.transfer.promotion_copy: kernel: the kernel library of shard {shard} has no \
+                 host-to-device copy kernel (kernel ABI v2.11 turbine_memcpy_h2d_kernel; \
+                 promotion_copy_kernel_unavailable)"
+            ));
+        }
+        if kernel {
+            tracing::info!(
+                event = "kv_promotion_copy",
+                path = copy.as_str(),
+                "KV promotions run on the copy kernel"
+            );
+        }
+        self.kernel_promotions = kernel;
+        Ok(())
+    }
+
     /// A ladder rewrite (P6b S-6) that completed with `Full`: its tier had no slot of the new
     /// format's size (a slab still holds blocks of an old size), so the copy keeps its format
     /// and the rewrite is skipped. Counted as `turbine_kv_ladder_actions_total{reason="no_room"}`
@@ -2405,9 +2438,12 @@ impl CopyStreamBackend {
             acc += len;
         }
         // On an error no copy of the batch is in flight (the `copy_async_batch` contract).
-        engine
-            .copy_async_batch(&ops)
-            .map_err(|e| TierError::Io(format!("copy stream: {e}")))
+        if to_device && self.kernel_promotions {
+            engine.copy_async_batch_kernel(&ops)
+        } else {
+            engine.copy_async_batch(&ops)
+        }
+        .map_err(|e| TierError::Io(format!("copy stream: {e}")))
     }
 
     /// Synchronous copy of shard `shard` of L0 block `block` into (`to_device` false) or from
@@ -4694,6 +4730,79 @@ mod tests {
         assert_eq!(ctx.copies.load(Ordering::Relaxed) - c0, 2 * segments);
     }
 
+    /// `kv.transfer.promotion_copy: kernel` (P6b, decision "6b: KV promotions slow decode —
+    /// which fix" A): every pinned → L0 batch (calibration and promotions) goes to the copy
+    /// kernel, every L0 → pinned batch stays on the copy engine, and the bytes come back whole;
+    /// a library without the copy kernel is refused at startup with
+    /// `promotion_copy_kernel_unavailable`. Breaks if promotions ignore the switch, a demotion
+    /// goes to the kernel, or a missing kernel silently falls back.
+    #[test]
+    fn promotions_use_the_copy_kernel_when_configured() {
+        let dir = TempDir::new("turbine-kv-copy-kernel");
+        let mut kv = kv_config(&dir, true);
+        kv.transfer.promotion_copy = turbine_core::config::PromotionCopy::Kernel;
+        let start = |ctx: &Arc<FakeCtx>, pool: &mut BlockPool| {
+            KvOrchestrator::start(
+                KvStart {
+                    cfg: &kv,
+                    memory_kind: MemoryKind::Dedicated,
+                    identity: identity(),
+                    device: CopyDevice::Stream {
+                        engine: Arc::clone(ctx) as _,
+                        pinned: Arc::clone(ctx) as _,
+                    },
+                    shards: Vec::new(),
+                    l2: None,
+                    clock: Arc::new(SystemClock::new()),
+                    metrics: KvMetrics::register(&MetricsRegistry::new()),
+                    remote: None,
+                    kv_scales: None,
+                },
+                pool,
+            )
+        };
+        let (mem, mut pool) = rank(0);
+        let without = FakeCtx::new(&mem, 0);
+        let err = start(&without, &mut pool)
+            .err()
+            .expect("no copy kernel: refused");
+        assert!(
+            err.to_string()
+                .contains("promotion_copy_kernel_unavailable"),
+            "{err}"
+        );
+
+        let (mem, mut pool) = rank(0);
+        let ctx = FakeCtx::new(&mem, 0);
+        ctx.kernel.store(true, Ordering::Relaxed);
+        let free = u64::from(pool.free_blocks());
+        let (mut o, _handle) = start(&ctx, &mut pool).expect("the KV hierarchy starts");
+        assert!(o.h.l1_enabled(), "L1 calibrated");
+        // Calibration: down on the copy engine, up on the kernel, warm-up and timed pass.
+        let blocks = free.min(CALIBRATION_BYTES / layout().block_bytes());
+        assert_eq!(ctx.batches.load(Ordering::Relaxed), 2 * blocks);
+        assert_eq!(ctx.kernel_batches.load(Ordering::Relaxed), 2 * blocks);
+
+        let r = (mem, pool);
+        let bb = layout().block_bytes() as usize;
+        let want = pattern(2, 7, bb);
+        write_block(&r, 4, &want);
+        let (b0, k0) = (
+            ctx.batches.load(Ordering::Relaxed),
+            ctx.kernel_batches.load(Ordering::Relaxed),
+        );
+        let key = KvKey([13; 16]);
+        run(&mut o, 1, TransferPath::L0ToL1, key, 4, 0).unwrap();
+        run(&mut o, 2, TransferPath::L1ToL0, key, 0, 8).unwrap();
+        assert_eq!(read_block(&r, 8), want, "the block came back whole");
+        assert_eq!(ctx.batches.load(Ordering::Relaxed) - b0, 1, "demotion");
+        assert_eq!(
+            ctx.kernel_batches.load(Ordering::Relaxed) - k0,
+            1,
+            "promotion"
+        );
+    }
+
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer
     /// is only a copy target on the context that allocated it (buffer ids never overlap
     /// between contexts, so a cross-rank copy fails).
@@ -4703,6 +4812,9 @@ mod tests {
         copies: AtomicU64,
         /// `copy_async_batch` calls (each one compute fence and one event on a real stream).
         batches: AtomicU64,
+        /// Whether the context has the copy kernel, and its `copy_async_batch_kernel` calls.
+        kernel: std::sync::atomic::AtomicBool,
+        kernel_batches: AtomicU64,
     }
 
     /// A pinned buffer with a lock of its own.
@@ -4723,6 +4835,8 @@ mod tests {
                 }),
                 copies: AtomicU64::new(0),
                 batches: AtomicU64::new(0),
+                kernel: Default::default(),
+                kernel_batches: AtomicU64::new(0),
             })
         }
     }
@@ -4780,6 +4894,26 @@ mod tests {
 
         fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
             self.batches.fetch_add(1, Ordering::Relaxed);
+            ops.iter()
+                .map(|op| self.copy_async(op.dst, op.src, op.bytes))
+                .collect()
+        }
+
+        fn has_copy_kernel(&self) -> bool {
+            self.kernel.load(Ordering::Relaxed)
+        }
+
+        fn copy_async_batch_kernel(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+            let h2d = |op: &CopyOp| {
+                matches!(
+                    (op.dst, op.src),
+                    (CopyTarget::Device(_), CopyTarget::Pinned { .. })
+                )
+            };
+            if !self.has_copy_kernel() || !ops.iter().all(h2d) {
+                return Err(MemoryError::Unsupported("copy kernel".into()));
+            }
+            self.kernel_batches.fetch_add(1, Ordering::Relaxed);
             ops.iter()
                 .map(|op| self.copy_async(op.dst, op.src, op.bytes))
                 .collect()

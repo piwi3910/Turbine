@@ -765,3 +765,46 @@ Tq4 multi-turn A/B rerun with the drift exclusion (decision "6b: OLMoE tq4 after
 
 - Gate holds on both models: OLMoE `tq4` 0.8625 ≥ `l0` 0.8624 (a 0.0001 margin, inside run-to-run spread), Llama `tq4` 0.9075 ≥ `l0` 0.9007. No run went YELLOW on `step_time_drift`; the drift window left 66–87 (`l0`) and 157–254 (`tq4`) copy-overlapped steps unjudged per run. Both Llama arms leave GREEN the same way (L0 fill reaches 0.71–0.78 against 0.70, a real signal), so the arms run under the same pressure. Llama `l0` drops 90–110 blocks on L1 capacity per run, `tq4` none.
 - Flipped: lower-tier `tq4` is `supported` (`TIER_FORMAT_REFUSALS` keeps only `tq2`).
+
+### Promotion copy kernel (decision "6b: KV promotions slow decode — which fix", A; branch `p6b-copykernel`)
+
+Microbenchmark `kernels/rocm/tools/copy_eval.cpp` (`turbine_copy_eval`), novanas GPU 0 under the bench lock, ROCm 7.14. A decode-like loop runs on one non-blocking stream: per step one 16 KiB pinned upload and 300 pairs of an rmsnorm-like kernel (16 rows × 2048) and a 256-workgroup weight-stream kernel (8 MiB from a 512 MiB ring), 2.3 ms a step (11.3 ms with 1500 pairs). 256 MiB of pinned (`hipHostMallocDefault`, like L1) → device copies start at step 2 on a second non-blocking stream. The slope is the extra compute time over the no-copy median step, divided by the MiB copied. Each cell is the median of 3 runs; the copied bytes are checked.
+
+| H2D path (256 MiB)                                  | segment | GB/s under compute (alone) | slope ms/MiB (3 runs)  | worst step ms (base 2.3) |
+| --------------------------------------------------- | ------- | -------------------------- | ---------------------- | ------------------------ |
+| SDMA `hipMemcpyAsync` (today)                       | 1 MiB   | 12.42 (12.27)              | 0.0495 (0.0495–0.0500) | 5.9                      |
+| SDMA                                                | 256 KiB | 10.50 (10.51)              | 0.0532                 | 5.1                      |
+| SDMA                                                | 64 KiB  | 6.65 (6.55)                | 0.0370                 | 3.1                      |
+| blit kernels, `HSA_ENABLE_SDMA=0`                   | 1 MiB   | 16.03 (15.85)              | 0.0585                 | 17.6                     |
+| blit, `HSA_ENABLE_SDMA=0 DEBUG_CLR_LIMIT_BLIT_WG=2` | 1 MiB   | 16.01 (15.80)              | 0.0587                 | 17.5                     |
+| SDMA, `HSA_ENABLE_SDMA_HDP_FLUSH=0`                 | 1 MiB   | 12.53 (12.37)              | 0.0502                 | 6.1                      |
+| copy kernel, 1 workgroup                            | 1 MiB   | 15.65 (15.50)              | 0.0006                 | 2.5                      |
+| copy kernel, 2 workgroups                           | 1 MiB   | 22.31 (23.40)              | 0.0029 (0.0020–0.0034) | 2.8                      |
+| copy kernel, 2 workgroups                           | 256 KiB | 20.43 (22.72)              | 0.0034                 | 2.7                      |
+| copy kernel, 3 workgroups                           | 1 MiB   | 22.44 (23.06)              | 0.0079                 | 3.1                      |
+| copy kernel, 4 workgroups                           | 1 MiB   | 21.94 (22.83)              | 0.0135                 | 3.6                      |
+| copy kernel, 6 workgroups                           | 1 MiB   | 21.75 (21.54)              | 0.0181                 | 4.1                      |
+| copy kernel, 16 / 32 / 64 workgroups (1 run)        | 1 MiB   | 12.1 / 10.0 / 9.1          | 0.065 / 0.095 / 0.112  | 10.6 / 26.9 / 31.2       |
+| SDMA, 11.3 ms steps                                 | 1 MiB   | 12.11                      | 0.0495                 | 25.0 (base 11.3)         |
+| copy kernel, 2 workgroups, 11.3 ms steps            | 1 MiB   | 21.50                      | −0.0003                | 13.4 (base 11.3)         |
+
+- The loop reproduces the serving slope: SDMA promotions cost 0.050 ms per MiB (serving: 0.061–0.069). Single runs isolate it: only the small kernels (`CB_ONLY=small`) or only the stream kernel give 0.034 / 0.062, so every kernel kind stalls, and the per-step upload is not the cause (`CB_NOUP`: 0.051).
+- The stall comes from host-link reads in flight, not from the copy engine. Device-to-device copies of the same size (`CB_SRC=dev`, SDMA or kernel, no host link, 1 run each) cost nothing (−0.002 / −0.005). A copy kernel stalls compute in proportion to its workgroups, that is to its reads in flight: 0.0006 at 1, 0.003 at 2, 0.065 at 16 (SDMA's level) and 0.11 at 64. The runtime's blit kernels use many workgroups, and `DEBUG_CLR_LIMIT_BLIT_WG` does not change them. Smaller SDMA segments cut the slope per MiB only by moving fewer MiB per second (64 KiB: 0.037 at 6.7 GB/s), so the cost per second of copying stays the same.
+- Chosen: a copy kernel with 2 workgroups on the copy stream (the knee: rate at its peak, 22 GB/s, 1.8× SDMA, and the slope 17× lower). Reuse first: ROCm offers no host-to-device copy with a bounded number of reads in flight (SDMA, or blit kernels whose workgroup count cannot be limited). SGLang's `sgl-kernel` kvcacheio (`transfer_kv_*`) and LMCache's `multi_layer_kv_transfer` are CUDA kernels of this shape that do not ship for ROCm. The copy is a vector load/store loop, so it is ours: `kernels/rocm/src/copy_kernel.hip`, ABI v2.11 `turbine_memcpy_h2d_kernel` (v2.11 has not shipped; optional symbol), behind `kv.transfer.promotion_copy: kernel` (default `sdma`).
+
+Lab A/B, tree 314c848 (`p6b-stack` 6652755 + the switch), harness `scratch/copykernel-ab/ab.sh` (the `p6b-copydrift` one) on novanas GPU 0: OLMoE `l0` L1, the multi-turn workload of "Lossless last block scored like its history", debug traces on, a fresh server per arm, arms interleaved, 5 runs each. `corr3.py` gives the slope from the `decode_step` and `kv_copy_stages` traces.
+
+| OLMoE `l0`, 5 runs each                       | `promotion_copy: sdma` (default) | `promotion_copy: kernel`           |
+| --------------------------------------------- | -------------------------------- | ---------------------------------- |
+| slope, extra ms per MiB promoted in flight    | 0.064 (0.058–0.066, r 0.87–0.98) | 0.000 (−0.004–0.003, r −0.11–0.11) |
+| extra ms per promotion-overlapped step (mean) | 6.89 (5.33–7.41)                 | 0.97 (0.88–1.63)                   |
+| decode steps ≥ 1.5× their baseline            | 17 (8–19)                        | 3 (3–4)                            |
+| L1 → L0 latency median / p90 (ms)             | 30.2 / 45.9                      | 19.5 / 31.3                        |
+| L1 → L0 latency p99 (ms, runs)                | 52.7 / 57.1 / 65.5 / 43.1 / 48.5 | 41.0 / 293 / 276 / 54.1 / 48.5     |
+| cached_tokens_ratio                           | 0.8616 (0.8607–0.8620)           | 0.8611 (0.8604–0.8631)             |
+| output tok/s                                  | 246.7 (242.4–251.7)              | 246.4 (230.3–248.8)                |
+| later-turn TTFT p50 / p99 (ms)                | 50.1 / 360 (325–412)             | 50.3 / 288 (107–336)               |
+
+- The copy kernel removes the per-byte decode cost of promotions: the slope drops from 0.064 ms/MiB to zero, and the steps that overlap a promotion lose 1.0 ms instead of 6.9. Promotions finish a third sooner (median 30 → 20 ms). Reuse is unchanged, later-turn TTFT p99 is lower in the median (360 → 288 ms), and median tok/s is the same (two kernel runs at 230 and 235 widen the spread; the decode time saved, ~0.2 s per run, is under 1 % of the wall time).
+- The two p99 outliers of the kernel arm (276 and 293 ms) are copy bounds, not measured copy times: the copy stream has no timestamps, so a copy ends somewhere between the last poll that saw it running and the poll that saw it done. In r2 all ten long copies spanned an idle engine (no step in between). In r3, three copies spanned a 257 ms host-side gap between two decode steps, and gaps of that length occur in both arms (sdma 100–502 ms, kernel 104–1371 ms). Whether the kernel copies were really still running then is not decided by these traces.
+- The default stays `sdma` (flipping it is the user's call). A shim mutation (tail loop off by one byte) fails `pinned_copy_kernel_is_bit_exact` on the GPU. Over a Llama block's 28 × 512 KiB batches the lab test measured 23.79 GB/s for the kernel against 11.67 GB/s for SDMA on GPU 0 (18.46 / 9.57 in a k3s Job on an unpinned card).

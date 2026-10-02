@@ -153,6 +153,19 @@ impl ShimContext {
         }
     }
 
+    /// The ABI v2.11 host-to-device copy kernel, `Unsupported` without it.
+    fn copy_kernel_fn(&self) -> Result<ffi::CopyKernelFn, MemoryError> {
+        let syms = &self.library().syms().v21;
+        syms.copy_kernel.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.11 copy kernel \
+                 (turbine_memcpy_h2d_kernel; minor {})",
+                self.library().path().display(),
+                syms.minor
+            ))
+        })
+    }
+
     fn resolve_end(
         s: &PinnedInner,
         what: &str,
@@ -403,8 +416,17 @@ impl ShimContext {
     /// after the last copy completes the ticket. A fence and an event per copy cost ~30 us each
     /// on the R9700's SDMA queue, halving pinned device-to-host bandwidth at the 512 KiB layer
     /// segments of a KV block (perf-log "Pinned D2H").
-    fn enqueue(&self, ops: &[CopyOp]) -> Result<CopyTicket, MemoryError> {
+    ///
+    /// With `kernel` every op must be pinned → device and the batch runs as one ABI v2.11
+    /// `turbine_memcpy_h2d_kernel` call on the copy stream instead of the copy engine
+    /// (`kv.transfer.promotion_copy: kernel`).
+    fn enqueue(&self, ops: &[CopyOp], kernel: bool) -> Result<CopyTicket, MemoryError> {
         let (staging, copies) = self.copy_fns()?;
+        let copy_kernel = if kernel {
+            Some(self.copy_kernel_fn()?)
+        } else {
+            None
+        };
         let mut s = self.pinned_state().lock();
         let mut resolved = Vec::with_capacity(ops.len());
         let mut device_source = false;
@@ -421,6 +443,11 @@ impl ShimContext {
                     ));
                 }
             };
+            if copy_kernel.is_some() && kind != COPY_H2D {
+                return Err(MemoryError::Unsupported(
+                    "the copy kernel copies pinned host memory to the device only".into(),
+                ));
+            }
             device_source |= from.device;
             resolved.push((d.addr, from.addr, op.bytes, kind));
         }
@@ -433,7 +460,38 @@ impl ShimContext {
         // The event exists before the copies are enqueued, so a failure to create it leaves no
         // copy in flight without a ticket.
         let event = self.new_event(&staging)?;
-        for &(dst, src, bytes, kind) in &resolved {
+        if let Some(run) = copy_kernel {
+            let segs: Vec<ffi::CopySeg> = resolved
+                .iter()
+                .map(|&(dst, src, bytes, _)| ffi::CopySeg {
+                    dst: dst as *mut c_void,
+                    src: src as *const c_void,
+                    bytes,
+                })
+                .collect();
+            // SAFETY: every segment was resolved above (a device pointer of the caller's
+            // allocation, `bytes` inside a live pinned buffer of this context); the library reads
+            // `segs` during the call only and the buffers stay untouched until the ticket's event
+            // signals, as for `memcpy_async` below. 0 workgroups: the library's choice.
+            let code = unsafe { run(self.raw_ctx(), stream, segs.as_ptr(), segs.len() as i32, 0) };
+            if let Err(e) = self.check_code(code) {
+                // A launch may have been enqueued before the failing one: wait for it.
+                // SAFETY: `event` and `stream` are live objects of this context.
+                unsafe {
+                    if (staging.event_record)(self.raw_ctx(), event.raw, stream) == 0 {
+                        let _ = (staging.event_synchronize)(self.raw_ctx(), event.raw);
+                    }
+                }
+                return Err(e.into());
+            }
+        }
+        // Without the kernel: one copy-engine copy per op.
+        let engine_ops: &[_] = if copy_kernel.is_some() {
+            &[]
+        } else {
+            &resolved
+        };
+        for &(dst, src, bytes, kind) in engine_ops {
             // SAFETY: both ends were resolved above: a device pointer of the caller's allocation
             // or `bytes` inside a live pinned buffer of this context. The copy only enqueues; the
             // buffers are not freed or touched by the host until the ticket's event signals (the
@@ -484,14 +542,26 @@ impl CopyEngine for ShimContext {
         src: CopySource,
         bytes: usize,
     ) -> Result<CopyTicket, MemoryError> {
-        self.enqueue(&[CopyOp { dst, src, bytes }])
+        self.enqueue(&[CopyOp { dst, src, bytes }], false)
     }
 
     fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(vec![self.enqueue(ops)?])
+        Ok(vec![self.enqueue(ops, false)?])
+    }
+
+    fn has_copy_kernel(&self) -> bool {
+        self.copy_fns().is_ok() && self.copy_kernel_fn().is_ok()
+    }
+
+    fn copy_async_batch_kernel(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+        self.copy_kernel_fn()?;
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.enqueue(ops, true)?])
     }
 
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError> {
