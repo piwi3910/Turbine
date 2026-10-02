@@ -103,16 +103,23 @@ const PREFILL_MIN_TOKENS: u32 = 64;
 
 /// Refuses (exit 1) a lower-tier format the host path cannot store (P6b S-1): one the codec
 /// cannot encode for this layout, or any format other than `l0` when a block is split into
-/// rank or stage shards (the host codec works on one shard's layout).
+/// rank or stage shards (the host codec works on one shard's layout). The compression ladder's
+/// rungs down to `kv.ladder.max_format` (P6b S-6) are checked like the tiers' own formats.
 fn check_tier_formats(
     cfg: &KvConfig,
     format: &KvFormat,
     sharded: bool,
 ) -> Result<(), StartupError> {
+    let ladder = cfg.ladder.enabled && (cfg.cpu.enabled || cfg.nvme.enabled);
+    let rungs = tier_formats(cfg);
+    let ladder_rungs = rungs.iter().map(|f| (ladder, "kv.ladder.max_format", *f));
     for (on, key, name) in [
         (cfg.cpu.enabled, "kv.cpu.format", cfg.cpu.format.as_str()),
         (cfg.nvme.enabled, "kv.nvme.format", cfg.nvme.format.as_str()),
-    ] {
+    ]
+    .into_iter()
+    .chain(ladder_rungs)
+    {
         if !on || name == L0_FORMAT {
             continue;
         }
@@ -618,8 +625,9 @@ impl KvOrchestrator {
         kernel: Arc<dyn KernelProvider>,
         mem: &Arc<dyn DeviceMemory>,
     ) -> bool {
+        let lanes = if cfg.ladder.enabled { LADDER_LANES } else { 0 };
         self.backend
-            .enable_device_transcode(kernel, mem, &tier_formats(cfg))
+            .enable_device_transcode(kernel, mem, &tier_formats(cfg), lanes)
     }
 
     /// `reliability.pressure.deescalate_dwell`: the compression ladder's step-up dwell (P6b S-6).
@@ -1515,6 +1523,13 @@ enum AfterCopies {
         gpu_slot: usize,
         format: &'static str,
     },
+    /// A ladder rewrite whose source copy is now on lane `lane` (P6b S-6): decode and encode it
+    /// there, then copy the new format's bytes into a staging buffer (`bufs`, the one the source
+    /// was read into from L2, or empty for an L1 source).
+    Rewrite { lane: usize, bufs: Staged },
+    /// A ladder rewrite's new bytes are in `bufs`: the lane is free and the I/O pool stores them
+    /// in the copy's own tier.
+    RewriteStore { lane: usize, bufs: Staged },
 }
 
 enum IoStage {
@@ -1530,6 +1545,9 @@ enum IoStage {
         format: &'static str,
         bytes: usize,
     },
+    /// A ladder rewrite of an L2 copy: the source bytes read into the staging buffer go to lane
+    /// `lane` (P6b S-6).
+    ThenRewrite { lane: usize },
 }
 
 impl AfterCopies {
@@ -1542,6 +1560,8 @@ impl AfterCopies {
             AfterCopies::WriteTier { gpu_slot: None, .. } => "d2h_staging",
             AfterCopies::WriteTier { .. } => "encode_d2h",
             AfterCopies::Decode { .. } => "h2d_slot",
+            AfterCopies::Rewrite { .. } => "h2d_lane",
+            AfterCopies::RewriteStore { .. } => "rewrite_d2h",
         }
     }
 }
@@ -1553,13 +1573,19 @@ impl IoStage {
             IoStage::Final => "io",
             IoStage::ThenIntoL0 { .. } => "io_read",
             IoStage::ThenDecode { .. } => "io_read_coded",
+            IoStage::ThenRewrite { .. } => "io_read_rewrite",
         }
     }
 }
 
 enum Job {
-    Copies { copies: Copies, then: AfterCopies },
+    Copies {
+        copies: Copies,
+        then: AfterCopies,
+    },
     Io(IoStage),
+    /// A ladder rewrite waiting for a free lane (P6b S-6).
+    Lane,
     Done(Result<TierSlot, TierError>),
 }
 
@@ -1708,15 +1734,36 @@ impl KvCodecFns for CodecTable {
     }
 }
 
-/// The codecs of the enabled lower tiers (`kv.cpu.format`, `kv.nvme.format`).
+/// The codecs of the enabled lower tiers (`kv.cpu.format`, `kv.nvme.format`) and, with the
+/// compression ladder on (P6b S-6), every rung below them down to `kv.ladder.max_format`: new
+/// demotions take a tier's current rung and the ladder rewrites copies into each of them.
 pub(crate) fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
-    [
+    let mut out: Vec<&str> = [
         (cfg.cpu.enabled, cfg.cpu.format.as_str()),
         (cfg.nvme.enabled, cfg.nvme.format.as_str()),
     ]
     .into_iter()
     .filter_map(|(on, f)| on.then_some(f))
-    .collect()
+    .collect();
+    if cfg.ladder.enabled {
+        let max = turbine_kv::codec::rung_index(cfg.ladder.max_format.as_str());
+        let first = out
+            .iter()
+            .filter_map(|f| turbine_kv::codec::rung_index(f))
+            .min();
+        if let (Some(first), Some(max)) = (first, max) {
+            for c in turbine_kv::codec::registry()
+                .iter()
+                .take(max + 1)
+                .skip(first)
+            {
+                if !out.contains(&c.name()) {
+                    out.push(c.name());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Device bytes the KV transcode's staging slots need for a pool of `layout` pages (P6b S-1):
@@ -1726,6 +1773,7 @@ pub(crate) fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
 /// counts it in the workspace pool before the KV pool is sized, so a budget that cannot hold it
 /// refuses at startup like any other fixed cost; [`DeviceTranscode`] allocates the same bytes.
 pub fn transcode_staging_bytes(cfg: &KvConfig, layout: &KvLayout) -> u64 {
+    let lanes = if cfg.ladder.enabled { LADDER_LANES } else { 0 } as u64;
     tier_formats(cfg)
         .into_iter()
         .filter(|f| {
@@ -1736,9 +1784,17 @@ pub fn transcode_staging_bytes(cfg: &KvConfig, layout: &KvLayout) -> u64 {
         .filter_map(|f| encoded_bytes(f, layout).ok())
         .max()
         .map_or(0, |slot| {
-            slot as u64 * turbine_kv::hierarchy::DEMOTION_INFLIGHT as u64
+            let slot = slot as u64;
+            slot * turbine_kv::hierarchy::DEMOTION_INFLIGHT as u64
+                + lanes * (layout.block_bytes() + slot)
         })
 }
+
+/// Ladder rewrite lanes the device transcode allocates with `kv.ladder.enabled` (P6b S-6): each
+/// holds one rewrite from its source copy to its destination copy (an L0 block plus a slot);
+/// a rewrite waits for a free lane. Two keep one rewrite's transcode overlapping the next one's
+/// copies.
+pub const LADDER_LANES: usize = 2;
 
 /// The kernel library's ABI v2.11 KV transcode for the demotion and promotion paths (P6b S-1):
 /// encodes L0 pages into a device staging slot (one slot per copy in flight,
@@ -1759,6 +1815,20 @@ pub struct DeviceTranscode {
     staging: DeviceBuffer,
     slot_bytes: usize,
     free: Vec<usize>,
+    /// The ladder's rewrite lanes (P6b S-6, [`LADDER_LANES`]); empty with the ladder off.
+    lanes: Vec<RewriteLane>,
+    /// The lanes not in use.
+    free_lanes: Vec<usize>,
+    /// Byte offsets of the layer pages inside a lane's L0 block (the pool's segment lengths).
+    page_offsets: SmallVec<[u64; 64]>,
+}
+
+/// The device memory one ladder rewrite holds from its source copy to its destination copy
+/// (P6b S-6): a block in the L0 page layout, decoded into and re-encoded from, and a slot of
+/// the transcode's slot size for the source and destination formats' bytes.
+struct RewriteLane {
+    block: DeviceBuffer,
+    slot: DeviceBuffer,
 }
 
 impl DeviceTranscode {
@@ -1827,6 +1897,39 @@ impl DeviceTranscode {
         slot: usize,
         pages: &[DevicePtr],
     ) -> Result<(), TierError> {
+        let codec = encoded_bytes(name, &self.layout)?;
+        let coded = self.staging.slice(slot * self.slot_bytes, codec);
+        self.run_on(name, decode, coded, pages)
+    }
+
+    /// The layer pages of lane `lane`'s L0 block.
+    fn lane_pages(&self, lane: usize) -> SmallVec<[DevicePtr; 64]> {
+        let base = self.lanes[lane].block.ptr();
+        self.page_offsets.iter().map(|&o| base.offset(o)).collect()
+    }
+
+    /// Enqueues a ladder rewrite on lane `lane` (P6b S-6): its slot holds the copy in `from`
+    /// (or, for `l0`, its L0 block already does), decoded into the lane's L0 block and encoded
+    /// from it into the slot in `to`. Both kernels run on the compute stream in order.
+    fn rewrite(&self, lane: usize, from: &str, to: &str) -> Result<(), TierError> {
+        let pages = self.lane_pages(lane);
+        let slot = &self.lanes[lane].slot;
+        if from != L0_FORMAT {
+            let n = encoded_bytes(from, &self.layout)?;
+            self.run_on(from, true, slot.slice(0, n), &pages)?;
+        }
+        let n = encoded_bytes(to, &self.layout)?;
+        self.run_on(to, false, slot.slice(0, n), &pages)
+    }
+
+    /// Enqueues the transcode of the pages of one block to or from `coded`.
+    fn run_on(
+        &self,
+        name: &str,
+        decode: bool,
+        coded: turbine_tensor::DeviceSlice<'_>,
+        pages: &[DevicePtr],
+    ) -> Result<(), TierError> {
         let cfg = self
             .config(name, decode)
             .ok_or_else(|| TierError::Io(format!("no device transcode for `{name}`")))?;
@@ -1845,7 +1948,7 @@ impl DeviceTranscode {
                 &mut KvTranscodeContext {
                     cfg,
                     pages,
-                    coded: self.staging.slice(slot * self.slot_bytes, codec),
+                    coded,
                     coded_block_bytes: codec,
                     seed: self.seed,
                     k_scales: None,
@@ -1961,13 +2064,15 @@ impl CopyStreamBackend {
 
     /// Runs lower-tier copies of `formats` on the device through `kernel` (P6b S-1) when it
     /// implements them in both directions for this layout: allocates the staging slots in `mem`
-    /// (`DEMOTION_INFLIGHT` × the largest encoded block) and returns whether it is on. Any other
-    /// copy keeps the host codec path; nothing is allocated when no format needs the device.
+    /// (`DEMOTION_INFLIGHT` × the largest encoded block) and `lanes` ladder rewrite lanes (P6b
+    /// S-6, [`RewriteLane`]), and returns whether it is on. Any other copy keeps the host codec
+    /// path; nothing is allocated when no format needs the device.
     pub fn enable_device_transcode(
         &mut self,
         kernel: Arc<dyn KernelProvider>,
         mem: &Arc<dyn DeviceMemory>,
         formats: &[&str],
+        lanes: usize,
     ) -> bool {
         let (Some(host), 1) = (self.io.host_codec.clone(), self.shards.len()) else {
             return false;
@@ -1989,6 +2094,18 @@ impl CopyStreamBackend {
             },
             slot_bytes: 0,
             free: Vec::new(),
+            lanes: Vec::new(),
+            free_lanes: Vec::new(),
+            page_offsets: self.shards[0]
+                .addresses
+                .segments(BlockId(0))
+                .iter()
+                .scan(0u64, |at, &(_, len)| {
+                    let o = *at;
+                    *at += len as u64;
+                    Some(o)
+                })
+                .collect(),
         };
         // The tables of a TurboQuant tier format go up once, before `serves` is asked; dropped
         // again when the library runs none of them. A failed upload keeps the host codec.
@@ -2034,11 +2151,32 @@ impl CopyStreamBackend {
         };
         dev.slot_bytes = slot_bytes;
         dev.free = (0..slots).rev().collect();
+        let block_bytes = self.shards[0].bytes;
+        for _ in 0..lanes {
+            let lane = DeviceBuffer::alloc(mem, block_bytes).and_then(|block| {
+                DeviceBuffer::alloc(mem, slot_bytes).map(|slot| RewriteLane { block, slot })
+            });
+            match lane {
+                Ok(l) => dev.lanes.push(l),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "kv_transcode_lanes_failed",
+                        bytes = block_bytes + slot_bytes,
+                        error = %e,
+                        "a ladder rewrite lane could not be allocated; rewrites without a lane \
+                         use the host codec"
+                    );
+                    break;
+                }
+            }
+        }
+        dev.free_lanes = (0..dev.lanes.len()).rev().collect();
         tracing::info!(
             event = "kv_transcode_device",
             formats = ?served,
             slots,
             slot_bytes,
+            lanes = dev.lanes.len(),
             "lower-tier copies are transcoded on the device"
         );
         self.gpu = Some(dev);
@@ -2231,9 +2369,11 @@ impl CopyStreamBackend {
     fn start_job(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
         let req = &t.req;
         if req.purpose == TransferPurpose::Compress {
-            // A ladder rewrite runs on the I/O pool with the host codec (the v2.11 device
-            // transcode through staging replaces it with P6b Task 5); the ladder is refused at
-            // startup until then.
+            // A ladder rewrite runs on a device lane (P6b S-6); one the device cannot serve
+            // runs on the I/O pool with the host codec.
+            if let Some(job) = self.start_rewrite(t)? {
+                return Ok(job);
+            }
             self.io.start(t)?;
             return Ok(Job::Io(IoStage::Final));
         }
@@ -2340,7 +2480,18 @@ impl CopyStreamBackend {
             .gpu
             .as_ref()
             .expect("a slot came from the device transcode");
-        let ptr = gpu.slot_ptr(slot);
+        self.device_copies(gpu.slot_ptr(slot), bufs, bytes, to_device)
+    }
+
+    /// Copies `bytes` at device address `ptr` into (`to_device` false) or from the first
+    /// staging buffer of `bufs`, as [`slot_copies`](Self::slot_copies).
+    fn device_copies(
+        &self,
+        ptr: DevicePtr,
+        bufs: &mut Staged,
+        bytes: usize,
+        to_device: bool,
+    ) -> Result<Copies, TierError> {
         let io = |e: MemoryError| TierError::Io(format!("staging copy: {e}"));
         match &self.shards[0].device {
             CopyDevice::Stream { engine, .. } => {
@@ -2370,6 +2521,165 @@ impl CopyStreamBackend {
                     })
                     .map_err(io)?;
                 Ok(Copies::new())
+            }
+        }
+    }
+
+    /// A ladder rewrite of an L1 or L2 copy on the device (P6b S-6): with one shard, a device
+    /// transcode with rewrite lanes that serves the destination format and the source format
+    /// (or the source at `l0`). The copy's bytes go to a lane (an L1 slot straight on the copy
+    /// stream, an L2 copy through the I/O pool and a staging buffer), are decoded into the
+    /// lane's L0 block and encoded into the new format there, come back through a staging
+    /// buffer and are stored in the same tier by the I/O pool. Without a free lane the rewrite
+    /// waits ([`Job::Lane`]). `None` when the device cannot run it: the caller takes the host
+    /// codec path.
+    fn start_rewrite(&mut self, t: &TransferTicket) -> Result<Option<Job>, TierError> {
+        let c = t.req.codec;
+        let applies = self.shards.len() == 1
+            && self.gpu.as_ref().is_some_and(|g| {
+                !g.lanes.is_empty() && g.serves(c.to) && (c.from == L0_FORMAT || g.serves(c.from))
+            });
+        if !applies {
+            return Ok(None);
+        }
+        match self.gpu.as_mut().and_then(|g| g.free_lanes.pop()) {
+            Some(lane) => self.rewrite_source(t, lane).map(Some),
+            None => Ok(Some(Job::Lane)),
+        }
+    }
+
+    fn lane_give(&mut self, lane: usize) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            debug_assert!(!gpu.free_lanes.contains(&lane));
+            gpu.free_lanes.push(lane);
+        }
+    }
+
+    /// Where a rewrite's source bytes go on lane `lane`: its L0 block for an `l0` copy, else its
+    /// slot.
+    fn lane_target(&self, lane: usize, from: &str) -> (DevicePtr, usize) {
+        let l = &self.gpu.as_ref().expect("a lane came from it").lanes[lane];
+        let buf = if from == L0_FORMAT { &l.block } else { &l.slot };
+        (buf.ptr(), buf.len())
+    }
+
+    /// Starts moving the source copy of rewrite `t` onto lane `lane`; on an error the lane is
+    /// free again.
+    fn rewrite_source(&mut self, t: &TransferTicket, lane: usize) -> Result<Job, TierError> {
+        let req = &t.req;
+        let n = req.codec.from_bytes as usize;
+        let (dst, room) = self.lane_target(lane, req.codec.from);
+        let r = if n > room {
+            Err(TierError::Io(format!(
+                "a {} copy of {n} bytes does not fit a rewrite lane ({room})",
+                req.codec.from
+            )))
+        } else {
+            match req.path.from() {
+                TierId::L1 => self.rewrite_from_l1(t, lane, dst, n),
+                TierId::L2 => self.rewrite_from_l2(t, lane),
+                _ => Err(TierError::Missing),
+            }
+        };
+        if r.is_err() {
+            self.lane_give(lane);
+        }
+        r
+    }
+
+    /// The L1 slot of rewrite `t` straight into the lane on the copy stream.
+    fn rewrite_from_l1(
+        &mut self,
+        t: &TransferTicket,
+        lane: usize,
+        dst: DevicePtr,
+        n: usize,
+    ) -> Result<Job, TierError> {
+        let l1 = self.l1.clone().ok_or(TierError::Missing)?;
+        let CopyDevice::Stream { engine, .. } = &self.shards[0].device else {
+            return Err(TierError::Io("L1 needs a copy stream".into()));
+        };
+        let (buffer_id, offset, len) = l1.locate_len(&t.req.key).ok_or(TierError::Missing)?;
+        if len != n {
+            return Err(TierError::Io(format!(
+                "the L1 copy is {len} bytes, the rewrite expects {n}"
+            )));
+        }
+        match engine.copy_async(
+            CopyTarget::Device(dst),
+            CopyTarget::Pinned { buffer_id, offset },
+            n,
+        ) {
+            Ok(ticket) => Ok(Job::Copies {
+                copies: vec![(0, ticket)],
+                then: AfterCopies::Rewrite {
+                    lane,
+                    bufs: Staged::new(),
+                },
+            }),
+            Err(e) => {
+                l1.record_copy_error(0);
+                Err(TierError::Io(format!("copy stream: {e}")))
+            }
+        }
+    }
+
+    /// The L2 copy of rewrite `t` read into a staging buffer by the I/O pool (then to the lane).
+    fn rewrite_from_l2(&mut self, t: &TransferTicket, lane: usize) -> Result<Job, TierError> {
+        let l2 = self.l2.clone().ok_or(TierError::Missing)?;
+        let bufs = self.staging_bufs()?;
+        let mut codec = self.io.transcode(t.req.codec);
+        codec.pre_encoded = true;
+        self.io.submit(
+            t.id,
+            IoOp::Read {
+                from: l2,
+                key: t.req.key,
+                bufs,
+                codec,
+            },
+        )?;
+        Ok(Job::Io(IoStage::ThenRewrite { lane }))
+    }
+
+    /// The source of rewrite `t` is on lane `lane`: enqueue the transcode and the copy of the new
+    /// bytes into a staging buffer.
+    fn rewrite_transcode(
+        &mut self,
+        t: &TransferTicket,
+        lane: usize,
+        bufs: Staged,
+    ) -> Result<Job, TierError> {
+        let c = t.req.codec;
+        let mut bufs = if bufs.is_empty() {
+            match self.staging_bufs() {
+                Ok(b) => b,
+                Err(e) => {
+                    self.lane_give(lane);
+                    return Err(e);
+                }
+            }
+        } else {
+            bufs
+        };
+        let gpu = self.gpu.as_ref().expect("a lane came from it");
+        let slot = gpu.lanes[lane].slot.ptr();
+        let copies = gpu
+            .rewrite(lane, c.from, c.to)
+            .and_then(|()| self.device_copies(slot, &mut bufs, c.to_bytes as usize, false));
+        match copies {
+            Ok(copies) => {
+                let then = AfterCopies::RewriteStore { lane, bufs };
+                if copies.is_empty() {
+                    self.finish_copies(t, then)
+                } else {
+                    Ok(Job::Copies { copies, then })
+                }
+            }
+            Err(e) => {
+                self.lane_give(lane);
+                self.release_staging(bufs);
+                Err(e)
             }
         }
     }
@@ -2547,6 +2857,26 @@ impl CopyStreamBackend {
                 )?;
                 Ok(Job::Io(IoStage::Final))
             }
+            AfterCopies::Rewrite { lane, bufs } => self.rewrite_transcode(t, lane, bufs),
+            AfterCopies::RewriteStore { lane, bufs } => {
+                self.lane_give(lane);
+                let Some(to) = self.io.tier(t.req.path.from()) else {
+                    self.release_staging(bufs);
+                    return Err(TierError::Missing);
+                };
+                let mut codec = self.io.transcode(t.req.codec);
+                codec.pre_encoded = true;
+                self.io.submit(
+                    t.id,
+                    IoOp::Write {
+                        to,
+                        key: t.req.key,
+                        bufs,
+                        codec,
+                    },
+                )?;
+                Ok(Job::Io(IoStage::Final))
+            }
             AfterCopies::Decode {
                 block,
                 bufs,
@@ -2640,6 +2970,32 @@ impl CopyStreamBackend {
                     }
                 }
             }
+            IoStage::ThenRewrite { lane } => {
+                let mut bufs = bufs;
+                if bufs.is_empty() || result.is_err() {
+                    let e = result.err().unwrap_or(TierError::Missing);
+                    self.release_staging(bufs);
+                    self.lane_give(lane);
+                    return Err(e);
+                }
+                let n = t.req.codec.from_bytes as usize;
+                let (dst, _) = self.lane_target(lane, t.req.codec.from);
+                match self.device_copies(dst, &mut bufs, n, true) {
+                    Ok(copies) => {
+                        let then = AfterCopies::Rewrite { lane, bufs };
+                        if copies.is_empty() {
+                            self.finish_copies(t, then)
+                        } else {
+                            Ok(Job::Copies { copies, then })
+                        }
+                    }
+                    Err(e) => {
+                        self.release_staging(bufs);
+                        self.lane_give(lane);
+                        Err(e)
+                    }
+                }
+            }
             IoStage::ThenIntoL0 { block } => {
                 let mut bufs = bufs;
                 if bufs.is_empty() {
@@ -2675,6 +3031,10 @@ impl CopyStreamBackend {
     fn advance(&mut self, t: &TransferTicket, job: Job) -> Result<Job, TierError> {
         match job {
             Job::Done(r) => Ok(Job::Done(r)),
+            Job::Lane => match self.gpu.as_mut().and_then(|g| g.free_lanes.pop()) {
+                Some(lane) => self.rewrite_source(t, lane),
+                None => Ok(Job::Lane),
+            },
             Job::Io(stage) => match self.io.take(t.id) {
                 None => Ok(Job::Io(stage)),
                 Some(done) => {
@@ -2750,6 +3110,19 @@ impl CopyStreamBackend {
                 {
                     l1.record_copy_error(shard);
                 }
+                self.release_staging(bufs);
+            }
+            AfterCopies::Rewrite { lane, bufs } => {
+                self.lane_give(lane);
+                if t.req.path == TransferPath::L1ToL0
+                    && let Some(l1) = &self.l1
+                {
+                    l1.record_copy_error(shard);
+                }
+                self.release_staging(bufs);
+            }
+            AfterCopies::RewriteStore { lane, bufs } => {
+                self.lane_give(lane);
                 self.release_staging(bufs);
             }
         }
@@ -3342,6 +3715,245 @@ mod tests {
                 assert_eq!(slots(&o), None);
             }
         }
+    }
+
+    /// The host codec's bytes of `block` after the ladder rewrites `chain` (`l0` first): each
+    /// step decodes the previous format (unless `l0`) and encodes the next.
+    fn host_chain(block: &[u8], l: &KvLayout, params: &CodecParams, chain: &[&str]) -> Vec<u8> {
+        let mut l0 = block.to_vec();
+        let mut coded = block.to_vec();
+        for w in chain.windows(2) {
+            if w[0] != L0_FORMAT {
+                let c = turbine_kv::codec::registry().get(w[0]).unwrap();
+                c.decode_cpu(&coded, l, &mut l0, params).unwrap();
+            }
+            let c = turbine_kv::codec::registry().get(w[1]).unwrap();
+            coded = vec![0u8; c.bytes_per_block(l) as usize];
+            c.encode_cpu(&l0, l, &mut coded, params).unwrap();
+        }
+        coded
+    }
+
+    /// P6b S-6 on the server: with `kv.ladder.enabled` the device transcode allocates
+    /// `LADDER_LANES` rewrite lanes, and a ladder rewrite (`TransferPurpose::Compress`) of an L1
+    /// or L2 copy runs on one: the copy goes to the lane (an L1 slot on the copy stream, an L2
+    /// copy through the I/O pool's read), is decoded and re-encoded there by the kernel
+    /// library's transcode, and the new bytes are stored back in the same tier. Each rung of
+    /// `chain` gives exactly the host codec's bytes, the tier holds the smaller copy, a promotion
+    /// of the last one decodes like the host codec, and every lane and staging slot is back.
+    /// Breaks if a rewrite runs on the host codec again (the I/O pool's `Move`), skips the
+    /// decode of a lossy source, stores the source format's bytes or length, or leaks a lane.
+    fn ladder_rewrite_case(l: KvLayout, l1_tier: bool, chain: &[&'static str]) {
+        let format = kv_format(l);
+        let params = HostCodec::of(&identity(), &format).params;
+        let bb = l.block_bytes() as usize;
+        let block: Vec<u8> = (0..bb / 2)
+            .flat_map(|i| {
+                let x = ((i as f32) * 0.37).sin() * (1.0 + (i % 7) as f32);
+                turbine_kv::codec::f32_to_bf16(x).to_le_bytes()
+            })
+            .collect();
+        let dir = TempDir::new("turbine-kv-ladder-rewrite");
+        let mut kv = kv_config(&dir, l1_tier);
+        kv.block_tokens = l.block_tokens;
+        kv.nvme.max_bytes = ByteSize(256 << 20);
+        kv.nvme.slab_bytes = ByteSize(16 << 20);
+        kv.ladder.enabled = true;
+        kv.ladder.l0 = false;
+        kv.ladder.max_format = ModuleName::new(chain[chain.len() - 1]).unwrap();
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: l,
+                num_blocks: BLOCKS,
+            },
+            Arc::clone(&mem),
+        )
+        .unwrap();
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem, 0),
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        assert!(
+            o.enable_device_transcode(&kv, turbine_kernels::cpu_reference_provider(), &mem),
+            "the ladder's rungs put the device transcode on although the tiers store l0"
+        );
+        let lanes = |o: &KvOrchestrator| o.backend.gpu.as_ref().map(|g| g.free_lanes.len());
+        assert_eq!(lanes(&o), Some(LADDER_LANES));
+        let r = (mem, pool);
+        write_block(&r, 4, &block);
+
+        let (tier, down, up): (Arc<dyn KvTier>, _, _) = if l1_tier {
+            let l1 = o.backend.l1.clone().expect("L1");
+            (
+                l1 as Arc<dyn KvTier>,
+                TransferPath::L0ToL1,
+                TransferPath::L1ToL0,
+            )
+        } else {
+            (
+                Arc::clone(&l2) as _,
+                TransferPath::L0ToL2,
+                TransferPath::L2ToL0,
+            )
+        };
+        let key = KvKey([9; 16]);
+        run(&mut o, 1, down, key, 4, 0).unwrap();
+        let bytes = |name: &str| encoded_bytes(name, &l).unwrap() as u64;
+        for (i, w) in chain.windows(2).enumerate() {
+            let codec = TransferCodec {
+                from: w[0],
+                from_bytes: bytes(w[0]),
+                to: w[1],
+                to_bytes: bytes(w[1]),
+            };
+            let mut t = ticket(10 + i as u64, up, key, (0, 0), codec);
+            t.req.purpose = TransferPurpose::Compress;
+            o.backend.start(&t).unwrap();
+            let on_lane = match o.backend.jobs.get(&t.id) {
+                Some(Job::Copies {
+                    then: AfterCopies::Rewrite { .. } | AfterCopies::RewriteStore { .. },
+                    ..
+                }) => true,
+                Some(Job::Io(IoStage::ThenRewrite { .. })) => !l1_tier,
+                _ => false,
+            };
+            assert!(on_lane, "{} → {}: the rewrite runs on a lane", w[0], w[1]);
+            finish(&mut o, &t).unwrap();
+            let want = host_chain(&block, &l, &params, &chain[..i + 2]);
+            let mut stored = vec![0u8; want.len()];
+            tier.get(&key, TierBlockMut::Host(&mut stored)).unwrap();
+            assert_eq!(stored, want, "{} → {}: the host codec's bytes", w[0], w[1]);
+        }
+        let last = chain[chain.len() - 1];
+        let promote = TransferCodec {
+            from: last,
+            from_bytes: bytes(last),
+            to: L0_FORMAT,
+            to_bytes: bb as u64,
+        };
+        run_as(&mut o, 99, up, key, (0, 11), promote).unwrap();
+        let mut want_dec = vec![0u8; bb];
+        turbine_kv::codec::registry()
+            .get(last)
+            .unwrap()
+            .decode_cpu(
+                &host_chain(&block, &l, &params, chain),
+                &l,
+                &mut want_dec,
+                &params,
+            )
+            .unwrap();
+        assert_eq!(read_block(&r, 11), want_dec, "the rewritten copy promotes");
+        assert_eq!(lanes(&o), Some(LADDER_LANES), "every lane is back");
+        assert_eq!(
+            o.backend.gpu.as_ref().map(|g| g.free.len()),
+            Some(turbine_kv::hierarchy::DEMOTION_INFLIGHT),
+            "every staging slot is back"
+        );
+    }
+
+    #[test]
+    fn ladder_rewrites_run_on_device_lanes() {
+        let tq = KvLayout {
+            head_dim: 128,
+            ..layout()
+        };
+        for l1_tier in [true, false] {
+            ladder_rewrite_case(layout(), l1_tier, &[L0_FORMAT, "fp8_e4m3"]);
+            ladder_rewrite_case(tq, l1_tier, &[L0_FORMAT, "fp8_e4m3", "tq4", "tq2"]);
+        }
+    }
+
+    /// With every lane busy a rewrite waits (`Job::Lane`) instead of falling back to the host
+    /// codec, and starts once a lane is back. Breaks if it is refused or runs on the I/O pool.
+    #[test]
+    fn a_rewrite_waits_for_a_lane() {
+        let dir = TempDir::new("turbine-kv-ladder-lane-wait");
+        let mut kv = kv_config(&dir, false);
+        kv.ladder.enabled = true;
+        kv.ladder.l0 = false;
+        kv.ladder.max_format = ModuleName::new("fp8_e4m3").unwrap();
+        let reg = MetricsRegistry::new();
+        let metrics = KvMetrics::register(&reg);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+        let format = kv_format(layout());
+        let l2 = open_l2(
+            &kv,
+            &format,
+            &identity(),
+            Arc::clone(&clock),
+            metrics.clone(),
+        )
+        .unwrap()
+        .expect("L2 is enabled");
+        let (mem, mut pool) = rank(0);
+        let (mut o, _handle) = KvOrchestrator::start(
+            KvStart {
+                cfg: &kv,
+                memory_kind: MemoryKind::Dedicated,
+                identity: identity(),
+                device: stream(&mem, 0),
+                shards: Vec::new(),
+                l2: Some(Arc::clone(&l2)),
+                clock,
+                metrics,
+                remote: None,
+                kv_scales: None,
+            },
+            &mut pool,
+        )
+        .expect("the KV hierarchy starts");
+        assert!(o.enable_device_transcode(&kv, turbine_kernels::cpu_reference_provider(), &mem));
+        let r = (mem, pool);
+        let bb = layout().block_bytes();
+        let key = KvKey([3; 16]);
+        write_block(&r, 4, &pattern(0, 4, bb as usize));
+        run(&mut o, 1, TransferPath::L0ToL2, key, 4, 0).unwrap();
+        let held: Vec<usize> =
+            std::iter::from_fn(|| o.backend.gpu.as_mut()?.free_lanes.pop()).collect();
+        assert_eq!(held.len(), LADDER_LANES);
+        let codec = TransferCodec {
+            from: L0_FORMAT,
+            from_bytes: bb,
+            to: "fp8_e4m3",
+            to_bytes: encoded_bytes("fp8_e4m3", &layout()).unwrap() as u64,
+        };
+        let mut t = ticket(2, TransferPath::L2ToL0, key, (0, 0), codec);
+        t.req.purpose = TransferPurpose::Compress;
+        o.backend.start(&t).unwrap();
+        assert!(matches!(o.backend.jobs.get(&2), Some(Job::Lane)));
+        assert_eq!(o.backend.poll(&t), Ok(None), "still waiting");
+        assert!(matches!(o.backend.jobs.get(&2), Some(Job::Lane)));
+        for lane in held {
+            o.backend.lane_give(lane);
+        }
+        finish(&mut o, &t).unwrap();
+        assert_eq!(l2.used_bytes(), codec.to_bytes, "L2 holds the fp8 copy");
     }
 
     /// The bytes of the whole tables and of the four codebooks one transcode call received.

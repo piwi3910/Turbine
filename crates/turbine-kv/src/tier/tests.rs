@@ -507,6 +507,42 @@ fn l1_grows_and_shrinks() {
     );
 }
 
+/// P6b S-6: at its size limit L1 gives an empty slab of another slot size to a block of a new
+/// size (a ladder rewrite into another format), as L2 reformats an empty slab; a slab that still
+/// holds a block keeps its size. Breaks if a rewrite into a new format is refused while a slab
+/// is empty (the ladder could then never step an L1 of few slabs past its second format).
+#[test]
+fn l1_reuses_an_empty_slab_for_another_slot_size() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc.clone(), clock());
+    let half = (BLOCK / 2) as usize;
+    let quarter = (BLOCK / 4) as usize;
+    l1.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    l1.put(key(1), TierBlockRef::Host(&bytes(1)[..half]))
+        .unwrap();
+    assert_eq!(l1.slab_count(), 2);
+    // Key 0 is rewritten at half size: it moves to slab 1, slab 0 is empty.
+    l1.put(key(0), TierBlockRef::Host(&bytes(0)[..half]))
+        .unwrap();
+    // A quarter-size block takes the empty slab.
+    l1.put(key(1), TierBlockRef::Host(&bytes(1)[..quarter]))
+        .unwrap();
+    assert_eq!(l1.slab_count(), 2);
+    assert_eq!(alloc.live_buffers(), 2, "no slab beyond the limit");
+    let mut out = vec![0u8; quarter];
+    l1.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(1)[..quarter]);
+    let mut out = vec![0u8; half];
+    l1.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(0)[..half]);
+    // Both slabs hold blocks now: a third size is refused.
+    let eighth = (BLOCK / 8) as usize;
+    assert_eq!(
+        l1.put(key(2), TierBlockRef::Host(&bytes(2)[..eighth])),
+        Err(TierError::Full)
+    );
+}
+
 #[test]
 fn l1_passes_the_contract_suite() {
     let alloc = Arc::new(HostPinned::new(u64::MAX));
