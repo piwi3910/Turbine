@@ -537,8 +537,8 @@ async fn run_task(
 /// 256 by the caller); results are reported in task-file order whatever order the replies
 /// arrive in. The first failed request aborts the run (no partial report). With
 /// `fillers.requests` > 0 the first [`FILLER_HEAD`] tasks run alone, one after the other, then
-/// the fillers (`fillers.concurrency` in flight at once), then the rest at `concurrency`: the
-/// first task publishes the
+/// the fillers (`fillers.concurrency` in flight at once), with `fillers.settle` a wait for GREEN
+/// and the next task alone, then the rest at `concurrency`: the first task publishes the
 /// shared prefix, the second hits it (the reuse evidence a server needs before it copies a
 /// block down rather than dropping it), the fillers push it out of L0, and the rest read it
 /// back from the lower tier.
@@ -588,6 +588,15 @@ pub async fn run_eval(
             settle(client, base).await?;
         }
     }
+    // After the settle the first remaining item runs alone: it brings the shared prefix back
+    // into L0, so the others plan a hit instead of each reserving a cold prompt at once.
+    let rest = match rest.split_first() {
+        Some((first, more)) if fillers.settle && !head.is_empty() => {
+            results.push(run_task(client, base, model, first).await?);
+            more
+        }
+        _ => rest,
+    };
     let mut replies = stream::iter(rest.iter().enumerate())
         .map(|(index, task)| async move {
             Ok::<_, EvalError>((index, run_task(client, base, model, task).await?))

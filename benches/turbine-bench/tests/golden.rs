@@ -1115,12 +1115,14 @@ mod phase8_eval {
     /// takes 20 ms, and the third value is the most fillers that were in flight at once. The
     /// first `reject_fillers` filler arrivals get 503 `overloaded` (logged `filler-rejected`),
     /// as a server in SURVIVAL answers. `/turbine/v1/pressure` answers ORANGE for its first
-    /// three polls and GREEN after (each poll logged `pressure-<state>`).
+    /// three polls and GREEN after (each poll logged `pressure-<state>`). Item `q2` takes 30 ms;
+    /// the fourth value counts the items that arrived while it was in flight.
     async fn spawn_eval_usage_mock(
         reject_fillers: usize,
     ) -> (
         String,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1132,6 +1134,9 @@ mod phase8_eval {
         let rejected: Arc<AtomicUsize> = Arc::default();
         let peak_out = peak.clone();
         let polls: Arc<AtomicUsize> = Arc::default();
+        let overlap: Arc<AtomicUsize> = Arc::default();
+        let q2_active: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let overlap_out = overlap.clone();
         let pressure_log = log.clone();
         let app = Router::new()
             .route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }))
@@ -1152,6 +1157,7 @@ mod phase8_eval {
                     let log = state.clone();
                     let (peak, in_flight) = (peak.clone(), in_flight.clone());
                     let rejected = rejected.clone();
+                    let (overlap, q2_active) = (overlap.clone(), q2_active.clone());
                     async move {
                         let messages = body["messages"].as_array().unwrap();
                         let last = messages.last().unwrap()["content"].as_str().unwrap();
@@ -1169,6 +1175,14 @@ mod phase8_eval {
                             in_flight.fetch_sub(1, Ordering::SeqCst);
                             return Ok::<_, StatusCode>(Json(json!({"choices": [{"index": 0,
                                 "message": {"role": "assistant", "content": "0"}}]})));
+                        }
+                        if q2_active.load(Ordering::SeqCst) {
+                            overlap.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if last == "q2" {
+                            q2_active.store(true, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                            q2_active.store(false, Ordering::SeqCst);
                         }
                         let mut log = log.lock().unwrap();
                         let text = eval_mock_reply(last)?;
@@ -1190,7 +1204,7 @@ mod phase8_eval {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), log, peak_out)
+        (format!("http://{addr}"), log, peak_out, overlap_out)
     }
 
     /// 20 chat items behind a shared system message.
@@ -1210,7 +1224,7 @@ mod phase8_eval {
     /// Runs `turbine-golden eval` over the usage mock with `extra` flags; (exit code, stdout,
     /// stderr, the mock's request log).
     async fn eval_with_usage_mock(extra: &[&str]) -> (Option<i32>, String, String, Vec<String>) {
-        let (code, stdout, stderr, log, _) = eval_with_usage_mock_peak(extra, 0).await;
+        let (code, stdout, stderr, log, _, _) = eval_with_usage_mock_peak(extra, 0).await;
         (code, stdout, stderr, log)
     }
 
@@ -1219,8 +1233,8 @@ mod phase8_eval {
     async fn eval_with_usage_mock_peak(
         extra: &[&str],
         reject_fillers: usize,
-    ) -> (Option<i32>, String, String, Vec<String>, usize) {
-        let (base, log, peak) = spawn_eval_usage_mock(reject_fillers).await;
+    ) -> (Option<i32>, String, String, Vec<String>, usize, usize) {
+        let (base, log, peak, overlap) = spawn_eval_usage_mock(reject_fillers).await;
         let dir = EvalTempDir::new();
         let tasks = dir.path().join("tasks.jsonl");
         write_shared_prefix_tasks(&tasks);
@@ -1251,6 +1265,7 @@ mod phase8_eval {
             String::from_utf8_lossy(&out.stderr).into_owned(),
             log,
             peak.load(std::sync::atomic::Ordering::SeqCst),
+            overlap.load(std::sync::atomic::Ordering::SeqCst),
         )
     }
 
@@ -1304,7 +1319,7 @@ mod phase8_eval {
     /// sequential, overlap the head or the rest, or the report drops the setting.
     #[tokio::test(flavor = "multi_thread")]
     async fn eval_fillers_run_concurrently_with_filler_concurrency() {
-        let (code, stdout, stderr, log, peak) = eval_with_usage_mock_peak(
+        let (code, stdout, stderr, log, peak, _) = eval_with_usage_mock_peak(
             &[
                 "--filler-requests",
                 "8",
@@ -1330,7 +1345,7 @@ mod phase8_eval {
         assert_eq!(report["filler_concurrency"], 4);
         assert_eq!(report["filler_requests"], 8);
         // The default sends them one after another.
-        let (code, stdout, stderr, _, peak) =
+        let (code, stdout, stderr, _, peak, _) =
             eval_with_usage_mock_peak(&["--filler-requests", "4", "--filler-words", "50"], 0).await;
         assert_eq!(code, Some(0), "{stderr}");
         assert_eq!(peak, 1);
@@ -1345,7 +1360,7 @@ mod phase8_eval {
     /// counted.
     #[tokio::test(flavor = "multi_thread")]
     async fn eval_retries_fillers_the_server_rejects() {
-        let (code, stdout, stderr, log, _) = eval_with_usage_mock_peak(
+        let (code, stdout, stderr, log, _, _) = eval_with_usage_mock_peak(
             &[
                 "--filler-requests",
                 "4",
@@ -1377,20 +1392,26 @@ mod phase8_eval {
     /// `--fillers-settle`: after the fillers the runner polls `/turbine/v1/pressure` until it
     /// reports GREEN and only then sends the other items, so they are planned at GREEN (at
     /// ORANGE the planner recomputes the prefix into a fresh exact L0 copy instead of reading
-    /// the ladder's lossy one); the report records it and `eval-compare` refuses a pair that
-    /// differs. Without the flag nothing is polled. Breaks if an item goes out before GREEN or
-    /// the setting is not recorded.
+    /// the ladder's lossy one), and the first of them runs alone, so it brings the prefix back
+    /// into L0 before the others arrive (else each plans a cold prefill and reserves its whole
+    /// prompt); the report records it and `eval-compare` refuses a pair that differs. Without
+    /// the flag nothing is polled. Breaks if an item goes out before GREEN, the first one does
+    /// not run alone, or the setting is not recorded.
     #[tokio::test(flavor = "multi_thread")]
     async fn eval_fillers_settle_waits_for_green() {
-        let (code, stdout, stderr, log) = eval_with_usage_mock(&[
-            "--filler-requests",
-            "2",
-            "--filler-words",
-            "50",
-            "--fillers-settle",
-        ])
+        let (code, stdout, stderr, log, _, overlap) = eval_with_usage_mock_peak(
+            &[
+                "--filler-requests",
+                "2",
+                "--filler-words",
+                "50",
+                "--fillers-settle",
+            ],
+            0,
+        )
         .await;
         assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(overlap, 0, "no item arrived while q2 ran");
         let first_green = log
             .iter()
             .position(|l| l == "pressure-GREEN")
