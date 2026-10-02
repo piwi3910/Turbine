@@ -481,6 +481,26 @@ Transcode kernels, remeasured with MSE-only K (no kernel changed; lab job `turbi
 
 Result: `tq4` stays `experimental`. It passes on Llama and misses on OLMoE.
 
+### OLMoE tq4 multi-turn block loss (decision "6b: lower-tier tq4 after the promotion fix", A; branch `p6b-olmoe-tq4`)
+
+Two mechanisms, both reproduced in `kv_sim` with the OLMoE shape scaled to 16-token blocks (16 sessions behind one 96-token prefix, seeded short turns with think time, `submit_session` hints, a 64–128-block L0, an L1 that holds every history):
+
+1. Lossy-chain misses (fixed, 018016c). A block computed over a lossy prefix is keyed by the chain of the request that computed it, which starts at that request's first lossy block. Histories leave L0 leaf-first, so a session's first lossy block moves earlier from turn to turn, and the later lookup's chain never named the earlier turn's computed blocks: they were recomputed. The lookup now also takes the lossy-lineage children of the previous block's matching entries. kv_sim at YELLOW, L0 64, seeds 1 / 2 / 4: `tq4` cached 1,184 / 640 / 1,328 tokens fewer than `l0` before, equal after. Tests `hierarchy::tests::lossy_lineage_blocks_survive_an_earlier_switch`, `kv_sim lossy_multi_turn_matches_l0_reuse` (mutation "child walk off": both FAIL).
+2. Lossless-tail scoring (not changed; needs a decision). A lossless-tail block is scored at the L0-format bytes it would be demoted at (decision B, encoded-size scores), about 3.5× its chain's `tq4` retrieval. Leaf-first, the tail is its chain's leaf: once it goes, its cheap parents follow, so whole histories drain where `l0` trims across sessions. kv_sim at GREEN (no lossy block reused at all), seeds 1 / 2 / 4 / 6 × L0 64 / 96 / 128: `tq4` −944 … +208 tokens against `l0`; with `kv.lossless_tail_blocks: 0`, or with the tail scored at the tier's rung bytes, `tq4` equals `l0` in all twelve, and every other kv_sim test still passes.
+
+Lab A/B after (1) (tree 018016c, harness `scratch/p6b-olmoe-tq4/ab.sh` on novanas: a fresh native server per run on GPU 0, cores 0-11, under `port18000` and `bench.lock`, client on novanas; workloads as in "TurboQuant promotion path"; arms interleaved):
+
+| Model | L1 format | cached_tokens_ratio (runs)  | median | prompt − cached tokens (runs) | retrieve plans | later-turn TTFT p50 / p99 (ms) |
+| ----- | --------- | --------------------------- | ------ | ----------------------------- | -------------- | ------------------------------ |
+| OLMoE | `l0`      | 0.8613 / 0.8619 / 0.8622    | 0.8619 | 38,170 / 38,035 / 38,020      | 48 / 50 / 47   | 51–54 / 123–334                |
+| OLMoE | `tq4`     | 0.8611 / 0.8609 / 0.8611    | 0.8611 | 38,292 / 38,318 / 38,327      | 24 / 24 / 28   | 47–51 / 130–136                |
+| Llama | `l0`      | 0.9063 / 0.9050 / 0.9052    | 0.9052 | 62,520 / 63,494 / 63,566      | 31 / 28 / 31   | 78–80 / 264–386                |
+| Llama | `tq4`     | 0.9063 / 0.9067 / (invalid) | —      | 62,857 / 62,488 / —           | 17 / 11 / —    | 79 / 198–220                   |
+
+- OLMoE: the shortfall fell from 0.0035 to 0.0008 (about 1–2 blocks of 128 per run instead of 8), but every `tq4` run is still below every `l0` run: the gate (tq4 median ≥ `l0`) still fails. The residue matches mechanism 2: the `tq4` servers stayed GREEN throughout (no reclaim event), where capacity demotion and allocation reclaim take victims in the tail-distorted order.
+- Llama `tq4` r3 is invalid: 3 s after `/ready` the controller went RED on `step_time_drift` (3.37 > 3.0) and stayed there (admission queued, `free_cached` reclaims, TTFT p50 32 s, ratio 0.558, no lossy reuse). Not caused by this change (no KV event preceded it); rerun that arm.
+- Not flipped: `tq4` stays `experimental`.
+
 ### TurboQuant in L0 (Task 13, `kv.dtype=tq4` / `tq2`; branch `p6b-t13`)
 
 Tree 427f6f2 (`p6b-stack` 3349b4a plus `lab-bench --batched-bounds`). `scripts/lab-bench.sh --model <m> --golden16 --batched-bounds --c1 -- --set kv.dtype=<f>`: GPU 0, 200 requests at c16, client on novanas. The c1 leg is lab-bench's (10 requests, 128 tokens, `--ignore-eos`), not the plan's 32 × 256. Golden is judged by the batched bounds at c1 and c16; the strict c1 verdict is noted too. Labbook set `phase-6b-kv-compression`: cad82a75, 72719594, f5e74f28, 1f2126fd, 4ab782a0, 3aadbc6b.
