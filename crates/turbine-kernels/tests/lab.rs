@@ -314,6 +314,113 @@ fn pinned_block_batches_d2h_keeps_up_with_h2d() {
     );
 }
 
+/// Kernel ABI v2.11 copy kernel (P6b, decision "6b: KV promotions slow decode — which fix" A):
+/// pinned → device batches through `copy_async_batch_kernel` land bit-exact, for aligned
+/// layer segments, a misaligned odd-length segment, a 7-byte one and a batch of 40 segments
+/// (more than one launch), leaving the bytes between segments untouched; a Llama block's 28 ×
+/// 512 KiB batches run at no less than 80 % of the copy engine's rate (printed as
+/// `pinned_copy_kernel kernel_gbps=… sdma_gbps=…`). Breaks if the kernel drops or shifts bytes
+/// (a promotion would serve another block's KV) or splits a batch wrongly.
+#[test]
+#[ignore = "needs a HIP device and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn pinned_copy_kernel_is_bit_exact() {
+    use turbine_tensor::CopyOp;
+    const MIB: usize = 1 << 20;
+    if !require_backend("hip") {
+        return;
+    }
+    let ctx = open_context("hip");
+    assert!(
+        ctx.has_copy_kernel(),
+        "libturbine_hip.so exports the v2.11 copy kernel"
+    );
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let host = ctx.alloc_pinned(8 * MIB).expect("pinned");
+    let mut src = vec![0u8; 8 * MIB];
+    fill(77, &mut src);
+    host.with_bytes_mut(|b| b.copy_from_slice(&src));
+    let mut gpu = DeviceBuffer::alloc(&mem, 16 * MIB).expect("device");
+    let sentinel = vec![0xa5u8; 16 * MIB];
+    let check = |segs: &[(usize, usize, usize)], gpu: &mut DeviceBuffer, what: &str| {
+        gpu.copy_from_host(0, &sentinel).expect("sentinel");
+        mem.synchronize().expect("sentinel written");
+        let ops: Vec<CopyOp> = segs
+            .iter()
+            .map(|&(dev, at, bytes)| CopyOp {
+                dst: CopyTarget::Device(gpu.ptr().offset(dev as u64)),
+                src: CopyTarget::Pinned {
+                    buffer_id: host.id(),
+                    offset: at,
+                },
+                bytes,
+            })
+            .collect();
+        for t in ctx.copy_async_batch_kernel(&ops).expect("kernel batch") {
+            ctx.wait(&t).expect("wait");
+        }
+        let mut back = vec![0u8; 16 * MIB];
+        mem.copy_d2h(&mut back, gpu.ptr()).expect("read back");
+        let mut want = sentinel.clone();
+        for &(dev, at, bytes) in segs {
+            want[dev..dev + bytes].copy_from_slice(&src[at..at + bytes]);
+        }
+        let first = back.iter().zip(&want).position(|(a, b)| a != b);
+        assert!(first.is_none(), "{what}: first differing byte {first:?}");
+    };
+    check(
+        &[
+            (0, MIB, MIB),
+            (2 * MIB + 5, MIB + 1, 1_000_003),
+            (4 * MIB + 3, 7, 7),
+            (5 * MIB, 0, 512 * 1024),
+        ],
+        &mut gpu,
+        "mixed segments",
+    );
+    let many: Vec<_> = (0..40)
+        .map(|i| (i * 300_000, (i * 131_072) % (7 * MIB), 4096 * (i + 1)))
+        .collect();
+    check(&many, &mut gpu, "40 segments");
+
+    // Rate: 16 Llama blocks of 28 × 512 KiB, kernel against copy engine.
+    const SEG: usize = 512 * 1024;
+    let blocks = 16;
+    let rate = |kernel: bool| -> f64 {
+        let started = Instant::now();
+        let mut tickets = Vec::new();
+        for b in 0..blocks {
+            let ops: Vec<CopyOp> = (0..28)
+                .map(|l| CopyOp {
+                    dst: CopyTarget::Device(gpu.ptr().offset(((l * SEG) % (16 * MIB)) as u64)),
+                    src: CopyTarget::Pinned {
+                        buffer_id: host.id(),
+                        offset: ((b * 28 + l) * SEG) % (8 * MIB),
+                    },
+                    bytes: SEG,
+                })
+                .collect();
+            tickets.extend(if kernel {
+                ctx.copy_async_batch_kernel(&ops).expect("kernel batch")
+            } else {
+                ctx.copy_async_batch(&ops).expect("batch")
+            });
+        }
+        for t in &tickets {
+            ctx.wait(t).expect("wait");
+        }
+        (blocks * 28 * SEG) as f64 / started.elapsed().as_secs_f64() / 1e9
+    };
+    rate(true);
+    rate(false);
+    let kernel = rate(true);
+    let sdma = rate(false);
+    println!("pinned_copy_kernel kernel_gbps={kernel:.2} sdma_gbps={sdma:.2}");
+    assert!(
+        kernel >= 0.8 * sdma,
+        "the copy kernel {kernel:.2} GB/s is below 80 % of the copy engine's {sdma:.2} GB/s"
+    );
+}
+
 /// P5 S-13: the startup host-link probe on every visible GPU of the backend's vendor, printed as
 /// `host_link device=<i> h2d_gbps=… d2h_gbps=…`; each direction must measure > 1 GB/s. With
 /// `TURBINE_EXPECT_AMD=2` (a `--gpus 2` run on novanas) GPU0's slot (Gen5 x8) must measure no

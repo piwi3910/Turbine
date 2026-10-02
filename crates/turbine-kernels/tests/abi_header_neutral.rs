@@ -540,6 +540,30 @@ fn header_declares_the_v211_kv_transcode_group() {
     }
 }
 
+/// Kernel ABI v2.11 host-to-device copy kernel (P6b, decision "6b: KV promotions slow decode —
+/// which fix" A): `turbine_copy_seg` keeps its field order (dst, src, bytes: the layout of
+/// `ffi::CopySeg`) and `turbine_memcpy_h2d_kernel` its signature. Breaks if a field moves (a
+/// library would copy from the destination) or the declaration drifts from the Rust binding.
+#[test]
+fn header_declares_the_v211_copy_kernel() {
+    let flat = strip_comments(&header())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for decl in [
+        "typedef struct turbine_copy_seg { void *dst; const void *src; size_t bytes; } \
+         turbine_copy_seg;",
+        "int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *s, const \
+         turbine_copy_seg *segs, int32_t count, int32_t workgroups);",
+    ] {
+        let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&decl),
+            "turbine_kernels.h lacks the v2.11 {decl}"
+        );
+    }
+}
+
 /// Kernel ABI v2.11 mixed-format paged attention (P6b Task 12): the paged attention descriptor
 /// ends with the device `block_formats` table and the layer's `tq_params` (after the v2.9 FP8
 /// scales), and the TurboQuant page dtypes keep the codes of `DType::{Tq4, Tq2}`. Breaks if the

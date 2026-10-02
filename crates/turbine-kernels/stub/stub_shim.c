@@ -30,7 +30,8 @@
  * TURBINE_STUB_V210 as well it reports minor 10, whose only addition is
  * turbine_rope_desc.attn_factor; with TURBINE_STUB_V211 as well it reports
  * minor TURBINE_ABI_MINOR (11) and exports the v2.11 kv_transcode trio
- * (unsupported like every op; see the v2.11 section at the end), except that
+ * (unsupported like every op) and the host-to-device copy kernel (memcpy;
+ * see the v2.11 section at the end), except that
  * TURBINE_STUB_V211_PARTIAL leaves out turbine_kv_transcode_impl (a library
  * exporting part of the group).
  *
@@ -1104,4 +1105,39 @@ const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d) {
   return "stub_kv_transcode";
 }
 #endif
+
+/* v2.11: the host-to-device copy kernel is memcpy per segment, like
+ * turbine_memcpy_async. stub_h2d_kernel_calls() counts the calls and
+ * stub_h2d_kernel_segs() the segments copied (test hooks). */
+static atomic_int h2d_kernel_calls;
+static atomic_int h2d_kernel_segs;
+
+int32_t stub_h2d_kernel_calls(void) { return atomic_load(&h2d_kernel_calls); }
+int32_t stub_h2d_kernel_segs(void) { return atomic_load(&h2d_kernel_segs); }
+
+int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *st,
+                                  const turbine_copy_seg *segs, int32_t count,
+                                  int32_t workgroups) {
+  if (st != NULL && st->ctx != ctx) {
+    set_error(ctx->last_error, "stub: stream of another context");
+    return TURBINE_E_ARGUMENT;
+  }
+  if (count < 0 || (count > 0 && segs == NULL) || workgroups < 0) {
+    set_error(ctx->last_error, "stub: bad copy kernel arguments");
+    return TURBINE_E_ARGUMENT;
+  }
+  for (int32_t i = 0; i < count; ++i) {
+    if (segs[i].bytes != 0 && (segs[i].dst == NULL || segs[i].src == NULL)) {
+      set_error(ctx->last_error, "stub: null copy pointer");
+      return TURBINE_E_ARGUMENT;
+    }
+  }
+  for (int32_t i = 0; i < count; ++i) {
+    if (segs[i].bytes != 0)
+      memcpy(segs[i].dst, segs[i].src, segs[i].bytes);
+  }
+  atomic_fetch_add(&h2d_kernel_calls, 1);
+  atomic_fetch_add(&h2d_kernel_segs, count);
+  return TURBINE_OK;
+}
 #endif /* TURBINE_STUB_V211 */

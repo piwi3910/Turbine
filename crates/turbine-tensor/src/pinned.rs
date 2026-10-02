@@ -130,6 +130,21 @@ pub trait CopyEngine: Send + Sync {
         }
         Ok(tickets)
     }
+    /// Whether [`CopyEngine::copy_async_batch_kernel`] runs on this engine.
+    fn has_copy_kernel(&self) -> bool {
+        false
+    }
+    /// [`CopyEngine::copy_async_batch`] for a batch of pinned → device ops only, run as a copy
+    /// kernel with few workgroups that reads the pinned memory directly instead of the copy
+    /// engine (`kv.transfer.promotion_copy: kernel`; on the R9700 a copy-engine promotion
+    /// stalls the compute queue for about its own length, `.procoder/perf-log.md` 6b "Promotion
+    /// copy kernel"). Same ticket and error contract; the default is `Unsupported`.
+    fn copy_async_batch_kernel(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+        let _ = ops;
+        Err(MemoryError::Unsupported(
+            "this copy engine has no host-to-device copy kernel".into(),
+        ))
+    }
     /// `Ok(true)` once the ticket's event has signalled.
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError>;
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError>;

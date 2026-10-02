@@ -431,8 +431,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
  * mapped collective step; v2.9 the quantized GEMM, activation quantization
  * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
- * no new symbol); v2.11 the KV transcode (below) and the mixed-format paged
- * attention fields (block_formats, tq_params; no new symbol). */
+ * no new symbol); v2.11 the KV transcode and the host-to-device copy kernel
+ * (below) and the mixed-format paged attention fields (block_formats,
+ * tq_params; no new symbol). */
 #define TURBINE_ABI_MINOR 11u
 uint32_t turbine_abi_minor(void);
 
@@ -1090,6 +1091,33 @@ int32_t turbine_kv_transcode(turbine_ctx *ctx,
                              const turbine_kv_transcode_desc *d);
 int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);
 const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);
+
+/* ======== v2.11 (additive, optional): host-to-device copy kernel ========
+ * Phase 6b (decision "6b: KV promotions slow decode — which fix", A). Resolved
+ * only when turbine_abi_minor() >= 11, the symbol exists and the v2.5 group is
+ * resolved, apart from the KV transcode trio; a library without it runs every
+ * copy as turbine_memcpy_async (kv.transfer.promotion_copy: kernel is then
+ * refused at startup, promotion_copy_kernel_unavailable).
+ *
+ * turbine_memcpy_h2d_kernel enqueues on stream s (NULL = the compute stream)
+ * one or more kernels that copy the count segments of segs in order, each
+ * segs[i].bytes from segs[i].src (inside pinned host memory of this context,
+ * turbine_host_alloc_pinned, which the kernel reads over the host link) to
+ * segs[i].dst (device memory), with `workgroups` workgroups (0 = the
+ * library's choice). On the R9700 a copy-engine copy of pinned memory stalls
+ * the compute queue for about its own length, while a kernel with few
+ * workgroups moves the same bytes faster without that stall
+ * (.procoder/perf-log.md, 6b "Promotion copy kernel"). The copied bytes equal
+ * the source bytes, for any length and alignment. segs is a host array read
+ * during the call only; the buffers follow the turbine_memcpy_async rules. */
+typedef struct turbine_copy_seg {
+  void *dst;
+  const void *src;
+  size_t bytes;
+} turbine_copy_seg;
+int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *s,
+                                  const turbine_copy_seg *segs, int32_t count,
+                                  int32_t workgroups);
 
 #ifdef __cplusplus
 }

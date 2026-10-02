@@ -519,6 +519,20 @@ pub(crate) struct CopyFns {
         unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut TurbineEvent) -> i32,
 }
 
+/// `turbine_copy_seg` (v2.11): one segment of `turbine_memcpy_h2d_kernel`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopySeg {
+    pub dst: *mut c_void,
+    pub src: *const c_void,
+    pub bytes: usize,
+}
+
+/// `turbine_memcpy_h2d_kernel` (v2.11): the host-to-device copy kernel (P6b, decision "6b: KV
+/// promotions slow decode — which fix" A).
+pub(crate) type CopyKernelFn =
+    unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *const CopySeg, i32, i32) -> i32;
+
 /// The v2.6 tensor-parallel group: `turbine_stream_native_handle` and the `row_sumsq` and
 /// `rmsnorm_sharded` trios.
 #[derive(Clone, Copy)]
@@ -626,8 +640,8 @@ pub(crate) struct ImplFns {
 /// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved,
 /// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
 /// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
-/// from minor 10, and `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
-/// (v2.5) groups resolved.
+/// from minor 10, `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
+/// (v2.5) groups resolved, and `copy_kernel` minor ≥ 11 with `copies`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -655,6 +669,8 @@ pub(crate) struct V21Symbols {
     pub rope_attn_factor: bool,
     /// v2.11 KV transcode (Phase 6b); needs the v2.9 and v2.5 groups.
     pub kv_transcode: Option<OpTrio<KvTranscodeDesc>>,
+    /// v2.11 host-to-device copy kernel (Phase 6b); needs the v2.5 group.
+    pub copy_kernel: Option<CopyKernelFn>,
 }
 
 impl V21Symbols {
@@ -772,10 +788,16 @@ impl V21Symbols {
         } else {
             None
         };
+        let copy_kernel = if minor >= 11 && copies.is_some() {
+            optional(lib, "turbine_memcpy_h2d_kernel")
+        } else {
+            None
+        };
         V21Symbols {
             minor,
             rope_attn_factor: minor >= 10,
             kv_transcode,
+            copy_kernel,
             mapped_dseq,
             mapped_dma,
             quant,

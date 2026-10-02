@@ -4179,6 +4179,102 @@ pub(crate) mod tests {
         drop((host, dev, mem, ctx));
     }
 
+    /// ABI v2.11 copy kernel (P6b, decision "6b: KV promotions slow decode — which fix" A): a
+    /// pinned → device batch through `copy_async_batch_kernel` is one `turbine_memcpy_h2d_kernel`
+    /// call with every segment, behind one ticket of the batch's bytes and no compute fence (a
+    /// host source needs none), each segment landing at its device offset; a batch with a
+    /// device source or a bad end is refused with nothing called; a v2.5 library has no copy
+    /// kernel. Breaks if the batch goes to the copy engine, is split per segment, or a refused
+    /// batch reaches the library.
+    #[test]
+    fn a_kernel_copy_batch_is_one_kernel_call() {
+        use turbine_tensor::{CopyEngine, CopyOp, CopyTarget, PinnedMemory};
+
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let old = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V25")), "hip")
+                .expect("load v2.5");
+            let ctx = old
+                .create_context(&mocked_device("gfx942"))
+                .expect("context");
+            assert!(!ctx.has_copy_kernel(), "v2.5 has no copy kernel");
+            let err = ctx
+                .copy_async_batch_kernel(&[])
+                .expect_err("no copy kernel");
+            assert!(matches!(err, MemoryError::Unsupported(_)), "{err:?}");
+        }
+        let lib = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V211")), "hip")
+            .expect("load v2.11");
+        let ctx = lib
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        assert!(ctx.has_copy_kernel());
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let dev = DeviceBuffer::alloc(&mem, 256).expect("device buffer");
+        let pattern: Vec<u8> = (0..128u8).map(|i| i.wrapping_mul(7) ^ 0x5a).collect();
+        let host = ctx.alloc_pinned(128).expect("pinned buffer");
+        host.with_bytes_mut(|b| b.copy_from_slice(&pattern));
+        // Four 32-byte segments packed on the host, scattered on the device.
+        let seg = |i: usize| CopyOp {
+            dst: CopyTarget::Device(dev.ptr().offset(64 * i as u64)),
+            src: CopyTarget::Pinned {
+                buffer_id: host.id(),
+                offset: 32 * i,
+            },
+            bytes: 32,
+        };
+        let ops: Vec<CopyOp> = (0..4).map(seg).collect();
+        let calls = stub_count(&lib, "stub_h2d_kernel_calls");
+        let segs = stub_count(&lib, "stub_h2d_kernel_segs");
+        let waits = stub_count(&lib, "stub_stream_waits");
+        let tickets = ctx.copy_async_batch_kernel(&ops).expect("kernel batch");
+        assert_eq!(tickets.len(), 1, "one ticket per batch: {tickets:?}");
+        assert_eq!(tickets[0].bytes, 128);
+        assert_eq!(stub_count(&lib, "stub_h2d_kernel_calls"), calls + 1);
+        assert_eq!(stub_count(&lib, "stub_h2d_kernel_segs"), segs + 4);
+        assert_eq!(stub_count(&lib, "stub_stream_waits"), waits, "no fence");
+        ctx.wait(&tickets[0]).expect("wait");
+        let mut back = vec![0u8; 256];
+        mem.copy_d2h(&mut back, dev.ptr()).expect("read back");
+        for i in 0..4 {
+            assert_eq!(
+                &back[64 * i..64 * i + 32],
+                &pattern[32 * i..32 * (i + 1)],
+                "segment {i}"
+            );
+        }
+
+        // A device source (a demotion) or a bad end: refused, nothing called.
+        let calls = stub_count(&lib, "stub_h2d_kernel_calls");
+        let mut d2h = ops.clone();
+        d2h[1] = CopyOp {
+            dst: CopyTarget::Pinned {
+                buffer_id: host.id(),
+                offset: 0,
+            },
+            src: CopyTarget::Device(dev.ptr()),
+            bytes: 32,
+        };
+        let err = ctx
+            .copy_async_batch_kernel(&d2h)
+            .expect_err("not host to device");
+        assert!(matches!(err, MemoryError::Unsupported(_)), "{err:?}");
+        let mut bad = ops.clone();
+        bad[3].src = CopyTarget::Pinned {
+            buffer_id: host.id(),
+            offset: 120,
+        };
+        let err = ctx.copy_async_batch_kernel(&bad).expect_err("past the end");
+        assert!(matches!(err, MemoryError::InvalidArgument(_)), "{err:?}");
+        assert_eq!(
+            stub_count(&lib, "stub_h2d_kernel_calls"),
+            calls,
+            "nothing called"
+        );
+        assert!(ctx.copy_async_batch_kernel(&[]).expect("empty").is_empty());
+        drop((host, dev, mem, ctx));
+    }
+
     /// ABI v2.9 (Phase 6a Task 7): a v2.8 library has no quantized GEMM and no activation
     /// quantization, is not asked for their op codes, and a quantized config is not supported
     /// by it; the v2.9 stub resolves both trios (named by the library's `_impl`, unsupported

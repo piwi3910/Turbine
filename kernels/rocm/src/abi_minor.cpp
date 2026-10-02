@@ -14,7 +14,8 @@
 // pages, which paged attention refuses until an implementation takes them.
 // v2.10 adds no symbol: the rope kernels (elementwise.hip) multiply cos and
 // sin by turbine_rope_desc.attn_factor (YaRN's attention factor). v2.11 adds
-// the KV transcode trio (kv_transcode.hip).
+// the KV transcode trio (kv_transcode.hip) and the host-to-device copy kernel
+// (copy_kernel.hip).
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)
