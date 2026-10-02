@@ -3,6 +3,7 @@
 # turbine-server on a lab host, then a pass/fail verdict.
 #
 #   scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>]
+#                            [--set <dotted.key>=<value>]...
 #
 # 0. precondition: prints the host, the GPU and the memory it will claim and refuses to start
 #    (exit 1, `precondition`) unless an R9700 on novanas has < 1 GiB VRAM in use (amdgpu sysfs
@@ -11,7 +12,8 @@
 #    decision, never this script's.
 # 1. start: novanas runs scripts/lab-serve.sh novanas scripts/lab/phase3-novanas-soak.yaml (a
 #    k3s Job with one R9700, rust:1.97-trixie, ROCm mounted read-only, the weights read-only at
-#    /models; --model <host path under /home/piwi/turbine-models> becomes model.path) and waits
+#    /models; --model <host path under /home/piwi/turbine-models> becomes model.path, and each
+#    --set is passed on to lab-serve.sh, e.g. the P6b compression ladder's tiers) and waits
 #    at most 10 min for /ready. The Sparks need the Phase 2b NVIDIA serve path (docker run
 #    --gpus all --memory 24g of the Phase 2b lab image); until it exists this step fails there.
 # 2. calibrate (2 min): closed loop at --concurrency 4: baseline ITL p99 and request rate R.
@@ -27,7 +29,8 @@
 #    1 on fail. A trap always stops the serve Job it started (and nothing else).
 #
 # Outputs: target/soak/<host>-<timestamp>/{calibrate.json,overload.json,timeline.jsonl,
-# cooldown.jsonl,verdict.json,serve.log}.
+# cooldown.jsonl,metrics.txt,verdict.json,serve.log}; metrics.txt is the server's /metrics at
+# the end of the cool-down.
 # Environment: SOAK_BENCH (a turbine-bench binary; default `cargo run --release` of it),
 # SOAK_CALIBRATE (default 2m), SOAK_COOLDOWN_SECONDS (default 300), SOAK_SOURCE_ONLY=1 (define
 # the functions and return: the tests call soak_precondition).
@@ -42,7 +45,7 @@ SPARK_CONTAINER_CAP=$((24 * GIB))
 HOST_RESERVE=$((8 * GIB))
 
 usage() {
-	echo "usage: scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>]" >&2
+	echo "usage: scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>] [--set <dotted.key>=<value>]..." >&2
 	exit 2
 }
 
@@ -92,6 +95,7 @@ dgx-spark2) ADDR=192.168.10.245 ;;
 esac
 DURATION=10m
 MODEL=/home/piwi/turbine-models/llama-3.2-3b-instruct
+SETS=()
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--duration)
@@ -102,6 +106,11 @@ while [[ $# -gt 0 ]]; do
 	--model)
 		[[ $# -ge 2 && "$2" =~ ^/home/piwi/turbine-models/[A-Za-z0-9._-]+/?$ ]] || usage
 		MODEL="${2%/}"
+		shift 2
+		;;
+	--set)
+		[[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_.]+=.+$ ]] || usage
+		SETS+=(--set "$2")
 		shift 2
 		;;
 	*) usage ;;
@@ -172,7 +181,7 @@ serve_rc=0
 	fail "the Spark serve path (Phase 2b docker image) is not available in this tree"
 TURBINE_LAB_SERVE_TIMEOUT=600 "${REPO_ROOT}/scripts/lab-serve.sh" novanas \
 	"${REPO_ROOT}/scripts/lab/phase3-novanas-soak.yaml" \
-	--set "model.path=/models/$(basename "$MODEL")" 2>&1 | tee "$OUT/serve.log" || serve_rc=$?
+	--set "model.path=/models/$(basename "$MODEL")" ${SETS[@]+"${SETS[@]}"} 2>&1 | tee "$OUT/serve.log" || serve_rc=$?
 RUN_ID=$(sed -n 's/^lab-serve: novanas: run \([0-9a-f-]*\): .*/\1/p' "$OUT/serve.log" | head -n 1)
 # A refused start (e.g. another server already answers on the port) must not go on to measure
 # whatever answers there: that is someone else's server.
@@ -205,6 +214,7 @@ for ((i = 0; i < COOLDOWN_SECONDS; i++)); do
 	printf '{"t":%s,"doc":%s}\n' "$t" "$doc" >>"$OUT/cooldown.jsonl"
 	sleep 1
 done
+curl -fsS -m 5 "$URL/metrics" >"$OUT/metrics.txt" || echo "overload-soak: ${HOST}: /metrics unreadable" >&2
 
 step verdict
 ELAPSED=$(($(date +%s) - STARTED))

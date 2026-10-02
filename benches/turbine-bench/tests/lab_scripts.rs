@@ -1735,6 +1735,8 @@ fn soak_precondition_refuses_busy_gpu() {
         &["localhost"][..],
         &["novanas", "--duration", "ten"][..],
         &["novanas", "--model", "/etc"][..],
+        &["novanas", "--set"][..],
+        &["novanas", "--set", "kv.ladder.enabled"][..],
     ] {
         let (out, called) = lab_script("overload-soak.sh", "soak-usage", args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));

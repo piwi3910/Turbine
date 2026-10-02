@@ -242,8 +242,9 @@ pub struct KvFormatUnavailable {
 /// its per-block format tags, which no provider wires yet (`kv_tq_unavailable`); a lower tier
 /// not stored at the L0 format needs the ABI v2.11 KV transcode (`kv_transcode_unavailable`).
 /// `library`: whether the loaded kernel library has the v2.11 group (`None` before the library
-/// is loaded: those checks wait for the second call); the ladder's L1/L2 rungs stay refused
-/// until their rewrites run on the device transcode too.
+/// is loaded: those checks wait for the second call). The ladder's L1/L2 rungs
+/// (`kv.ladder.max_format`) are lower-tier formats like the tiers' own: their rewrites run on
+/// the device transcode (P6b S-6), so they need it too.
 pub fn kv_format_availability(
     cfg: &Config,
     library: Option<bool>,
@@ -279,10 +280,7 @@ pub fn kv_format_availability(
     };
     let l0 = kv.dtype.as_str();
     let l0_rung = turbine_kv::codec::tier_rung("l0", l0);
-    for (key, format) in tier_format_keys(cfg)
-        .into_iter()
-        .filter(|(key, _)| *key != "kv.ladder.max_format")
-    {
+    for (key, format) in tier_format_keys(cfg) {
         // Below TurboQuant L0 pages a tier stores them as they are (`l0`): the tier codecs
         // encode from BF16 / FP8 pages only. Any other lossier tier needs the library's
         // transcode, once it is known.
@@ -291,14 +289,6 @@ pub fn kv_format_availability(
         {
             return Err(transcode(format!("{key} {format}")));
         }
-    }
-    if kv.ladder.enabled {
-        return Err(KvFormatUnavailable {
-            code: "kv_transcode_unavailable",
-            message: "kv.ladder.enabled: the ladder's L1/L2 rewrites are not wired to the device \
-                      transcode yet"
-                .to_string(),
-        });
     }
     Ok(())
 }
@@ -605,9 +595,19 @@ mod tests {
             kv_format_availability(&ladder, None).unwrap_err().code,
             "kv_tq_unavailable"
         );
+        // The L1/L2 ladder runs its rewrites on the device transcode (P6b S-6): allowed with a
+        // library that has it, refused (naming kv.ladder.max_format) with one that has not.
         ladder.kv.ladder.l0 = false;
+        assert_eq!(kv_format_availability(&ladder, None), Ok(()));
+        assert_eq!(kv_format_availability(&ladder, Some(true)), Ok(()));
+        let err = kv_format_availability(&ladder, Some(false)).unwrap_err();
+        assert_eq!(err.code, "kv_transcode_unavailable", "{err:?}");
+        assert!(err.message.contains("kv.ladder.max_format"), "{err:?}");
+        // Below TurboQuant L0 pages the tier codecs cannot encode: the ladder is refused.
+        let mut tq_ladder = ladder.clone();
+        tq_ladder.kv.dtype = KvDtypeChoice::Tq4;
         assert_eq!(
-            kv_format_availability(&ladder, None).unwrap_err().code,
+            kv_format_availability(&tq_ladder, None).unwrap_err().code,
             "kv_transcode_unavailable"
         );
 
