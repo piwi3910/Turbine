@@ -3036,3 +3036,18 @@ empty, and a `queue_timeout` aborted the run). Soak PASS but 0 ladder actions (r
 **Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Ladder eval without L2 and with concurrent fillers on both sides; fix the L2 copy loss now (allocate before free); back off L1 rewrites after `no_room` until a slab frees; give part of the soak's requests a shared prefix.
 
 **Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Ladder eval without L2 and with concurrent fillers on both sides; fix the L2 copy loss now (allocate before free); back off L1 rewrites after `no_room` until a slab frees; give part of the soak's requests a shared prefix.
+
+## 6b: KV promotions slow decode — which fix (2026-10-02)
+
+From `p6b-copydrift` (merged; perf log "KV copies and decode steps"). rocprofv3: promotions are copy-engine copies of
+1 MiB (one per layer, 83 µs each); while one runs, every compute kernel stretches to about the copy's length (rmsnorm
+6→80 µs), occupancy 0.83→0.45; decode loses 61–69 µs per MiB promoted (`HIP_FORCE_DEV_KERNARG=1` doesn't change it).
+A 64 MiB in-flight cap removes the worst steps (16.8 → 4.5 ms) and speeds promotions (29.4 → 19.1 ms median), but the
+total cost is per byte (236 → 302–336 ms extra per run), tok/s −1.6 % and later-turn TTFT p99 worse.
+
+- A) Shim experiment: promotions via a copy kernel reading pinned host memory (off the copy engine), or smaller copies
+  (256 KiB) if the stall is per copy; measure whether the ms/MiB slope drops; keep the default cap meanwhile
+- B) Lower the default in-flight cap (fewer worst steps, slightly worse throughput and p99)
+- C) Leave it (the drift signal no longer misjudges these steps)
+
+**Decision (user, 2026-10-02): A.** Shim experiment (copy kernel from pinned host memory, or smaller copies); measure the per-MiB slope; default cap unchanged meanwhile.
