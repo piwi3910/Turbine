@@ -3,7 +3,8 @@
 # turbine-server on a lab host, then a pass/fail verdict.
 #
 #   scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>]
-#                            [--set <dotted.key>=<value>]...
+#                            [--set <dotted.key>=<value>]... [--shared-prefix-share <0..1>]
+#                            [--shared-prefixes <n>] [--shared-prefix-words <n>]
 #
 # 0. precondition: prints the host, the GPU and the memory it will claim and refuses to start
 #    (exit 1, `precondition`) unless an R9700 on novanas has < 1 GiB VRAM in use (amdgpu sysfs
@@ -20,6 +21,17 @@
 # 3. overload (--duration, default 10m; 4h for the pre-exit run): open loop --rate 4R,
 #    --prompt-words-range 64..6000, --max-tokens-range 16..1024, --concurrency 1024, with the
 #    pressure timeline.
+#    With --shared-prefix-share <s> (default 0: the Phase 3 workload unchanged) both the
+#    calibration and the overload send that share of their requests behind one of
+#    --shared-prefixes (default 128) fixed prefixes of --shared-prefix-words (default 1024)
+#    words (turbine-bench --shared-prefix-share; the request keeps its drawn length, at least 16
+#    words of its own), so the KV hierarchy reuses, demotes and, with the P6b compression ladder
+#    on, rewrites those blocks under overload (user decision "6b Task 16: ladder proof results —
+#    four open points", 4 A). The ladder soak uses 0.5: 128 prefixes of about 11 blocks each
+#    are about 20 GB of KV, more than L0 plus a 4 GiB L1 hold, so L2 fills too, and each prefix
+#    is reused tens of times in 10 minutes. The verdict's checks keep their meaning; the report
+#    adds `shared_prefix_share` and `kv_ladder_actions` (the sum of
+#    turbine_kv_ladder_actions_total at the end), which no check judges.
 # 4. cool-down (5 min): no load; /turbine/v1/pressure sampled every second.
 # 5. verdict: the server never restarted (uptime covers the whole run) and still answers;
 #    5xx are only 503 with codes overloaded / queue_timeout / circuit_open; no incomplete
@@ -45,8 +57,19 @@ SPARK_CONTAINER_CAP=$((24 * GIB))
 HOST_RESERVE=$((8 * GIB))
 
 usage() {
-	echo "usage: scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>] [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>] [--set <dotted.key>=<value>]... [--shared-prefix-share <0..1>] [--shared-prefixes <n>] [--shared-prefix-words <n>]" >&2
 	exit 2
+}
+
+# soak_load_flags <share> <prefixes> <words>: the turbine-bench flags of the soak's workload
+# shape beyond lengths, one per line: nothing at share 0 (the Phase 3 workload), else the
+# shared-prefix flags. Both the calibration and the overload get them.
+soak_load_flags() {
+	local share="$1" prefixes="$2" words="$3"
+	if [[ "$share" =~ ^0*(\.0*)?$ ]]; then
+		return 0
+	fi
+	printf '%s\n' --shared-prefix-share "$share" --shared-prefixes "$prefixes" --shared-prefix-words "$words"
 }
 
 # soak_precondition <host> <bytes>: novanas <bytes> = VRAM in use on the least-used R9700;
@@ -96,6 +119,9 @@ esac
 DURATION=10m
 MODEL=/home/piwi/turbine-models/llama-3.2-3b-instruct
 SETS=()
+SHARE=0
+PREFIXES=128
+PREFIX_WORDS=1024
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--duration)
@@ -113,10 +139,27 @@ while [[ $# -gt 0 ]]; do
 		SETS+=(--set "$2")
 		shift 2
 		;;
+	--shared-prefix-share)
+		[[ $# -ge 2 && "$2" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || usage
+		SHARE="$2"
+		shift 2
+		;;
+	--shared-prefixes)
+		[[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,4}$ ]] || usage
+		PREFIXES="$2"
+		shift 2
+		;;
+	--shared-prefix-words)
+		[[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,4}$ ]] || usage
+		PREFIX_WORDS="$2"
+		shift 2
+		;;
 	*) usage ;;
 	esac
 done
 
+LOAD=()
+while IFS= read -r flag; do LOAD+=("$flag"); done < <(soak_load_flags "$SHARE" "$PREFIXES" "$PREFIX_WORDS")
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${REPO_ROOT}/target/soak/${HOST}-$(date -u +%Y%m%dT%H%M%SZ)"
 URL="http://${ADDR}:18000"
@@ -193,7 +236,8 @@ MODEL_ID=$(curl -fsS -m 5 "$URL/v1/models" | python3 -c 'import json,sys; print(
 
 step calibrate
 bench --url "$URL" --model "$MODEL_ID" --concurrency 4 --duration "$CALIBRATE" \
-	--prompt-words-range 64..6000 --max-tokens-range 16..1024 --output json >"$OUT/calibrate.json" ||
+	--prompt-words-range 64..6000 --max-tokens-range 16..1024 ${LOAD[@]+"${LOAD[@]}"} \
+	--output json >"$OUT/calibrate.json" ||
 	fail "calibration run failed"
 RATE=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(4 * r["requests_ok"] / r["wall_seconds"])' "$OUT/calibrate.json") ||
 	fail "calibration report has no request rate"
@@ -202,7 +246,7 @@ echo "overload-soak: ${HOST}: calibration: 4R = ${RATE} req/s"
 step overload
 bench --url "$URL" --model "$MODEL_ID" --rate "$RATE" --duration "$DURATION" \
 	--prompt-words-range 64..6000 --max-tokens-range 16..1024 --concurrency 1024 \
-	--pressure-timeline "$OUT/timeline.jsonl" --output json >"$OUT/overload.json" ||
+	${LOAD[@]+"${LOAD[@]}"} --pressure-timeline "$OUT/timeline.jsonl" --output json >"$OUT/overload.json" ||
 	fail "overload run failed"
 
 step cool-down
@@ -219,9 +263,10 @@ curl -fsS -m 5 "$URL/metrics" >"$OUT/metrics.txt" || echo "overload-soak: ${HOST
 step verdict
 ELAPSED=$(($(date +%s) - STARTED))
 STATUS=$(curl -fsS -m 5 "$URL/turbine/v1/status" || echo '{}')
-python3 - "$OUT" "$ELAPSED" "$STATUS" <<'PY'
-import json, sys
+python3 - "$OUT" "$ELAPSED" "$STATUS" "$SHARE" <<'PY'
+import json, os, sys
 out, elapsed, status = sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3])
+share = float(sys.argv[4])
 cal = json.load(open(f"{out}/calibrate.json"))
 over = json.load(open(f"{out}/overload.json"))
 timeline = [json.loads(l) for l in open(f"{out}/timeline.jsonl") if l.strip()]
@@ -258,7 +303,15 @@ verdict = {
     "by_status": over.get("by_status"),
     "by_error_code": over.get("by_error_code"),
     "client_dropped": over.get("client_dropped"),
+    "shared_prefix_share": share,
+    "kv_ladder_actions": None,
 }
+if os.path.exists(f"{out}/metrics.txt"):
+    verdict["kv_ladder_actions"] = sum(
+        float(l.rsplit(" ", 1)[1])
+        for l in open(f"{out}/metrics.txt")
+        if l.startswith("turbine_kv_ladder_actions_total{")
+    )
 json.dump(verdict, open(f"{out}/verdict.json", "w"), indent=2)
 print(json.dumps(verdict, indent=2))
 sys.exit(0 if verdict["pass"] else 1)

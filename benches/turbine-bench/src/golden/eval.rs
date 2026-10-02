@@ -110,11 +110,16 @@ fn ratio(part: u64, whole: u64) -> f64 {
 
 /// Unrelated requests sent between the first two items and the rest (`--filler-requests`):
 /// they fill L0 so the first items' shared prefix is demoted to the lower KV tier before the other
-/// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates).
+/// items arrive and a lossy tier format serves it (Phase 6b lossy-KV gates). Up to
+/// `concurrency` of them are in flight at once (`--filler-concurrency`; 0 counts as 1, one after
+/// another), so together they press on L0 as real load does and the pressure controller leaves
+/// GREEN (the ladder gate, user decision "6b Task 16: ladder proof results — four open points",
+/// 1 A).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fillers {
     pub requests: u32,
     pub words: u32,
+    pub concurrency: u32,
 }
 
 /// Seed of the filler prompts (`crate::prompt::prompt(FILLER_SEED, i, words)`), apart from the
@@ -143,6 +148,10 @@ pub struct EvalReport {
     pub filler_requests: u32,
     #[serde(default)]
     pub filler_words: u32,
+    /// `--filler-concurrency` of this run; an older report with no field reads as 1 (the
+    /// fillers one after another). `eval-compare` refuses a pair that differs.
+    #[serde(default = "default_concurrency")]
+    pub filler_concurrency: u32,
     pub results: Vec<TaskResult>,
 }
 
@@ -453,7 +462,8 @@ async fn run_task(
 /// 256 by the caller); results are reported in task-file order whatever order the replies
 /// arrive in. The first failed request aborts the run (no partial report). With
 /// `fillers.requests` > 0 the first [`FILLER_HEAD`] tasks run alone, one after the other, then
-/// the fillers one after another, then the rest at `concurrency`: the first task publishes the
+/// the fillers (`fillers.concurrency` in flight at once), then the rest at `concurrency`: the
+/// first task publishes the
 /// shared prefix, the second hits it (the reuse evidence a server needs before it copies a
 /// block down rather than dropping it), the fillers push it out of L0, and the rest read it
 /// back from the lower tier.
@@ -489,9 +499,13 @@ pub async fn run_eval(
     for task in head {
         results.push(run_task(client, base, model, task).await?);
     }
+    let filler_concurrency = fillers.concurrency.max(1);
     if !head.is_empty() {
-        for i in 0..fillers.requests {
-            send_filler(client, base, model, i, fillers.words).await?;
+        let mut sent = stream::iter(0..fillers.requests)
+            .map(|i| send_filler(client, base, model, i, fillers.words))
+            .buffer_unordered(filler_concurrency as usize);
+        while let Some(reply) = sent.next().await {
+            reply?;
         }
     }
     let mut replies = stream::iter(rest.iter().enumerate())
@@ -520,6 +534,7 @@ pub async fn run_eval(
         concurrency: concurrency as u32,
         filler_requests: fillers.requests,
         filler_words: fillers.words,
+        filler_concurrency,
         results,
     })
 }
@@ -665,6 +680,7 @@ mod tests {
             concurrency: 1,
             filler_requests: 0,
             filler_words: 0,
+            filler_concurrency: 1,
             results,
         }
     }
@@ -719,8 +735,13 @@ mod tests {
             "results":[{"id":"x","correct":true,"output":"1"}]}"#;
         let r: EvalReport = serde_json::from_str(json).unwrap();
         assert_eq!(
-            (r.concurrency, r.filler_requests, r.filler_words),
-            (1, 0, 0)
+            (
+                r.concurrency,
+                r.filler_requests,
+                r.filler_words,
+                r.filler_concurrency
+            ),
+            (1, 0, 0, 1)
         );
         assert!(r.token_totals().is_none());
     }

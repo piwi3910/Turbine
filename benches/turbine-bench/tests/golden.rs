@@ -1111,26 +1111,40 @@ mod phase8_eval {
     /// report `usage` as the real server does. The first item computes cold; an item after it
     /// reuses 896 of its 1000 prompt tokens from cache, and from lossy blocks only when a
     /// filler (a one-token request) was served between the first item and it, which is what
-    /// pushes the prefix out of L0. The log records the order requests arrived in.
-    async fn spawn_eval_usage_mock() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    /// pushes the prefix out of L0. The log records the order requests arrived in; a filler
+    /// takes 20 ms, and the third value is the most fillers that were in flight at once.
+    async fn spawn_eval_usage_mock() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let log: Arc<Mutex<Vec<String>>> = Arc::default();
         let state = log.clone();
+        let peak: Arc<AtomicUsize> = Arc::default();
+        let in_flight: Arc<AtomicUsize> = Arc::default();
+        let peak_out = peak.clone();
         let app = Router::new()
             .route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }))
             .route(
                 "/v1/chat/completions",
                 post(move |Json(body): Json<Value>| {
                     let log = state.clone();
+                    let (peak, in_flight) = (peak.clone(), in_flight.clone());
                     async move {
                         let messages = body["messages"].as_array().unwrap();
                         let last = messages.last().unwrap()["content"].as_str().unwrap();
-                        let mut log = log.lock().unwrap();
                         if body["max_tokens"] == 1 {
-                            log.push("filler".into());
+                            log.lock().unwrap().push("filler".into());
+                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            in_flight.fetch_sub(1, Ordering::SeqCst);
                             return Ok::<_, StatusCode>(Json(json!({"choices": [{"index": 0,
                                 "message": {"role": "assistant", "content": "0"}}]})));
                         }
+                        let mut log = log.lock().unwrap();
                         let text = eval_mock_reply(last)?;
                         let first = !log.iter().any(|l| l.starts_with('q'));
                         let after_filler = log.iter().any(|l| l == "filler");
@@ -1150,7 +1164,7 @@ mod phase8_eval {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), log)
+        (format!("http://{addr}"), log, peak_out)
     }
 
     /// 20 chat items behind a shared system message.
@@ -1170,7 +1184,15 @@ mod phase8_eval {
     /// Runs `turbine-golden eval` over the usage mock with `extra` flags; (exit code, stdout,
     /// stderr, the mock's request log).
     async fn eval_with_usage_mock(extra: &[&str]) -> (Option<i32>, String, String, Vec<String>) {
-        let (base, log) = spawn_eval_usage_mock().await;
+        let (code, stdout, stderr, log, _) = eval_with_usage_mock_peak(extra).await;
+        (code, stdout, stderr, log)
+    }
+
+    /// [`eval_with_usage_mock`] plus the most fillers the mock saw in flight at once.
+    async fn eval_with_usage_mock_peak(
+        extra: &[&str],
+    ) -> (Option<i32>, String, String, Vec<String>, usize) {
+        let (base, log, peak) = spawn_eval_usage_mock().await;
         let dir = EvalTempDir::new();
         let tasks = dir.path().join("tasks.jsonl");
         write_shared_prefix_tasks(&tasks);
@@ -1200,6 +1222,7 @@ mod phase8_eval {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
             log,
+            peak.load(std::sync::atomic::Ordering::SeqCst),
         )
     }
 
@@ -1244,6 +1267,44 @@ mod phase8_eval {
         assert_eq!(results[1]["lossy_cached_tokens"], 0);
         assert_eq!(results[2]["lossy_cached_tokens"], 896);
         assert_eq!(results[19]["prompt_tokens"], 1000);
+    }
+
+    /// `--filler-concurrency <n>` (user decision "6b Task 16: ladder proof results — four open
+    /// points", 1 A) keeps up to n fillers in flight at once, so they press on L0 together as
+    /// real load does, still after the two head items and before every other item; the report
+    /// records it. Without the flag the fillers go one after another. Breaks if the fillers stay
+    /// sequential, overlap the head or the rest, or the report drops the setting.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_fillers_run_concurrently_with_filler_concurrency() {
+        let (code, stdout, stderr, log, peak) = eval_with_usage_mock_peak(&[
+            "--filler-requests",
+            "8",
+            "--filler-words",
+            "50",
+            "--filler-concurrency",
+            "4",
+            "--min-lossy-cached-ratio",
+            "0.8",
+        ])
+        .await;
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(&log[..2], ["q0", "q1"], "{log:?}");
+        assert!(log[2..10].iter().all(|l| l == "filler"), "{log:?}");
+        assert_eq!(log.len(), 8 + 20);
+        assert!(
+            (2..=4).contains(&peak),
+            "--filler-concurrency 4 put {peak} fillers in flight at once"
+        );
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["filler_concurrency"], 4);
+        assert_eq!(report["filler_requests"], 8);
+        // The default sends them one after another.
+        let (code, stdout, stderr, _, peak) =
+            eval_with_usage_mock_peak(&["--filler-requests", "4", "--filler-words", "50"]).await;
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(peak, 1);
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["filler_concurrency"], 1);
     }
 
     /// Without fillers the prefix never leaves L0, nothing lossy is reused, and a stated
@@ -1294,6 +1355,20 @@ mod phase8_eval {
             "{stderr}"
         );
         assert!(out.stdout.is_empty());
+        // The same fillers sent at another concurrency are refused too.
+        let mut candidate = report.clone();
+        candidate["filler_concurrency"] = json!(16);
+        std::fs::write(&c, candidate.to_string()).unwrap();
+        let out = eval_golden_cmd()
+            .args(["eval-compare", "--baseline"])
+            .arg(&b)
+            .arg("--candidate")
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("filler concurrency"), "{stderr}");
     }
 
     /// An older report with no `concurrency` field reads as concurrency 1.

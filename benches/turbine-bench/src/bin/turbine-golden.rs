@@ -130,6 +130,12 @@ enum Command {
         /// Words in each filler prompt (about the shared prefix's size fills L0 fastest).
         #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u32).range(1..=20000))]
         filler_words: u32,
+        /// Fillers in flight at once (default 1: one after another). Several at once press on
+        /// L0 together, as real load does, so the KV pressure controller leaves GREEN and the
+        /// compression ladder acts (the ladder gate). Both sides of a comparison must use the
+        /// same value.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
+        filler_concurrency: u32,
         /// Exit 1 (the report is still printed) when fewer than this share of the items'
         /// prompt tokens were served from cached KV (`usage.prompt_tokens_details.cached_tokens`).
         #[arg(long)]
@@ -248,6 +254,13 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
             baseline.filler_words,
             candidate.filler_requests,
             candidate.filler_words
+        );
+        return ExitCode::from(2);
+    }
+    if baseline.filler_concurrency != candidate.filler_concurrency {
+        eprintln!(
+            "turbine-golden eval-compare: baseline sent its fillers at filler concurrency {} but candidate at filler concurrency {}; a comparison must use the same fillers on both sides",
+            baseline.filler_concurrency, candidate.filler_concurrency
         );
         return ExitCode::from(2);
     }
@@ -423,6 +436,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             concurrency,
             filler_requests,
             filler_words,
+            filler_concurrency,
             min_cached_ratio,
             min_lossy_cached_ratio,
         } => Ok(run_eval(
@@ -434,6 +448,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             eval::Fillers {
                 requests: filler_requests,
                 words: filler_words,
+                concurrency: filler_concurrency,
             },
             (min_cached_ratio, min_lossy_cached_ratio),
         )
