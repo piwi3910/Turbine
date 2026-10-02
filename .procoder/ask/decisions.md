@@ -2890,3 +2890,18 @@ recomputed. Both formats stay `experimental` (one row per format, no per-model s
    - B) Define another
 
 **Decision (user, 2026-10-01): 1 A, 2 A, 3 A.** Speed up the tq4 promotion path and rerun the multi-turn A/B before flipping; tq2 stays an `experimental` capacity tier; the OLMoE multi-turn workload above is the spec's OLMoE variant.
+
+## 6b: lower-tier tq4 after the promotion fix — OLMoE misses multi-turn by 0.0035 (2026-10-02)
+
+From `p6b-tqspeed` (merged 66ebd48): lossy L1→L0 promotions now copy pinned L1 straight to the device staging slot
+(not via the I/O pool); Llama promotions 245–289 → 50–63 ms, Llama tq4 multi-turn 0.9047 vs `l0` 0.9016 (PASS, 0
+recomputes, later-turn p99 255 vs 411 ms). OLMoE (new variant): tq4 0.8591 vs `l0` 0.8626 (miss 0.0035; every tq4 run
+below every `l0` run; ~1k fewer cached tokens and ~16 more lookup misses per run; same gap as Task 9's −0.003, so not
+promotion speed). tq4 stays `experimental` (one row per format).
+
+- A) Investigate the ~8 blocks per run tq4 loses on OLMoE (likely lookup misses in the lossy-copy key chain), fix,
+  rerun the OLMoE A/B, flip if it holds
+- B) Amend the criterion to "within 0.005 of `l0`" and flip tq4 now
+- C) Per-model support rows (Llama supported, OLMoE experimental): a `TIER_FORMAT_REFUSALS` schema change
+
+**Decision (user, 2026-10-02): A.** Investigate the OLMoE tq4 block loss, fix, rerun the OLMoE A/B, flip if it holds.
