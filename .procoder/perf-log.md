@@ -521,3 +521,26 @@ Staged-prefill profile (decision "6b Task 12: follow-ups", 1 A; measure only). M
 - Encode dominates: 58 % of the Llama tq4 increase and 69 % of OLMoE's. That is 0.35 ms per 2048-row layer chunk on Llama, about 30 GB/s effective and 21× the BF16 append.
 - Second is the single-query `turbine_hip_mixed` pass that `run_mixed_staged` launches after CK on every layer and chunk: 7 + 4 full-grid launches per layer per Llama request. It runs even when the batch has no `q_len` 1 row, and this workload has none.
 - Staging decode is small, and CK is unchanged.
+
+### Compression ladder in L1/L2 on the server (Task 16; branch `p6b-t16`, 4e49409)
+
+Multi-turn A/B, Llama-3.2-3B, `scripts/lab/phase6-novanas-ladder.yaml` (L0 8 GiB, L1 2 GiB `l0`, L2 4 GiB `l0`, `max_format: tq4`) against the same file with `--set kv.ladder.enabled=false`. A fresh native server per run on GPU 0 (port 18010, under `bench.lock`, fixtures paused), arms interleaved. Workload: `turbine-bench --profile multi-turn --sessions 24 --turns 8 --concurrency 24 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on novanas. Recomputed tokens are `turbine_kv_recompute_tokens_total`; every run went GREEN → YELLOW → ORANGE (on-r3 also RED).
+
+| Arm | Run | ok      | recomputed tokens | cached_tokens_ratio | lossy cached tokens | later-turn TTFT p50 / p99 (ms) | L1 rewrites (no_room) | L2 rewrites (no_room) | L2 new demotions |
+| --- | --- | ------- | ----------------- | ------------------- | ------------------- | ------------------------------ | --------------------- | --------------------- | ---------------- |
+| on  | r1  | 192/192 | 149,895           | 0.8515              | 32,640              | 160.5 / 27,758                 | 1,494 (1,483)         | 401 (88)              | 39               |
+| on  | r2  | 192/192 | 155,442           | 0.8453              | 16,896              | 153.1 / 19,277                 | 914 (911)             | 403 (34)              | 12               |
+| on  | r3  | 184/192 | 128,869           | 0.8660              | 8,448               | 129.6 / 61,723                 | 3,360 (3,350)         | 258 (0)               | 41               |
+| off | r1  | 192/192 | 213,207           | 0.7876              | 0                   | 145.4 / 12,871                 |                       |                       |                  |
+| off | r2  | 192/192 | 183,330           | 0.8172              | 0                   | 171.1 / 13,997                 |                       |                       |                  |
+| off | r3  | 192/192 | 206,270           | 0.7939              | 0                   | 138.1 / 14,137                 |                       |                       |                  |
+
+Medians, on against off: recomputed tokens 149,895 against 206,270 (−27 %), `cached_tokens_ratio` 0.8515 against 0.7939, later-turn TTFT p50 153 against 145 ms, p99 27.8 against 14.0 s, output tok/s 249 against 301 (−17 %). Labbook set `phase-6b-kv-compression`: the 6 runs (`p6b-t16:mt:llama:ladder-{on,off}:r{1,2,3}`). Rungs at the end: L1 `fp8_e4m3`, L2 `tq4`. on-r3 lost 8 requests to 503 `queue_timeout` (60 s, RED); no off run lost any.
+
+- L1 rewrites almost never store: 99.3–99.7 % end `no_room`. L1's two 1 GiB slabs are both `l0`-sized and never empty, so no slot of the `fp8_e4m3` size exists (handoff Open 3, slab fragmentation). The sweep picks the same blocks again every tick, so the ladder spends up to 32 device transcodes per tick for nothing (3,360 submits in on-r3); that load is the likely cause of the doubled later-turn p99 and of on-r3's RED.
+- L2 rewrites mostly store (0–22 % `no_room`). A `no_room` rewrite in L2 loses the copy: `L2NvmeTier::store` frees the replaced slot before it looks for one of the new size, and `on_copy_failed` then evicts the block (`a_rewrite_without_room_counts_no_room` pins this).
+
+Shared-prefix GSM8K with the ladder (`p6b-eval-prefix.md` recipe on the ladder config plus `--set kv.gpu.max_bytes=4GiB`, candidate guard `--min-lossy-cached-ratio 0.5`): no usable report, nothing committed.
+
+- Default thresholds: the whole eval stayed GREEN, so the ladder never ran; lossy ratio 0.000 (cached ratio 0.931, 726,723 prompt tokens, accuracy 0.745). The guard exited 1.
+- `reliability.pressure.thresholds.kv_utilization=[0.03,0.06,0.9,0.97]` (decision "6b Task 16 … four points", 4 A): the eval ran at ORANGE from the first item. Still no ladder action: the sweep starts at the lowest tier (L2, which the eval leaves empty), and L1 holds the prefix at `l0` while L2 sits on its base rung. Admission also queued the items on `kv_reservation`, and item 6 got 503 `queue_timeout`, which aborted the run (exit 2). Lowering the thresholds cannot make this eval gate the ladder. Options are in `.procoder/handoff/p6b-t16.md`.
