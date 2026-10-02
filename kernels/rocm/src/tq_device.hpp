@@ -90,6 +90,61 @@ __device__ inline float midpoint(const float *cb, int i) {
   return (cb[i] + cb[i + 1]) * 0.5f;
 }
 
+// norm_of(row) without its 128-step F64 chain wherever that is provably the
+// same F32 (bit for bit): the squares, exact in F32 for BF16 inputs (checked
+// with a fused multiply-add), are summed in double-F32 (TwoSum, then a
+// Fast2Sum renormalisation; relative error <= 128 * 2^-47 = 2^-40), and the
+// codec's sequential F64 sum S_seq lies within 2^-46 of the exact sum. r =
+// f32(sqrt(S)) of that estimate S is taken when every sum within a relative
+// 2^-35 of S rounds to r: when S * (1 - 2^-35) lies above m_lo^2 and S * (1 +
+// 2^-35) below m_hi^2, m_lo and m_hi being the midpoints between r and its F32
+// neighbours (exact in F64, and so are their squares), the double sqrt of any
+// such sum lies strictly between the midpoints, so it rounds to r. Otherwise
+// (about 2^-11 of vectors), a square that is not exact, or an element
+// outside 2^-40 <= |x| < 2^60 other than 0, the sequential loop. A row of
+// zeros gives 0 either way.
+__device__ inline float norm_fast(const float *row) {
+#pragma clang fp contract(off)
+  float hi = 0.0f;
+  float lo = 0.0f;
+  bool exact = true;
+  for (int j = 0; j < kDim; ++j) {
+    const float x = row[j];
+    const float p = x * x;
+    // Exactness is only trusted where neither the square nor its residual
+    // can underflow or overflow: 0, or 2^-40 <= |x| < 2^60 (NaN fails).
+    const float ax = __builtin_fabsf(x);
+    exact = exact && (x == 0.0f || (ax >= 0x1p-40f && ax < 0x1p60f)) &&
+            __builtin_fmaf(x, x, -p) == 0.0f;
+    // (s, e) = TwoSum(hi, p); (hi, lo) = Fast2Sum(s, lo + e).
+    const float s = hi + p;
+    const float bb = s - hi;
+    const float e = (hi - (s - bb)) + (p - bb);
+    const float v = lo + e;
+    hi = s + v;
+    lo = v - (hi - s);
+  }
+  const double sum = static_cast<double>(hi) + static_cast<double>(lo);
+  if (sum == 0.0 && exact)
+    return 0.0f;
+  const float r = static_cast<float>(sqrt(sum));
+  if (exact && sum > 0.0 && __builtin_isfinite(sum) && r > 0.0f &&
+      __builtin_isfinite(r)) {
+    constexpr double kWindow = 0x1p-35;
+    // r's F32 neighbours (r is positive and finite; above the largest F32
+    // comes infinity).
+    const uint32_t bits = __builtin_bit_cast(uint32_t, r);
+    const float below = __builtin_bit_cast(float, bits - 1u);
+    const float above = __builtin_bit_cast(float, bits + 1u);
+    const double m_lo = (static_cast<double>(below) + r) * 0.5;
+    const double m_hi = (static_cast<double>(r) + above) * 0.5;
+    if (__builtin_isfinite(m_hi) && sum * (1.0 - kWindow) > m_lo * m_lo &&
+        sum * (1.0 + kWindow) < m_hi * m_hi)
+      return r;
+  }
+  return norm_of(row);
+}
+
 // Index of the nearest centroid of an ascending codebook of N entries, given
 // its N - 1 midpoints: the number of midpoints x is above (codebook.rs nearest
 // scans them in order and stops at the first one x is not above, the same
@@ -157,7 +212,7 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
   if (tid < 2 * kChunk && tid % kChunk < nt) {
     const int kind = tid / kChunk;
     const int tok = tid % kChunk;
-    const float n = norm_of(lds.xs[kind][tok]);
+    const float n = norm_fast(lds.xs[kind][tok]);
     lds.norms[kind][tok] = n;
     lds.norm_bits[kind][tok] = f32_to_bf16(n).bits;
   }
