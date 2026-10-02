@@ -402,6 +402,18 @@ int32_t run_ck_fp8_staged(turbine_ctx *ctx,
   return turbine_hip::launch_paged_decode_fp8(ctx, d);
 }
 
+// Whether a batch may hold a sequence of exactly one query row, judged on the
+// host from the descriptor alone (q_indptr is device memory): not when every
+// sequence must have max_q_len > 1 rows -- a single sequence, or total_q equal
+// to num_seqs * max_q_len.
+bool may_have_single_query_row(const turbine_attention_paged_desc *d) {
+  if (d->max_q_len <= 1)
+    return true;
+  return !(d->num_seqs == 1 ||
+           static_cast<int64_t>(d->total_q) ==
+               static_cast<int64_t>(d->num_seqs) * d->max_q_len);
+}
+
 // The staged mixed-format prefill: groups of sequences whose pages, decoded to
 // BF16, fit kStagedMaxBytes, each staged into the attention scratch and
 // attended by CK (use_ck) or the Turbine BF16 kernel; turbine_hip_mixed when
@@ -468,7 +480,11 @@ int32_t run_mixed_staged(turbine_ctx *ctx,
       return rc;
   }
   // The single-query rows the BF16 kernel only saw one unconverted key for
-  // (after every group, so they overwrite its rows).
+  // (after every group, so they overwrite its rows). Skipped when the batch
+  // cannot hold one (decision "6b Task 13", 3 C): its grid spans every query
+  // row, so on a prefill-only batch it cost ~0.2 ms a layer for nothing.
+  if (!may_have_single_query_row(d))
+    return TURBINE_OK;
   return turbine_hip::run_paged_mixed_attention(ctx, d, true);
 }
 
