@@ -501,6 +501,24 @@ Lab A/B after (1) (tree 018016c, harness `scratch/p6b-olmoe-tq4/ab.sh` on novana
 - Llama `tq4` r3 is invalid: 3 s after `/ready` the controller went RED on `step_time_drift` (3.37 > 3.0) and stayed there (admission queued, `free_cached` reclaims, TTFT p50 32 s, ratio 0.558, no lossy reuse). Not caused by this change (no KV event preceded it); rerun that arm.
 - Not flipped: `tq4` stays `experimental`.
 
+### Lossless last block scored like its history (decision "6b: OLMoE tq4 — lossless last block in eviction order", 1 A; branch `p6b-lastblock`)
+
+Change 028f465: `score_one` prices a lossless last block's retrieval at the bytes its history would be stored at in the tier below; its demotion, memory term and planner pricing keep its L0-format size. kv_sim `lossy_multi_turn_green_matches_l0_reuse` (GREEN, L0 64 / 96 / 128 / 192 × seeds 1 / 2 / 4): `tq4` ≥ `l0` in all twelve after, L0 64 seed 1 16,496 vs 16,976 before. No fixture moved.
+
+Lab A/B, tree 028f465, harness `scratch/p6b-lastblock/ab.sh` on novanas (the `p6b-olmoe-tq4` harness with an absolute output path and the pressure transitions counted per run): same workloads, servers and locks as "OLMoE tq4 multi-turn block loss", arms interleaved, results in `scratch/p6b-lastblock/ab1/`:
+
+| Model | L1 format | cached_tokens_ratio (runs) | median | prompt − cached tokens (runs) | retrieve plans | later-turn TTFT p50 / p99 (ms) | pressure transitions                 |
+| ----- | --------- | -------------------------- | ------ | ----------------------------- | -------------- | ------------------------------ | ------------------------------------ |
+| OLMoE | `l0`      | 0.8627 / 0.8628 / 0.8616   | 0.8627 | 37,648 / 37,778 / 38,029      | 45 / 45 / 48   | 51–56 / 117–289                | YELLOW on `step_time_drift`, 24–25 s |
+| OLMoE | `tq4`     | 0.8619 / 0.8609 / 0.8604   | 0.8609 | 38,062 / 38,364 / 38,306      | 43 / 40 / 42   | 48–52 / 131–148                | none                                 |
+| Llama | `l0`      | 0.9052 / 0.9056 / 0.9022   | 0.9052 | 63,083 / 63,143 / 65,421      | 30 / 32 / 29   | 78–80 / 172–401                | YELLOW (r2 on drift at 33 s)         |
+| Llama | `tq4`     | 0.9059 / 0.9074 / 0.9061   | 0.9061 | 62,594 / 62,094 / 62,949      | 26 / 30 / 31   | 77–83 / 205–402                | YELLOW on `kv_utilization` (r1, r3)  |
+
+- Llama passes: `tq4` 0.9061 ≥ `l0` 0.9052, every `tq4` run at or above every `l0` run.
+- OLMoE fails: `tq4` 0.8609 vs `l0` 0.8627, every `tq4` run below every `l0` run. `tq4`'s uncached tokens are unchanged from the previous A/B (38.1–38.4k against 38.3k); the gap moved only because the `l0` runs came out higher (37.6–38.0k against 38.0–38.2k). In the lab the change does not measurably move OLMoE `tq4`.
+- No run left GREEN in its first seconds, so none was discarded. Every OLMoE `l0` run, here and in the previous A/B, goes YELLOW on `step_time_drift` (1.55–1.63 against 1.5) 24–25 s after `/ready`, late in a ~35 s run, and stays there: 15 `reclaim` events and throttle changes follow. No OLMoE `tq4` run leaves GREEN or reclaims. The arms therefore run under different pressure states: `l0` gets YELLOW's proactive demotion, `tq4` only GREEN's on-demand reclaim.
+- Not flipped: `tq4` stays `experimental`.
+
 ### TurboQuant in L0 (Task 13, `kv.dtype=tq4` / `tq2`; branch `p6b-t13`)
 
 Tree 427f6f2 (`p6b-stack` 3349b4a plus `lab-bench --batched-bounds`). `scripts/lab-bench.sh --model <m> --golden16 --batched-bounds --c1 -- --set kv.dtype=<f>`: GPU 0, 200 requests at c16, client on novanas. The c1 leg is lab-bench's (10 requests, 128 tokens, `--ignore-eos`), not the plan's 32 × 256. Golden is judged by the batched bounds at c1 and c16; the strict c1 verdict is noted too. Labbook set `phase-6b-kv-compression`: cad82a75, 72719594, f5e74f28, 1f2126fd, 4ab782a0, 3aadbc6b.
