@@ -3085,3 +3085,16 @@ From `p6b-t16` (merged; perf log "Compression ladder in L1/L2 on the server"). E
    - B) Ship the ladder off by default (it already is) and investigate later
 
 **Decision (user, 2026-10-02): 1 A, 2 A.** Apply the admission headroom rule at GREEN too, capped at the SURVIVAL/RED threshold (Phase 3 spec amendment); investigate the ladder-on throughput and tail regression before Task 17.
+
+## 6b: which cap the GREEN admission headroom uses (2026-10-02)
+
+Follows "GREEN→SURVIVAL admission burst" (1 A). `Admission::within_headroom` queues at YELLOW/ORANGE/RED when a
+reservation would lift `kv_utilization` past the next state's threshold (0.82 / 0.90 / 0.97); at GREEN it admits
+everything (the hole behind the 14-admission burst to 0.9946). The existing pattern at GREEN would cap at YELLOW's 0.70
+(option B, declined), so decision A needs a looser cap:
+
+- A) RED threshold (0.90): GREEN admissions may reach ORANGE but never RED or SURVIVAL (~7 % of pool capacity reserved
+  as margin at GREEN; expected no throughput change at c16)
+- B) SURVIVAL threshold (0.97): admissions alone can't enter SURVIVAL, but can still jump GREEN → RED
+
+**Decision (user, 2026-10-02): A.** At GREEN, admissions are capped at the RED threshold (0.90).
