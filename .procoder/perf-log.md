@@ -521,3 +521,40 @@ Staged-prefill profile (decision "6b Task 12: follow-ups", 1 A; measure only). M
 - Encode dominates: 58 % of the Llama tq4 increase and 69 % of OLMoE's. That is 0.35 ms per 2048-row layer chunk on Llama, about 30 GB/s effective and 21× the BF16 append.
 - Second is the single-query `turbine_hip_mixed` pass that `run_mixed_staged` launches after CK on every layer and chunk: 7 + 4 full-grid launches per layer per Llama request. It runs even when the batch has no `q_len` 1 row, and this workload has none.
 - Staging decode is small, and CK is unchanged.
+
+### TurboQuant prefill follow-ups (decision "6b Task 13", 3 C; branch `p6b-tqfollow`)
+
+Two changes, measured one after the other: the single-query `turbine_hip_mixed` pass after the staged prefill now runs only when the descriptor allows a single-query row (497ddd1), then the TurboQuant encode shared by the transcode and the mixed append got faster (ad28f9a, 0a26bd4, 8e39d7d; bit-exact, `kv_transcode_matches_cpu` and `paged_mixed_matches_cpu` green, three mutations red). `f2faa53` (a double-F32 norm) was measured slower and replaced by `0a26bd4`.
+
+Kernel timings (`hip_ops`, k3s card, mean of 10 calls; the 32-block Llama-shape transcode batch, 448 MiB of BF16 pages):
+
+| Step                                                                       | Commit  | tq4 encode (µs) | tq2 encode (µs) | Llama staged prefill tq4, 1 × 2,048 / 16 × 512 (µs) | OLMoE, same (µs) |
+| -------------------------------------------------------------------------- | ------- | --------------- | --------------- | --------------------------------------------------- | ---------------- |
+| earlier entries (encode: `p6b-tqspeed` remeasure; prefill: Task 12, GPU 0) | ee7b950 | 22,387          | 12,586          | 1,517 / 7,088                                       | 1,952 / 11,391   |
+| skip the single-query pass                                                 | 497ddd1 | 22,278          | 12,662          | 880 / 3,653                                         | 1,201 / 6,414    |
+| midpoint binary search, byte packing                                       | ad28f9a | 12,555          | 11,509          |                                                     |                  |
+| F64 FMA norm, 16-byte loads, words                                         | 8e39d7d | 7,162           | 5,985           | 530 / 2,496                                         | 577 / 4,091      |
+
+BF16 for comparison: the FP8 transcode encodes the same batch in 2,430 µs; the BF16 CK prefill is 350 / 1,757 µs (Llama) and 271 / 2,538 µs (OLMoE). A one-run variant sweep on top of ad28f9a (`p6b-tqfollow-exp`, not merged; tq4 µs) split the encode: scalar loads with the F64 norm 12,477, scalar loads without any norm 9,883, 16-byte loads with the F64 norm 8,168, 16-byte loads without a norm 5,042, 16-byte loads with the F64 FMA norm 7,216; the double-F32 norm 15,716 (scalar) / 11,111 (16-byte). The F64 norm is still about 2 ms of the 7.2.
+
+Served prefill TTFT, c1, 20 requests, `--max-tokens 1` (Llama 2,000-word prompts ≈ 2,950 tokens in two chunks, OLMoE 1,500 words; native server on GPU 0 under `bench.lock`, `phase2c` config, `--set kv.dtype=<f>`), the Task 13 profile's workload:
+
+| Model | KV     | before (b4e9f46) | pass skipped (497ddd1) | faster encode (8e39d7d) | overhead vs BF16 (ms) |
+| ----- | ------ | ---------------- | ---------------------- | ----------------------- | --------------------- |
+| Llama | `bf16` |                  | 196.8                  |                         |                       |
+| Llama | `tq4`  | 227.2            | 215.7                  | 204.3                   | 30.4 → 18.9 → 7.5     |
+| OLMoE | `bf16` |                  |                        | 94.1                    |                       |
+| OLMoE | `tq4`  | 114.3            |                        | 101.0                   | 20.2 → 6.9            |
+
+`scripts/lab-bench.sh --quick --c1 --batched-bounds --model llama -- --set kv.dtype=tq4` (64 requests at c16, 512-word prompts; the c1 leg uses short prompts):
+
+| Commit  | tok/s | ITL p50 (ms) | TTFT p50 c16 (ms) | TTFT p50 c1 (ms) | ITL p50 c1 (ms) | golden c1 (batched) |
+| ------- | ----- | ------------ | ----------------- | ---------------- | --------------- | ------------------- |
+| b4e9f46 | 834.9 | 15.9         | 281               | 42.9             | 12.57           | FAIL 0/16           |
+| 497ddd1 | 829.8 | 16.0         | 285               | 43.5             | 12.57           | FAIL 0/16           |
+| 8e39d7d | 866.6 | 15.3         | 248               | 43.5             | 12.51           | FAIL 0/16           |
+
+- The pass skip shows only on prefill-only batches: at c16 almost every batch carries decode rows, so the pass still runs there (now over every query row of the batch, prefill rows included, as before); the c1 leg's prompts are short. The 2,000-word c1 run shows it: −11.5 ms, the 12.3 ms the profile attributed to the pass.
+- The encode speed-up shows at c16: TTFT p50 −12 %, tok/s +3.8 %.
+- Golden output (`golden1.txt`) is byte-identical across the three runs: the encode is bit-exact and the skipped pass never wrote a prefill row. Golden still fails (decision 1: tq4 stays `experimental`).
+- Not done: a pass over only the single-query rows (a grid over sequences instead of query rows) would remove the pass's cost from mixed c16 batches too; the remaining F64 norm loop (≈ 2 ms of 7.2) and the LDS footprint (≈ 41 KB a workgroup) are the next encode items.
