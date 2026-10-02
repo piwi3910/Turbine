@@ -2955,3 +2955,22 @@ two budgeted rewrite lanes (host codec: ~1.3 s per fp8→tq4 rewrite of a Llama 
    - B) Another approach (lead to propose)
 
 **Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Merge the turbine-kv fixes to the stack first and share them; prove the ladder with `max_format: tq4` and make tq4 the spec default; count an unmet rewrite as `no_room`; lower the KV-pressure thresholds on both sides of the eval pair if the guard fails.
+
+## 6b: OLMoE tq4 — lossless last block in eviction order; step-time drift at startup (2026-10-02)
+
+From `p6b-olmoe-tq4` (merged 1eb593a). Cause 1 fixed (018016c: lookups follow directory parent links when a lossy
+chain switched earlier). OLMoE A/B after it: tq4 0.8611 vs `l0` 0.8619 (gap 0.0035 → 0.0008, every tq4 run still below).
+Cause 2: eviction scores a sequence's lossless last block at full L0 size (~3.5× a tq4 history block, per the
+encoded-size scoring decision B), so it is evicted first and histories drain; in kv_sim at GREEN tq4 runs up to 944
+tokens short of `l0`; scoring that block like its history gives exact parity in 12/12 cases.
+
+1. Lossless last block:
+   - A) Score it like its history for eviction ORDER only (keep its encoded-size cost elsewhere), rerun both A/Bs, flip
+     tq4 if they hold
+   - B) History-aware eviction (wider Phase 4 change)
+   - C) Accept the 0.0008 gap and flip now (relaxes the gate)
+2. One Llama A/B run went RED on step-time drift 3 s after start and stayed there (run invalid):
+   - A) Investigate the step-time drift signal at startup now (Phase 3 signal)
+   - B) Rerun and note it; investigate later
+
+**Decision (user, 2026-10-02): 1 A, 2 A.** Score the lossless last block like its history for eviction order, rerun both A/Bs, flip tq4 if they hold; investigate the step-time drift signal at startup now.
