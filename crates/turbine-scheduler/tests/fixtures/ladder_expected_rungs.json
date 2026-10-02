@@ -42,13 +42,13 @@
     "to": "tq4"
   },
   {
-    "step": 5756,
+    "step": 5786,
     "tier": "l2",
     "from": "tq4",
     "to": "fp8_e4m3"
   },
   {
-    "step": 6313,
+    "step": 6399,
     "tier": "l2",
     "from": "fp8_e4m3",
     "to": "l0"

@@ -2455,6 +2455,8 @@ host-codec demotion encodes, which ran when the 32 device staging slots were tak
 kernel changed, so no kernel before/after pair. The encode (0.70 ms a block, the F64 per-vector norm loop) still sets
 how fast `tq4` demotions can go.
 
+Encode speed-up (2026-10-02, `p6b-tqfollow`, decision "6b Task 13", 3 C; perf log 6b "TurboQuant prefill follow-ups"). No new provider: the encode stays the own `turbine_hip_tq` / mixed-append code (`tq_device.hpp` `encode_chunk`), and the changes are code-level, each bit-exact with the codec. (1) The nearest-centroid search was a linear scan that recomputed each midpoint; it is now a branch-free binary search over midpoints computed once per chunk (the count of midpoints the value is above, so a value on a midpoint keeps the lower code). (2) A packed byte is built from its 8 / B codes, not eight bit gathers. (3) The F64 norm takes one fused multiply-add per element: an F32 square is exact in F64, so `fma(v, v, acc)` rounds exactly as the codec's multiply-then-add. (4) Pages (transcode) and K / V rows (append) load 16 bytes a thread when 16-byte aligned (the old 2-byte loads otherwise). (5) Records are stored 32 bits at a time when 4-byte aligned. A double-F32 norm with an exactness check (`f2faa53`) was tried and measured slower than the F64 loop (tq4 15.7 vs 12.5 ms), so it was removed. Same 32-block Llama batch (lab k3s card, `kv_transcode_matches_cpu` green; mutations of the norm, the transcode load and the append load each RED, jobs `1002053535-3456837a`, `1002053619-1501d855`, `1002053659-2f3d8fb2`): `tq4` encode 22,278 → 7,162 µs (0.70 → 0.22 ms a block, 21 → 66 GB/s of pages), `tq2` 12,662 → 5,985 µs; decode unchanged (1,245 / 1,135 µs). The F64 norm is still ≈ 2 ms of the 7.2 (variant sweep); the next items are the norm and the encode's 41 KB of LDS a workgroup.
+
 ## 6b Task 8: TurboQuant tables through the transcode descriptor (2026-09-30)
 
 Found by the Task 8 builder (`p6b-t8`, c3839c9). `turbine_kv_transcode_desc` carries only `seed`. The K/V signs are
@@ -2955,3 +2957,39 @@ two budgeted rewrite lanes (host codec: ~1.3 s per fp8→tq4 rewrite of a Llama 
    - B) Another approach (lead to propose)
 
 **Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Merge the turbine-kv fixes to the stack first and share them; prove the ladder with `max_format: tq4` and make tq4 the spec default; count an unmet rewrite as `no_room`; lower the KV-pressure thresholds on both sides of the eval pair if the guard fails.
+
+## 6b: OLMoE tq4 — lossless last block in eviction order; step-time drift at startup (2026-10-02)
+
+From `p6b-olmoe-tq4` (merged 1eb593a). Cause 1 fixed (018016c: lookups follow directory parent links when a lossy
+chain switched earlier). OLMoE A/B after it: tq4 0.8611 vs `l0` 0.8619 (gap 0.0035 → 0.0008, every tq4 run still below).
+Cause 2: eviction scores a sequence's lossless last block at full L0 size (~3.5× a tq4 history block, per the
+encoded-size scoring decision B), so it is evicted first and histories drain; in kv_sim at GREEN tq4 runs up to 944
+tokens short of `l0`; scoring that block like its history gives exact parity in 12/12 cases.
+
+1. Lossless last block:
+   - A) Score it like its history for eviction ORDER only (keep its encoded-size cost elsewhere), rerun both A/Bs, flip
+     tq4 if they hold
+   - B) History-aware eviction (wider Phase 4 change)
+   - C) Accept the 0.0008 gap and flip now (relaxes the gate)
+2. One Llama A/B run went RED on step-time drift 3 s after start and stayed there (run invalid):
+   - A) Investigate the step-time drift signal at startup now (Phase 3 signal)
+   - B) Rerun and note it; investigate later
+
+**Decision (user, 2026-10-02): 1 A, 2 A.** Score the lossless last block like its history for eviction order, rerun both A/Bs, flip tq4 if they hold; investigate the step-time drift signal at startup now.
+
+**Filed (user, 2026-10-02):** https://github.com/ROCm/rocm-systems/issues/12677 (HIP) and https://github.com/ROCm/rocm-libraries/issues/12895 (hipBLASLt), cross-linked.
+
+**Upstream fix PRs (user, 2026-10-02): hipBLASLt only.** A builder prepares a fix PR for rocm-libraries#12895 from a fork under the user's account, verified on novanas; the HIP clr change is left to AMD (rocm-systems#12677); our shim lock stays.
+
+## 6b: OLMoE tq4 after the last-block change — the A/B arms ran under different pressure (2026-10-02)
+
+From `p6b-lastblock` (merged): Llama tq4 0.9061 vs `l0` 0.9052 (PASS); OLMoE tq4 0.8609 vs `l0` 0.8627 (FAIL). Every
+OLMoE `l0` run (this A/B and the previous one) went YELLOW on step-time drift 24–25 s after ready and stayed there
+(~15 reclaim events); no tq4 run left GREEN — the same signal the drift builder is investigating. kv_sim shows tq4 ≥ `l0`
+at GREEN in 12/12 after the change.
+
+- A) Rerun the OLMoE A/B after the drift fix lands (both arms under the same pressure), flip tq4 if it holds
+- B) Investigate OLMoE tq4 block loss at GREEN now (per-arm dropped-block counts; kv_sim does not reproduce it)
+- C) Accept the gap and flip now (relaxes the gate)
+
+**Decision (user, 2026-10-02): A.** Rerun the OLMoE A/B after the drift fix lands; flip tq4 if it holds.

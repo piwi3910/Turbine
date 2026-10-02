@@ -481,6 +481,44 @@ Transcode kernels, remeasured with MSE-only K (no kernel changed; lab job `turbi
 
 Result: `tq4` stays `experimental`. It passes on Llama and misses on OLMoE.
 
+### OLMoE tq4 multi-turn block loss (decision "6b: lower-tier tq4 after the promotion fix", A; branch `p6b-olmoe-tq4`)
+
+Two mechanisms, both reproduced in `kv_sim` with the OLMoE shape scaled to 16-token blocks (16 sessions behind one 96-token prefix, seeded short turns with think time, `submit_session` hints, a 64–128-block L0, an L1 that holds every history):
+
+1. Lossy-chain misses (fixed, 018016c). A block computed over a lossy prefix is keyed by the chain of the request that computed it, which starts at that request's first lossy block. Histories leave L0 leaf-first, so a session's first lossy block moves earlier from turn to turn, and the later lookup's chain never named the earlier turn's computed blocks: they were recomputed. The lookup now also takes the lossy-lineage children of the previous block's matching entries. kv_sim at YELLOW, L0 64, seeds 1 / 2 / 4: `tq4` cached 1,184 / 640 / 1,328 tokens fewer than `l0` before, equal after. Tests `hierarchy::tests::lossy_lineage_blocks_survive_an_earlier_switch`, `kv_sim lossy_multi_turn_matches_l0_reuse` (mutation "child walk off": both FAIL).
+2. Lossless-tail scoring (not changed; needs a decision). A lossless-tail block is scored at the L0-format bytes it would be demoted at (decision B, encoded-size scores), about 3.5× its chain's `tq4` retrieval. Leaf-first, the tail is its chain's leaf: once it goes, its cheap parents follow, so whole histories drain where `l0` trims across sessions. kv_sim at GREEN (no lossy block reused at all), seeds 1 / 2 / 4 / 6 × L0 64 / 96 / 128: `tq4` −944 … +208 tokens against `l0`; with `kv.lossless_tail_blocks: 0`, or with the tail scored at the tier's rung bytes, `tq4` equals `l0` in all twelve, and every other kv_sim test still passes.
+
+Lab A/B after (1) (tree 018016c, harness `scratch/p6b-olmoe-tq4/ab.sh` on novanas: a fresh native server per run on GPU 0, cores 0-11, under `port18000` and `bench.lock`, client on novanas; workloads as in "TurboQuant promotion path"; arms interleaved):
+
+| Model | L1 format | cached_tokens_ratio (runs)  | median | prompt − cached tokens (runs) | retrieve plans | later-turn TTFT p50 / p99 (ms) |
+| ----- | --------- | --------------------------- | ------ | ----------------------------- | -------------- | ------------------------------ |
+| OLMoE | `l0`      | 0.8613 / 0.8619 / 0.8622    | 0.8619 | 38,170 / 38,035 / 38,020      | 48 / 50 / 47   | 51–54 / 123–334                |
+| OLMoE | `tq4`     | 0.8611 / 0.8609 / 0.8611    | 0.8611 | 38,292 / 38,318 / 38,327      | 24 / 24 / 28   | 47–51 / 130–136                |
+| Llama | `l0`      | 0.9063 / 0.9050 / 0.9052    | 0.9052 | 62,520 / 63,494 / 63,566      | 31 / 28 / 31   | 78–80 / 264–386                |
+| Llama | `tq4`     | 0.9063 / 0.9067 / (invalid) | —      | 62,857 / 62,488 / —           | 17 / 11 / —    | 79 / 198–220                   |
+
+- OLMoE: the shortfall fell from 0.0035 to 0.0008 (about 1–2 blocks of 128 per run instead of 8), but every `tq4` run is still below every `l0` run: the gate (tq4 median ≥ `l0`) still fails. The residue matches mechanism 2: the `tq4` servers stayed GREEN throughout (no reclaim event), where capacity demotion and allocation reclaim take victims in the tail-distorted order.
+- Llama `tq4` r3 is invalid: 3 s after `/ready` the controller went RED on `step_time_drift` (3.37 > 3.0) and stayed there (admission queued, `free_cached` reclaims, TTFT p50 32 s, ratio 0.558, no lossy reuse). Not caused by this change (no KV event preceded it); rerun that arm.
+- Not flipped: `tq4` stays `experimental`.
+
+### Lossless last block scored like its history (decision "6b: OLMoE tq4 — lossless last block in eviction order", 1 A; branch `p6b-lastblock`)
+
+Change 028f465: `score_one` prices a lossless last block's retrieval at the bytes its history would be stored at in the tier below; its demotion, memory term and planner pricing keep its L0-format size. kv_sim `lossy_multi_turn_green_matches_l0_reuse` (GREEN, L0 64 / 96 / 128 / 192 × seeds 1 / 2 / 4): `tq4` ≥ `l0` in all twelve after, L0 64 seed 1 16,496 vs 16,976 before. No fixture moved.
+
+Lab A/B, tree 028f465, harness `scratch/p6b-lastblock/ab.sh` on novanas (the `p6b-olmoe-tq4` harness with an absolute output path and the pressure transitions counted per run): same workloads, servers and locks as "OLMoE tq4 multi-turn block loss", arms interleaved, results in `scratch/p6b-lastblock/ab1/`:
+
+| Model | L1 format | cached_tokens_ratio (runs) | median | prompt − cached tokens (runs) | retrieve plans | later-turn TTFT p50 / p99 (ms) | pressure transitions                 |
+| ----- | --------- | -------------------------- | ------ | ----------------------------- | -------------- | ------------------------------ | ------------------------------------ |
+| OLMoE | `l0`      | 0.8627 / 0.8628 / 0.8616   | 0.8627 | 37,648 / 37,778 / 38,029      | 45 / 45 / 48   | 51–56 / 117–289                | YELLOW on `step_time_drift`, 24–25 s |
+| OLMoE | `tq4`     | 0.8619 / 0.8609 / 0.8604   | 0.8609 | 38,062 / 38,364 / 38,306      | 43 / 40 / 42   | 48–52 / 131–148                | none                                 |
+| Llama | `l0`      | 0.9052 / 0.9056 / 0.9022   | 0.9052 | 63,083 / 63,143 / 65,421      | 30 / 32 / 29   | 78–80 / 172–401                | YELLOW (r2 on drift at 33 s)         |
+| Llama | `tq4`     | 0.9059 / 0.9074 / 0.9061   | 0.9061 | 62,594 / 62,094 / 62,949      | 26 / 30 / 31   | 77–83 / 205–402                | YELLOW on `kv_utilization` (r1, r3)  |
+
+- Llama passes: `tq4` 0.9061 ≥ `l0` 0.9052, every `tq4` run at or above every `l0` run.
+- OLMoE fails: `tq4` 0.8609 vs `l0` 0.8627, every `tq4` run below every `l0` run. `tq4`'s uncached tokens are unchanged from the previous A/B (38.1–38.4k against 38.3k); the gap moved only because the `l0` runs came out higher (37.6–38.0k against 38.0–38.2k). In the lab the change does not measurably move OLMoE `tq4`.
+- No run left GREEN in its first seconds, so none was discarded. Every OLMoE `l0` run, here and in the previous A/B, goes YELLOW on `step_time_drift` (1.55–1.63 against 1.5) 24–25 s after `/ready`, late in a ~35 s run, and stays there: 15 `reclaim` events and throttle changes follow. No OLMoE `tq4` run leaves GREEN or reclaims. The arms therefore run under different pressure states: `l0` gets YELLOW's proactive demotion, `tq4` only GREEN's on-demand reclaim.
+- Not flipped: `tq4` stays `experimental`.
+
 ### TurboQuant in L0 (Task 13, `kv.dtype=tq4` / `tq2`; branch `p6b-t13`)
 
 Tree 427f6f2 (`p6b-stack` 3349b4a plus `lab-bench --batched-bounds`). `scripts/lab-bench.sh --model <m> --golden16 --batched-bounds --c1 -- --set kv.dtype=<f>`: GPU 0, 200 requests at c16, client on novanas. The c1 leg is lab-bench's (10 requests, 128 tokens, `--ignore-eos`), not the plan's 32 × 256. Golden is judged by the batched bounds at c1 and c16; the strict c1 verdict is noted too. Labbook set `phase-6b-kv-compression`: cad82a75, 72719594, f5e74f28, 1f2126fd, 4ab782a0, 3aadbc6b.
@@ -521,6 +559,43 @@ Staged-prefill profile (decision "6b Task 12: follow-ups", 1 A; measure only). M
 - Encode dominates: 58 % of the Llama tq4 increase and 69 % of OLMoE's. That is 0.35 ms per 2048-row layer chunk on Llama, about 30 GB/s effective and 21× the BF16 append.
 - Second is the single-query `turbine_hip_mixed` pass that `run_mixed_staged` launches after CK on every layer and chunk: 7 + 4 full-grid launches per layer per Llama request. It runs even when the batch has no `q_len` 1 row, and this workload has none.
 - Staging decode is small, and CK is unchanged.
+
+### TurboQuant prefill follow-ups (decision "6b Task 13", 3 C; branch `p6b-tqfollow`)
+
+Two changes, measured one after the other: the single-query `turbine_hip_mixed` pass after the staged prefill now runs only when the descriptor allows a single-query row (497ddd1), then the TurboQuant encode shared by the transcode and the mixed append got faster (ad28f9a, 0a26bd4, 8e39d7d; bit-exact, `kv_transcode_matches_cpu` and `paged_mixed_matches_cpu` green, three mutations red). `f2faa53` (a double-F32 norm) was measured slower and replaced by `0a26bd4`.
+
+Kernel timings (`hip_ops`, k3s card, mean of 10 calls; the 32-block Llama-shape transcode batch, 448 MiB of BF16 pages):
+
+| Step                                                                       | Commit  | tq4 encode (µs) | tq2 encode (µs) | Llama staged prefill tq4, 1 × 2,048 / 16 × 512 (µs) | OLMoE, same (µs) |
+| -------------------------------------------------------------------------- | ------- | --------------- | --------------- | --------------------------------------------------- | ---------------- |
+| earlier entries (encode: `p6b-tqspeed` remeasure; prefill: Task 12, GPU 0) | ee7b950 | 22,387          | 12,586          | 1,517 / 7,088                                       | 1,952 / 11,391   |
+| skip the single-query pass                                                 | 497ddd1 | 22,278          | 12,662          | 880 / 3,653                                         | 1,201 / 6,414    |
+| midpoint binary search, byte packing                                       | ad28f9a | 12,555          | 11,509          |                                                     |                  |
+| F64 FMA norm, 16-byte loads, words                                         | 8e39d7d | 7,162           | 5,985           | 530 / 2,496                                         | 577 / 4,091      |
+
+BF16 for comparison: the FP8 transcode encodes the same batch in 2,430 µs; the BF16 CK prefill is 350 / 1,757 µs (Llama) and 271 / 2,538 µs (OLMoE). A one-run variant sweep on top of ad28f9a (`p6b-tqfollow-exp`, not merged; tq4 µs) split the encode: scalar loads with the F64 norm 12,477, scalar loads without any norm 9,883, 16-byte loads with the F64 norm 8,168, 16-byte loads without a norm 5,042, 16-byte loads with the F64 FMA norm 7,216; the double-F32 norm 15,716 (scalar) / 11,111 (16-byte). The F64 norm is still about 2 ms of the 7.2.
+
+Served prefill TTFT, c1, 20 requests, `--max-tokens 1` (Llama 2,000-word prompts ≈ 2,950 tokens in two chunks, OLMoE 1,500 words; native server on GPU 0 under `bench.lock`, `phase2c` config, `--set kv.dtype=<f>`), the Task 13 profile's workload:
+
+| Model | KV     | before (b4e9f46) | pass skipped (497ddd1) | faster encode (8e39d7d) | overhead vs BF16 (ms) |
+| ----- | ------ | ---------------- | ---------------------- | ----------------------- | --------------------- |
+| Llama | `bf16` |                  | 196.8                  |                         |                       |
+| Llama | `tq4`  | 227.2            | 215.7                  | 204.3                   | 30.4 → 18.9 → 7.5     |
+| OLMoE | `bf16` |                  |                        | 94.1                    |                       |
+| OLMoE | `tq4`  | 114.3            |                        | 101.0                   | 20.2 → 6.9            |
+
+`scripts/lab-bench.sh --quick --c1 --batched-bounds --model llama -- --set kv.dtype=tq4` (64 requests at c16, 512-word prompts; the c1 leg uses short prompts):
+
+| Commit  | tok/s | ITL p50 (ms) | TTFT p50 c16 (ms) | TTFT p50 c1 (ms) | ITL p50 c1 (ms) | golden c1 (batched) |
+| ------- | ----- | ------------ | ----------------- | ---------------- | --------------- | ------------------- |
+| b4e9f46 | 834.9 | 15.9         | 281               | 42.9             | 12.57           | FAIL 0/16           |
+| 497ddd1 | 829.8 | 16.0         | 285               | 43.5             | 12.57           | FAIL 0/16           |
+| 8e39d7d | 866.6 | 15.3         | 248               | 43.5             | 12.51           | FAIL 0/16           |
+
+- The pass skip shows only on prefill-only batches: at c16 almost every batch carries decode rows, so the pass still runs there (now over every query row of the batch, prefill rows included, as before); the c1 leg's prompts are short. The 2,000-word c1 run shows it: −11.5 ms, the 12.3 ms the profile attributed to the pass.
+- The encode speed-up shows at c16: TTFT p50 −12 %, tok/s +3.8 %.
+- Golden output (`golden1.txt`) is byte-identical across the three runs: the encode is bit-exact and the skipped pass never wrote a prefill row. Golden still fails (decision 1: tq4 stays `experimental`).
+- Not done: a pass over only the single-query rows (a grid over sequences instead of query rows) would remove the pass's cost from mixed c16 batches too; the remaining F64 norm loop (≈ 2 ms of 7.2) and the LDS footprint (≈ 41 KB a workgroup) are the next encode items.
 
 ### Compression ladder in L1/L2 on the server (Task 16; branch `p6b-t16`, 4e49409)
 

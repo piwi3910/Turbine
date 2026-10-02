@@ -98,7 +98,8 @@ pub enum KvDtypeChoice {
     /// gfx1201 Llama / OLMoE (the ABI v2.11 mixed-format attention reads the tables the server
     /// uploads at startup); a library without it is refused with `kv_tq_unavailable`.
     Tq4,
-    /// TurboQuant 2-bit pages (P6b S-5); like [`KvDtypeChoice::Tq4`].
+    /// TurboQuant 2-bit pages (P6b S-5): parsed, but refused at startup on every backend
+    /// (`kv_tq2_l0_refused`, user decision 2026-10-02); `tq2` stays a lower-tier format.
     Tq2,
 }
 

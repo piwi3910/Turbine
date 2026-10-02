@@ -1026,6 +1026,46 @@ fn unsupported_row_exits_2_before_bind() {
     TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
 }
 
+/// P6b (user decision 2026-10-02, "6b Task 13", 2 B): `kv.dtype: tq2` is refused on every
+/// backend before the port is bound: exit 2 naming `kv.dtype` and the reason code
+/// `kv_tq2_l0_refused`, under `--check-config` too; `kv.dtype: tq4` still passes the check, and
+/// `tq2` as a lower-tier format is not refused. Breaks if L0 `tq2` binds or loses its reason
+/// code, or if the refusal spreads to the lower-tier format.
+#[test]
+fn kv_dtype_tq2_exits_2_before_bind() {
+    let dir = TempDir::new("turbine-server-tq2-l0");
+    write_tiny_llama(dir.path(), 5);
+    let port = free_port();
+    let yaml = |kv: &str| {
+        format!(
+            "model:\n  path: {}\nserver:\n  listen: 127.0.0.1:{port}\nexecution:\n  backend: cpu\n\
+             kv:\n{kv}",
+            dir.path().display()
+        )
+    };
+    let tq2 = TempConfig::new("tq2-l0", &yaml("  dtype: tq2\n"));
+    for args in [&[][..], &["--check-config"][..]] {
+        let out = wait_with_timeout(spawn_server(args, &tq2.path), Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(stderr.contains("kv.dtype"), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("kv_tq2_l0_refused"),
+            "{args:?}: stderr: {stderr}"
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
+    }
+    for kv in ["  dtype: tq4\n", "  cpu:\n    format: tq2\n"] {
+        let cfg = TempConfig::new("tq-ok", &yaml(kv));
+        let out = wait_with_timeout(
+            spawn_server(&["--check-config"], &cfg.path),
+            Duration::from_secs(20),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{kv}: stderr: {stderr}");
+    }
+}
+
 /// Phase 2m S-4 / S-11: `model.tool_call_parser: hermes` (and `mistral`) names a registered
 /// tool format, so `--check-config` accepts it (main refused it); an unregistered format is
 /// still exit 2 naming the registered ones.

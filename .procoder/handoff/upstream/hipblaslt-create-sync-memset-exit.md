@@ -1,6 +1,6 @@
-# Draft (not filed): hipblasLtCreate calls the process-wide exit(1) when its synchronous hipMemset fails (for example, during another thread's graph capture)
+# Filed: hipblasLtCreate calls the process-wide exit(1) when its synchronous hipMemset fails (for example, during another thread's graph capture)
 
-Target: ROCm/rocm-libraries (projects/hipblaslt). Status: draft for review, not filed.
+Target: ROCm/rocm-libraries (projects/hipblaslt). Status: filed 2026-10-02 as https://github.com/ROCm/rocm-libraries/issues/12895 (user said file). Fix PR: https://github.com/ROCm/rocm-libraries/pull/12900 (2026-10-02).
 
 ## Environment
 

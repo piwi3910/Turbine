@@ -993,6 +993,48 @@ fn tq_kv_serves_on_cpu() {
     assert_eq!(status["support"]["status"], "experimental", "{status}");
 }
 
+/// P6b S-3 / S-5 (user decision 2026-10-02, "6b Task 13", 4 A): over TurboQuant L0 pages a
+/// reused prefix is served from lossy blocks, so the second run of a 201-token prompt reports
+/// its full 128-token block as both `cached_tokens` and `lossy_cached_tokens`, and
+/// `turbine_kv_lossy_cached_tokens_total` counts it; over BF16 pages the same reuse reports 0
+/// lossy tokens. Breaks if cached L0 TurboQuant blocks are reported lossless, or BF16 blocks
+/// lossy.
+#[test]
+fn tq_l0_reuse_counts_lossy_cached_tokens() {
+    let prompt = "x".repeat(200);
+    for (dtype, lossy) in [("bf16", false), ("tq4", true)] {
+        let kv_extra = format!("  dtype: {dtype}\n");
+        let server = TinyServer::launch(&Setup {
+            kv_extra: &kv_extra,
+            head_dim: Some(128),
+            ..Setup::default()
+        });
+        let details = || {
+            let resp = server.post(
+                "/v1/completions",
+                &json!({"model": server.model, "prompt": prompt, "max_tokens": 2,
+                        "ignore_eos": true, "temperature": 0}),
+            );
+            assert_eq!(resp.status, 200, "{dtype}: {}", resp.body);
+            resp.json()["usage"]["prompt_tokens_details"].clone()
+        };
+        let cold = details();
+        assert_eq!(cold["cached_tokens"], 0, "{dtype}: {cold}");
+        assert_eq!(cold["lossy_cached_tokens"], 0, "{dtype}: {cold}");
+        let warm = details();
+        assert_eq!(warm["cached_tokens"], 128, "{dtype}: {warm}");
+        let want = if lossy { 128 } else { 0 };
+        assert_eq!(warm["lossy_cached_tokens"], want, "{dtype}: {warm}");
+        let metrics = server.metrics();
+        let counted = metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("turbine_kv_lossy_cached_tokens_total "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{dtype}: no lossy counter:\n{metrics}"));
+        assert_eq!(counted, f64::from(want), "{dtype}");
+    }
+}
+
 /// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of
 /// `/turbine/v1/status`, drives `turbine_support_matrix_status`, and is logged as
 /// `event="support_matrix"` (WARN for the CPU reference provider's experimental row).
@@ -1662,7 +1704,6 @@ fn tq_tables_are_in_the_workspace_pool() {
     };
     let plain = workspace("  dtype: bf16\n");
     assert_eq!(workspace("  dtype: tq4\n"), plain + tables, "tq4 pages");
-    assert_eq!(workspace("  dtype: tq2\n"), plain + tables, "tq2 pages");
     let nvme = |format: &str| {
         format!(
             "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    format: {format}\n",

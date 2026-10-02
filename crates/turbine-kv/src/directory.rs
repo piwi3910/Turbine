@@ -281,7 +281,9 @@ impl KvDirectory {
     /// exact copy. Where none exists and `allow_lossy`, it continues on the block's fastest
     /// lossy copy — a lossy-format copy of the block, or its promoted copy under
     /// `lossy_key(key, codec, seed)` — and from then on also on the blocks computed over that
-    /// lossy prefix (keyed by [`PrefixMatch::lossy_chain`]). Without `allow_lossy` it stops at
+    /// lossy prefix (keyed by [`PrefixMatch::lossy_chain`], or by another request's chain that
+    /// started at a later block: reached as lossy-lineage children of the previous block's
+    /// matching entries). Without `allow_lossy` it stops at
     /// the first block only a lossy copy holds (`denied`).
     pub fn lookup(
         &mut self,
@@ -294,6 +296,9 @@ impl KvDirectory {
     ) -> PrefixMatch {
         let mut m = PrefixMatch::default();
         let mut matching = true;
+        // The previous block's entries whose tokens matched: their lossy-lineage children are
+        // candidates too (see below).
+        let mut prev: SmallVec<[KvKey; 8]> = SmallVec::new();
         for (i, chunk) in tokens.chunks_exact(block_tokens as usize).enumerate() {
             let key = hasher.key(m.keys.last(), chunk);
             m.keys.push(key);
@@ -308,7 +313,7 @@ impl KvDirectory {
             }
             // Candidates: the block's own entry, its promoted lossy copies, and (on a lossy
             // prefix) the block computed over that prefix.
-            let mut cands: SmallVec<[KvKey; 5]> = SmallVec::new();
+            let mut cands: SmallVec<[KvKey; 8]> = SmallVec::new();
             cands.push(key);
             for c in crate::codec::registry().iter() {
                 let lk = crate::identity::lossy_key(key, c.name(), seed);
@@ -317,6 +322,22 @@ impl KvDirectory {
                 }
             }
             cands.extend(chain);
+            // A block computed over a lossy prefix is keyed by the chain of the request that
+            // computed it, which starts at *that* request's first lossy block; once an earlier
+            // block has turned lossy too (history leaves L0 leaf-first), this lookup's own
+            // chain starts earlier and never names it. Its directory parent is the entry its
+            // predecessor was served from, so it is reached through the children of the
+            // previous block's matching entries.
+            for p in &prev {
+                for c in self.children.get(p).into_iter().flatten() {
+                    if !cands.contains(c)
+                        && self.blocks.get(c).is_some_and(|b| b.lineage.is_lossy())
+                    {
+                        cands.push(*c);
+                    }
+                }
+            }
+            let mut here: SmallVec<[KvKey; 8]> = SmallVec::new();
             // (entry, location, lossy codec) of the best exact and the best lossy copy.
             let mut exact: Option<(KvKey, KvLocation)> = None;
             let mut lossy: Option<(KvKey, KvLocation, &'static str)> = None;
@@ -330,6 +351,7 @@ impl KvDirectory {
                     mismatch = true;
                     continue;
                 }
+                here.push(*k);
                 for loc in &b.locations {
                     let codec = match b.lineage {
                         Lineage::Lossy { format } => Some(format),
@@ -358,6 +380,7 @@ impl KvDirectory {
                 (None, Some((k, loc, f))) => Some((k, loc, Some(f))),
                 (None, None) => None,
             };
+            prev = here;
             match chosen {
                 Some((k, location, codec)) => {
                     if let Some(b) = self.blocks.get_mut(&k) {
