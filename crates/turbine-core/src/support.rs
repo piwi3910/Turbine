@@ -252,6 +252,11 @@ const QUANT_REASON: &str =
 const RESERVED_NVIDIA_REASON: &str = "this weight format is reserved for the deferred phase-2b-nvidia (NVFP4 arrives with NVIDIA support)";
 const TQ_KV_REASON: &str =
     "TurboQuant KV pages are not validated yet (track phase-6b-kv-compression)";
+/// Why `kv.dtype: tq2` is refused (user decision 2026-10-02, "6b Task 13: TurboQuant in L0", 2 B);
+/// the reason code is its first word.
+pub const TQ2_L0_REASON: &str = "kv_tq2_l0_refused: TurboQuant 2-bit L0 pages fail the quality gate \
+     (shared-prefix GSM8K 0.15-0.20 on Llama and OLMoE); use kv.dtype tq4, or tq2 as a lower-tier \
+     format (kv.cpu.format, kv.nvme.format, kv.ladder.max_format)";
 const FAMILY_REASON: &str =
     "this model family is not validated on this vendor yet (track phase-7-model-families)";
 /// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
@@ -504,20 +509,12 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    row(
-        Some("cpu"),
-        None,
-        None,
-        BF16,
-        Some(KvFormatColumn::Tq2),
-        NO_SPEC,
-        SupportStatus::Experimental,
-    ),
     // TurboQuant L0 pages on gfx1201 (P6b S-5, Task 12 mixed-format attention + the tables the
     // server uploads): `experimental`. The Task 13 proof (S-8 gate, 2026-10-02) failed golden
     // under the batched bounds for all four (Llama tq4 0/16, tq2 1/16; OLMoE tq4 8/16, tq2 1/16);
     // shared-prefix GSM8K medians against BF16 KV: Llama tq4 0.785 (0.780) PASS, tq2 0.195 FAIL;
-    // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0").
+    // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0"). `tq4`
+    // stays `experimental`; `tq2` is refused below (`kv_tq2_l0_refused`).
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -530,27 +527,9 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     row(
         Some("amd"),
         Some("gfx1201"),
-        Some("LlamaForCausalLM"),
-        BF16,
-        Some(KvFormatColumn::Tq2),
-        NO_SPEC,
-        SupportStatus::Experimental,
-    ),
-    row(
-        Some("amd"),
-        Some("gfx1201"),
         Some("OlmoeForCausalLM"),
         BF16,
         Some(KvFormatColumn::Tq4),
-        NO_SPEC,
-        SupportStatus::Experimental,
-    ),
-    row(
-        Some("amd"),
-        Some("gfx1201"),
-        Some("OlmoeForCausalLM"),
-        BF16,
-        Some(KvFormatColumn::Tq2),
         NO_SPEC,
         SupportStatus::Experimental,
     ),
@@ -580,7 +559,8 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         unsupported("fp8_e4m3 KV cache is not validated yet (track phase-6a-quantization)"),
     ),
-    // TurboQuant L0 pages (P6b S-5): refused until the mixed-format attention passes its gates.
+    // TurboQuant L0 pages (P6b S-5): `tq4` refused until the mixed-format attention passes its
+    // gates.
     row(
         None,
         None,
@@ -590,6 +570,9 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         unsupported(TQ_KV_REASON),
     ),
+    // `kv.dtype: tq2` is refused on every vendor (user decision 2026-10-02, "6b Task 13", 2 B):
+    // shared-prefix GSM8K collapses to 0.15-0.20 on Llama and OLMoE. `tq2` stays a lower-tier
+    // format and a ladder rung (TIER_FORMAT_REFUSALS).
     row(
         None,
         None,
@@ -597,7 +580,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         None,
         Some(KvFormatColumn::Tq2),
         NO_SPEC,
-        unsupported(TQ_KV_REASON),
+        unsupported(TQ2_L0_REASON),
     ),
     row(
         None,
@@ -1343,29 +1326,43 @@ mod tests {
             status.reason().unwrap().contains("phase-6a-quantization"),
             "{status:?}"
         );
-        // TurboQuant L0 pages (P6b S-5): `experimental` on the CPU reference provider and on
-        // gfx1201 Llama / OLMoE (BF16 weights; Task 12 attention, Task 8 tables) until the S-8
-        // gate; refused naming the track on any other arch, weight format or vendor, blaming
-        // kv.dtype. The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
-        for kv in [K::Tq4, K::Tq2] {
-            for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
-                let k = key("cpu", "cpu", architecture, W::Bf16, kv, S::None);
-                assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
-                let k = key("cpu", "cpu", architecture, W::Fp8, kv, S::None);
-                assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
-                let k = key("amd", "gfx1201", architecture, W::Bf16, kv, S::None);
-                assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
-                assert!(check(k).is_ok());
-                for (arch, weights) in [("gfx942", W::Bf16), ("gfx1201", W::Fp8)] {
-                    let k = key("amd", arch, architecture, weights, kv, S::None);
+        // TurboQuant L0 pages (P6b S-5): `tq4` is `experimental` on the CPU reference provider
+        // and on gfx1201 Llama / OLMoE (BF16 weights; Task 12 attention, Task 8 tables) until the
+        // S-8 gate; refused naming the track on any other arch, weight format or vendor, blaming
+        // kv.dtype. `tq2` is refused everywhere with `kv_tq2_l0_refused` (user decision
+        // 2026-10-02, 2 B). The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
+        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+            for (vendor, arch) in [("cpu", "cpu"), ("amd", "gfx1201"), ("amd", "gfx942")] {
+                for weights in [W::Bf16, W::Fp8] {
+                    let k = key(vendor, arch, architecture, weights, K::Tq2, S::None);
                     let status = resolve(&k);
                     assert_eq!(status.as_str(), "unsupported", "{k}");
                     assert!(
-                        status.reason().unwrap().contains("phase-6b-kv-compression"),
+                        status.reason().unwrap().starts_with("kv_tq2_l0_refused:"),
                         "{k}: {status:?}"
                     );
                     assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
                 }
+            }
+        }
+        let kv = K::Tq4;
+        for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+            let k = key("cpu", "cpu", architecture, W::Bf16, kv, S::None);
+            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            let k = key("cpu", "cpu", architecture, W::Fp8, kv, S::None);
+            assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
+            let k = key("amd", "gfx1201", architecture, W::Bf16, kv, S::None);
+            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            assert!(check(k).is_ok());
+            for (arch, weights) in [("gfx942", W::Bf16), ("gfx1201", W::Fp8)] {
+                let k = key("amd", arch, architecture, weights, kv, S::None);
+                let status = resolve(&k);
+                assert_eq!(status.as_str(), "unsupported", "{k}");
+                assert!(
+                    status.reason().unwrap().contains("phase-6b-kv-compression"),
+                    "{k}: {status:?}"
+                );
+                assert_eq!(check(k).unwrap_err().key(), Some("kv.dtype"));
             }
         }
         for format in ["tq4", "tq2"] {

@@ -611,11 +611,22 @@ mod tests {
             "kv_transcode_unavailable"
         );
 
-        // TurboQuant L0 pages (P6b S-5): the cpu backend and gfx1201 run them
+        // `kv.dtype: tq2` is refused before discovery on every backend, naming kv.dtype and
+        // the reason code (user decision 2026-10-02, 2 B).
+        for backend in ["cpu", "hip"] {
+            let mut tq2 = config(backend, llama.path());
+            tq2.kv.dtype = KvDtypeChoice::Tq2;
+            let err = before_discovery(&tq2).unwrap_err();
+            assert_eq!(err.key(), Some("kv.dtype"), "{backend}: {err}");
+            assert!(err.to_string().contains("kv_tq2_l0_refused"), "{err}");
+        }
+
+        // TurboQuant L0 pages (P6b S-5): the cpu backend and gfx1201 run tq4 pages
         // (`experimental`); a GPU library without the ABI v2.11 attention is refused
         // (`kv_tq_unavailable`, known once the library is loaded); another arch is refused by
         // the support matrix naming kv.dtype; a lower tier below them stores them as they are.
-        for dtype in [KvDtypeChoice::Tq4, KvDtypeChoice::Tq2] {
+        {
+            let dtype = KvDtypeChoice::Tq4;
             let mut l0 = config("cpu", llama.path());
             l0.kv.dtype = dtype;
             assert_eq!(kv_format_availability(&l0, None), Ok(()));

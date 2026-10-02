@@ -1662,7 +1662,6 @@ fn tq_tables_are_in_the_workspace_pool() {
     };
     let plain = workspace("  dtype: bf16\n");
     assert_eq!(workspace("  dtype: tq4\n"), plain + tables, "tq4 pages");
-    assert_eq!(workspace("  dtype: tq2\n"), plain + tables, "tq2 pages");
     let nvme = |format: &str| {
         format!(
             "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    format: {format}\n",
