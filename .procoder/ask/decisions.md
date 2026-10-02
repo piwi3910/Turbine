@@ -3006,3 +3006,31 @@ normal steps did); `l0` copies 16 MiB blocks vs 4.5 MiB for tq4, so `l0` shows i
 - C) B, plus a perf item: find why promotions slow decode (copy-engine / PCIe contention vs compute-stream fence)
 
 **Decision (user, 2026-10-02): C.** Decode steps overlapping a KV copy are not judged by the drift signal; a perf item finds why promotions slow decode.
+
+## 6b Task 16: ladder proof results — four open points (2026-10-02)
+
+From `p6b-t16` (merged; `.procoder/handoff/p6b-t16.md`, perf log "Compression ladder in L1/L2 on the server"). A/B
+medians of 3, ladder on vs off: recomputed tokens 163,166 vs 202,388 (−19 %), cached ratio 0.8365 vs 0.7997,
+later-turn TTFT p50 143 vs 163 ms but p99 17.4 vs 11.0 s, tok/s 308 vs 321. 97–100 % of L1 rewrites end `no_room` (both
+1 GiB slabs full-size, never empty; the same blocks are resubmitted every tick); in L2 41–87 % end `no_room` and each
+loses the copy (the old slot is freed before a new-size slot is found). Eval: no valid run (the ladder never put the
+prefix on a lossy rung: at default thresholds GREEN; at lowered thresholds the sweep starts at L2, which the eval leaves
+empty, and a `queue_timeout` aborted the run). Soak PASS but 0 ladder actions (random prompts never fill L1/L2).
+
+1. Eval gate:
+   - A) Disable L2 on both sides and add a runner flag that sends the fillers concurrently, so pressure is real
+   - B) A test-only endpoint that forces a ladder sweep
+   - C) Rely on the per-rung gates already passed (never measured the fp8→tq4 double-quantization chain)
+2. L2 copy loss on `no_room` (a turbine-kv defect): allocate the new slot before freeing the old one —
+   - A) Fix now (flip the test that pins today's behaviour)
+   - B) Later
+3. L1 rewrites spinning on `no_room`:
+   - A) Back off after `no_room` until a slab frees
+   - B) Smaller L1 slabs
+   - C) Sweep slab by slab so slabs empty out
+4. Soak with ladder actions:
+   - A) Give part of the soak's requests a shared prefix
+   - B) Add a multi-turn leg to the soak
+   - C) Amend the criterion
+
+**Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Ladder eval without L2 and with concurrent fillers on both sides; fix the L2 copy loss now (allocate before free); back off L1 rewrites after `no_room` until a slab frees; give part of the soak's requests a shared prefix.

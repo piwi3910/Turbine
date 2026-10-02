@@ -1034,6 +1034,9 @@ const LADDER_TURNS: u32 = 10;
 fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
     let mut kv = KvConfig::default();
     kv.ladder.enabled = enabled;
+    // The whole rung order down to `tq2`, so the trace exercises every rung and the steady-YELLOW
+    // drift check means something (the default floor is `tq4` since 6b Task 16).
+    kv.ladder.max_format = ModuleName::new("tq2").unwrap();
     let dwell = Duration::from_millis(trace.dwell_ms);
     let mut s = setup_cfg(
         64,
