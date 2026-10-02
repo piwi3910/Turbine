@@ -122,23 +122,48 @@ __global__ void __launch_bounds__(kThreads)
     lds.cbk[tid] = cb_k[tid];
   if (tid < (1 << VB))
     lds.cbv[tid] = cb_v[tid];
+  const bool vec_loads = (reinterpret_cast<uintptr_t>(page) & 15u) == 0;
 
   for (int t0 = 0; t0 < tokens; t0 += kChunk) {
     const int nt = min(kChunk, tokens - t0);
-    // Load K and V of the chunk (coalesced along the head dimension).
-    for (int i = tid; i < 2 * nt * kDim; i += kThreads) {
-      const int kind = i / (nt * kDim);
-      const int tok = (i / kDim) % nt;
-      const int e = i % kDim;
-      lds.xs[kind][tok][e] = turbine_hip::bf16_to_f32(turbine_hip::Bf16{
-          page[vec_offset(kind, t0 + tok, head, tokens, heads) + e]});
+    // Load K and V of the chunk (coalesced along the head dimension): 16
+    // bytes (8 elements) a thread when the page is 16-byte aligned (every
+    // vector starts at a multiple of 256 bytes in it), else one element.
+    if (vec_loads) {
+      constexpr int kPerLoad = 8;
+      for (int i = tid; i < 2 * nt * (kDim / kPerLoad); i += kThreads) {
+        const int kind = i / (nt * (kDim / kPerLoad));
+        const int tok = (i / (kDim / kPerLoad)) % nt;
+        const int e = (i % (kDim / kPerLoad)) * kPerLoad;
+        const uint4 w = *reinterpret_cast<const uint4 *>(
+            page + vec_offset(kind, t0 + tok, head, tokens, heads) + e);
+        const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          lds.xs[kind][tok][e + 2 * k] = turbine_hip::bf16_to_f32(
+              turbine_hip::Bf16{static_cast<uint16_t>(words[k] & 0xffffu)});
+          lds.xs[kind][tok][e + 2 * k + 1] = turbine_hip::bf16_to_f32(
+              turbine_hip::Bf16{static_cast<uint16_t>(words[k] >> 16)});
+        }
+      }
+    } else {
+      for (int i = tid; i < 2 * nt * kDim; i += kThreads) {
+        const int kind = i / (nt * kDim);
+        const int tok = (i / kDim) % nt;
+        const int e = i % kDim;
+        lds.xs[kind][tok][e] = turbine_hip::bf16_to_f32(turbine_hip::Bf16{
+            page[vec_offset(kind, t0 + tok, head, tokens, heads) + e]});
+      }
     }
     __syncthreads();
     // The chunk's records are contiguous.
     encode_chunk<KB, VB>(lds, nt, head_tables,
-                         [&](int tok, int o, uint8_t v) {
-                           records[static_cast<int64_t>(t0 + tok) * R::kBytes +
-                                   o] = v;
+                         [&](int tok, int o, uint32_t word) {
+                           store_word(records +
+                                          static_cast<int64_t>(t0 + tok) *
+                                              R::kBytes +
+                                          o,
+                                      word);
                          });
   }
 }
