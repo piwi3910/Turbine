@@ -83,29 +83,35 @@ __device__ inline float norm_of(const float *row) {
   return static_cast<float>(sqrt(acc));
 }
 
-// Index of the nearest centroid of an ascending codebook of n entries; a
-// value on a midpoint takes the lower one (codebook.rs nearest).
-__device__ inline int nearest(const float *cb, int n, float x) {
+// The midpoint (cb[i] + cb[i + 1]) * 0.5 of an ascending codebook's
+// neighbours i, i + 1, as codebook.rs nearest computes it.
+__device__ inline float midpoint(const float *cb, int i) {
 #pragma clang fp contract(off)
-  int code = 0;
-  for (int i = 0; i + 1 < n; ++i) {
-    if (x > (cb[i] + cb[i + 1]) * 0.5f)
-      ++code;
-    else
-      break;
-  }
-  return code;
+  return (cb[i] + cb[i + 1]) * 0.5f;
 }
 
-// Byte `byte` of the packed (LSB first) B-bit codes.
+// Index of the nearest centroid of an ascending codebook of N entries, given
+// its N - 1 midpoints: the number of midpoints x is above (codebook.rs nearest
+// scans them in order and stops at the first one x is not above, the same
+// count since they ascend), so a value on a midpoint takes the lower code and
+// NaN takes 0. A branch-free binary search: log2(N) comparisons.
+template <int N> __device__ inline int nearest(const float *mid, float x) {
+  int pos = 0;
+#pragma unroll
+  for (int step = N / 2; step >= 1; step /= 2)
+    pos += x > mid[pos + step - 1] ? step : 0;
+  return pos;
+}
+
+// Byte `byte` of the packed (LSB first) B-bit codes (each code < 2^B, B
+// dividing 8): 8 / B codes, the first in the low bits.
 template <int B>
 __device__ inline uint8_t packed_byte(const uint8_t *codes, int byte) {
+  constexpr int kPerByte = 8 / B;
   uint32_t out = 0;
 #pragma unroll
-  for (int b = 0; b < 8; ++b) {
-    const int p = byte * 8 + b;
-    out |= static_cast<uint32_t>((codes[p / B] >> (p % B)) & 1u) << b;
-  }
+  for (int k = 0; k < kPerByte; ++k)
+    out |= static_cast<uint32_t>(codes[byte * kPerByte + k]) << (k * B);
   return static_cast<uint8_t>(out);
 }
 
@@ -128,6 +134,9 @@ template <int KB, int VB> struct EncodeLds {
   uint16_t norm_bits[2][kChunk];
   float cbk[1 << KB];
   float cbv[1 << VB];
+  // The codebooks' midpoints (encode_chunk fills them).
+  float midk[1 << KB];
+  float midv[1 << VB];
 };
 
 // Encodes nt <= kChunk token vectors of one KV head (head_tables: its K signs
@@ -152,6 +161,11 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
     lds.norms[kind][tok] = n;
     lds.norm_bits[kind][tok] = f32_to_bf16(n).bits;
   }
+  // The midpoints, by threads the norms leave idle.
+  if (tid >= 2 * kChunk && tid < 2 * kChunk + (1 << KB) - 1)
+    lds.midk[tid - 2 * kChunk] = midpoint(lds.cbk, tid - 2 * kChunk);
+  if (tid >= 3 * kChunk && tid < 3 * kChunk + (1 << VB) - 1)
+    lds.midv[tid - 3 * kChunk] = midpoint(lds.cbv, tid - 3 * kChunk);
   __syncthreads();
   // Rotate and quantize: each group of 32 lanes one vector at a time.
   for (int vec = group; vec < 2 * nt; vec += kThreads / kGroup) {
@@ -171,8 +185,8 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
     for (int i = 0; i < kPer; ++i) {
       const int e = i * kGroup + lane;
       const float yi = y[i] * kInvSqrtD;
-      const int code = kind == 0 ? nearest(lds.cbk, 1 << KB, yi * inv)
-                                 : nearest(lds.cbv, 1 << VB, yi * inv);
+      const int code = kind == 0 ? nearest<1 << KB>(lds.midk, yi * inv)
+                                 : nearest<1 << VB>(lds.midv, yi * inv);
       lds.codes[kind][tok][e] = static_cast<uint8_t>(code);
     }
   }
