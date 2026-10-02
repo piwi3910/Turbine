@@ -65,7 +65,7 @@ Red test: `hierarchy::tests::a_demotion_without_a_slot_of_the_rung_stores_at_the
    - the spec S-6 line "new demotions into a tier take its current rung" (add "while the tier has a slot of its size, else its own
      format", plus an edge case);
    - the contract ladder entry.
-   Then `scripts/gate.sh`, commit, and delete the remote `target/debug`.
+     Then `scripts/gate.sh`, commit, and delete the remote `target/debug`.
 4. Lab A/B, medians of 3 on GPU 0, with the t16 harness (`remote/agent-p6b-t16/h.sh … mt`). Use the default
    `kv.transfer.promotion_copy` (`sdma` on 202bd4a, unless the copy-kernel builder has flipped it), run under the port lock and then
    the bench lock. Expect the ladder arm's demotions, ORANGE share and tok/s to come close to the off arm.
