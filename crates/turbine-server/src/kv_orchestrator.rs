@@ -2291,31 +2291,55 @@ impl CopyStreamBackend {
         self.metrics = Some(metrics);
     }
 
-    /// `kv.transfer.promotion_copy` (P6b, decision "6b: KV promotions slow decode — which fix"
-    /// A): with `kernel` every pinned → L0 batch of a copy-stream shard runs on its library's
-    /// copy kernel instead of the copy engine. Refused (`promotion_copy_kernel_unavailable`)
-    /// when a copy-stream shard's library has none.
-    pub fn set_promotion_copy(&mut self, copy: PromotionCopy) -> Result<(), String> {
-        let kernel = copy == PromotionCopy::Kernel;
+    /// `kv.transfer.promotion_copy` (P6b, decisions "6b: KV promotions slow decode — which fix"
+    /// A and "6b: promotion copy kernel — default" A): with `kernel` every pinned → L0 batch of
+    /// a copy-stream shard runs on its library's copy kernel instead of the copy engine. Unset
+    /// (`None`, the default) means `kernel` when every copy-stream shard's library has the copy
+    /// kernel, else `sdma` with a WARN (`promotion_copy_kernel_unavailable`); an explicit
+    /// `kernel` on such a library is refused instead. Returns the path chosen.
+    pub fn set_promotion_copy(
+        &mut self,
+        copy: Option<PromotionCopy>,
+    ) -> Result<PromotionCopy, String> {
+        let streams = self
+            .shards
+            .iter()
+            .any(|s| matches!(&s.device, CopyDevice::Stream { .. }));
         let lacking = self.shards.iter().position(
             |s| matches!(&s.device, CopyDevice::Stream { engine, .. } if !engine.has_copy_kernel()),
         );
-        if let (true, Some(shard)) = (kernel, lacking) {
-            return Err(format!(
-                "kv.transfer.promotion_copy: kernel: the kernel library of shard {shard} has no \
-                 host-to-device copy kernel (kernel ABI v2.11 turbine_memcpy_h2d_kernel; \
-                 promotion_copy_kernel_unavailable)"
-            ));
-        }
-        if kernel {
+        let chosen = match (copy, lacking) {
+            (Some(PromotionCopy::Kernel), Some(shard)) => {
+                return Err(format!(
+                    "kv.transfer.promotion_copy: kernel: the kernel library of shard {shard} has \
+                     no host-to-device copy kernel (kernel ABI v2.11 turbine_memcpy_h2d_kernel; \
+                     promotion_copy_kernel_unavailable)"
+                ));
+            }
+            (None, Some(shard)) => {
+                tracing::warn!(
+                    event = "kv_promotion_copy",
+                    path = PromotionCopy::Sdma.as_str(),
+                    reason = "promotion_copy_kernel_unavailable",
+                    shard,
+                    "the kernel library has no host-to-device copy kernel (kernel ABI v2.11 \
+                     turbine_memcpy_h2d_kernel): KV promotions stay on the copy engine"
+                );
+                PromotionCopy::Sdma
+            }
+            (None, None) => PromotionCopy::Kernel,
+            (Some(c), _) => c,
+        };
+        let kernel = chosen == PromotionCopy::Kernel;
+        if kernel && streams {
             tracing::info!(
                 event = "kv_promotion_copy",
-                path = copy.as_str(),
+                path = chosen.as_str(),
                 "KV promotions run on the copy kernel"
             );
         }
         self.kernel_promotions = kernel;
-        Ok(())
+        Ok(chosen)
     }
 
     /// A ladder rewrite (P6b S-6) that completed with `Full`: its tier had no slot of the new
@@ -4740,7 +4764,7 @@ mod tests {
     fn promotions_use_the_copy_kernel_when_configured() {
         let dir = TempDir::new("turbine-kv-copy-kernel");
         let mut kv = kv_config(&dir, true);
-        kv.transfer.promotion_copy = turbine_core::config::PromotionCopy::Kernel;
+        kv.transfer.promotion_copy = Some(turbine_core::config::PromotionCopy::Kernel);
         let start = |ctx: &Arc<FakeCtx>, pool: &mut BlockPool| {
             KvOrchestrator::start(
                 KvStart {
@@ -4801,6 +4825,76 @@ mod tests {
             1,
             "promotion"
         );
+    }
+
+    /// `kv.transfer.promotion_copy` unset (the default; decision "6b: promotion copy kernel —
+    /// default" A): a library with the copy kernel runs promotions on it, one without starts
+    /// on the copy engine instead of refusing, and an explicit `sdma` keeps the copy engine
+    /// even when the kernel is there. Breaks if the default stays on the copy engine, a
+    /// missing kernel refuses an unset key (or silently picks the kernel), or an explicit
+    /// `sdma` is overridden.
+    #[test]
+    fn an_unset_promotion_copy_prefers_the_kernel_and_falls_back() {
+        use turbine_core::config::PromotionCopy;
+        let dir = TempDir::new("turbine-kv-copy-default");
+        let promote = |copy: Option<PromotionCopy>, has_kernel: bool| {
+            let mut kv = kv_config(&dir, true);
+            kv.transfer.promotion_copy = copy;
+            let (mem, mut pool) = rank(0);
+            let ctx = FakeCtx::new(&mem, 0);
+            ctx.kernel.store(has_kernel, Ordering::Relaxed);
+            let (mut o, _handle) = KvOrchestrator::start(
+                KvStart {
+                    cfg: &kv,
+                    memory_kind: MemoryKind::Dedicated,
+                    identity: identity(),
+                    device: CopyDevice::Stream {
+                        engine: Arc::clone(&ctx) as _,
+                        pinned: Arc::clone(&ctx) as _,
+                    },
+                    shards: Vec::new(),
+                    l2: None,
+                    clock: Arc::new(SystemClock::new()),
+                    metrics: KvMetrics::register(&MetricsRegistry::new()),
+                    remote: None,
+                    kv_scales: None,
+                },
+                &mut pool,
+            )
+            .expect("the KV hierarchy starts");
+            let r = (mem, pool);
+            let want = pattern(3, 5, layout().block_bytes() as usize);
+            write_block(&r, 4, &want);
+            let (b0, k0) = (
+                ctx.batches.load(Ordering::Relaxed),
+                ctx.kernel_batches.load(Ordering::Relaxed),
+            );
+            let key = KvKey([17; 16]);
+            run(&mut o, 1, TransferPath::L0ToL1, key, 4, 0).unwrap();
+            run(&mut o, 2, TransferPath::L1ToL0, key, 0, 8).unwrap();
+            assert_eq!(read_block(&r, 8), want, "the block came back whole");
+            (
+                ctx.batches.load(Ordering::Relaxed) - b0,
+                ctx.kernel_batches.load(Ordering::Relaxed) - k0,
+            )
+        };
+        // (copy-engine batches, kernel batches) for one demotion and one promotion.
+        assert_eq!(
+            promote(None, true),
+            (1, 1),
+            "unset: promotion on the kernel"
+        );
+        assert_eq!(
+            promote(None, false),
+            (2, 0),
+            "unset, no kernel: copy engine"
+        );
+        assert_eq!(
+            promote(Some(PromotionCopy::Sdma), true),
+            (2, 0),
+            "explicit sdma: copy engine"
+        );
+        assert_eq!(promote(Some(PromotionCopy::Kernel), true), (1, 1));
     }
 
     /// A kernel-library context stand-in: copies are done when enqueued, and a pinned buffer

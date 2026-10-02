@@ -242,31 +242,35 @@ pub struct KvTransferConfig {
     /// Bound on bytes of block copies in flight across all local paths.
     pub max_inflight_bytes: ByteSize,
     /// How pinned → L0 copies (L1 promotions, staged L2 / transcoded promotions) cross the
-    /// host link.
-    pub promotion_copy: PromotionCopy,
+    /// host link. Unset (the default): the copy kernel when every copy-stream device's library
+    /// has it, else the copy engine with a WARN (`promotion_copy_kernel_unavailable`); set
+    /// explicitly, `kernel` is refused at startup on such a library and `sdma` keeps the copy
+    /// engine (decision "6b: promotion copy kernel — default" A).
+    pub promotion_copy: Option<PromotionCopy>,
 }
 
 impl Default for KvTransferConfig {
     fn default() -> Self {
         KvTransferConfig {
             max_inflight_bytes: ByteSize::gib(1),
-            promotion_copy: PromotionCopy::Sdma,
+            promotion_copy: None,
         }
     }
 }
 
-/// `kv.transfer.promotion_copy` (P6b, decision "6b: KV promotions slow decode — which fix" A).
-#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// `kv.transfer.promotion_copy` (P6b, decisions "6b: KV promotions slow decode — which fix" A
+/// and "6b: promotion copy kernel — default" A).
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionCopy {
     /// The device's copy engine (`turbine_memcpy_async`).
-    #[default]
     Sdma,
     /// The kernel library's host-to-device copy kernel (kernel ABI v2.11
     /// `turbine_memcpy_h2d_kernel`): a few workgroups read the pinned memory directly. On the
     /// R9700 it moves a promotion ~1.8× faster and stalls decode ~17× less per MiB than the
-    /// copy engine (`.procoder/perf-log.md` 6b "Promotion copy kernel"). Refused at startup
-    /// (`promotion_copy_kernel_unavailable`) when a device's library lacks it.
+    /// copy engine (`.procoder/perf-log.md` 6b "Promotion copy kernel"). The default; set
+    /// explicitly, it is refused at startup (`promotion_copy_kernel_unavailable`) when a
+    /// device's library lacks it.
     Kernel,
 }
 
