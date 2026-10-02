@@ -1114,7 +1114,8 @@ mod phase8_eval {
     /// pushes the prefix out of L0. The log records the order requests arrived in; a filler
     /// takes 20 ms, and the third value is the most fillers that were in flight at once. The
     /// first `reject_fillers` filler arrivals get 503 `overloaded` (logged `filler-rejected`),
-    /// as a server in SURVIVAL answers.
+    /// as a server in SURVIVAL answers. `/turbine/v1/pressure` answers ORANGE for its first
+    /// three polls and GREEN after (each poll logged `pressure-<state>`).
     async fn spawn_eval_usage_mock(
         reject_fillers: usize,
     ) -> (
@@ -1130,8 +1131,21 @@ mod phase8_eval {
         let in_flight: Arc<AtomicUsize> = Arc::default();
         let rejected: Arc<AtomicUsize> = Arc::default();
         let peak_out = peak.clone();
+        let polls: Arc<AtomicUsize> = Arc::default();
+        let pressure_log = log.clone();
         let app = Router::new()
             .route("/v1/models", get(|| async { Json(json!({"object": "list", "data": [{"id": "mock-model"}]})) }))
+            .route(
+                "/turbine/v1/pressure",
+                get(move || {
+                    let (log, polls) = (pressure_log.clone(), polls.clone());
+                    async move {
+                        let state = if polls.fetch_add(1, Ordering::SeqCst) < 3 { "ORANGE" } else { "GREEN" };
+                        log.lock().unwrap().push(format!("pressure-{state}"));
+                        Json(json!({"enabled": true, "state": state}))
+                    }
+                }),
+            )
             .route(
                 "/v1/chat/completions",
                 post(move |Json(body): Json<Value>| {
@@ -1360,6 +1374,52 @@ mod phase8_eval {
         assert_eq!(report["filler_retries"], 3);
     }
 
+    /// `--fillers-settle`: after the fillers the runner polls `/turbine/v1/pressure` until it
+    /// reports GREEN and only then sends the other items, so they are planned at GREEN (at
+    /// ORANGE the planner recomputes the prefix into a fresh exact L0 copy instead of reading
+    /// the ladder's lossy one); the report records it and `eval-compare` refuses a pair that
+    /// differs. Without the flag nothing is polled. Breaks if an item goes out before GREEN or
+    /// the setting is not recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn eval_fillers_settle_waits_for_green() {
+        let (code, stdout, stderr, log) = eval_with_usage_mock(&[
+            "--filler-requests",
+            "2",
+            "--filler-words",
+            "50",
+            "--fillers-settle",
+        ])
+        .await;
+        assert_eq!(code, Some(0), "{stderr}");
+        let first_green = log
+            .iter()
+            .position(|l| l == "pressure-GREEN")
+            .expect("polled to GREEN");
+        assert_eq!(
+            &log[..first_green + 1],
+            [
+                "q0",
+                "q1",
+                "filler",
+                "filler",
+                "pressure-ORANGE",
+                "pressure-ORANGE",
+                "pressure-ORANGE",
+                "pressure-GREEN"
+            ],
+            "{log:?}"
+        );
+        assert_eq!(log.len(), first_green + 1 + 18, "{log:?}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["fillers_settle"], true);
+        let (code, stdout, _, log) =
+            eval_with_usage_mock(&["--filler-requests", "2", "--filler-words", "50"]).await;
+        assert_eq!(code, Some(0));
+        assert!(!log.iter().any(|l| l.starts_with("pressure")), "{log:?}");
+        let report: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["fillers_settle"], false);
+    }
+
     /// Without fillers the prefix never leaves L0, nothing lossy is reused, and a stated
     /// `--min-lossy-cached-ratio` fails the run (exit 1) after printing the report.
     #[tokio::test(flavor = "multi_thread")]
@@ -1422,6 +1482,19 @@ mod phase8_eval {
         assert_eq!(out.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("filler concurrency"), "{stderr}");
+        let mut candidate = report.clone();
+        candidate["fillers_settle"] = json!(true);
+        std::fs::write(&c, candidate.to_string()).unwrap();
+        let out = eval_golden_cmd()
+            .args(["eval-compare", "--baseline"])
+            .arg(&b)
+            .arg("--candidate")
+            .arg(&c)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("settle"), "{stderr}");
     }
 
     /// An older report with no `concurrency` field reads as concurrency 1.

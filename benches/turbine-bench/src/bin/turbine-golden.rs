@@ -138,6 +138,13 @@ enum Command {
         /// same value.
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=256))]
         filler_concurrency: u32,
+        /// After the fillers, poll <url>/turbine/v1/pressure until it reports GREEN (up to
+        /// 180 s) before the other items: concurrent fillers leave the controller above GREEN
+        /// for its de-escalation dwell, and an item planned then recomputes the prefix into a
+        /// fresh exact L0 copy instead of reading the lossy copy the fillers pushed down. Both
+        /// sides of a comparison must use the same value.
+        #[arg(long)]
+        fillers_settle: bool,
         /// Exit 1 (the report is still printed) when fewer than this share of the items'
         /// prompt tokens were served from cached KV (`usage.prompt_tokens_details.cached_tokens`).
         #[arg(long)]
@@ -256,6 +263,13 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
             baseline.filler_words,
             candidate.filler_requests,
             candidate.filler_words
+        );
+        return ExitCode::from(2);
+    }
+    if baseline.fillers_settle != candidate.fillers_settle {
+        eprintln!(
+            "turbine-golden eval-compare: baseline was measured with fillers settle {} but candidate with {}; a comparison must use the same fillers on both sides",
+            baseline.fillers_settle, candidate.fillers_settle
         );
         return ExitCode::from(2);
     }
@@ -439,6 +453,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             filler_requests,
             filler_words,
             filler_concurrency,
+            fillers_settle,
             min_cached_ratio,
             min_lossy_cached_ratio,
         } => Ok(run_eval(
@@ -451,6 +466,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 requests: filler_requests,
                 words: filler_words,
                 concurrency: filler_concurrency,
+                settle: fillers_settle,
             },
             (min_cached_ratio, min_lossy_cached_ratio),
         )

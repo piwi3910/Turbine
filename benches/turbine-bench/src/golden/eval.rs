@@ -120,6 +120,9 @@ pub struct Fillers {
     pub requests: u32,
     pub words: u32,
     pub concurrency: u32,
+    /// After the fillers, wait until the server's pressure controller is GREEN again
+    /// ([`settle`]) before the other items go out.
+    pub settle: bool,
 }
 
 /// Seed of the filler prompts (`crate::prompt::prompt(FILLER_SEED, i, words)`), apart from the
@@ -155,6 +158,9 @@ pub struct EvalReport {
     /// Fillers the server rejected under load and the runner sent again (not compared).
     #[serde(default)]
     pub filler_retries: u32,
+    /// `--fillers-settle` of this run. `eval-compare` refuses a pair that differs.
+    #[serde(default)]
+    pub fillers_settle: bool,
     pub results: Vec<TaskResult>,
 }
 
@@ -428,6 +434,45 @@ pub const FILLER_RETRIES: u32 = 120;
 /// Pause before a rejected filler is sent again.
 pub const FILLER_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// How long [`settle`] waits for GREEN, and how often it polls.
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+pub const SETTLE_POLL: Duration = Duration::from_millis(250);
+
+/// `--fillers-settle`: polls `<base>/turbine/v1/pressure` until its `state` is GREEN (a server
+/// without the endpoint, 404, has no controller to wait for). The concurrent fillers leave the
+/// controller at ORANGE or above for its de-escalation dwell; an item planned then recomputes
+/// the shared prefix into a fresh exact L0 copy (`l0_pressure`) instead of reading the copy the
+/// fillers pushed down. Fails after [`SETTLE_TIMEOUT`].
+async fn settle(client: &reqwest::Client, base: &str) -> Result<(), EvalError> {
+    let start = std::time::Instant::now();
+    loop {
+        let sent = client
+            .get(format!("{base}/turbine/v1/pressure"))
+            .send()
+            .await;
+        if sent
+            .as_ref()
+            .is_ok_and(|r| r.status() == reqwest::StatusCode::NOT_FOUND)
+        {
+            return Ok(());
+        }
+        let doc = json_body(sent)
+            .await
+            .map_err(|e| EvalError::Server(format!("GET /turbine/v1/pressure: {e}")))?;
+        if doc["state"] == "GREEN" {
+            return Ok(());
+        }
+        if start.elapsed() >= SETTLE_TIMEOUT {
+            return Err(EvalError::Server(format!(
+                "the pressure controller did not return to GREEN within {} s after the fillers (state {})",
+                SETTLE_TIMEOUT.as_secs(),
+                doc["state"]
+            )));
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
 /// One filler request (`--filler-requests`): an unrelated random-word chat prompt, one token.
 /// Fillers exist to load the server, so one it rejects under that load (503 or 429) is sent
 /// again after [`FILLER_RETRY_DELAY`], up to [`FILLER_RETRIES`] times, each counted in
@@ -539,6 +584,9 @@ pub async fn run_eval(
         while let Some(reply) = sent.next().await {
             reply?;
         }
+        if fillers.settle {
+            settle(client, base).await?;
+        }
     }
     let mut replies = stream::iter(rest.iter().enumerate())
         .map(|(index, task)| async move {
@@ -568,6 +616,7 @@ pub async fn run_eval(
         filler_words: fillers.words,
         filler_concurrency,
         filler_retries: filler_retries.into_inner(),
+        fillers_settle: fillers.settle && !head.is_empty(),
         results,
     })
 }
@@ -715,6 +764,7 @@ mod tests {
             filler_words: 0,
             filler_concurrency: 1,
             filler_retries: 0,
+            fillers_settle: false,
             results,
         }
     }
