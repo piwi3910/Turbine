@@ -1710,12 +1710,18 @@ impl KvHierarchy {
         // would be dropped. The copy is priced at the bytes it would be stored at there (path
         // estimates are rates per encoded byte, like the planner's `copy_bytes`), and the
         // memory the copy holds is its encoded size in `tier` (user decision 2026-09-30, B).
+        // For eviction order a lossless last block is priced like its history, at the rung of
+        // `to`; it is still demoted (and its memory counted) at the L0 format (user decision
+        // 2026-10-02, 1 A: at its own L0 size it outranked every history block, so histories
+        // drained first).
         let retrieval = match demotion_target(tier, self.l1.is_some(), self.l2.is_some()) {
             Some(to) => {
                 let path = TransferPath::between(to, TierId::L0).expect("lower tier to L0");
                 let bytes = self
                     .copy_codec(&b.key, tier, to)
-                    .map_or(self.cfg.block_bytes, |c| c.to_bytes);
+                    .map_or(self.cfg.block_bytes, |c| {
+                        self.format_bytes(crate::codec::lossier(c.from, self.rung(to)))
+                    });
                 self.transfer.estimate(path).block_seconds(bytes)
             }
             None => recompute,
@@ -3363,6 +3369,82 @@ pub(crate) mod tests {
             s.retrieval.seconds,
             l2_rate.block_seconds(fp8),
             "retrieval at the size it would be stored at in L2"
+        );
+    }
+
+    /// User decision 2026-10-02 (1 A): a sequence's lossless last block is scored like its
+    /// history for eviction order — its retrieval at the bytes its history would be stored at in
+    /// the tier below — while its demotion and its memory keep its real L0-format size. Before,
+    /// its retrieval was priced at the L0 size (several times its history's), so the leaf
+    /// outranked every history block and other sessions' histories drained first. Breaks if the
+    /// last block's retrieval is priced at its own L0-format bytes, or if it demotes lossy.
+    #[test]
+    fn last_block_is_scored_like_its_history() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc.clone()));
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc));
+        let mut r = rig(16, Some(l1.clone()), Some(l2), clock);
+        r.h.cfg.l1_format = "fp8_e4m3";
+        r.h.cfg.l2_format = "fp8_e4m3";
+        let fp8 = r.h.format_bytes("fp8_e4m3");
+        assert!(fp8 < bb);
+
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        let now = r.h.now();
+        let tail =
+            r.h.dir
+                .iter()
+                .find(|b| r.h.tail.contains(&b.key))
+                .expect("a lossless last block")
+                .clone();
+        let history =
+            r.h.dir
+                .iter()
+                .find(|b| !r.h.tail.contains(&b.key))
+                .expect("a history block")
+                .clone();
+        let t = r.h.score_one(&tail, TierId::L0, &r.pool, now);
+        let h = r.h.score_one(&history, TierId::L0, &r.pool, now);
+        let l1_rate = r.h.transfer.estimate(TransferPath::L1ToL0);
+        assert_eq!(h.retrieval.seconds, l1_rate.block_seconds(fp8));
+        assert_eq!(
+            t.retrieval.seconds, h.retrieval.seconds,
+            "the last block's retrieval is priced like its history's"
+        );
+        assert_eq!(t.block.size_bytes, bb, "its memory stays the L0 size");
+        let codec = r.h.copy_codec(&tail.key, TierId::L0, TierId::L1).unwrap();
+        assert_eq!(
+            (codec.to, codec.to_bytes),
+            (L0_FORMAT, bb),
+            "it still demotes at the L0 format"
+        );
+
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..3 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        let tail =
+            r.h.dir
+                .iter()
+                .find(|b| {
+                    r.h.tail.contains(&b.key)
+                        && b.location(TierId::L1)
+                            .is_some_and(|l| l.format == L0_FORMAT)
+                })
+                .expect("a lossless last block in L1")
+                .clone();
+        let now = r.h.now();
+        let s = r.h.score_one(&tail, TierId::L1, &r.pool, now);
+        assert_eq!(s.block.size_bytes, bb, "L1 memory at its real encoded size");
+        let l2_rate = r.h.transfer.estimate(TransferPath::L2ToL0);
+        assert_eq!(
+            s.retrieval.seconds,
+            l2_rate.block_seconds(fp8),
+            "retrieval at the size its history would be stored at in L2"
         );
     }
 
