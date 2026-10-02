@@ -3034,3 +3034,5 @@ empty, and a `queue_timeout` aborted the run). Soak PASS but 0 ladder actions (r
    - C) Amend the criterion
 
 **Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Ladder eval without L2 and with concurrent fillers on both sides; fix the L2 copy loss now (allocate before free); back off L1 rewrites after `no_room` until a slab frees; give part of the soak's requests a shared prefix.
+
+**Decision (user, 2026-10-02): 1 A, 2 A, 3 A, 4 A.** Ladder eval without L2 and with concurrent fillers on both sides; fix the L2 copy loss now (allocate before free); back off L1 rewrites after `no_room` until a slab frees; give part of the soak's requests a shared prefix.
