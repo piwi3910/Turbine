@@ -272,4 +272,11 @@ impl KvTier for ShardedL1Tier {
     fn degraded(&self) -> bool {
         self.shards.iter().any(|s| s.degraded())
     }
+
+    /// Changes when any shard's does.
+    fn room_epoch(&self) -> u64 {
+        self.shards
+            .iter()
+            .fold(0u64, |a, s| a.wrapping_add(s.room_epoch()))
+    }
 }

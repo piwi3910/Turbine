@@ -1913,6 +1913,8 @@ fn check_labels(line: &str) {
         "floor_evict",
         // A rewrite whose tier had no slot of the new format (counted by the server).
         "no_room",
+        // The tier's rewrites backed off after a `no_room` until a slab frees.
+        "no_room_backoff",
     ];
     const CODECS: &[&str] = &["l0", "fp8_e4m3", "tq4", "tq2"];
     let ladder = line.starts_with("turbine_kv_ladder_actions");

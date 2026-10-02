@@ -124,6 +124,13 @@ pub trait KvTier: Send + Sync {
     fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError>;
     fn evict(&self, key: &KvKey) -> Result<(), TierError>;
     fn degraded(&self) -> bool;
+    /// A counter that changes whenever the tier may have gained room for a block of a slot
+    /// size it had none for: a slab emptied (it can take another slot size), a slab was
+    /// released, or the tier's capacity grew back. A tier without slabs changes it whenever a
+    /// stored block's bytes are released. The compression ladder backs off a tier's rewrites
+    /// after one ended `Full` until it changes (P6b S-6; user decision "6b Task 16: ladder proof
+    /// results — four open points", 3 A).
+    fn room_epoch(&self) -> u64;
 }
 
 /// Pressure of a tier from its utilisation, on the Phase 3 `kv_utilization` thresholds

@@ -793,3 +793,111 @@ fn nvme_slabs_per_codec() {
         "no slab is free for an l0 block"
     );
 }
+
+/// An L2 tier on `dir` with `slabs` slab files of `blocks` `l0` blocks each.
+fn l2_slabs(dir: &std::path::Path, blocks: u64, slabs: u64) -> L2NvmeTier {
+    let cfg = L2Config {
+        path: dir.to_path_buf(),
+        max_bytes: slabs * (4096 + blocks * 8192),
+        slab_bytes: blocks * 8192,
+        max_queue_depth: 8,
+        block_bytes: BLOCK,
+        namespace: NamespaceKey([3; 32]),
+    };
+    L2NvmeTier::open(cfg, clock(), KvMetrics::unregistered()).unwrap()
+}
+
+/// P6b S-6 edge case (user decision "6b Task 16: ladder proof results — four open points", 2 A):
+/// a rewrite of a block into another codec finds its new slot before it frees the old one, so a
+/// rewrite that finds no room (`Full`) leaves the old copy stored, readable and accounted. Breaks
+/// if the store frees the replaced slot (or drops its index entry) before it has the new one.
+#[test]
+fn nvme_rewrite_without_room_keeps_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put(key(1), TierBlockRef::Host(&bytes(1))).unwrap();
+    assert_eq!(
+        t.put_as(key(0), "fp8_e4m3", 3000, TierBlockRef::Host(&[7u8; 3000])),
+        Err(TierError::Full),
+        "the only slab file holds l0 blocks"
+    );
+    assert!(t.contains(&key(0)), "the old copy stays");
+    let mut out = vec![0u8; BLOCK as usize];
+    t.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(0), "at its old format");
+    assert_eq!(t.used_bytes(), 2 * BLOCK);
+    // Its slot is still taken: two more l0 blocks fill the slab, a fifth finds none.
+    t.put(key(2), TierBlockRef::Host(&bytes(2))).unwrap();
+    t.put(key(3), TierBlockRef::Host(&bytes(3))).unwrap();
+    assert_eq!(
+        t.put(key(4), TierBlockRef::Host(&bytes(4))),
+        Err(TierError::Full)
+    );
+}
+
+/// The other half of [`nvme_rewrite_without_room_keeps_the_copy`]: a rewrite that finds room
+/// stores the new copy and only then frees the old slot, whose emptied slab takes `l0` blocks
+/// again. Breaks if the old slot leaks or the old copy stays indexed.
+#[test]
+fn nvme_rewrite_with_room_frees_the_old_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2_slabs(dir.path(), 4, 2);
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put_as(key(0), "fp8_e4m3", 3000, TierBlockRef::Host(&[7u8; 3000]))
+        .unwrap();
+    assert_eq!(t.used_bytes(), 3000);
+    let mut out = vec![0u8; 3000];
+    t.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, vec![7u8; 3000]);
+    // Slab 0 is empty again: it holds four l0 blocks.
+    for i in 1..5u8 {
+        t.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(
+        t.put(key(5), TierBlockRef::Host(&bytes(5))),
+        Err(TierError::Full)
+    );
+}
+
+/// `room_epoch` (P6b S-6, user decision "6b Task 16: ladder proof results — four open points",
+/// 3 A): L1 changes it when a slab empties or is released and when host pressure drops below RED,
+/// never for a freed slot of a slab that still holds blocks. Breaks if the ladder's back-off
+/// could resume while no slab freed, or wait forever after one did.
+#[test]
+fn l1_room_epoch_changes_when_a_slab_frees() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc, clock());
+    let e0 = l1.room_epoch();
+    for i in 0..3u8 {
+        l1.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    // Slab 0 holds keys 0 and 1, slab 1 key 2.
+    l1.evict(&key(0)).unwrap();
+    assert_eq!(l1.room_epoch(), e0, "slab 0 still holds key 1");
+    l1.evict(&key(1)).unwrap();
+    let e1 = l1.room_epoch();
+    assert_ne!(e1, e0, "slab 0 emptied");
+    l1.set_host_pressure(PressureState::Red);
+    let e2 = l1.room_epoch();
+    assert_ne!(e2, e1, "the empty slab is released");
+    l1.set_host_pressure(PressureState::Red);
+    assert_eq!(l1.room_epoch(), e2, "nothing more to release");
+    l1.set_host_pressure(PressureState::Orange);
+    assert_ne!(l1.room_epoch(), e2, "slabs may be allocated again");
+}
+
+/// L2's `room_epoch` changes when a slab's last slot frees, not for a slot of a slab still in
+/// use (see [`l1_room_epoch_changes_when_a_slab_frees`]).
+#[test]
+fn nvme_room_epoch_changes_when_a_slab_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    let e0 = t.room_epoch();
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put(key(1), TierBlockRef::Host(&bytes(1))).unwrap();
+    t.evict(&key(0)).unwrap();
+    assert_eq!(t.room_epoch(), e0, "the slab still holds key 1");
+    t.evict(&key(1)).unwrap();
+    assert_ne!(t.room_epoch(), e0, "the slab emptied");
+}
