@@ -3597,6 +3597,77 @@ pub(crate) mod tests {
         assert!(tier("l1").formats.is_empty());
     }
 
+    /// Attach (waiting for promotions), prefill and finish `prompt`; the attach.
+    fn run_through_promotions(r: &mut Rig, prompt: &[u32]) -> PrefixAttach {
+        let id = RequestId::new_v4();
+        let a = match attach(r, id, prompt) {
+            AttachOutcome::Ready(a) => a,
+            AttachOutcome::Promoting => (0..20)
+                .find_map(|_| {
+                    r.clock.advance(Duration::from_millis(10));
+                    r.h.poll(&mut r.pool, &mut r.backend)
+                        .into_iter()
+                        .find(|(rid, _)| *rid == id)
+                        .map(|(_, a)| a)
+                })
+                .expect("the promotions land"),
+            other => panic!("expected an attach, got {other:?}"),
+        };
+        prefill_and_finish(r, id, prompt, &a);
+        a
+    }
+
+    /// The OLMoE multi-turn shortfall of lower-tier tq4 (decision "6b: lower-tier tq4 after the
+    /// promotion fix"): one session's turns, with its history leaving L0 leaf-first between
+    /// turns, so the first lossy block of each turn's prefix moves *earlier*. Turn 2 reuses
+    /// blocks 0-1 exact and 2-3 lossy, so its new blocks 4-5 are keyed by the lossy chain that
+    /// starts at block 2. Turn 3 finds block 0 lossy, so its lookup's chain starts at block 0
+    /// and never names blocks 4-5: they were computed over a lossy prefix of the same tokens
+    /// and are still cached, but turn 3 recomputes them. Breaks if a lookup can only reach a
+    /// lossy-lineage block through a chain that starts at the request's own first lossy block.
+    #[test]
+    fn lossy_lineage_blocks_survive_an_earlier_switch() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 32 * bb, arc));
+        let mut r = rig(32, Some(l1), None, clock);
+        r.h.cfg.l1_format = "fp8_e4m3";
+        r.h.cfg.allow_lossy = true;
+        r.h.cfg.lossless_tail_blocks = 0;
+        let turn = |blocks: u32| -> Vec<u32> { (0..blocks * 16).chain([9000, 9001]).collect() };
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &turn(8), 16);
+
+        // Turn 1: blocks 0-3; then its last two blocks leave L0 (leaf-first) for the lossy L1.
+        assert_eq!(run(&mut r, &turn(4)).cached_tokens, 0);
+        r.h.demote_keys(&mut r.pool, vec![keys[2], keys[3]], EvictReason::Pressure);
+        settle(&mut r);
+        for k in &keys[2..4] {
+            let b = r.h.directory().get(k).expect("the exact entry");
+            assert!(b.location(TierId::L0).is_none(), "{:?}", b.locations);
+        }
+
+        // Turn 2: blocks 0-1 exact, 2-3 lossy (promoted), 4-5 computed over the lossy prefix.
+        let t2 = run_through_promotions(&mut r, &turn(6));
+        assert_eq!((t2.cached_tokens, t2.lossy_tokens), (64, 32), "{t2:?}");
+
+        // Everything leaves L0 for the lossy L1, block 0 included.
+        for _ in 0..4 {
+            r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+            settle(&mut r);
+        }
+        assert_eq!(r.pool.cached_unreferenced(), 0, "L0 holds nothing cached");
+
+        // Turn 3 reuses all six cached blocks, lossy from block 0 on.
+        let t3 = run_through_promotions(&mut r, &turn(8));
+        assert_eq!(
+            (t3.cached_tokens, t3.lossy_tokens),
+            (96, 96),
+            "blocks 4-5 (computed over a lossy prefix by turn 2) are reused: {t3:?}"
+        );
+    }
+
     /// The Task 4 kv-sim regression (MultiTurn lru 251 → 199 s, cost_aware/lru 0.78 → 0.93):
     /// the P6b S-3 publish rule ("an exact entry whose every copy is lossy") also fired for an
     /// entry with *no* copy — a parent kept only by its children — so with L0-format tiers a
