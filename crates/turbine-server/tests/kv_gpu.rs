@@ -994,6 +994,16 @@ fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
             format!("kv.cpu.format={format}"),
             "kv.cpu.max_bytes=2GiB".to_string(),
             "kv.nvme.enabled=false".to_string(),
+            // The lossless tail (S-2, a finished sequence's last full blocks demote at the L0
+            // format) is orthogonal to what this test judges — that a capacity demotion into a
+            // lossy tier is encoded. With the default 1, every finished filler keeps its last
+            // full block tail-tagged for its (one-shot) life, and since the tail block scores
+            // like its history (user decision 2026-10-02, "6b: OLMoE tq4 — lossless last block
+            // in eviction order") those 28 stale tails were 28 of the first 42 demotions,
+            // stored raw: 0.83 x full size, "not encoded". The tail's own behaviour is pinned
+            // by `document_lists_copies_per_codec` and `last_block_is_scored_like_its_history`;
+            // the open question of stale tails' cost is `p6b-tq4enc`.
+            "kv.lossless_tail_blocks=0".to_string(),
         ],
     );
     let a = prompt(100, 350);
