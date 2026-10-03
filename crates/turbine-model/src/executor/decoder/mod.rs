@@ -787,6 +787,9 @@ pub struct DecoderExecutor {
     /// TurboQuant L0 pages on a GPU provider (P6b S-5): every model layer's tables in device
     /// memory, set by [`DecoderExecutor::set_tq_device_tables`].
     tq_device: Option<TqDeviceTables>,
+    /// The pool grows page classes (P6b S-5/S-7): every forward reads the batch's
+    /// `block_formats` table, set by [`DecoderExecutor::set_mixed_blocks`].
+    mixed_blocks: bool,
 }
 
 impl DecoderExecutor {
@@ -1260,6 +1263,7 @@ impl DecoderExecutor {
             step_prefill: AtomicBool::new(false),
             overlap: None,
             tq_device: None,
+            mixed_blocks: false,
         })
     }
 
@@ -1273,6 +1277,13 @@ impl DecoderExecutor {
     /// before the first forward (decode graphs capture the pointers); the CPU provider reads
     /// the host tables of `kv_cache` and needs none. Refused when the pages are not TurboQuant
     /// or the tables do not cover every model layer and this rank's KV heads.
+    /// The pool's block tables mix formats (P6b S-5/S-7): every paged attention takes the
+    /// batch's `block_formats` table (a library without the v2.11 group is refused at
+    /// startup, with the ladder / the window that needs it).
+    pub fn set_mixed_blocks(&mut self, on: bool) {
+        self.mixed_blocks = on;
+    }
+
     pub fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
         let Some(tq) = self.cfg.kv_cache.tq.as_ref() else {
             return Err(invalid(format!(
@@ -1872,10 +1883,10 @@ impl DecoderExecutor {
                     scale: d.attn_scale,
                     k_scale,
                     v_scale,
-                    // P6b S-5: every L0 block is in the pool's one format until the ladder's L0
-                    // step (S-7) carves pages of other formats; TurboQuant pages take the
-                    // layer's tables and codec.
-                    block_formats: None,
+                    // P6b S-5/S-7: with page classes (the ladder's L0 rungs, the recent
+                    // window's BF16 class) the table's bytes say which format each block
+                    // holds; TurboQuant pages take the layer's tables and codec.
+                    block_formats: self.mixed_blocks.then(|| w.meta.block_formats_view(p)),
                     tq: self.cfg.kv_cache.tq_paged(model_layer).map(|t| TqPaged {
                         device: self
                             .tq_device
@@ -2088,6 +2099,11 @@ impl DecoderExecutor {
 }
 
 impl ModelExecutor for DecoderExecutor {
+    fn set_mixed_blocks(&mut self, on: bool) -> Result<(), ModelError> {
+        DecoderExecutor::set_mixed_blocks(self, on);
+        Ok(())
+    }
+
     fn shape(&self) -> &ModelShape {
         &self.shape
     }
@@ -2530,6 +2546,7 @@ mod tests {
                             q_len: 1,
                             kv_len,
                             block_table: table,
+                            block_formats: &[],
                             reduce,
                         })
                         .collect()
@@ -2606,6 +2623,7 @@ mod tests {
             q_len: 2,
             kv_len: 2,
             block_table: &table,
+            block_formats: &[],
             reduce: None,
         }];
         let prefill = BatchInput {
@@ -2629,6 +2647,7 @@ mod tests {
                     q_len,
                     kv_len: cached + q_len,
                     block_table: &[],
+                    block_formats: &[],
                     reduce: None,
                 };
                 start += q_len;

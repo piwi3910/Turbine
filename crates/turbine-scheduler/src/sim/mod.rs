@@ -1587,6 +1587,7 @@ mod tests {
             free_watermark: 0.01,
             max_seq_len: 8192,
             queue_timeout: Duration::from_secs(60),
+            recent_window: None,
         }
     }
 

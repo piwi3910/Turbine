@@ -49,6 +49,23 @@ pub struct PageClassUsage {
     pub bytes: u64,
 }
 
+/// The `TURBINE_KVFMT_*` code of a page-class name under an L0 `dtype`: `l0` and `bf16` name
+/// the base class, the other names their registered codec's code.
+fn class_code(format: &str, dtype: DType) -> u8 {
+    let base = match dtype {
+        DType::F8E4M3 => 1,
+        DType::Tq4 => 2,
+        DType::Tq2 => 3,
+        _ => 0,
+    };
+    match format {
+        "fp8_e4m3" => 1,
+        "tq4" => 2,
+        "tq2" => 3,
+        _ => base,
+    }
+}
+
 /// The name of the base page class of an L0 dtype (the `kv.dtype` spelling).
 pub fn base_format(dtype: DType) -> &'static str {
     match dtype {
@@ -151,8 +168,21 @@ pub struct BlockPool {
     reclaimed: Vec<BlockId>,
     /// Base-class pages of the allocation (`num_blocks`); ids `0..base_blocks`.
     base_blocks: u32,
+    /// Page classes other than the base (P6b L0 ladder, S-7): bumped on every page free, the
+    /// back-off's `room_epoch` for L0 (a class grows from freed base pages, so any free is
+    /// new room).
+    room_epoch: u64,
     /// Page classes other than the base (P6b S-5); `None` = the base class only.
     slabs: Option<Slabs>,
+}
+
+impl BlockPool {
+    /// Monotonic room marker: bumped every time a page returns to a class's free pages or the
+    /// base free list (the L0 ladder back-off's resume mark, S-7; cf.
+    /// `KvTier::room_epoch`).
+    pub fn room_epoch(&self) -> u64 {
+        self.room_epoch
+    }
 }
 
 impl std::fmt::Debug for BlockPool {
@@ -189,6 +219,7 @@ impl BlockPool {
             reclaim_order: VecDeque::new(),
             reclaimed: Vec::new(),
             base_blocks: cfg.num_blocks,
+            room_epoch: 0,
             slabs: None,
         })
     }
@@ -272,6 +303,18 @@ impl BlockPool {
         let slab = (rel / slabs.stride) as usize;
         let class = slabs.owner[slab].expect("a class page lives in a slab its class owns");
         Some((slab, class, rel % slabs.stride))
+    }
+
+    /// Whether the pool grows page classes besides the base (`kv.ladder.l0` or the recent
+    /// window): a block's format tag can then differ from the pool base.
+    pub fn has_page_classes(&self) -> bool {
+        self.slabs.is_some()
+    }
+
+    /// The v2.11 `block_formats` byte of block `b` (`TURBINE_KVFMT_*`): its page class, the
+    /// base dtype's code for a base page.
+    pub fn format_code(&self, b: BlockId) -> u8 {
+        class_code(self.format_of(b), self.layout.dtype)
     }
 
     /// The format of block `b`: the base format, or the class of the slab it was carved from.
@@ -390,6 +433,7 @@ impl BlockPool {
     /// Returns block `b` (reference count 0, not cached) to its class's free pages; a slab
     /// whose last page this was goes back to the base class.
     fn free_page(&mut self, b: BlockId) {
+        self.room_epoch += 1;
         let Some((slab, ci, _)) = self.class_page(b) else {
             self.free.push(b);
             return;
@@ -464,6 +508,27 @@ impl BlockPool {
             });
         }
         let blocks = self.allocate(n)?;
+        reservation.commit_bytes(needed);
+        Ok(blocks)
+    }
+
+    /// `n` pages of page class `format` paid from `reservation` like
+    /// [`BlockPool::allocate_reserved`] (P6b S-5, the recent window's BF16 class): the
+    /// commitment is the base page size, the reservation's worst case, whatever the class.
+    pub fn allocate_in_reserved(
+        &mut self,
+        format: &str,
+        n: u32,
+        reservation: &mut Reservation,
+    ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
+        let needed = u64::from(n) * self.layout.block_bytes();
+        if needed > reservation.bytes() {
+            return Err(PoolError::ReservationShort {
+                needed,
+                uncommitted: reservation.bytes() - reservation.committed(),
+            });
+        }
+        let blocks = self.allocate_in(format, n)?;
         reservation.commit_bytes(needed);
         Ok(blocks)
     }

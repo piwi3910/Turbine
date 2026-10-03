@@ -281,6 +281,9 @@ struct Built {
     tokens: Vec<u32>,
     positions: Vec<u32>,
     slices: Vec<(usize, u32, u32, u32)>,
+    /// The `block_formats` bytes of each plan item's table (`TURBINE_KVFMT_*`, P6b S-5/S-7);
+    /// empty vectors while the pool has one page class.
+    formats: Vec<Vec<u8>>,
     rows: Vec<RowInfo>,
     feeds: Vec<TokenFeed>,
 }
@@ -1685,6 +1688,7 @@ impl EngineLoop {
             tokens: Vec::with_capacity(total),
             positions: Vec::with_capacity(total),
             slices: Vec::with_capacity(items.len()),
+            formats: Vec::with_capacity(items.len()),
             rows: Vec::with_capacity(items.len()),
             feeds: Vec::new(),
         };
@@ -1714,6 +1718,16 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
+            built.formats.push(if self.pool.has_page_classes() {
+                plan.items[it.index]
+                    .block_table
+                    .blocks
+                    .iter()
+                    .map(|b| self.pool.format_code(*b))
+                    .collect()
+            } else {
+                Vec::new()
+            });
             built.rows.push(RowInfo {
                 seq,
                 prefill: it.prefill,
@@ -2618,19 +2632,23 @@ impl EngineLoop {
 }
 
 /// The [`SeqSlice`] of each row of `built`, a batch of `plan`.
-fn seq_slices<'a>(plan: &'a IterationPlan, built: &Built) -> Vec<SeqSlice<'a>> {
+fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>> {
     built
         .slices
         .iter()
         .zip(&built.rows)
-        .map(|(&(index, q_start, q_len, kv_len), row)| SeqSlice {
-            seq: row.seq,
-            q_start,
-            q_len,
-            kv_len,
-            block_table: &plan.items[index].block_table.blocks,
-            reduce: row.reduce,
-        })
+        .zip(&built.formats)
+        .map(
+            |((&(index, q_start, q_len, kv_len), row), formats)| SeqSlice {
+                seq: row.seq,
+                q_start,
+                q_len,
+                kv_len,
+                block_table: &plan.items[index].block_table.blocks,
+                block_formats: formats,
+                reduce: row.reduce,
+            },
+        )
         .collect()
 }
 
@@ -2788,6 +2806,7 @@ mod tests {
             free_watermark: 0.01,
             max_seq_len: 128,
             queue_timeout: Duration::from_secs(60),
+            recent_window: None,
         }
     }
 

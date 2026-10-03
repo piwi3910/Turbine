@@ -47,6 +47,13 @@ pub struct KvConfig {
     /// The last N full blocks of a sequence at demotion time leave L0 at the L0 format,
     /// whatever the tier's format (P6b S-2, user decision 2026-09-28, Q13); 0..=64.
     pub lossless_tail_blocks: u32,
+    /// The newest N full blocks of each live sequence hold BF16 pages while the L0 base format
+    /// is lossy (P6b S-5, the recent window; user decision 2026-10-02, "6b Task 13", 1 C);
+    /// 0..=64. A block that leaves the window is recompressed in place into the L0 base
+    /// format. Only with a lossy `kv.dtype`; 0 (the default) turns the window off — a page
+    /// class larger than the base page needs the executor's per-class block addressing before
+    /// a serving path can run it (Task 17's open item).
+    pub recent_window_blocks: u32,
     /// Whether requests without `x-turbine-kv-lossy` may reuse lossy cached blocks (P6b S-3,
     /// Q15).
     pub lossy_reuse: LossyReuse,
@@ -75,6 +82,7 @@ impl Default for KvConfig {
             prefetch: KvPrefetchConfig::default(),
             policy_weights: KvPolicyWeights::default(),
             lossless_tail_blocks: 1,
+            recent_window_blocks: 0,
             lossy_reuse: LossyReuse::Allow,
             lossy_penalty: None,
             ladder: KvLadderConfig::default(),
@@ -426,6 +434,15 @@ impl KvConfig {
                 format!(
                     "must be between 0 and 64, got {}",
                     self.lossless_tail_blocks
+                ),
+            ));
+        }
+        if self.recent_window_blocks > 64 {
+            return Err(invalid(
+                "kv.recent_window_blocks",
+                format!(
+                    "must be between 0 and 64, got {}",
+                    self.recent_window_blocks
                 ),
             ));
         }

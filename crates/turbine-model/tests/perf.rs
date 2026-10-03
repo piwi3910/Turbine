@@ -176,6 +176,7 @@ fn step(
             q_len: toks.len() as u32,
             kv_len: start + toks.len() as u32,
             block_table: table,
+            block_formats: &[],
             reduce: None,
         });
         tokens.extend_from_slice(toks);
@@ -1505,6 +1506,7 @@ fn served_step(
             q_len: toks.len() as u32,
             kv_len: start + toks.len() as u32,
             block_table: table,
+            block_formats: &[],
             reduce,
         });
         tokens.extend_from_slice(toks);

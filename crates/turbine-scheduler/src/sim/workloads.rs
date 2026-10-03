@@ -50,6 +50,7 @@ pub(crate) fn params() -> SchedulerParams {
         free_watermark: 0.01,
         max_seq_len: 4096,
         queue_timeout: Duration::from_secs(3600),
+        recent_window: None,
     }
 }
 

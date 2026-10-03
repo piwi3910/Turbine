@@ -91,13 +91,14 @@ impl EvictionPolicy for CostAwarePolicy {
         {
             return ctx.phase4_action();
         }
-        let max = codec::rung_index(ladder.max_format).unwrap_or(0);
-        let target =
-            codec::next_rung(ctx.format).filter(|t| codec::rung_index(t).is_some_and(|i| i <= max));
+        let max = codec::tier_rung(ladder.max_format, ladder.l0_dtype).unwrap_or(0);
+        let target = codec::next_rung_in(ctx.format, ladder.l0_dtype)
+            .filter(|t| codec::tier_rung(t, ladder.l0_dtype).is_some_and(|i| i <= max));
         match target {
             Some(to) => {
                 let reached = ctx.lower_rung.is_none_or(|lower| {
-                    codec::rung_index(lower).unwrap_or(0) >= codec::rung_index(to).unwrap_or(0)
+                    codec::tier_rung(lower, ladder.l0_dtype).unwrap_or(0)
+                        >= codec::tier_rung(to, ladder.l0_dtype).unwrap_or(0)
                 });
                 if reached {
                     EvictAction::Compress { to }

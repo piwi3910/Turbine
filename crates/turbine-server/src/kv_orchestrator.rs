@@ -1676,6 +1676,8 @@ enum Job {
     Io(IoStage),
     /// A ladder rewrite waiting for a free lane (P6b S-6).
     Lane,
+    /// An L0 rewrite waiting for a free lane (P6b S-7).
+    LaneL0,
     Done(Result<TierSlot, TierError>),
 }
 
@@ -1899,6 +1901,9 @@ pub const LADDER_NO_ROOM: &str = "no_room";
 /// free slot) takes the host codec path instead.
 pub struct DeviceTranscode {
     kernel: Arc<dyn KernelProvider>,
+    /// The device the staging slots and lanes were allocated in: an L0 rewrite's coded bytes
+    /// are copied into their destination page through it (S-7).
+    mem: Arc<dyn DeviceMemory>,
     /// Fences the compute stream (a decode still reads its slot); `None` when kernels and
     /// copies are synchronous.
     engine: Option<Arc<dyn CopyEngine>>,
@@ -2186,6 +2191,7 @@ impl CopyStreamBackend {
         let mut dev = DeviceTranscode {
             kernel,
             engine,
+            mem: Arc::clone(mem),
             layout: host.layout,
             seed: host.params.seed,
             tq: None,
@@ -2559,6 +2565,9 @@ impl CopyStreamBackend {
 
     fn start_job(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
         let req = &t.req;
+        if req.path == TransferPath::L0ToL0 {
+            return self.start_l0_rewrite(t);
+        }
         if req.purpose == TransferPurpose::Compress {
             // A ladder rewrite runs on a device lane (P6b S-6); one the device cannot serve
             // runs on the I/O pool with the host codec.
@@ -2569,6 +2578,7 @@ impl CopyStreamBackend {
             return Ok(Job::Io(IoStage::Final));
         }
         match req.path {
+            TransferPath::L0ToL0 => self.start_l0_rewrite(t),
             TransferPath::L1ToL2 | TransferPath::L2ToL1 => {
                 self.io.start(t)?;
                 Ok(Job::Io(IoStage::Final))
@@ -2737,6 +2747,112 @@ impl CopyStreamBackend {
             Some(lane) => self.rewrite_source(t, lane).map(Some),
             None => Ok(Some(Job::Lane)),
         }
+    }
+
+    /// A ladder or recent-window rewrite of an L0 block (P6b S-5, S-7): with one shard and a
+    /// device transcode serving the destination format, the encode runs from the source pages
+    /// (already on the device) into a free lane's slot and the coded bytes are copied into
+    /// the destination page right behind it — the compute stream orders every later reader of
+    /// the new page and writer of the freed source page behind the rewrite, so the job
+    /// completes when the work is enqueued. Without a free lane the rewrite waits
+    /// ([`Job::LaneL0`]). Without a device transcode the rewrite runs on the host (the pages
+    /// are host memory on such a backend); a copy-stream backend without the v2.11 group
+    /// fails the rewrite (the hierarchy backs off and recompresses nothing).
+    fn start_l0_rewrite(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
+        let c = t.req.codec;
+        let device = self.shards.len() == 1
+            && self
+                .gpu
+                .as_ref()
+                .is_some_and(|g| !g.lanes.is_empty() && g.serves(c.to));
+        if device {
+            match self.gpu.as_mut().and_then(|g| g.free_lanes.pop()) {
+                Some(lane) => self.l0_rewrite_encode(t, lane),
+                None => Ok(Job::LaneL0),
+            }
+        } else if matches!(self.shards[0].device, CopyDevice::Sync { .. }) {
+            self.l0_rewrite_host(t)
+        } else {
+            Err(TierError::Io(
+                "no device transcode for an L0 rewrite".into(),
+            ))
+        }
+    }
+
+    /// The device leg of an L0 rewrite: the source pages are encoded into the lane's slot and
+    /// the coded bytes are copied into the destination page (compute stream, in order).
+    fn l0_rewrite_encode(&mut self, t: &TransferTicket, lane: usize) -> Result<Job, TierError> {
+        let req = &t.req;
+        let src = BlockId(req.src_slot as u32);
+        let dst = BlockId(req.dst_slot as u32);
+        let n = req.codec.to_bytes as usize;
+        let r = {
+            let gpu = self.gpu.as_ref().expect("a lane came from it");
+            let coded = gpu.lanes[lane].slot.slice(0, n);
+            let pages = self.block_pages(u64::from(src.0));
+            gpu.run_on(req.codec.to, false, coded, &pages)
+        };
+        if let Err(e) = r {
+            self.lane_give(lane);
+            return Err(e);
+        }
+        // The coded bytes into the destination page, segment by segment, device to device.
+        let r = {
+            let gpu = self.gpu.as_ref().expect("a lane came from it");
+            let coded = gpu.lanes[lane].slot.ptr();
+            let dst_pages = self.shards[0].addresses.segments(dst);
+            let mut at = 0usize;
+            let mut out = Ok(());
+            for &(ptr, len) in dst_pages.iter() {
+                out = self
+                    .gpu
+                    .as_ref()
+                    .expect("a lane came from it")
+                    .mem
+                    .copy_d2d(ptr, coded.offset(at as u64), len);
+                if out.is_err() {
+                    break;
+                }
+                at += len;
+            }
+            out.map_err(|e| TierError::Io(format!("L0 rewrite page copy: {e}")))
+        };
+        if let Err(e) = r {
+            self.lane_give(lane);
+            return Err(e);
+        }
+        self.lane_give(lane);
+        Ok(Job::Done(Ok(TierSlot(u64::from(dst.0)))))
+    }
+
+    /// The host leg of an L0 rewrite (a backend without a copy stream): the source pages are
+    /// read through the synchronous device memory (host RAM on the cpu backend), encoded with
+    /// the host codec and written into the destination page before the job returns.
+    fn l0_rewrite_host(&mut self, t: &TransferTicket) -> Result<Job, TierError> {
+        let req = &t.req.clone();
+        let src = BlockId(req.src_slot as u32);
+        let dst = BlockId(req.dst_slot as u32);
+        let CopyDevice::Sync { mem } = &self.shards[0].device else {
+            return Err(TierError::Io("no host path for an L0 rewrite".into()));
+        };
+        let src_pages = self.shards[0].addresses.segments(src);
+        let block_bytes: usize = src_pages.iter().map(|&(_, len)| len).sum();
+        let mut l0 = vec![0u8; block_bytes];
+        let mut at = 0usize;
+        for &(ptr, len) in src_pages.iter() {
+            mem.copy_d2h(&mut l0[at..at + len], ptr)
+                .map_err(|e| TierError::Io(format!("L0 rewrite read: {e}")))?;
+            at += len;
+        }
+        let encoded = self.io.transcode(req.codec).encode(&l0)?.into_owned();
+        let dst_pages = self.shards[0].addresses.segments(dst);
+        let mut at = 0usize;
+        for &(ptr, len) in dst_pages.iter() {
+            mem.copy_h2d(ptr, &encoded[at..at + len])
+                .map_err(|e| TierError::Io(format!("L0 rewrite write: {e}")))?;
+            at += len;
+        }
+        Ok(Job::Done(Ok(TierSlot(u64::from(dst.0)))))
     }
 
     fn lane_give(&mut self, lane: usize) {
@@ -3225,6 +3341,10 @@ impl CopyStreamBackend {
             Job::Lane => match self.gpu.as_mut().and_then(|g| g.free_lanes.pop()) {
                 Some(lane) => self.rewrite_source(t, lane),
                 None => Ok(Job::Lane),
+            },
+            Job::LaneL0 => match self.gpu.as_mut().and_then(|g| g.free_lanes.pop()) {
+                Some(lane) => self.l0_rewrite_encode(t, lane),
+                None => Ok(Job::LaneL0),
             },
             Job::Io(stage) => match self.io.take(t.id) {
                 None => Ok(Job::Io(stage)),

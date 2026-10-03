@@ -166,6 +166,7 @@ impl Harness {
                 q_len: p.tokens.len() as u32,
                 kv_len: p.start + p.tokens.len() as u32,
                 block_table: table,
+                block_formats: &[],
                 reduce: None,
             });
         }

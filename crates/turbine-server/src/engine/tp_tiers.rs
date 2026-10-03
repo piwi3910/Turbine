@@ -140,6 +140,8 @@ fn wire_path(p: TransferPath) -> TierPath {
         TransferPath::L2ToL1 => TierPath::L2ToL1,
         TransferPath::L0ToL2 => TierPath::L0ToL2,
         TransferPath::L2ToL0 => TierPath::L2ToL0,
+        // An L0 rewrite (S-7) never runs in a static-rank group (the ladder is refused there).
+        TransferPath::L0ToL0 => TierPath::L1ToL2,
     }
 }
 

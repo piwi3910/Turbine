@@ -137,6 +137,9 @@ pub struct LadderLimits {
     /// compresses only while its fill plus the YELLOW reclaim's demand is above it (user
     /// decision 2026-09-29, "Compress only until GREEN").
     pub low_water: f64,
+    /// The L0 page format's name (`kv.dtype`): `l0` ranks at its rung (`codec::tier_rung`),
+    /// so a TurboQuant L0's rung order skips the more precise codecs (S-2).
+    pub l0_dtype: &'static str,
 }
 
 /// The facts of one tier (and of the copy's place in it) the ladder decides on (P6b S-6). The
@@ -494,6 +497,7 @@ pub(crate) mod tests {
                 max_format: "tq2",
                 high_water: 0.95,
                 low_water: 0.85,
+                l0_dtype: "bf16",
             }),
         }
     }
@@ -539,6 +543,7 @@ pub(crate) mod tests {
                 max_format: "tq4",
                 high_water: 0.95,
                 low_water: 0.85,
+                l0_dtype: "bf16",
             });
         };
         assert_eq!(act(with(capped)), EvictAction::Drop);

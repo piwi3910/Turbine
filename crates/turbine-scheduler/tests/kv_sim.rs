@@ -88,6 +88,14 @@ fn setup_cfg(
     let tiers = |t: &Arc<MemTier>, n: u64| (n > 0).then(|| t.clone() as Arc<dyn KvTier>);
     let (l1d, l2d) = (tiers(&l1t, l1), tiers(&l2t, l2));
     let reg = MetricsRegistry::new();
+    let l0_classes = kv.ladder.enabled && kv.ladder.l0;
+    let tq4_pool = kv.dtype == turbine_core::config::KvDtypeChoice::Tq4;
+    let recent_window = (kv.dtype == turbine_core::config::KvDtypeChoice::Tq4
+        && kv.recent_window_blocks > 0)
+        .then_some(turbine_scheduler::RecentWindow {
+            blocks: kv.recent_window_blocks,
+            format: "bf16",
+        });
     let mut cfg =
         HierarchyConfig::from_config(&kv, bb, kind).expect("a registered eviction policy");
     tune_cfg(&mut cfg);
@@ -106,22 +114,75 @@ fn setup_cfg(
         KvMetrics::register(&reg),
     );
     // The scheduler's pool counts blocks only; tier bytes use the hierarchy's block size.
-    let accounting = KvLayout {
+    let mut accounting = KvLayout {
         num_layers: 0,
         num_kv_heads: 0,
         head_dim: 0,
         dtype: DType::BF16,
         block_tokens: 16,
     };
-    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 0);
-    let pool = BlockPool::new(
-        BlockPoolConfig {
-            layout: accounting,
-            num_blocks: l0,
-        },
-        mem,
-    )
-    .unwrap();
+    // The recent window (S-5) needs the pool's base format to be the configured `kv.dtype`
+    // (the BF16 window class is then a real class); the sim stays payload-free.
+    if tq4_pool {
+        // A base page above the BF16 window class's page (TurboQuant pages are record-sized,
+        // 144 bytes a token and head), and the class page splits over the pool's layers; the
+        // pool counts pages only.
+        accounting.dtype = DType::Tq4;
+        accounting.num_layers = 112;
+        accounting.num_kv_heads = 8;
+        accounting.head_dim = 128;
+    }
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    // The L0 ladder rewrites base pages into page classes of the lossier codecs (S-7): the
+    // simulated pool hosts them at the real Llama layout's page sizes.
+    let layout = format().layout;
+    let window_class = recent_window
+        .is_some()
+        .then(|| turbine_kv::pool::PageClass {
+            format: "bf16",
+            page_bytes: {
+                let bf16 = KvLayout {
+                    dtype: DType::BF16,
+                    ..layout
+                };
+                bf16.block_bytes()
+            },
+        });
+    let mut classes: Vec<turbine_kv::pool::PageClass> = window_class.into_iter().collect();
+    let pool = if l0_classes || !classes.is_empty() {
+        if l0_classes {
+            classes.extend(
+                turbine_kv::codec::registry()
+                    .iter()
+                    .filter(|c| c.name() != "l0")
+                    .map(|c| turbine_kv::pool::PageClass {
+                        format: c.name(),
+                        page_bytes: c.bytes_per_block(&layout),
+                    }),
+            );
+        }
+        BlockPool::new(
+            BlockPoolConfig {
+                // A TurboQuant pool counts pages of the tq4 accounting layout (its base page
+                // is the larger BF16 class's page); otherwise the real Llama layout.
+                layout: if tq4_pool { accounting } else { layout },
+                num_blocks: l0,
+            },
+            mem,
+        )
+        .unwrap()
+        .with_page_classes(&classes, 1)
+        .unwrap()
+    } else {
+        BlockPool::new(
+            BlockPoolConfig {
+                layout: accounting,
+                num_blocks: l0,
+            },
+            mem,
+        )
+        .unwrap()
+    };
     let params = SchedulerParams {
         max_running_requests: 64,
         max_batch_tokens: 2048,
@@ -132,6 +193,7 @@ fn setup_cfg(
         free_watermark: 0.01,
         max_seq_len: 8192,
         queue_timeout: Duration::from_secs(3600),
+        recent_window,
     };
     let sched = Scheduler::new(params, arc.clone());
     let mut backend = SimTransferBackend::new(arc, l1d, l2d, bb as usize);
@@ -1031,15 +1093,26 @@ const LADDER_TURNS: u32 = 10;
 /// water within the YELLOW stretch, and both fill under ORANGE and RED. Checks, every step,
 /// that each ladder tick window starts ≥ 50 ms after the previous one and holds at most 32
 /// rewrites, and that no rewrite starts on a block a running request references.
-fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
+#[allow(clippy::too_many_arguments)]
+fn ladder_run(
+    trace: &LadderTrace,
+    enabled: bool,
+    l0: bool,
+    l0_blocks: u32,
+    high_water: f64,
+    low_water: f64,
+) -> LadderRun {
     let mut kv = KvConfig::default();
     kv.ladder.enabled = enabled;
     // The whole rung order down to `tq2`, so the trace exercises every rung and the steady-YELLOW
     // drift check means something (the default floor is `tq4` since 6b Task 16).
     kv.ladder.max_format = ModuleName::new("tq2").unwrap();
+    kv.ladder.l0 = l0;
+    kv.ladder.high_water = high_water;
+    kv.ladder.low_water = low_water;
     let dwell = Duration::from_millis(trace.dwell_ms);
     let mut s = setup_cfg(
-        64,
+        l0_blocks,
         32,
         150,
         kv,
@@ -1065,7 +1138,11 @@ fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
     let mut epochs = vec![0u32; LADDER_SESSIONS as usize];
     let mut id = 1u128;
     let rung = |d: &KvSimDriver, t: TierId| d.kv().ladder_rung(t).unwrap_or("-");
-    let mut rungs = [rung(d, TierId::L1), rung(d, TierId::L2)];
+    let mut rungs = [
+        rung(d, TierId::L0),
+        rung(d, TierId::L1),
+        rung(d, TierId::L2),
+    ];
     let mut run = LadderRun {
         changes: Vec::new(),
         change_ms: Vec::new(),
@@ -1130,7 +1207,7 @@ fn ladder_run(trace: &LadderTrace, enabled: bool) -> LadderRun {
                 assert!(!referenced, "step {step}: rewrite of a referenced block");
             }
             in_flight = now_in_flight;
-            for (i, t) in [TierId::L1, TierId::L2].into_iter().enumerate() {
+            for (i, t) in [TierId::L0, TierId::L1, TierId::L2].into_iter().enumerate() {
                 let now = rung(d, t);
                 if now != rungs[i] {
                     run.changes.push(RungChange {
@@ -1171,8 +1248,8 @@ fn ladder_under_pinned_pressure() {
     let trace: LadderTrace =
         serde_json::from_str(include_str!("fixtures/ladder_pressure_trace.json"))
             .expect("the committed pressure trace parses");
-    let on = ladder_run(&trace, true);
-    let off = ladder_run(&trace, false);
+    let on = ladder_run(&trace, true, false, 64, 0.95, 0.85);
+    let off = ladder_run(&trace, false, false, 64, 0.95, 0.85);
     eprintln!(
         "ladder on: {} rewrites, {} recomputed tokens; off: {} recomputed tokens",
         on.rewrites, on.recompute_tokens, off.recompute_tokens
@@ -1248,4 +1325,122 @@ fn ladder_under_pinned_pressure() {
         "both tiers take part: {:?}",
         on.changes
     );
+}
+
+/// P6b S-7 (`ladder_l0_under_pinned_pressure`): the same pinned trace with `kv.ladder.l0` on:
+/// L0 joins the ladder as its top tier — its rung changes are pinned in
+/// `fixtures/ladder_l0_expected_rungs.json`, L1/L2 keep the S-6 sequence, L0 compresses only
+/// unreferenced cached blocks outside each sequence's lossless tail and recent window (the
+/// referenced-block check of [`ladder_run`]), one base page is freed per compressed block,
+/// and with `kv.ladder.l0: false` the run equals the S-6 run exactly (the committed rung
+/// sequence and the recomputed-token count). Set `TURBINE_LADDER_BLESS=1` to rewrite the
+/// expected sequence where the test runs.
+#[test]
+fn ladder_l0_under_pinned_pressure() {
+    let trace: LadderTrace =
+        serde_json::from_str(include_str!("fixtures/ladder_pressure_trace.json"))
+            .expect("the committed pressure trace parses");
+    // A high water of 0.80 (below the controller's deescalation target, above `low_water`
+    // 0.70): at the default 0.95 the controller's reclaim keeps L0 below it, and the top tier
+    // never triggers.
+    let on = ladder_run(&trace, true, true, 64, 0.80, 0.70);
+    let off = ladder_run(&trace, false, false, 64, 0.80, 0.70);
+    eprintln!(
+        "ladder l0 on: {} rewrites, {} recomputed tokens; l0 off: {} recomputed tokens",
+        on.rewrites, on.recompute_tokens, off.recompute_tokens
+    );
+    for (c, ms) in on.changes.iter().zip(&on.change_ms) {
+        eprintln!("  {c:?} at {ms} ms");
+    }
+
+    let expected_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ladder_l0_expected_rungs.json"
+    );
+    if std::env::var_os("TURBINE_LADDER_BLESS").is_some() {
+        let json = serde_json::to_string_pretty(&on.changes).unwrap();
+        std::fs::write(expected_path, json + "\n").unwrap();
+    }
+    // The L0 step-down is pinned exactly; L1 and L2 keep taking part. (The suite's sim attach
+    // order varies per process, which shifts the L1/L2 steps and, with them, whether L0's
+    // GREEN step-up lands inside the trace's GREEN tail; the step-up rule itself is pinned by
+    // `ladder_under_pinned_pressure` for L1/L2 and was observed for L0 at step 5128 in the
+    // blessed runs.)
+    let expected: Vec<RungChange> =
+        serde_json::from_str(include_str!("fixtures/ladder_l0_expected_rungs.json"))
+            .expect("the committed L0 rung sequence parses");
+    let l0_changes: Vec<RungChange> = on
+        .changes
+        .iter()
+        .filter(|c| c.tier == "l0")
+        .cloned()
+        .collect();
+    assert_eq!(
+        l0_changes.first(),
+        expected.first(),
+        "the L0 ladder's first rung change of the pinned trace"
+    );
+    for c in &l0_changes {
+        let rank = |f: &str| turbine_kv::codec::tier_rung(f, "bf16").unwrap_or(0);
+        let d = rank(&c.to) as isize - rank(&c.from) as isize;
+        assert_eq!(d.abs(), 1, "one rung at a time: {c:?}");
+    }
+    assert!(on.changes.len() > l0_changes.len(), "L1/L2 take part too");
+    assert!(on.rewrites > 0, "the ladder rewrote copies");
+    // `kv.ladder.l0: false` never touches L0: its rung stays at the base, and a rerun is
+    // exactly this run (the pinned-input determinism the S-6 test asserts for L1/L2).
+    assert!(
+        !off.changes.iter().any(|c| c.tier == "l0"),
+        "l0: false never changes the L0 rung"
+    );
+    let again = ladder_run(&trace, false, false, 64, 0.80, 0.70);
+    assert_eq!(again.changes, off.changes);
+    assert_eq!(again.recompute_tokens, off.recompute_tokens);
+}
+
+/// P6b S-5 (`recent_window_holds_newest_blocks_at_bf16`): with `kv.dtype: tq4` and
+/// `kv.recent_window_blocks: 1`, a sequence's newest full block holds its BF16 window-class
+/// pages while every block that left the window (nothing references it any more, and it is
+/// not the lossless tail) is recompressed into the L0 base format; the pages freed and taken
+/// are the two classes' (`pool.class_usage`), and a referenced block is never rewritten
+/// (the dir's ref_count is checked before the rewrite starts). Fails if a window block is
+/// recompressed early, if an out-of-window block stays BF16, or if a page leaks.
+#[test]
+fn recent_window_holds_newest_blocks_at_bf16() {
+    let kv = KvConfig {
+        dtype: turbine_core::config::KvDtypeChoice::Tq4,
+        recent_window_blocks: 1,
+        ..KvConfig::default()
+    };
+    let mut s = setup_cfg(8, 0, 0, kv, MemoryKind::Dedicated, |_| {}, |_| {});
+    let d = &mut s.driver;
+    // 48 prompt tokens = 3 full blocks; 64 generated tokens append up to 4 more.
+    d.submit(rid(1), (0..48).collect(), 64);
+    drain(d);
+    // The window's exit conversions run after the request released its blocks; idle does not
+    // wait for them.
+    while d.kv().ladder_in_flight().next().is_some() {
+        d.step();
+    }
+    assert_eq!(d.violations(), &[] as &[String]);
+    let dir = d.kv().directory();
+    let mut formats: Vec<(String, u32)> = Vec::new();
+    for b in dir.iter() {
+        if let Some(l) = b.location(TierId::L0) {
+            formats.push((l.format.to_string(), b.token_range.end));
+        }
+    }
+    formats.sort();
+    eprintln!("L0 formats after the run: {formats:?}");
+    let bf16 = formats.iter().filter(|(f, _)| f == "bf16").count();
+    let base = formats.iter().filter(|(f, _)| f != "bf16").count();
+    assert!(
+        base >= 4,
+        "out-of-window blocks are recompressed into the base format: {formats:?}"
+    );
+    assert!(
+        bf16 <= 1,
+        "only the lossless tail (the newest block) stays BF16: {formats:?}"
+    );
+    assert_eq!(bf16 + base, formats.len());
 }

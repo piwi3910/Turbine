@@ -24,6 +24,7 @@ use turbine_core::types::{
     RequestId,
 };
 
+use crate::codec;
 use crate::directory::{
     CostEstimate, KvBlock, KvDirectory, KvPriority, Lineage, PrefixMatch, SessionId, TokenRange,
     format_is_lossy,
@@ -72,6 +73,15 @@ pub struct HierarchyConfig {
     /// `kv.lossless_tail_blocks`: the last N full blocks of a finished sequence are demoted at
     /// the L0 format whatever the tier's format.
     pub lossless_tail_blocks: u32,
+    /// `kv.recent_window_blocks`: while the L0 base format is lossy, the newest N full blocks
+    /// of each live sequence hold BF16 pages (S-5); a block that leaves the window is
+    /// recompressed in place into the L0 base format. 0 turns the window off.
+    pub recent_window_blocks: u32,
+    /// The L0 page format's name (`kv.dtype`): `l0` ranks at its rung ([`codec::tier_rung`]),
+    /// so a TurboQuant L0's rung order skips the more precise codecs.
+    pub l0_dtype: &'static str,
+    /// `kv.ladder.l0`: L0 joins the ladder as its top tier (S-7).
+    pub ladder_l0: bool,
     /// `kv.lossy_reuse: allow`: requests without `x-turbine-kv-lossy` may reuse lossy blocks
     /// (P6b S-3).
     pub allow_lossy: bool,
@@ -91,12 +101,15 @@ pub struct LadderConfig {
     /// `kv.ladder.high_water`.
     pub high_water: f64,
     /// `kv.ladder.low_water`: also the fill a tier must stay below for `dwell` before its rung
-    /// steps back up (at GREEN only).
+    /// steps back up (at GREEN only); an upper tier (L0 included) compresses only above it.
     pub low_water: f64,
     /// How long a tier stays below `low_water` before its rung for new demotions steps back up
     /// one rung, which happens only at GREEN (`reliability.pressure.deescalate_dwell`; the
     /// server sets it).
     pub dwell: Duration,
+    /// The L0 page format's name (`kv.dtype`): `l0` ranks at its rung
+    /// (`codec::tier_rung`), so a TurboQuant L0's rung order skips the more precise codecs.
+    pub l0_dtype: &'static str,
 }
 
 impl LadderConfig {
@@ -109,6 +122,7 @@ impl LadderConfig {
             max_format: self.max_format,
             high_water: self.high_water,
             low_water: self.low_water,
+            l0_dtype: self.l0_dtype,
         }
     }
 }
@@ -145,6 +159,9 @@ impl HierarchyConfig {
             l1_format: codec_name(kv.cpu.format.as_str())?,
             l2_format: codec_name(kv.nvme.format.as_str())?,
             lossless_tail_blocks: kv.lossless_tail_blocks,
+            recent_window_blocks: window_blocks(kv),
+            l0_dtype: kv.dtype.as_str(),
+            ladder_l0: kv.ladder.l0,
             allow_lossy: kv.lossy_reuse == LossyReuse::Allow,
             lossy_penalty: crate::codec::registry()
                 .iter()
@@ -161,6 +178,7 @@ impl HierarchyConfig {
                     high_water: kv.ladder.high_water,
                     low_water: kv.ladder.low_water,
                     dwell: LadderConfig::DEFAULT_DWELL,
+                    l0_dtype: kv.dtype.as_str(),
                 })
             } else {
                 None
@@ -174,6 +192,26 @@ impl HierarchyConfig {
             .iter()
             .find(|(n, _)| *n == format)
             .map_or(0.0, |(_, p)| *p)
+    }
+}
+
+/// `kv.recent_window_blocks` as the hierarchy holds it: only with a lossy `kv.dtype` (S-5).
+fn window_blocks(kv: &KvConfig) -> u32 {
+    if kv.dtype.is_lossy() {
+        kv.recent_window_blocks
+    } else {
+        0
+    }
+}
+
+/// The dir format tag of a fresh L0 block: `l0` for a base-class page, else the page's class
+/// name (the recent window's BF16 class, S-5).
+fn l0_tag(pool: &BlockPool, block: BlockId) -> &'static str {
+    let f = pool.format_of(block);
+    if f == pool.base_format() {
+        crate::tier::L0_FORMAT
+    } else {
+        f
     }
 }
 
@@ -442,7 +480,7 @@ struct TierRung {
 struct Ladder {
     cfg: LadderConfig,
     /// The enabled lower tiers, fastest first.
-    tiers: SmallVec<[TierRung; 2]>,
+    tiers: SmallVec<[TierRung; 3]>,
     last_tick: Option<Duration>,
     /// Rewrites started since `last_tick`.
     window_rewrites: usize,
@@ -551,6 +589,12 @@ pub struct KvHierarchy {
     ladder: Option<Ladder>,
     /// Keys with a ladder rewrite in flight.
     compressing: HashMap<KvKey, Compressing>,
+    /// L0 blocks the pool holds (`KvHierarchy::new`'s `l0_blocks`): the L0 tier's capacity
+    /// divisor (`tier_fill(TierId::L0)`).
+    l0_blocks: u32,
+    /// The pool's `room_epoch` at the last time the ladder saw the pool: the L0 back-off's
+    /// mark, refreshed wherever the ladder reads the pool.
+    l0_room_epoch: u64,
     /// Bytes the last pressure reclaim wanted to demote into L1 and L2 (the ladder's demand).
     ladder_demand: [u64; 2],
     /// Blocks the last pressure reclaim at YELLOW or ORANGE wanted and found no unreferenced
@@ -600,22 +644,35 @@ impl KvHierarchy {
             .saturating_add(blocks_of(&l2, cfg.l2_format));
         let mut namespaces = NamespaceCache::new(model, format);
         let lossy_seed = namespaces.get("").seed();
-        let ladder = cfg.ladder.map(|lc| Ladder {
-            cfg: lc,
-            tiers: [
-                (TierId::L1, &l1, cfg.l1_format),
-                (TierId::L2, &l2, cfg.l2_format),
-            ]
-            .into_iter()
-            .filter(|(_, t, _)| t.is_some())
-            .map(|(tier, _, base)| TierRung {
-                tier,
-                base,
-                rung: base,
+        // The ladder's tiers, fastest first: L0 when `kv.ladder.l0`, then L1, then L2. L0's
+        // base rung is `l0` (the L0 bytes unchanged); its capacity is the pool's.
+        let mut tiers: SmallVec<[TierRung; 3]> = SmallVec::new();
+        if cfg.ladder_l0 {
+            tiers.push(TierRung {
+                tier: TierId::L0,
+                base: L0_FORMAT,
+                rung: L0_FORMAT,
                 below_since: None,
                 backoff: None,
-            })
-            .collect(),
+            });
+        }
+        for (tier, t, base) in [
+            (TierId::L1, &l1, cfg.l1_format),
+            (TierId::L2, &l2, cfg.l2_format),
+        ] {
+            if t.is_some() {
+                tiers.push(TierRung {
+                    tier,
+                    base,
+                    rung: base,
+                    below_since: None,
+                    backoff: None,
+                });
+            }
+        }
+        let ladder = cfg.ladder.map(|lc| Ladder {
+            cfg: lc,
+            tiers,
             last_tick: None,
             window_rewrites: 0,
         });
@@ -629,6 +686,8 @@ impl KvHierarchy {
             lossy_seed,
             ladder,
             compressing: HashMap::new(),
+            l0_blocks,
+            l0_room_epoch: 0,
             ladder_demand: [0; 2],
             queued_prefix_demand: 0,
             layout: format.layout,
@@ -808,7 +867,13 @@ impl KvHierarchy {
         let dst = if to == TierId::L0 {
             L0_FORMAT
         } else if self.tail.contains(key) {
-            crate::codec::lossier(src, L0_FORMAT)
+            // A tail block keeps the format it holds (the L0 base format, or its recent-window
+            // BF16 class): `lossier` would rank the unregistered `bf16` most precise.
+            if src == "bf16" {
+                src
+            } else {
+                crate::codec::lossier(src, L0_FORMAT)
+            }
         } else {
             let rung = crate::codec::lossier(src, self.rung(to));
             let own = crate::codec::lossier(src, self.tier_format(to));
@@ -1289,7 +1354,7 @@ impl KvHierarchy {
                         KvLocation {
                             tier: TierId::L0,
                             slot: u64::from(block.0),
-                            format: L0_FORMAT,
+                            format: l0_tag(pool, block),
                         },
                     );
                     pool.set_keyed(block);
@@ -1314,7 +1379,7 @@ impl KvHierarchy {
                 locations: SmallVec::from_slice(&[KvLocation {
                     tier: TierId::L0,
                     slot: u64::from(block.0),
-                    format: L0_FORMAT,
+                    format: l0_tag(pool, block),
                 }]),
                 access_count: 0,
                 last_access: now,
@@ -1500,6 +1565,40 @@ impl KvHierarchy {
                     self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
                 }
             }
+            TransferPurpose::Compress if from == TierId::L0 => {
+                self.compressing.remove(&req.key);
+                let dst = BlockId(req.dst_slot as u32);
+                if self
+                    .dir
+                    .get(&req.key)
+                    .and_then(|b| b.location(TierId::L0))
+                    .is_none()
+                {
+                    // The block left L0 while it was rewritten: the page is free again.
+                    pool.release(&[dst]);
+                    return;
+                }
+                // The page was allocated at refcount 1 (the rewrite's); as a cached copy it
+                // is held by the keyed flag at refcount 0.
+                pool.set_keyed(dst);
+                pool.release(&[dst]);
+                self.l0_keys.insert(dst, req.key);
+                self.dir.add_location(
+                    &req.key,
+                    KvLocation {
+                        tier: TierId::L0,
+                        slot: req.dst_slot,
+                        format: req.codec.to,
+                    },
+                );
+                let src = BlockId(req.src_slot as u32);
+                if pool.is_keyed(src) {
+                    pool.evict_cached(src);
+                } else {
+                    pool.release(&[src]);
+                }
+                self.metrics.eviction(TierId::L0, EvictReason::Compressed);
+            }
             TransferPurpose::Compress => {
                 self.compressing.remove(&req.key);
                 let tier = from;
@@ -1612,6 +1711,12 @@ impl KvHierarchy {
                     && let Some(c) = compressing
                 {
                     self.ladder_back_off(tier, c.epoch, req.codec);
+                }
+                if tier == TierId::L0 {
+                    // The destination page was allocated at submit; the source page keeps the
+                    // block's bytes (a rewrite never loses an L0 copy).
+                    pool.release(&[BlockId(req.dst_slot as u32)]);
+                    return;
                 }
                 let lost = self.tier(tier).is_some_and(|t| !t.contains(&req.key));
                 if lost
@@ -2452,6 +2557,10 @@ impl KvHierarchy {
 
     /// `tier`'s fill once the copies in flight into it land and its rewrites complete.
     fn tier_fill(&self, tier: TierId) -> f64 {
+        if tier == TierId::L0 {
+            let cap = (u64::from(self.l0_blocks) * self.cfg.block_bytes).max(1);
+            return self.l0_used_bytes() as f64 / cap as f64;
+        }
         let Some(t) = self.tier(tier) else {
             return 0.0;
         };
@@ -2465,6 +2574,48 @@ impl KvHierarchy {
         used as f64 / t.capacity_bytes().max(1) as f64
     }
 
+    /// Bytes of the L0 copies the directory holds, by format (`tier_fill(TierId::L0)`).
+    fn l0_used_bytes(&self) -> u64 {
+        self.dir
+            .iter()
+            .filter_map(|b| b.location(TierId::L0))
+            .map(|l| self.format_bytes(l.format))
+            .sum()
+    }
+
+    /// The dtype-aware ladder rank of `format` ([`codec::tier_rung`]).
+    fn rung_rank(&self, format: &str) -> usize {
+        let dtype = self
+            .ladder
+            .as_ref()
+            .map_or(self.cfg.l0_dtype, |l| l.cfg.l0_dtype);
+        codec::tier_rung(format, dtype).unwrap_or(0)
+    }
+
+    /// The newest `kv.recent_window_blocks` full blocks of every live request (the recent
+    /// window, S-5): the ladder's L0 sweep never rewrites them, and a block that leaves the
+    /// window of its request is recompressed into the L0 base format.
+    fn window_keys(&self) -> HashSet<KvKey> {
+        let n = self.cfg.recent_window_blocks as usize;
+        let mut out = HashSet::new();
+        if n == 0 {
+            return out;
+        }
+        for r in self.requests.values() {
+            for k in &r.keys[r.keys.len().saturating_sub(n)..] {
+                out.insert(*k);
+            }
+        }
+        out
+    }
+
+    /// The recent window's exits (S-5): every L0 block that still holds its BF16 window-class
+    /// pages, that sits outside every live sequence's window and the lossless tail, and that
+    /// nothing references is recompressed in place into the L0 base format through the
+    /// ladder's L0 rewrite path (purpose `Compress`, path `L0ToL0`, reason `recent_window`),
+    /// within the ladder's rewrite budget. A block a sequence still references keeps its BF16
+    /// pages until it is released (never a live block): the window costs a live sequence at
+    /// most `recent_window_blocks` extra base-format blocks.
     /// The ladder's facts for a copy in `format` of `tier` (`None` with the ladder off).
     fn ladder_context(
         &self,
@@ -2474,7 +2625,13 @@ impl KvHierarchy {
         pressure: PressureState,
     ) -> Option<LadderContext> {
         let l = self.ladder.as_ref()?;
+        let dtype = l.cfg.l0_dtype;
         let below = match tier {
+            TierId::L0 => self
+                .l1
+                .as_ref()
+                .map(|_| TierId::L1)
+                .or_else(|| self.l2.as_ref().map(|_| TierId::L2)),
             TierId::L1 if self.l2.is_some() => Some(TierId::L2),
             _ => None,
         };
@@ -2493,17 +2650,47 @@ impl KvHierarchy {
             format,
             must_leave,
             demote_to: below.map(|t| (t, self.rung(t))),
-            lower_rung: below.map(|t| self.rung(t)),
+            // A tier compresses to a rung only once every enabled tier below has reached it:
+            // for L0 that is the most precise rung among L1 and L2 (dtype-aware ranks, S-2).
+            lower_rung: if tier == TierId::L0 {
+                [
+                    self.l1.as_ref().map(|_| self.rung(TierId::L1)),
+                    self.l2.as_ref().map(|_| self.rung(TierId::L2)),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|r| codec::tier_rung(r, dtype).unwrap_or(0))
+                .min()
+                .and_then(|m| {
+                    codec::registry()
+                        .iter()
+                        .find(|c| codec::tier_rung(c.name(), dtype) == Some(m))
+                        .map(|c| c.name())
+                })
+            } else {
+                below.map(|t| self.rung(t))
+            },
             ladder: Some(l.cfg.limits()),
         })
     }
 
-    /// Room for another ladder rewrite in this tick and in flight.
+    /// Room for another rewrite in this tick and in flight (the ladder's rewrites and, with
+    /// a lossy L0 base format, the recent window's conversions — S-5, S-7).
     fn ladder_budget(&self) -> bool {
-        self.ladder.as_ref().is_some_and(|l| {
-            l.window_rewrites < LADDER_REWRITES_PER_TICK
-                && self.compressing.len() < LADDER_REWRITES_PER_TICK
-        })
+        let window_ok = self
+            .ladder
+            .as_ref()
+            .is_none_or(|l| l.window_rewrites < LADDER_REWRITES_PER_TICK);
+        window_ok && self.compressing.len() < LADDER_REWRITES_PER_TICK
+    }
+
+    /// The back-off's `room_epoch` of `tier`: the pool's snapshot for L0, the tier's for L1/L2.
+    fn room_epoch_of(&self, tier: TierId) -> u64 {
+        if tier == TierId::L0 {
+            self.l0_room_epoch
+        } else {
+            self.tier(tier).map_or(0, |x| x.room_epoch())
+        }
     }
 
     /// Whether rewrites into `tier` wait for room (a rewrite ended `Full` and the tier's
@@ -2551,7 +2738,7 @@ impl KvHierarchy {
                 l.tiers
                     .iter()
                     .filter(|t| t.backoff.is_some())
-                    .map(|t| (t.tier, self.tier(t.tier).map_or(0, |x| x.room_epoch())))
+                    .map(|t| (t.tier, self.room_epoch_of(t.tier)))
                     .collect()
             })
             .unwrap_or_default();
@@ -2611,6 +2798,7 @@ impl KvHierarchy {
     /// down to `to` when it is lossier. False when the copy or the transfer queue is not there.
     fn submit_compress(
         &mut self,
+        pool: &mut BlockPool,
         key: KvKey,
         tier: TierId,
         to: &'static str,
@@ -2619,11 +2807,43 @@ impl KvHierarchy {
         let Some(loc) = self.dir.get(&key).and_then(|b| b.location(tier)) else {
             return false;
         };
-        if self.tier(tier).is_none_or(|t| t.degraded()) {
+        if tier != TierId::L0 && self.tier(tier).is_none_or(|t| t.degraded()) {
             return false;
         }
-        let Some(path) = TransferPath::between(tier, TierId::L0) else {
-            return false;
+        // An L0 rewrite fills a page of the smaller class, allocated now so a class that
+        // cannot grow is the back-off's trigger (`no_room`, S-7); the base page is freed at
+        // completion. A lower tier's rewrite stores back into its own slot.
+        let dst = if tier == TierId::L0 {
+            match pool.allocate_in(to, 1) {
+                Ok(mut b) => b.pop(),
+                Err(e) => {
+                    tracing::debug!(
+                        event = "kv_ladder",
+                        tier = tier.as_str(),
+                        to,
+                        error = %e,
+                        "no room in the destination page class; backing off"
+                    );
+                    self.ladder_back_off(
+                        tier,
+                        self.l0_room_epoch,
+                        TransferCodec {
+                            from: loc.format,
+                            from_bytes: self.format_bytes(loc.format),
+                            to,
+                            to_bytes: self.format_bytes(to),
+                        },
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let path = if tier == TierId::L0 {
+            TransferPath::L0ToL0
+        } else {
+            TransferPath::between(tier, TierId::L0).expect("a lower tier has a path to L0")
         };
         let codec = TransferCodec {
             from: loc.format,
@@ -2638,10 +2858,15 @@ impl KvHierarchy {
             owner: None,
             purpose: TransferPurpose::Compress,
             src_slot: loc.slot,
-            dst_slot: loc.slot,
+            dst_slot: dst.map_or(loc.slot, |b| u64::from(b.0)),
             codec,
         };
         if self.transfer.submit(req).is_err() {
+            // The queue is full: the destination page goes back (a lower tier's rewrite has
+            // no page of its own).
+            if let Some(b) = dst {
+                pool.release(&[b]);
+            }
             return false;
         }
         self.compressing.insert(
@@ -2649,7 +2874,7 @@ impl KvHierarchy {
             Compressing {
                 tier,
                 saved: codec.from_bytes.saturating_sub(codec.to_bytes),
-                epoch: self.tier(tier).map_or(0, |t| t.room_epoch()),
+                epoch: self.room_epoch_of(tier),
             },
         );
         if let Some(l) = self.ladder.as_mut() {
@@ -2658,7 +2883,8 @@ impl KvHierarchy {
         self.stats.compressions += 1;
         self.metrics.ladder_action(tier, loc.format, to, reason);
         let rung = self.rung(tier);
-        if crate::codec::rung_index(to) > crate::codec::rung_index(rung) {
+        let dtype = self.ladder.as_ref().map_or("bf16", |l| l.cfg.l0_dtype);
+        if codec::tier_rung(to, dtype) > codec::tier_rung(rung, dtype) {
             let now = self.now();
             self.set_rung(tier, to, reason, now);
         }
@@ -2668,7 +2894,7 @@ impl KvHierarchy {
     /// The ladder's say on a copy `make_room` must remove from `tier` (P6b S-6, `would_drop`):
     /// `Some(false)` when it is being rewritten one rung down instead (no room yet), `Some(true)`
     /// when it was evicted at the floor (`ladder_floor`), `None` to evict it as before.
-    fn ladder_victim(&mut self, pool: &BlockPool, key: &KvKey, tier: TierId) -> Option<bool> {
+    fn ladder_victim(&mut self, pool: &mut BlockPool, key: &KvKey, tier: TierId) -> Option<bool> {
         if self.l0_state == PressureState::Green {
             return None;
         }
@@ -2685,7 +2911,7 @@ impl KvHierarchy {
                 None
             }
             EvictAction::Compress { to } => (self.ladder_budget()
-                && self.submit_compress(*key, tier, to, LadderReason::WouldDrop))
+                && self.submit_compress(pool, *key, tier, to, LadderReason::WouldDrop))
             .then_some(false),
             EvictAction::Drop => {
                 self.metrics
@@ -2716,8 +2942,10 @@ impl KvHierarchy {
         }
         l.last_tick = Some(now);
         l.window_rewrites = 0;
+        self.l0_room_epoch = pool.room_epoch();
         let (low, dwell) = (l.cfg.low_water, l.cfg.dwell);
-        let tiers: SmallVec<[TierRung; 2]> = l.tiers.clone();
+        let dtype = l.cfg.l0_dtype;
+        let tiers: SmallVec<[TierRung; 3]> = l.tiers.clone();
         self.stats.ladder_ticks += 1;
         // Hysteresis: one rung up once the controller is GREEN and the tier has been below low
         // water for the dwell (user decision 2026-09-30, option A: never while not GREEN, so a
@@ -2740,8 +2968,8 @@ impl KvHierarchy {
                 && now.saturating_sub(since) >= dwell
                 && tr.rung != tr.base
             {
-                let up = prev_rung(tr.rung)
-                    .filter(|u| crate::codec::rung_index(u) >= crate::codec::rung_index(tr.base))
+                let up = codec::prev_rung_in(tr.rung, dtype)
+                    .filter(|u| codec::tier_rung(u, dtype) >= codec::tier_rung(tr.base, dtype))
                     .unwrap_or(tr.base);
                 self.set_rung(t.tier, up, LadderReason::RungStepUp, now);
             }
@@ -2777,9 +3005,16 @@ impl KvHierarchy {
             })
             .filter_map(|b| {
                 let loc = b.location(tier)?;
+                // S-7: an L0 sweep never rewrites a block of the lossless tail or of a live
+                // sequence's recent window.
+                if tier == TierId::L0
+                    && (self.tail.contains(&b.key) || self.window_keys().contains(&b.key))
+                {
+                    return None;
+                }
                 let inputs = self.score_one(b, tier, pool, now);
                 Some((
-                    crate::codec::rung_index(loc.format).unwrap_or(0),
+                    self.rung_rank(loc.format),
                     Victim {
                         value: self.policy.score(&inputs, now),
                         last_access: b.last_access,
@@ -2811,7 +3046,7 @@ impl KvHierarchy {
                     self.stats.ladder_backoff_skips += 1;
                 }
                 EvictAction::Compress { to } => {
-                    if !self.submit_compress(v.key, tier, to, LadderReason::FillHighWater) {
+                    if !self.submit_compress(pool, v.key, tier, to, LadderReason::FillHighWater) {
                         return;
                     }
                 }
@@ -2857,9 +3092,51 @@ impl KvHierarchy {
         }
     }
 
-    /// Session TTLs, expiry and predicted-resume prefetch; call once per iteration.
+    pub fn window_maintain(&mut self, pool: &mut BlockPool) {
+        let target = self.cfg.l0_dtype;
+        if target == crate::tier::L0_FORMAT
+            || target == "bf16"
+            || self.cfg.recent_window_blocks == 0
+        {
+            return;
+        }
+        if self.ladder_backed_off(TierId::L0) {
+            return;
+        }
+        self.sync_l0_refs(pool);
+        self.l0_room_epoch = pool.room_epoch();
+        let windows = self.window_keys();
+        let mut candidates: Vec<KvKey> = self
+            .dir
+            .iter()
+            .filter(|b| {
+                b.ref_count == 0
+                    && !self.tail.contains(&b.key)
+                    && !self.demoting.contains_key(&b.key)
+                    && !self.compressing.contains_key(&b.key)
+                    && !self.transfer.is_busy_with(&b.key)
+            })
+            .filter_map(|b| {
+                b.location(TierId::L0)
+                    .filter(|l| l.format == "bf16")
+                    .filter(|_| !windows.contains(&b.key))
+                    .map(|_| b.key)
+            })
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        for k in candidates {
+            if !self.ladder_budget() {
+                break;
+            }
+            self.submit_compress(pool, k, TierId::L0, target, LadderReason::RecentWindow);
+        }
+    }
+
+    /// Session TTLs, expiry and predicted-resume prefetch    /// Session TTLs, expiry and predicted-resume prefetch; call once per iteration.
     pub fn tick(&mut self, pool: &mut BlockPool) {
         self.sync_l0_refs(pool);
+        self.window_maintain(pool);
         let now = self.now();
         for action in self.sessions.sweep(now, self.l0_state) {
             match action {
@@ -3132,15 +3409,6 @@ impl KvHierarchy {
             }),
         }
     }
-}
-
-/// The rung above `name` in the `kv_format` registry's lossiness order (`None` for the first).
-fn prev_rung(name: &str) -> Option<&'static str> {
-    let i = crate::codec::rung_index(name)?;
-    crate::codec::registry()
-        .iter()
-        .nth(i.checked_sub(1)?)
-        .map(|c| c.name())
 }
 
 /// The plan of an attach cut short after the blocks of `used` (a failed allocation or a full

@@ -62,6 +62,19 @@ pub struct SchedulerParams {
     pub free_watermark: f64,
     pub max_seq_len: u32,
     pub queue_timeout: Duration,
+    /// The recent window (P6b S-5): the newest full blocks of each live sequence are allocated
+    /// in the BF16 page class while the L0 base format is lossy; a block that leaves the
+    /// window is recompressed by the KV hierarchy. `None` with the window off.
+    pub recent_window: Option<RecentWindow>,
+}
+
+/// The recent window (P6b S-5, `kv.recent_window_blocks` with a lossy `kv.dtype`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecentWindow {
+    /// How many of a sequence's newest full blocks hold BF16 pages.
+    pub blocks: u32,
+    /// The page class the window blocks are allocated in (the BF16 class).
+    pub format: &'static str,
 }
 
 impl SchedulerParams {
@@ -77,6 +90,12 @@ impl SchedulerParams {
             free_watermark: 0.01,
             max_seq_len,
             queue_timeout: cfg.reliability.admission.queue_timeout.0,
+            recent_window: (cfg.kv.dtype.is_lossy() && cfg.kv.recent_window_blocks > 0).then_some(
+                RecentWindow {
+                    blocks: cfg.kv.recent_window_blocks,
+                    format: "bf16",
+                },
+            ),
         }
     }
 }
@@ -1548,7 +1567,13 @@ impl Scheduler {
                 .get_mut(&seq)
                 .expect("decode set holds tracked sequences");
             let need = e.table.blocks_needed(1, bt);
-            let Ok(blocks) = Self::allocate_for(pool, &mut self.requests, e.request, need) else {
+            let Ok(blocks) = Self::allocate_for(
+                pool,
+                &mut self.requests,
+                e.request,
+                need,
+                self.params.recent_window,
+            ) else {
                 // With preemption allowed the loop above made the pool cover every decode;
                 // without it (a gate below SURVIVAL) the sequence waits for a block.
                 if victim_in_flight {
@@ -1706,7 +1731,13 @@ impl Scheduler {
                 self.preempt(pool, victim, plan, preempted_now);
             }
         }
-        let Ok(blocks) = Self::allocate_for(pool, &mut self.requests, id, need) else {
+        let Ok(blocks) = Self::allocate_for(
+            pool,
+            &mut self.requests,
+            id,
+            need,
+            self.params.recent_window,
+        ) else {
             return false; // new prefills wait for blocks
         };
         let e = self.seqs.get_mut(&seq).expect("sequence tracked");
@@ -1926,17 +1957,36 @@ impl Scheduler {
 
     // ---- helpers -----------------------------------------------------------------------
 
-    /// `n` blocks for request `id`, paid from its reservation when it has one.
+    /// `n` blocks for request `id`, paid from its reservation when it has one: the trailing
+    /// `min(n, window)` from the recent window's BF16 page class, the rest from the base class
+    /// (table order: base blocks first, window blocks last).
     fn allocate_for(
         pool: &mut BlockPool,
         requests: &mut HashMap<RequestId, ReqEntry>,
         id: RequestId,
         n: u32,
+        window: Option<RecentWindow>,
     ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
-        match requests.get_mut(&id).and_then(|r| r.reservation.as_mut()) {
-            Some(res) => pool.allocate_reserved(n, res),
-            None => pool.allocate(n),
+        let Some(w) = window else {
+            return match requests.get_mut(&id).and_then(|r| r.reservation.as_mut()) {
+                Some(res) => pool.allocate_reserved(n, res),
+                None => pool.allocate(n),
+            };
+        };
+        let win = (w.blocks as usize).min(n as usize);
+        let base = n as usize - win;
+        let mut out = match requests.get_mut(&id).and_then(|r| r.reservation.as_mut()) {
+            Some(res) => pool.allocate_reserved(base as u32, res)?,
+            None => pool.allocate(base as u32)?,
+        };
+        if win > 0 {
+            let window_blocks = match requests.get_mut(&id).and_then(|r| r.reservation.as_mut()) {
+                Some(res) => pool.allocate_in_reserved(w.format, win as u32, res)?,
+                None => pool.allocate_in(w.format, win as u32)?,
+            };
+            out.extend(window_blocks);
         }
+        Ok(out)
     }
 
     fn is_running(&self, id: RequestId) -> bool {
@@ -2094,6 +2144,7 @@ mod tests {
             free_watermark: 0.01,
             max_seq_len: 4096,
             queue_timeout: Duration::from_secs(60),
+            recent_window: None,
         }
     }
 

@@ -629,6 +629,7 @@ impl WorkerRank {
                 q_len: s.tokens.len() as u32,
                 kv_len: last + 1,
                 block_table: &s.block_table,
+                block_formats: &[],
                 reduce,
             });
             tokens.extend_from_slice(&s.tokens);
@@ -1555,6 +1556,7 @@ mod tests {
             q_len: tokens.len() as u32,
             kv_len: start + tokens.len() as u32,
             block_table: table,
+            block_formats: &[],
             reduce: None,
         }];
         let logits = exec.forward(&BatchInput {
