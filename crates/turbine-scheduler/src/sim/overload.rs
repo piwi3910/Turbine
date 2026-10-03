@@ -83,6 +83,11 @@ pub struct OverloadConfig {
     /// Hold the circuit in DEGRADED while `run_load` submits (a `telemetry_stale` event on every
     /// tick, as a stale vendor library would).
     pub degraded_during_load: bool,
+    /// A device OOM injected once, the first time `run_load` reaches this point of virtual
+    /// time (S-11's own SURVIVAL trigger; the GREEN admission cap of S-9 removed the
+    /// admissions-only path, so the SURVIVAL liveness regressions enter SURVIVAL this way).
+    /// `None` injects nothing.
+    pub oom_once_at: Option<Duration>,
     /// A tensor-parallel group (P5 S-8): the `kv` ledger pool, in blocks, of every rank after
     /// rank 0 (whose ledger holds `pool_blocks`). Every admission then reserves on every rank's
     /// ledger, and the block pool holds the smallest of them, as the ranks agree at startup.
@@ -119,6 +124,7 @@ impl Default for OverloadConfig {
             max_tokens_range: (16, 1024),
             policy: "default",
             degraded_during_load: false,
+            oom_once_at: None,
             group_kv_blocks: Vec::new(),
         }
     }
@@ -256,6 +262,8 @@ pub struct OverloadSim {
     decode_steps: DecodeStepWindow,
     iterations: u64,
     load_stop: Option<Duration>,
+    /// Set once `oom_once_at` has been injected (fires exactly one device OOM attempt).
+    oom_once_fired: bool,
     // report
     max_kv: u64,
     preempted_below_survival: u32,
@@ -423,6 +431,7 @@ impl OverloadSim {
             baseline_step_s: None,
             iterations: 0,
             load_stop: None,
+            oom_once_fired: false,
             max_kv: 0,
             preempted_below_survival: 0,
             red_growth: 0,
@@ -625,6 +634,10 @@ impl OverloadSim {
                 let max_tokens = self.draw(self.cfg.max_tokens_range);
                 self.submit_now(prompt, Some(max_tokens));
                 next_arrival += self.inter_arrival(rate);
+            }
+            if !self.oom_once_fired && self.cfg.oom_once_at.is_some_and(|at| self.now() >= at) {
+                self.oom_once_fired = true;
+                self.oom_attempts += 1;
             }
             self.step_iteration();
         }

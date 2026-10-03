@@ -445,11 +445,31 @@ fn survival_requeues_unstarted_admitted() {
 /// and the RED requirement (both seed-dependent), plus the spec's recovery criterion: GREEN
 /// and HEALTHY within 60 s of the load stopping.
 fn survival_case(seed: u64, survival: SurvivalLiveness) -> (OverloadReport, usize) {
+    survival_case_inner(seed, survival, None)
+}
+
+/// `survival_case` with one device OOM injected once the overload is `oom_at` under way: S-11's
+/// own SURVIVAL trigger (the GREEN admission cap of S-9, amendment 2026-10-02, keeps the
+/// admissions-only path below SURVIVAL).
+fn survival_case_with_oom(
+    seed: u64,
+    survival: SurvivalLiveness,
+    oom_at: Duration,
+) -> (OverloadReport, usize) {
+    survival_case_inner(seed, survival, Some(oom_at))
+}
+
+fn survival_case_inner(
+    seed: u64,
+    survival: SurvivalLiveness,
+    oom_at: Option<Duration>,
+) -> (OverloadReport, usize) {
     let mut cfg = OverloadConfig {
         seed,
         rate_multiple: 10.0,
         prompt_range: (64, 6000),
         max_tokens_range: (16, 1024),
+        oom_once_at: oom_at,
         ..OverloadConfig::default()
     };
     cfg.reliability.recovery.survival_liveness = survival;
@@ -512,16 +532,21 @@ fn assert_survival_case(seed: u64, survival: SurvivalLiveness, r: &OverloadRepor
 }
 
 /// P3 SURVIVAL liveness regression (decision "Phase 3: SURVIVAL liveness fix", provisional A:
-/// `survival_liveness: requeue_unstarted`). With seed 6 the ten-times overload jumps to
-/// SURVIVAL during the ramp; before the fix it never left it: SURVIVAL runs no prefill, so the
-/// 18 admitted requests that had not started and the 3 prefills in progress held their
-/// worst-case KV reservations and kept `kv_utilization` at 0.934, above SURVIVAL's exit
-/// threshold (0.97 − 5 %), with nothing left to release them. Option A returns the unstarted
-/// requests to the admission queue without their reservations, so the pool drains and the
-/// state descends. Breaks if SURVIVAL can hold reservations that nothing releases.
+/// `survival_liveness: requeue_unstarted`). With seed 6 the ten-times overload once jumped
+/// GREEN → SURVIVAL during the ramp and stuck there: SURVIVAL runs no prefill, so the 18
+/// admitted requests that had not started and the 3 prefills in progress held their worst-case
+/// KV reservations and kept `kv_utilization` at 0.934, above SURVIVAL's exit threshold
+/// (0.97 − 5 %), with nothing left to release them. Option A returns the unstarted requests to
+/// the admission queue without their reservations, so the pool drains and the state descends.
+/// Since the GREEN admission cap (S-9, amendment 2026-10-02) bounds held + reserved at RED's
+/// 0.90 — below SURVIVAL's 0.9215 exit threshold — admissions alone no longer reach SURVIVAL
+/// at all (the seed 1–12 sweep peaks at RED and recovers in 43–50 s under either option), so
+/// the case enters SURVIVAL the way the engine does under a real fault: one device OOM at 60 s
+/// into the overload, with the pool at the cap and a full admission queue. Breaks if SURVIVAL
+/// can hold reservations that nothing releases, or recovery is slower than the criterion.
 #[test]
 fn survival_liveness_seed_6() {
-    let (r, _) = survival_case(6, SurvivalLiveness::RequeueUnstarted);
+    let (r, _) = survival_case_with_oom(6, SurvivalLiveness::RequeueUnstarted, secs(60));
     assert!(
         r.states.contains(&PressureState::Survival),
         "seed 6 reaches SURVIVAL: {:?}",
@@ -539,15 +564,25 @@ fn survival_liveness_seed_1() {
     assert_survival_case(1, SurvivalLiveness::RequeueUnstarted, &r);
 }
 
-/// The switch to option B (`survival_liveness: continue_prefills`, prefills in progress
-/// continue in SURVIVAL) is live: the same two seeds keep every overload invariant and recover
-/// within the criterion. Breaks if B cannot be switched in.
+/// The switch to option B (`survival_liveness: continue_prefills`) is live: the same two seeds
+/// keep every overload invariant and recover within the criterion, and the same OOM-triggered
+/// SURVIVAL entry as `survival_liveness_seed_6` works under B too. Breaks if B cannot be
+/// switched in.
 #[test]
 fn survival_liveness_option_b() {
     for seed in [6, 1] {
         let (r, _) = survival_case(seed, SurvivalLiveness::ContinuePrefills);
         assert_survival_case(seed, SurvivalLiveness::ContinuePrefills, &r);
     }
+    // The OOM-triggered entry of `survival_liveness_seed_6` under B as well: prefills in
+    // progress continue in SURVIVAL at RED's budget and the state still descends.
+    let (r, _) = survival_case_with_oom(6, SurvivalLiveness::ContinuePrefills, secs(60));
+    assert!(
+        r.states.contains(&PressureState::Survival),
+        "seed 6 reaches SURVIVAL under option B: {:?}",
+        r.states
+    );
+    assert_survival_case(6, SurvivalLiveness::ContinuePrefills, &r);
 }
 
 /// Measurement, not a gate: seeds 1–12 under both SURVIVAL liveness options, printed per seed
