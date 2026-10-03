@@ -64,14 +64,27 @@ Branch `p6b-copykernel` (from `p6b-stack` a4e0941). Not pushed.
   promotion median 41.6 → 24.2 ms, tok/s 331 → 343, TTFT p99 389 → 325 ms, cached ratio 0.9054 → 0.9031 (watch item).
   Results on novanas `scratch/copykernel-llama/` (`sdma/`, `kernel/`, `summ_llama.py`, `corr3.py`, frozen binaries).
 
-### Next (exact)
+### Session 3 (2026-10-03) — validation done, default `kernel` stands
 
-1. Step 2: `scripts/lab-bench.sh --golden16 --model llama -- --set kv.transfer.promotion_copy=kernel`, then `--model olmoe`
-   (run with `run_in_background`; clean tree at 4ba941c or later). Compare tok/s with the 6a-exit baseline (Llama 854.2,
-   OLMoE 602.5; bound ≥ 0.98×) and golden c1/c16 PASS.
-2. Step 3: on novanas, `scratch/copykernel-d2h/run.sh` (already written: H2D/D2H × SDMA 64/256/1024 KiB and kernel 1/2/4/16
-   workgroups, 3 runs, plus 11.3 ms-step variants) under `flock -x bench.gate flock -x bench.lock`, detached. If D2H SDMA
-   shows a slope like H2D (~0.05 ms/MiB), also check the A/B traces (`corr3.py` counts only `l1_to_l0`; add `l0_to_l1`)
-   and report the D2H copy-kernel option before implementing anything.
-3. Perf log + labbook set `phase-6b-kv-compression` (the 10 Llama A/B runs, external ids `p6b-copykernel:llama-ab:*`, not
-   submitted yet), then remove `scratch/copykernel-llama` and `scratch/copykernel-d2h`.
+Branch `p6b-copykernel` (074e52a + `p6b-stack` 2c027ef merged as 5076c04). Not pushed.
+
+- Merged `p6b-stack` (2c027ef) and gated: `gate: ok passed=936 failed=0` (`--base a4e0941`).
+- Step 2, `lab-bench --golden16` with `kv.transfer.promotion_copy=kernel` explicit: Llama golden c1/c16 PASS, tok/s 853.0
+  (6a-exit 854.2, 0.999×); OLMoE golden c1/c16 PASS, tok/s 612.7 (602.5, 1.017×, best OLMoE c16 row in the set). Labels
+  `p6b-copykernel-k16`, commit 5076c04, results under `target/lab-bench/p6b-copykernel-k16-*/`, labbook runs
+  `lab-bench:p6b-copykernel-k16-{llama,olmoe}:5076c04` in set `phase-6b-kv-compression`.
+- Step 3, demotions: `copy_eval CB_DIR=d2h` ran on GPU 0 (3 runs per cell; raw output attached to the labbook run
+  `p6b-copykernel:copy-eval:d2h-sdma-1024`). D2H SDMA stalls like H2D SDMA (slope 0.053 vs 0.053 ms/MiB; serving traces:
+  0.046–0.047 ms/MiB, 217–243 overlapped steps per A/B run, ~1 s per run, under 1 %). The copy kernel does NOT transfer to
+  D2H — 1 wg matches SDMA (0.056), 2 wg is worse (0.073), 16 wg much worse (0.124). A demotion copy kernel is not worth
+  implementing; report only.
+- Verdict per user decision A: **the `kernel` default (4ba941c) stands** — golden and demotion checks hold.
+- Recorded: perf log 6b "Promotion copy kernel" (validation + demotion sections); labbook set `phase-6b-kv-compression`:
+  10 Llama A/B runs (`p6b-copykernel:llama-ab:*`), 9 copy-eval cells (new type `turbine-copy-eval`), the 2 golden16 bench
+  runs. Cached-ratio watch item unchanged (0.9054 vs 0.9031 medians; 0.8955 low run vs sdma 0.9015).
+- Cleanup: removed the stale `runall.sh` watcher on novanas (PID 700863 — its `pgrep -f runall.sh` self-matched, wedged
+  since Oct 2), then `scratch/copykernel-llama` and `scratch/copykernel-d2h` (raw outputs preserved as labbook attachments).
+- Open items for the user/lead: the two p99 copy-bound outliers from session 1 (event timestamps on the copy stream would
+  decide them — an ABI addition, report before making one); the D2H stall itself stands (no fix proposed).
+
+Nothing else pending on this branch. `target/copykernel/` (gitignored) holds the local copies of the raw records.

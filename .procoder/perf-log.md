@@ -899,4 +899,27 @@ Llama A/B (decision "6b: promotion copy kernel — default" A, step 1), tree a43
 | later-turn TTFT p50 / p99 (ms)                | 80.0 / 389 (185–1564)            | 78.4 / 325 (170–378)             |
 
 - Llama confirms OLMoE: the slope drops 9× (0.056 → 0.006 ms/MiB), overlapped steps lose 1.4 ms instead of 9.8, promotions are 42 % faster, tok/s +3.3 % in the median and TTFT p99 lower. The cached ratio is 0.002 lower in the median (one kernel run at 0.8955); within run-to-run spread of the sdma arm's low run (0.9015), noted as a watch item.
-- Still open when paused (2026-10-02): step 2 (`lab-bench --golden16` with the switch, both models) and step 3 (demotion stall, `copy_eval` `CB_DIR=d2h`); see `.procoder/handoff/p6b-copykernel.md`.
+  Validation of the default flip (decision "6b: promotion copy kernel — default" A, steps 2–3), tree 5076c04 (server code unchanged from 4ba941c, `p6b-stack` 2c027ef merged in).
+
+Step 2, `lab-bench --golden16` with `kv.transfer.promotion_copy=kernel` explicit, novanas GPU 0, the phase2c configs:
+
+| Model | golden c1 / c16 | tok/s (6a exit)       | ITL p50 (ms) | TTFT p50 / p99 (ms) |
+| ----- | --------------- | --------------------- | ------------ | ------------------- |
+| Llama | PASS / PASS     | 853.0 (854.2, 0.999×) | 15.4         | 207 / 774           |
+| OLMoE | PASS / PASS     | 612.7 (602.5, 1.017×) | 24.5         | 119 / 391           |
+
+Both above the ≥ 0.98× bound. Llama matches the recent 6b rows (844–850); OLMoE is the best OLMoE c16 row in the set (previous best 610.1).
+
+Step 3, demotions, `copy_eval CB_DIR=d2h` (a43c4f7), novanas GPU 0, 256 MiB total, medians of 3 runs (`scratch/copykernel-d2h/run.sh` under the bench locks; raw output attached to the labbook runs):
+
+| Cell                                   | copy GB/s               | slope (ms/MiB)                | extra ms (overlapped)     |
+| -------------------------------------- | ----------------------- | ----------------------------- | ------------------------- |
+| H2D SDMA, 1 MiB segments (reference)   | 11.9                    | 0.053                         | 13.6                      |
+| H2D copy kernel, 2 workgroups (ref.)   | 21.7                    | 0.004                         | 0.9                       |
+| D2H SDMA, 1 MiB / 256 KiB / 64 KiB     | 11.8 / 10.9 / 7.2       | 0.053 / 0.049 / 0.045         | 13.7 / 12.5 / 11.5        |
+| D2H copy kernel, 1 / 2 / 4 / 16 wg     | 13.5 / 11.6 / 9.5 / 8.1 | 0.056 / 0.073 / 0.095 / 0.124 | 14.2 / 18.7 / 24.4 / 31.7 |
+| D2H SDMA vs kernel 2 wg, 11.3 ms steps | 11.7 / 12.5             | 0.035 / 0.060                 | 9.0 / 15.4                |
+
+- Demotions stall decode the same way as promotions: D2H SDMA's slope matches H2D's (0.053 ms/MiB), and smaller segments do not help (the same finding as H2D). The serving traces agree: in the Llama A/B runs, demotions overlap 217–243 decode steps per run at a slope of 0.046–0.047 ms/MiB (mean 69–81 MiB in flight, 4–5 ms per overlapped step, ~17 GiB demoted per run) — identical in both arms, since demotions run on SDMA either way and the switch only touches H2D promotions. That is ~1 s of added decode time per multi-turn run, under 1 %.
+- The copy kernel does not transfer to D2H: a device → pinned copy is as bad as SDMA at 1 workgroup and worse from 2 up (0.073 at 2, 0.124 at 16 — the H2D pattern inverted). Its host stores hit the same host-link path without the SDMA engine's efficiency. A demotion copy kernel is not worth implementing on this evidence.
+- Verdict (user decision A): both legs hold — golden c1 and c16 pass on both models, tok/s 0.999× / 1.017× of the 6a-exit baselines, demotions unchanged — so the `kernel` default (4ba941c) stays. The cached-ratio watch item is unchanged: Llama A/B medians 0.9054 (sdma) vs 0.9031 (kernel), one kernel run at 0.8955 against an sdma low run of 0.9015; the golden16 bench and OLMoE show no drop beyond that spread.
