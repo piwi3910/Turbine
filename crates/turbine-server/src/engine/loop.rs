@@ -2760,6 +2760,7 @@ mod tests {
     use turbine_core::config::{ByteSize, HumanDuration, KvConfig, ReliabilityConfig};
     use turbine_core::pressure::PressureSignal;
     use turbine_core::request::CancelFlag;
+    use turbine_core::request::SessionHints;
     use turbine_core::telemetry::{
         DeviceSample, HostSample, LedgerSample, SourceStatus, TelemetrySample,
     };
@@ -2771,7 +2772,9 @@ mod tests {
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
-    use turbine_model::testing::tiny::{TinySpec, write_tiny_llama};
+    use turbine_model::testing::tiny::{
+        TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
+    };
     use turbine_model::{
         GenerateOptions, MAX_STAGING_BYTES, ModelError, ModelMetrics, SafetensorsIndex,
         WeightLoader, generate, llama_slots,
@@ -4762,6 +4765,132 @@ mod tests {
         assert_eq!(generated(&events), cold, "Q yields the cold run's tokens");
         drop(tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    /// Reproduction hunt for the 2026-10-03 lab transient ("engine thread panicked: release of
+    /// unreferenced KV block BlockId(146)", a 1 GiB-slab ladder multi-turn run, fatal exit 3):
+    /// the release paths that run there, driven together on the cpu backend — multi-turn
+    /// sessions over one shared prefix, an admission queue whose attached prefixes release
+    /// under YELLOW and attach again (queued-prefix demotion, `reattach`), promotions and
+    /// copy-ahead into L2, the ladder's L2 rewrites, and streams dropped mid-turn (cancels).
+    /// Breaks if any of them releases a block whose reference is gone (the engine thread's pool
+    /// assertion ends the run and the join fails) or leaks one (L0 holds nothing at the end).
+    #[test]
+    fn multi_turn_release_paths_stress_without_an_unreferenced_release() {
+        // The ladder's TurboQuant rung needs head_dim 128.
+        let dir = TempDir::new("turbine-engine-loop");
+        let spec = write_tiny_llama_with(
+            dir.path(),
+            7,
+            &TinyOptions {
+                head_dim: 128,
+                ..TinyOptions::default()
+            },
+        );
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        kv.ladder.enabled = true;
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // YELLOW from 1 % KV utilisation: the reclaim always falls short, so queued prefixes
+        // release and attach again around every admission, like the lab run.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.9), Some(0.95), Some(0.99)],
+        );
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(2, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine, tx, shared, ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+
+        const SEEDS: u64 = 12;
+        const SESSIONS: u64 = 6;
+        const TURNS: u64 = 6;
+        const PREFIX: u64 = 64;
+        let mut rng = 0x9E3779B97F4A7C15;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for seed in 0..SEEDS {
+            for turn in 0..TURNS {
+                let mut batch: Vec<(u64, mpsc::Receiver<GenerationEvent>, Admitted)> = Vec::new();
+                for s in 0..SESSIONS {
+                    let mut prompt: Vec<u32> = (10..10 + PREFIX as u32).collect();
+                    let len = 14 + next(20);
+                    prompt.extend((0..len).map(|i| (80 + (i * 7 + s + turn * 5) % 150) as u32));
+                    let mut req = request(&prompt, 4 + next(4) as u32);
+                    req.session = Some(SessionHints {
+                        session_id: format!("stress-{seed}-{s}"),
+                        resume_within_secs: Some(3600),
+                        end: turn == TURNS - 1,
+                    });
+                    let (rx, admitted) = submit(&tx, req);
+                    // A dropped stream mid-run: its request is cancelled from the queue or
+                    // mid-generation, whichever holds it.
+                    if seed % 2 == 1 && turn == 3 && s == 1 {
+                        drop(rx);
+                        drop(admitted);
+                        continue;
+                    }
+                    batch.push((s, rx, admitted));
+                }
+                for _ in 0..3 {
+                    tick(&ctl, 0.5);
+                }
+                for (s, mut rx, admitted) in batch {
+                    assert_eq!(
+                        admitted.blocking_recv().unwrap(),
+                        Ok(()),
+                        "seed {seed} turn {turn} session {s}"
+                    );
+                    let events: Vec<_> = std::iter::from_fn(|| rx.blocking_recv()).collect();
+                    assert!(
+                        !internal_error(&events),
+                        "seed {seed} session {s} turn {turn}: {events:?}"
+                    );
+                }
+            }
+        }
+        drop(tx);
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(()),
+            "an engine panic is a release-path bug"
+        );
+        assert_eq!(
+            held_blocks(&shared.docs().unwrap()),
+            0,
+            "every block reference came back"
+        );
     }
 
     /// 6b Task 16 (stale planner state): an idle engine blocks for its next command, and a new
