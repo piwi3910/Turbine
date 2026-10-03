@@ -279,4 +279,19 @@ impl KvTier for ShardedL1Tier {
             .iter()
             .fold(0u64, |a, s| a.wrapping_add(s.room_epoch()))
     }
+
+    /// A block is stored only when every shard takes its part: the fewest any shard has room
+    /// for, each shard asked for its share of `bytes`.
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        if let [one] = self.shards.as_slice() {
+            return one.free_slots(format, bytes);
+        }
+        let total: u64 = self.shard_bytes.iter().map(|&b| b as u64).sum();
+        self.shards
+            .iter()
+            .zip(&self.shard_bytes)
+            .map(|(s, &b)| s.free_slots(format, (bytes * b as u64).div_ceil(total.max(1))))
+            .min()
+            .unwrap_or(0)
+    }
 }

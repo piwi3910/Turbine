@@ -3085,3 +3085,32 @@ From `p6b-t16` (merged; perf log "Compression ladder in L1/L2 on the server"). E
    - B) Ship the ladder off by default (it already is) and investigate later
 
 **Decision (user, 2026-10-02): 1 A, 2 A.** Apply the admission headroom rule at GREEN too, capped at the SURVIVAL/RED threshold (Phase 3 spec amendment); investigate the ladder-on throughput and tail regression before Task 17.
+
+## 6b: ladder-on regression — demotions into a tier whose rung changed (2026-10-02)
+
+From `p6b-ladderperf` (handoff + `p6b-ladderperf.patch`). Root cause: ~3 s after YELLOW the ladder switches L1's format
+for new demotions from `l0` to `fp8_e4m3`; L1's two slabs hold only `l0`-size slots and never empty, so every new
+demotion fails `Full` and its L0 block stays → L0 can't drain → ORANGE throttling → the −28 % tok/s and 3× p99 (on-r1:
+L1 137 blocks all `l0`, L0 553/585 at ORANGE; L0→L1 demotions 726 vs 1,567 off). L2 likewise for L1→L2.
+
+- A) Fallback: a new demotion uses the tier's new rung only while the tier has a free slot of that size, else stores at
+  the tier's own format (demotions keep flowing; L1 holds no compressed copies while its slabs stay non-empty); measure
+  whether B or C is worth adding after
+- B) A plus emptying a whole slab so it can be re-sized to the new format
+- C) Smaller L1 slabs
+
+**Decision (user, 2026-10-02): A.** Fallback to the tier's own format when no new-size slot is free, then measure whether slab re-sizing or smaller slabs are worth adding.
+
+## 6b: after the demotion fallback — L1/L2 slabs hold only l0 slots (2026-10-03)
+
+From `p6b-ladderperf` (81dfd76, 0fef559): regression fixed (ladder on 328 tok/s vs off 319, p99 16.6 vs 12.3 s,
+recomputed −13 %, 0/576 failures; `make_room` accounting now byte-accurate). Consequence: with the fallback, L1/L2
+slabs store only `l0`-size slots — L1+L2 hold 438 blocks where fp8/tq4/tq2 would hold 876/1,748/3,496. The ladder
+compresses lower tiers only once slabs can take the rung's size.
+
+- B) Slab re-sizing: empty a whole slab (evict/re-store its blocks) so it can take the new rung's size; converts now,
+  evicts/re-stores per rung change
+- C) Smaller L1 slabs (lower risk; formats mix more freely); the soak already saw 41 stored tq4 copies
+- D) Stop here: the ladder keeps demotions flowing at each tier's own format; compressed rungs stay opt-in until B/C
+
+**Decision (user, 2026-10-03): C.** Smaller L1 slabs (lower risk); slab re-sizing (B) only if compression must land sooner.

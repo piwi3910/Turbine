@@ -473,4 +473,33 @@ impl KvTier for L1PinnedTier {
     fn room_epoch(&self) -> u64 {
         self.lock().room_epoch
     }
+
+    /// Slots are sized, not labelled: `format` plays no part. Counts what
+    /// [`take_slot`](Self::take_slot) would find: a free slot of the size, a new slab below the
+    /// size limit (not under host RED), or at the limit an empty slab of another size.
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        let _ = format;
+        let len = bytes as usize;
+        if !self.enabled || len == 0 || bytes > self.cfg.block_bytes {
+            return 0;
+        }
+        let s = self.lock();
+        if s.health.is_degraded() {
+            return 0;
+        }
+        let per_slab = (self.cfg.slab_bytes / bytes) as usize;
+        let live = s.slabs.iter().flatten().count();
+        let mut n = 0;
+        for slab in s.slabs.iter().flatten() {
+            if slab.slot_bytes == len {
+                n += slab.slots.iter().filter(|x| **x == SlotState::Free).count();
+            } else if slab.occupied == 0 && live >= self.max_slabs {
+                n += per_slab;
+            }
+        }
+        if live < self.max_slabs && s.host_pressure < PressureState::Red {
+            n += (self.max_slabs - live) * per_slab;
+        }
+        n as u64
+    }
 }

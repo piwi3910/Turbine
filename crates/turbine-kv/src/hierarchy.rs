@@ -772,6 +772,24 @@ impl KvHierarchy {
         format_bytes(format, self.cfg.block_bytes, &self.layout, self.shards)
     }
 
+    /// Whether `tier` can store one more copy in `format` (its ladder rung) beyond the copies of
+    /// that size already in flight into it (P6b S-6). After a rung change the tier's slabs all
+    /// hold the old slot size until one empties: a copy at the new rung would end `Full` there
+    /// while the tier has free slots of its own format, and the L0 block it should free stays
+    /// (the Task 16 multi-turn regression: L0 → L1 demotions halved, ORANGE five times as long).
+    fn rung_has_slot(&self, tier: TierId, format: &'static str) -> bool {
+        let Some(t) = self.tier(tier) else {
+            return false;
+        };
+        let bytes = self.format_bytes(format);
+        let inflight = self
+            .demoting
+            .values()
+            .filter(|d| d.to == tier && d.bytes == bytes)
+            .count() as u64;
+        t.free_slots(format, bytes) > inflight
+    }
+
     /// The codec new demotions into `tier` take: the ladder's rung, else the tier's format.
     fn rung(&self, tier: TierId) -> &'static str {
         self.ladder
@@ -782,8 +800,9 @@ impl KvHierarchy {
 
     /// The formats of a copy of `key` from its copy in `from` to `to` (P6b S-1, S-2, S-6): into
     /// L0 the L0 format (a promotion decodes); into a lower tier that tier's ladder rung (its
-    /// configured format without the ladder), or the L0 format for a lossless-tail block, but
-    /// never more precise than the source copy.
+    /// configured format without the ladder) while the tier has a slot of the rung's size free
+    /// ([`KvHierarchy::rung_has_slot`]), else the tier's own format; the L0 format for a
+    /// lossless-tail block; never more precise than the source copy.
     fn copy_codec(&self, key: &KvKey, from: TierId, to: TierId) -> Option<TransferCodec> {
         let src = self.dir.get(key)?.location(from)?.format;
         let dst = if to == TierId::L0 {
@@ -791,7 +810,13 @@ impl KvHierarchy {
         } else if self.tail.contains(key) {
             crate::codec::lossier(src, L0_FORMAT)
         } else {
-            crate::codec::lossier(src, self.rung(to))
+            let rung = crate::codec::lossier(src, self.rung(to));
+            let own = crate::codec::lossier(src, self.tier_format(to));
+            if rung != own && !self.rung_has_slot(to, rung) {
+                own
+            } else {
+                rung
+            }
         };
         Some(TransferCodec {
             from: src,
@@ -828,11 +853,12 @@ impl KvHierarchy {
 
     /// Blocks of `tier`'s format a demotion of `key` from `from` into `tier` takes (more than
     /// one for a lossless-tail block stored at the larger L0 format).
-    fn demotion_units(&self, key: &KvKey, from: TierId, tier: TierId) -> usize {
-        let unit = self.format_bytes(self.rung(tier)).max(1);
+    /// The bytes a demotion of `key` from `from` into `tier` stores: the codec's destination
+    /// size ([`KvHierarchy::copy_codec`], the tier's format when the rung has no slot), the
+    /// currency [`KvHierarchy::make_room`] counts in.
+    fn demotion_bytes(&self, key: &KvKey, from: TierId, tier: TierId) -> u64 {
         self.copy_codec(key, from, tier)
-            .map_or(1, |c| c.to_bytes.div_ceil(unit) as usize)
-            .max(1)
+            .map_or(1, |c| c.to_bytes.max(1))
     }
 
     /// Admission-time prefix match (S-3, S-9): the planner's cutoff, L0 blocks attached by
@@ -1454,6 +1480,7 @@ impl KvHierarchy {
                 }
                 // Stored at the tier's ladder rung, lossier than its own format would make it.
                 let unladdered = crate::codec::lossier(req.codec.from, self.tier_format(to));
+                let rung = crate::codec::lossier(req.codec.from, self.rung(to));
                 if self.ladder.is_some() && req.codec.to != unladdered {
                     self.metrics.ladder_action(
                         to,
@@ -1461,6 +1488,13 @@ impl KvHierarchy {
                         req.codec.to,
                         LadderReason::NewDemotion,
                     );
+                } else if self.ladder.is_some()
+                    && rung != unladdered
+                    && !self.tail.contains(&req.key)
+                {
+                    // Stored at the tier's own format: no slot of the rung's size was free.
+                    self.metrics
+                        .ladder_action(to, rung, req.codec.to, LadderReason::RungNoSlot);
                 }
                 if !keep {
                     self.remove_copy(pool, &req.key, from, EvictReason::Pressure);
@@ -2007,10 +2041,10 @@ impl KvHierarchy {
                 departing.insert(key);
                 bytes += bb;
             } else if budget > 0
-                && room >= self.demotion_units(&key, TierId::L0, to)
+                && room >= self.demotion_bytes(&key, TierId::L0, to)
                 && self.submit_demotion(pool, key, TierId::L0, to)
             {
-                room -= self.demotion_units(&key, TierId::L0, to);
+                room -= self.demotion_bytes(&key, TierId::L0, to);
                 budget -= 1;
                 departing.insert(key);
                 bytes += bb;
@@ -2089,7 +2123,7 @@ impl KvHierarchy {
                 bytes += bb;
                 continue;
             }
-            let units = self.demotion_units(&key, TierId::L0, to);
+            let units = self.demotion_bytes(&key, TierId::L0, to);
             if room == 0 {
                 break;
             }
@@ -2149,7 +2183,7 @@ impl KvHierarchy {
                 self.stats.demotions += 1;
                 self.remove_copy(pool, &k, TierId::L0, reason);
             } else {
-                let units = self.demotion_units(&k, TierId::L0, to);
+                let units = self.demotion_bytes(&k, TierId::L0, to);
                 if room >= units && self.submit_demotion(pool, k, TierId::L0, to) {
                     room -= units;
                 }
@@ -2328,20 +2362,24 @@ impl KvHierarchy {
     }
 
     /// Makes room for up to `n` more blocks of `tier`'s format in `tier` and returns how many
-    /// fit now (a lossless-tail block takes [`KvHierarchy::demotion_units`] of them). L1
+    /// fit now (a lossless-tail block takes [`KvHierarchy::demotion_bytes`] of them). L1
     /// victims without an L2 copy move to L2 while storage accepts them (room appears when that
     /// copy completes); other victims are evicted now.
-    fn make_room(&mut self, pool: &mut BlockPool, tier: TierId, n: usize) -> usize {
+    /// Room in bytes for more demotions into `tier`: the free bytes, plus what spilling or
+    /// evicting up to `n` victims frees (a victim is only touched while the tier is short of
+    /// `n` demotions at the rung's size). Counts the bytes copies actually take
+    /// ([`KvHierarchy::copy_codec`], the tier's format when the rung has no slot), so the
+    /// callers' `demotion_bytes` accounting stays exact.
+    fn make_room(&mut self, pool: &mut BlockPool, tier: TierId, n: usize) -> u64 {
         let Some(t) = self.tier(tier).cloned() else {
             return 0;
         };
         let unit = self.format_bytes(self.rung(tier)).max(1);
-        let free = (t
+        let room = t
             .capacity_bytes()
-            .saturating_sub(t.used_bytes() + self.inflight_into(tier))
-            / unit) as usize;
-        if free >= n {
-            return n;
+            .saturating_sub(t.used_bytes() + self.inflight_into(tier));
+        if room >= n as u64 * unit {
+            return room;
         }
         // Copies already leaving `tier` (spills in flight) free their room when they complete:
         // count it, or every call before they land would spill further victims.
@@ -2354,26 +2392,38 @@ impl KvHierarchy {
             .sum();
         let pending = (leaving / unit) as usize;
         let spill = tier == TierId::L1 && self.storage_accepts_demotions();
-        let mut room = free;
-        for (victim, _) in self.victims(pool, tier, n.saturating_sub(free + pending)) {
+        let mut room = room;
+        for (victim, _) in self.victims(
+            pool,
+            tier,
+            n.saturating_sub((room / unit) as usize + pending),
+        ) {
             let has_l2 = self
                 .dir
                 .get(&victim)
                 .is_some_and(|b| b.location(TierId::L2).is_some());
-            let units = self.demotion_units(&victim, TierId::L1, TierId::L2);
+            let cost = self.demotion_bytes(&victim, TierId::L1, TierId::L2);
+            let want = cost.div_ceil(self.format_bytes(self.rung(TierId::L2)).max(1)) as usize;
             if spill
                 && !has_l2
-                && self.make_room(pool, TierId::L2, units) >= units
+                && self.make_room(pool, TierId::L2, want) >= cost
                 && self.submit_demotion(pool, victim, TierId::L1, TierId::L2)
             {
                 continue;
             }
+            // A removed copy frees its stored bytes: the victim's real size, not a rung-unit
+            // count. Read before the removal.
+            let freed = self
+                .dir
+                .get(&victim)
+                .and_then(|b| b.location(tier))
+                .map_or(1, |l| self.format_bytes(l.format).max(1));
             match self.ladder_victim(pool, &victim, tier) {
                 Some(false) => continue,
                 Some(true) => self.remove_copy(pool, &victim, tier, EvictReason::LadderFloor),
                 None => self.remove_copy(pool, &victim, tier, EvictReason::Capacity),
             }
-            room += 1;
+            room += freed;
         }
         room
     }
@@ -2826,11 +2876,12 @@ impl KvHierarchy {
                                 && b.location(TierId::L2).is_none()
                                 && b.location(TierId::L0).is_none()
                         });
-                        let units = self.demotion_units(&k, TierId::L1, TierId::L2);
+                        let cost = self.demotion_bytes(&k, TierId::L1, TierId::L2);
+                        let want = cost.div_ceil(self.format_bytes(self.rung(TierId::L2)).max(1));
                         if movable
                             && !self.demoting.contains_key(&k)
                             && !self.transfer.is_busy_with(&k)
-                            && self.make_room(pool, TierId::L2, units) >= units
+                            && self.make_room(pool, TierId::L2, want as usize) >= cost
                         {
                             self.submit_demotion(pool, k, TierId::L1, TierId::L2);
                         }
@@ -3165,11 +3216,23 @@ pub(crate) mod tests {
         clock: FakeClock,
         edit: impl FnOnce(&mut KvConfig),
     ) -> Rig {
+        let l1 = l1.map(|t| t as Arc<dyn KvTier>);
+        let l2 = l2.map(|t| t as Arc<dyn KvTier>);
+        rig_tiers(policy, l0_blocks, l1, l2, clock, edit)
+    }
+
+    /// `rig_kv` over any L1/L2 tiers (the slab tiers, for slot-size behaviour).
+    pub(crate) fn rig_tiers(
+        policy: &str,
+        l0_blocks: u32,
+        l1: Option<Arc<dyn KvTier>>,
+        l2: Option<Arc<dyn KvTier>>,
+        clock: FakeClock,
+        edit: impl FnOnce(&mut KvConfig),
+    ) -> Rig {
         let arc: Arc<dyn Clock> = Arc::new(clock.clone());
         let fmt = fmt16();
         let bb = fmt.layout.block_bytes();
-        let l1 = l1.map(|t| t as Arc<dyn KvTier>);
-        let l2 = l2.map(|t| t as Arc<dyn KvTier>);
         // The rig pages at 16 tokens (fmt16), not the 128-token default.
         let mut kv = KvConfig {
             block_tokens: fmt.layout.block_tokens,
@@ -3405,6 +3468,183 @@ pub(crate) mod tests {
             first + 4,
             "and back off again on the next Full"
         );
+    }
+
+    /// The Task 16 multi-turn regression (perf log "Compression ladder in L1/L2 on the server",
+    /// ladder on: L0 → L1 demotions halved, ORANGE five times as long): once L1's rung stepped
+    /// to `fp8_e4m3`, every new demotion into it needed an `fp8_e4m3` slot, but both slabs held
+    /// `l0` slots and never emptied, so each copy ended `Full` and its L0 block stayed although
+    /// the tier had free `l0` slots. A new demotion takes the tier's rung only while the tier
+    /// has a slot of that size; else it is stored at the tier's own format (never lossier than
+    /// the rung). Breaks if a demotion into a tier with free slots fails for want of a slot size.
+    #[test]
+    fn a_demotion_without_a_slot_of_the_rung_stores_at_the_tier_format() {
+        use crate::tier::{L1Config, L1PinnedTier, TierBlockRef};
+        use turbine_tensor::host::HostPinned;
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                max_bytes: 8 * bb,
+                slab_bytes: 4 * bb,
+                block_bytes: bb,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            arc,
+        ));
+        // Both slabs hold `l0` slots and neither is empty: five other copies, three slots free.
+        for i in 0..5u8 {
+            l1.put(
+                KvKey([200 + i; 16]),
+                TierBlockRef::Host(&vec![0u8; bb as usize]),
+            )
+            .unwrap();
+        }
+        let tier: Arc<dyn KvTier> = l1.clone();
+        let mut r = rig_tiers("cost_aware", 8, Some(tier), None, clock, |kv| {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+        });
+        let now = r.clock.now_mono();
+        r.h.set_rung(TierId::L1, "fp8_e4m3", LadderReason::FillHighWater, now);
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        run(&mut r, &prompt);
+        let cached = r.pool.used_blocks();
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert_eq!(r.h.stats().transfer_errors, 0, "no demotion ends Full");
+        assert_eq!(
+            l1.used_bytes(),
+            8 * bb,
+            "the three free l0 slots took demotions"
+        );
+        assert_eq!(r.h.stats().demotions, 3);
+        assert!(r.pool.used_blocks() < cached, "L0 drained");
+    }
+
+    /// [`KvTier::free_slots`] on the L1 slab tier counts what [`take_slot`](L1PinnedTier::take_slot)
+    /// would find: free slots of the asked size, an empty slab of another size at the slab limit
+    /// (it reformats), and the slabs it may still allocate (none under host RED). Breaks if the
+    /// count under- or over-shoots and a rung copy is refused or lands `Full`.
+    #[test]
+    fn l1_free_slots_counts_what_take_slot_finds() {
+        use crate::tier::{L1Config, L1PinnedTier, TierBlockRef};
+        use turbine_tensor::host::HostPinned;
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let fp8 = crate::codec::registry()
+            .get("fp8_e4m3")
+            .expect("fp8 registered")
+            .bytes_per_block(&fmt16().layout);
+        let l1 = Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                max_bytes: 2 * 4 * bb,
+                slab_bytes: 4 * bb,
+                block_bytes: bb,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            arc.clone(),
+        ));
+        // Fresh: both slabs may still be allocated at the asked size.
+        assert_eq!(l1.free_slots("l0", bb), 8);
+        assert_eq!(l1.free_slots("fp8_e4m3", fp8), 2 * (4 * bb / fp8));
+        // Five `l0` copies fill the first slab and spill one into the second: both non-empty,
+        // so an `fp8` copy has no slot anywhere.
+        for i in 0..5u8 {
+            l1.put(
+                KvKey([7 + i; 16]),
+                TierBlockRef::Host(&vec![0u8; bb as usize]),
+            )
+            .unwrap();
+        }
+        assert_eq!(l1.free_slots("l0", bb), 3);
+        assert_eq!(l1.free_slots("fp8_e4m3", fp8), 0);
+        // At the slab limit an empty other-size slab is counted at the asked size.
+        for i in 0..5u8 {
+            l1.evict(&KvKey([7 + i; 16])).unwrap();
+        }
+        assert_eq!(l1.free_slots("fp8_e4m3", fp8), 2 * (4 * bb / fp8));
+        // A size above the slot limit fits nowhere; under host RED the emptied slabs are
+        // released and no new slab is counted.
+        assert_eq!(l1.free_slots("l0", bb + 1), 0);
+        l1.set_host_pressure(PressureState::Red);
+        assert_eq!(l1.free_slots("fp8_e4m3", fp8), 0);
+    }
+
+    /// The rung is taken only while it has a free slot beyond the copies in flight into the tier
+    /// at its size: with two `fp8` slots free and three demotions queued, the third stores at the
+    /// tier's format instead of landing `Full` on a slot the first two will take. Breaks if the
+    /// in-flight copies are not subtracted.
+    #[test]
+    fn a_rung_slot_counts_the_copies_in_flight() {
+        use crate::tier::{L1Config, L1PinnedTier, TierBlockRef};
+        use turbine_tensor::host::HostPinned;
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let fp8 = crate::codec::registry()
+            .get("fp8_e4m3")
+            .expect("fp8 registered")
+            .bytes_per_block(&fmt16().layout);
+        let l1 = Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                max_bytes: 2 * 4 * bb,
+                slab_bytes: 4 * bb,
+                block_bytes: bb,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            arc,
+        ));
+        // Slab A holds `fp8` slots with two free; slab B holds `l0` slots with two free.
+        for i in 0..5u8 {
+            l1.put_as(
+                KvKey([30 + i; 16]),
+                "fp8_e4m3",
+                fp8,
+                TierBlockRef::Host(&vec![0u8; fp8 as usize]),
+            )
+            .unwrap();
+        }
+        for i in 0..2u8 {
+            l1.put(
+                KvKey([40 + i; 16]),
+                TierBlockRef::Host(&vec![0u8; bb as usize]),
+            )
+            .unwrap();
+        }
+        let tier: Arc<dyn KvTier> = l1.clone();
+        let mut r = rig_tiers("cost_aware", 8, Some(tier), None, clock, |kv| {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+        });
+        let now = r.clock.now_mono();
+        r.h.set_rung(TierId::L1, "fp8_e4m3", LadderReason::FillHighWater, now);
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        for _ in 0..4 {
+            r.clock.advance(Duration::from_millis(10));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert_eq!(
+            r.h.stats().transfer_errors,
+            0,
+            "the third rung copy fell back"
+        );
+        assert_eq!(r.h.stats().demotions, 4);
+        assert_eq!(l1.free_slots("l0", bb), 0, "the fallback took the l0 slot");
     }
 
     /// The reclaim handle answers from the published snapshot and the engine thread applies it.
@@ -3795,7 +4035,8 @@ pub(crate) mod tests {
         let hasher = Blake3Hasher(r.h.namespaces.get(""));
         for k in prefix_keys(&hasher, &prompt, 16) {
             let exact = r.h.directory().get(&k).expect("the exact entry");
-            // (The sequence's tail stays lossless, and block 0 never left L0: exact copies.)
+            // (The sequence's tail stays lossless, and now every demoted non-tail block sits at
+            // fp8; the exact entries keep their L0 locations only where no L0 copy exists.)
             let has_fp8 = exact.locations.iter().any(|l| l.format == "fp8_e4m3");
             assert!(
                 !has_fp8 || exact.location(TierId::L0).is_none(),
@@ -3811,8 +4052,8 @@ pub(crate) mod tests {
         };
         assert_eq!(a.cached_tokens, 64, "all four blocks reused");
         assert_eq!(
-            a.lossy_tokens, 32,
-            "the two promoted lossy blocks are served lossy"
+            a.lossy_tokens, 48,
+            "the three promoted lossy blocks are served lossy"
         );
         assert!(a.plan.promote.is_empty(), "no copy: {:?}", a.plan);
         assert_eq!(a.plan.reason, PlanReason::AllL0);
@@ -3857,13 +4098,21 @@ pub(crate) mod tests {
         let doc = r.h.document(&r.pool, (0, 0));
         let tier = |name: &str| doc.tiers.iter().find(|t| t.tier == name).expect("tier");
         let l2 = &tier("l2").formats;
-        assert_eq!(l2["fp8_e4m3"].blocks, 2, "{l2:?}");
-        assert_eq!(l2["fp8_e4m3"].bytes, 2 * fp8);
+        // The three non-tail full blocks demote at the rung (fp8); before `make_room` counted
+        // bytes, the root stayed in L0 because the rung-unit room ran out one victim early.
+        assert_eq!(l2["fp8_e4m3"].blocks, 3, "{l2:?}");
+        assert_eq!(l2["fp8_e4m3"].bytes, 3 * fp8);
         // The lossless tail is demoted at the L0 format.
         assert_eq!(l2[L0_FORMAT].blocks, 1, "{l2:?}");
         assert_eq!(l2[L0_FORMAT].bytes, bb);
         let l0 = &tier("l0").formats;
-        assert_eq!(l0[L0_FORMAT].blocks, 1, "{l0:?}");
+        assert!(
+            tier("l0")
+                .formats
+                .get(L0_FORMAT)
+                .is_none_or(|u| u.blocks == 0),
+            "{l0:?}"
+        );
         assert!(tier("l1").formats.is_empty());
     }
 

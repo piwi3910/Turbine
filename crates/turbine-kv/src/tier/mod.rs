@@ -131,6 +131,13 @@ pub trait KvTier: Send + Sync {
     /// after one ended `Full` until it changes (P6b S-6; user decision "6b Task 16: ladder proof
     /// results — four open points", 3 A).
     fn room_epoch(&self) -> u64;
+    /// How many copies of `bytes` bytes in codec `format` the tier can store now without
+    /// evicting: its free slots of that size and format, plus the slots an empty slab it may
+    /// reformat or a slab it may still allocate would give. `u64::MAX` for a tier without slot
+    /// sizes (its byte capacity is the caller's to check). A new demotion takes a tier's ladder
+    /// rung only while this is above the copies in flight into it (P6b S-6: a slab tier whose
+    /// slabs all hold another slot size refuses every copy of the rung's size).
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64;
 }
 
 /// Pressure of a tier from its utilisation, on the Phase 3 `kv_utilization` thresholds
