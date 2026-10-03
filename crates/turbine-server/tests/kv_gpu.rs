@@ -1019,6 +1019,7 @@ fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
         "L1 holds {used} bytes for {} demoted blocks of {block_bytes} bytes",
         to_l1(&server)
     );
+    dump_kv(&server);
     assert!(
         used < 0.75 * to_l1(&server) * block_bytes as f64,
         "L1 holds {used} bytes: not encoded"
