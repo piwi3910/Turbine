@@ -3066,3 +3066,22 @@ Behind `kv.transfer.promotion_copy: sdma|kernel` (default `sdma`); ABI: additive
 - C) Make `kernel` the default now
 
 **Decision (user, 2026-10-02): A.** Validate (Llama A/B, `lab-bench --golden16` with the switch on, demotions checked for the same stall), then make `kernel` the default.
+
+## 6b Task 16: GREEN→SURVIVAL admission burst; ladder-on throughput regression (2026-10-02)
+
+From `p6b-t16` (merged; perf log "Compression ladder in L1/L2 on the server"). Eval gate PASS at the bound (median drop
+0.010, lowest McNemar p 0.302, lossy ratio 0.927); soak PASS with 169 ladder actions; stale pressure state fixed.
+
+1. At ≥ 12 concurrent fillers GREEN → SURVIVAL on `kv_utilization` (0.9946 vs 0.97): 350 MiB used + 3,724 MiB reserved of
+   4,096 MiB, 14 requests admitted within one sample. Ledger correct; the Phase 3 admission headroom rule doesn't apply
+   at GREEN, so admissions alone reserve past SURVIVAL.
+   - A) Apply the headroom rule at GREEN too, capped at the SURVIVAL (or RED) threshold (Phase 3 spec amendment)
+   - B) Use YELLOW's threshold at GREEN (stricter, costs GREEN concurrency)
+   - C) Leave it (clients retry)
+2. Multi-turn A/B, ladder on vs off (medians of 3): recomputed tokens −37 %, cached ratio 0.864 vs 0.790, but tok/s 243 vs
+   336 (−28 %) and later-turn TTFT p99 40.5 vs 14.2 s; the ladder arm demotes L0→L1 less than half as often and stays at
+   ORANGE far longer (118 vs 23 half-second samples); one run lost 5 requests to `queue_timeout`.
+   - A) Investigate now before Task 17 (why the ladder keeps the server at ORANGE and slows it)
+   - B) Ship the ladder off by default (it already is) and investigate later
+
+**Decision (user, 2026-10-02): 1 A, 2 A.** Apply the admission headroom rule at GREEN too, capped at the SURVIVAL/RED threshold (Phase 3 spec amendment); investigate the ladder-on throughput and tail regression before Task 17.

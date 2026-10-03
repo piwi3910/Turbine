@@ -1052,8 +1052,10 @@ impl EngineLoop {
         }
     }
 
-    /// `KvHierarchy::attach_prefix` for `request` (P4 S-3).
+    /// `KvHierarchy::attach_prefix` for `request` (P4 S-3), planned with the controller's
+    /// current pressure state ([`EngineLoop::sync_l0_state`]).
     fn attach(&mut self, id: RequestId, request: &GenerationRequest) -> AttachOutcome {
+        self.sync_l0_state();
         self.kv.attach(
             &mut self.pool,
             &AttachRequest {
@@ -1065,6 +1067,15 @@ impl EngineLoop {
                 allow_lossy: request.kv_policy.map(|p| p.allow_lossy),
             },
         )
+    }
+
+    /// The planner sees the controller's state now: a submission reaches
+    /// [`EngineLoop::attach`] before the turn reads its snapshot, and on an engine that was
+    /// quiet the last snapshot is from its last busy turn (6b Task 16: an item arriving after
+    /// the controller went RED → GREEN while idle planned `l0_pressure` and recomputed).
+    fn sync_l0_state(&mut self) {
+        let state = self.rel.handle.snapshot().state;
+        self.kv.set_l0_state(state);
     }
 
     /// Scheduler submission checks (with the attached prefix, whose blocks the admission
@@ -1224,6 +1235,7 @@ impl EngineLoop {
     /// they start: resident blocks now, promotions when they land, or a recompute; one waiting on
     /// another request's block tries again next turn. Their KV reservation stays whole.
     fn reattach_released(&mut self) {
+        self.sync_l0_state();
         for id in self.sched.awaiting_reattach() {
             if self.reattaching.contains(&id) {
                 continue;
@@ -2727,7 +2739,7 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::oneshot;
     use turbine_core::clock::{FakeClock, SystemClock};
-    use turbine_core::config::{ByteSize, KvConfig, ReliabilityConfig};
+    use turbine_core::config::{ByteSize, HumanDuration, KvConfig, ReliabilityConfig};
     use turbine_core::pressure::PressureSignal;
     use turbine_core::request::CancelFlag;
     use turbine_core::telemetry::{
@@ -4731,6 +4743,109 @@ mod tests {
         assert_eq!(generated(&events), cold, "Q yields the cold run's tokens");
         drop(tx);
         assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    /// 6b Task 16 (stale planner state): an idle engine blocks for its next command, and a new
+    /// request attaches its prefix before the turn reads the controller's snapshot. The planner
+    /// must still see the controller's current state, not the one of the last busy turn. A
+    /// prompt's two blocks go to L2 (only there), a turn runs at RED (a `max_tokens: 0`
+    /// request), the engine goes quiet, the controller descends to GREEN, then the prompt comes
+    /// again: it retrieves both blocks from L2 (`cached_tokens` 32) and no plan is
+    /// `l0_pressure`. Breaks if the attach plans with the last busy turn's RED (the lab ladder
+    /// eval: the first item after GREEN recomputed its prefix with `l0_pressure`).
+    #[test]
+    fn an_idle_engine_plans_with_the_current_pressure_state() {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.5), Some(0.6), Some(0.7), Some(0.99)],
+        );
+        // One level down per all-clear tick.
+        config.pressure.deescalate_dwell = HumanDuration(Duration::ZERO);
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let l0_pressure = r#"turbine_kv_plans_total{reason="l0_pressure"}"#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let (cold, _) = run_one(&tx, request(&prompt, 8));
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        // Both blocks leave L0 for L2.
+        reclaim.demote(0.0);
+        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, demoted) < 2.0 {
+            assert!(Instant::now() < deadline, "the blocks never reached L2");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // RED, and one engine turn at RED; then the engine is quiet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.state() != PressureState::Red {
+            assert!(
+                Instant::now() < deadline,
+                "never RED: {:?}",
+                controller.state()
+            );
+            tick(&ctl, 0.8);
+        }
+        let (zero, _) = run_one(&tx, request(&[256, 1, 2], 0));
+        assert!(zero.is_empty());
+        std::thread::sleep(Duration::from_millis(200));
+        // The controller descends to GREEN while nothing runs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.state() != PressureState::Green {
+            assert!(
+                Instant::now() < deadline,
+                "never GREEN: {:?}",
+                controller.state()
+            );
+            tick(&ctl, 0.0);
+        }
+
+        let (warm, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(metric(&reg, l0_pressure), 0.0, "planned with a stale RED");
+        assert_eq!(cached, 32, "both blocks are retrieved from L2");
+        assert_eq!(warm, cold);
+        drop(tx);
+        handle.join().unwrap().unwrap();
     }
 
     /// P2 S-7 slow client, deterministic on a fake clock: a stream that stops reading pauses,
