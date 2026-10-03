@@ -4,7 +4,9 @@
 // the step time (perf log 6b "Promotion copy kernel"). A lab tool, not loaded
 // by the server. Environment: CB_NOUP (no per-step upload), CB_ONLY
 // (small|stream: one compute kernel kind), CB_SRC=dev (copy from device
-// memory: no host link), CB_ENV (a label echoed in the output).
+// memory: no host link), CB_DIR=d2h (device -> pinned host copies, a KV
+// demotion: SDMA, or the copy kernel writing the mapped host buffer), CB_ENV
+// (a label echoed in the output).
 //
 //   turbine_copy_eval <mode> <seg_kib> <grid> <total_mib> [steps] [pairs]
 //     mode: none | sdma | kernel
@@ -155,6 +157,52 @@ int main(int argc, char **argv) {
                                   : hipMemcpyHostToDevice;
   const uint8_t *ssrc =
       getenv("CB_SRC") ? static_cast<uint8_t *>(hsrc_dev) : hsrc;
+  // CB_DIR=d2h: demotions. The device buffer holds the pattern and is copied
+  // to a second pinned buffer (SDMA, or the kernel storing to its mapping).
+  const bool d2h = getenv("CB_DIR") && std::string(getenv("CB_DIR")) == "d2h";
+  uint8_t *hdst = nullptr;
+  void *hdst_dev = nullptr;
+  if (d2h) {
+    CK(hipMemcpy(ddst, hsrc, ring, hipMemcpyHostToDevice));
+    CK(hipHostMalloc(&hdst, ring, hipHostMallocDefault));
+    memset(hdst, 0, ring);
+    CK(hipHostGetDevicePointer(&hdst_dev, hdst, 0));
+  }
+  // One copy batch of `total` bytes on stream xs (the promotion, or with
+  // CB_DIR=d2h the demotion).
+  auto issue_copy = [&]() {
+    if (mode == "sdma") {
+      for (int64_t off = 0; off < total; off += seg) {
+        const int64_t b = std::min(seg, total - off);
+        if (d2h)
+          CK(hipMemcpyAsync(hdst + off % ring, ddst + off % ring, b,
+                            hipMemcpyDeviceToHost, xs));
+        else
+          CK(hipMemcpyAsync(ddst + off % ring, ssrc + off % ring, b, skind,
+                            xs));
+      }
+    } else if (mode == "kernel") {
+      Ops ops{};
+      for (int64_t off = 0; off < total; off += seg) {
+        const int64_t b = std::min(seg, total - off);
+        if (d2h)
+          ops.op[ops.count++] = {
+              reinterpret_cast<uint4 *>(static_cast<uint8_t *>(hdst_dev) +
+                                        off % ring),
+              reinterpret_cast<const uint4 *>(ddst + off % ring), b / 16};
+        else
+          ops.op[ops.count++] = {
+              reinterpret_cast<uint4 *>(ddst + off % ring),
+              reinterpret_cast<const uint4 *>(static_cast<uint8_t *>(hsrc_dev) +
+                                              off % ring),
+              b / 16};
+        if (ops.count == ops_per_launch || off + seg >= total) {
+          copy_k<<<grid, 256, 0, xs>>>(ops);
+          ops.count = 0;
+        }
+      }
+    }
+  };
   auto step = [&](int s) {
     if (!noup)
       CK(hipMemcpyAsync(up_d, up_h, 16384, hipMemcpyHostToDevice, cs));
@@ -187,25 +235,7 @@ int main(int argc, char **argv) {
         // Copies start once step 2 begins.
         CK(hipStreamWaitEvent(xs, ev[2], 0));
         CK(hipEventRecord(c0, xs));
-        if (mode == "sdma") {
-          for (int64_t off = 0; off < total; off += seg)
-            CK(hipMemcpyAsync(ddst + off % ring, ssrc + off % ring,
-                              std::min(seg, total - off), skind, xs));
-        } else if (mode == "kernel") {
-          Ops ops{};
-          for (int64_t off = 0; off < total; off += seg) {
-            const int64_t b = std::min(seg, total - off);
-            ops.op[ops.count++] = {
-                reinterpret_cast<uint4 *>(ddst + off % ring),
-                reinterpret_cast<const uint4 *>(
-                    static_cast<uint8_t *>(hsrc_dev) + off % ring),
-                b / 16};
-            if (ops.count == ops_per_launch || off + seg >= total) {
-              copy_k<<<grid, 256, 0, xs>>>(ops);
-              ops.count = 0;
-            }
-          }
-        }
+        issue_copy();
         CK(hipEventRecord(c1, xs));
       }
     }
@@ -243,7 +273,10 @@ int main(int argc, char **argv) {
     }
     // Verify the bytes.
     std::vector<uint8_t> back(std::min<int64_t>(total, ring));
-    CK(hipMemcpy(back.data(), ddst, back.size(), hipMemcpyDeviceToHost));
+    if (d2h)
+      memcpy(back.data(), hdst, back.size());
+    else
+      CK(hipMemcpy(back.data(), ddst, back.size(), hipMemcpyDeviceToHost));
     if (memcmp(back.data(), hsrc, back.size()) != 0) {
       fprintf(stderr, "MISMATCH\n");
       return 1;
@@ -254,25 +287,7 @@ int main(int argc, char **argv) {
   if (mode != "none") {
     CK(hipDeviceSynchronize());
     CK(hipEventRecord(c0, xs));
-    if (mode == "sdma") {
-      for (int64_t off = 0; off < total; off += seg)
-        CK(hipMemcpyAsync(ddst + off % ring, ssrc + off % ring,
-                          std::min(seg, total - off), skind, xs));
-    } else {
-      Ops ops{};
-      for (int64_t off = 0; off < total; off += seg) {
-        const int64_t b = std::min(seg, total - off);
-        ops.op[ops.count++] = {
-            reinterpret_cast<uint4 *>(ddst + off % ring),
-            reinterpret_cast<const uint4 *>(static_cast<uint8_t *>(hsrc_dev) +
-                                            off % ring),
-            b / 16};
-        if (ops.count == ops_per_launch || off + seg >= total) {
-          copy_k<<<grid, 256, 0, xs>>>(ops);
-          ops.count = 0;
-        }
-      }
-    }
+    issue_copy();
     CK(hipEventRecord(c1, xs));
     CK(hipDeviceSynchronize());
     CK(hipEventElapsedTime(&alone_ms, c0, c1));
@@ -280,11 +295,12 @@ int main(int argc, char **argv) {
   const double mib = (double)total / (1 << 20);
   printf("mode=%s seg_kib=%lld grid=%d mib=%.0f base_step_ms=%.3f "
          "copy_ms=%.2f gbps=%.2f alone_gbps=%.2f extra_ms=%.2f "
-         "slope_ms_per_mib=%.4f worst_step_ms=%.3f slowed_steps=%d env=%s\n",
+         "slope_ms_per_mib=%.4f worst_step_ms=%.3f slowed_steps=%d dir=%s "
+         "env=%s\n",
          mode.c_str(), (long long)(seg / 1024), grid, mib, bmed, copy_ms,
          copy_ms > 0 ? total / copy_ms / 1e6 : 0.0,
          alone_ms > 0 ? total / alone_ms / 1e6 : 0.0, extra,
-         mib > 0 ? extra / mib : 0.0, worst, overlapped,
+         mib > 0 ? extra / mib : 0.0, worst, overlapped, d2h ? "d2h" : "h2d",
          getenv("CB_ENV") ? getenv("CB_ENV") : "-");
   return 0;
 }

@@ -795,7 +795,8 @@ fn kv_config_validation() {
     assert_eq!(d.demote_min_value, 0.0);
     assert!(d.prefix_sharing);
     assert_eq!(d.transfer.max_inflight_bytes, ByteSize::gib(1));
-    assert_eq!(d.transfer.promotion_copy, PromotionCopy::Sdma);
+    // Unset: the copy kernel where the library has it, else the copy engine with a WARN.
+    assert_eq!(d.transfer.promotion_copy, None);
     assert_eq!(d.session.max_sessions, 10_000);
     assert_eq!(d.session.hot_ttl, HumanDuration::from_secs(60));
     assert_eq!(d.session.warm_ttl, HumanDuration::from_secs(600));
@@ -806,14 +807,25 @@ fn kv_config_validation() {
     assert_eq!(d.policy_weights.hit_half_life, HumanDuration::from_secs(60));
 
     let base = "model:\n  path: /m\n";
-    // kv.transfer.promotion_copy: sdma (default) or kernel, nothing else.
+    // kv.transfer.promotion_copy: unset (default), sdma or kernel, nothing else; an explicit
+    // value stays explicit (only an unset key may fall back at startup).
     let kernel = parse(
         &format!("{base}kv:\n  transfer:\n    promotion_copy: kernel\n"),
         &[],
     )
     .expect("kernel is valid");
-    assert_eq!(kernel.kv.transfer.promotion_copy, PromotionCopy::Kernel);
+    assert_eq!(
+        kernel.kv.transfer.promotion_copy,
+        Some(PromotionCopy::Kernel)
+    );
     assert_eq!(PromotionCopy::Kernel.as_str(), "kernel");
+    let sdma = parse(
+        &format!("{base}kv:\n  transfer:\n    promotion_copy: sdma\n"),
+        &[],
+    )
+    .expect("sdma is valid");
+    assert_eq!(sdma.kv.transfer.promotion_copy, Some(PromotionCopy::Sdma));
+    assert_eq!(PromotionCopy::Sdma.as_str(), "sdma");
     assert!(
         parse(
             &format!("{base}kv:\n  transfer:\n    promotion_copy: blit\n"),
