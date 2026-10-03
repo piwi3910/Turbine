@@ -133,6 +133,7 @@ impl OwnedBatch {
                 q_len: s.q_len,
                 kv_len: s.kv_len,
                 block_table: &s.block_table,
+                block_formats: &[],
                 reduce: s.reduce,
             })
             .collect()
@@ -1263,6 +1264,7 @@ mod tests {
                         q_len: tokens.len() as u32,
                         kv_len: lens[s] + tokens.len() as u32,
                         block_table: &tables[s],
+                        block_formats: &[],
                         reduce: None,
                     };
                     (tokens, positions, [slice])
@@ -1346,6 +1348,7 @@ mod tests {
                     q_len: 2,
                     kv_len: 2,
                     block_table: &tables[s],
+                    block_formats: &[],
                     reduce: None,
                 }]
             };

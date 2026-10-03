@@ -164,6 +164,7 @@ fn ladder_contract(p: &dyn EvictionPolicy, inputs: &[BlockScoreInputs]) -> Resul
                 max_format: RUNGS[1 + (next() % 3) as usize],
                 high_water: 0.95,
                 low_water: 0.85,
+                l0_dtype: "bf16",
             }),
         };
         let a = p.action(b, &ctx);

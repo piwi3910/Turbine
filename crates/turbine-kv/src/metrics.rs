@@ -101,10 +101,13 @@ pub enum LadderReason {
     FloorEvict,
     NoRoomBackoff,
     RungNoSlot,
+    /// A recent-window exit: an out-of-window BF16 block recompressed into the L0 base
+    /// format (S-5, `p6b-t17`).
+    RecentWindow,
 }
 
 impl LadderReason {
-    pub const ALL: [LadderReason; 7] = [
+    pub const ALL: [LadderReason; 8] = [
         LadderReason::FillHighWater,
         LadderReason::WouldDrop,
         LadderReason::NewDemotion,
@@ -112,6 +115,7 @@ impl LadderReason {
         LadderReason::FloorEvict,
         LadderReason::NoRoomBackoff,
         LadderReason::RungNoSlot,
+        LadderReason::RecentWindow,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -123,6 +127,7 @@ impl LadderReason {
             LadderReason::FloorEvict => "floor_evict",
             LadderReason::NoRoomBackoff => "no_room_backoff",
             LadderReason::RungNoSlot => "rung_no_slot",
+            LadderReason::RecentWindow => "recent_window",
         }
     }
 }
@@ -751,7 +756,8 @@ mod tests {
                 "rung_step_up",
                 "floor_evict",
                 "no_room_backoff",
-                "rung_no_slot"
+                "rung_no_slot",
+                "recent_window"
             ]
         );
     }

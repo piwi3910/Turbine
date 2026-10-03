@@ -24,6 +24,10 @@ pub enum TransferPath {
     L2ToL1,
     L0ToL2,
     L2ToL0,
+    /// A ladder rewrite of an L0 block (S-7): no copy between tiers — `src_slot` is the base
+    /// page the rewrite consumes, `dst_slot` the smaller-class page it fills (both `BlockId`s).
+    /// Never returned by [`TransferPath::between`], which has no same-tier pairs.
+    L0ToL0,
 }
 
 impl TransferPath {
@@ -44,6 +48,7 @@ impl TransferPath {
             TransferPath::L2ToL1 => "l2_to_l1",
             TransferPath::L0ToL2 => "l0_to_l2",
             TransferPath::L2ToL0 => "l2_to_l0",
+            TransferPath::L0ToL0 => "l0_to_l0",
         }
     }
 
@@ -56,7 +61,7 @@ impl TransferPath {
 
     pub fn from(self) -> TierId {
         match self {
-            TransferPath::L0ToL1 | TransferPath::L0ToL2 => TierId::L0,
+            TransferPath::L0ToL1 | TransferPath::L0ToL2 | TransferPath::L0ToL0 => TierId::L0,
             TransferPath::L1ToL0 | TransferPath::L1ToL2 => TierId::L1,
             TransferPath::L2ToL1 | TransferPath::L2ToL0 => TierId::L2,
         }
@@ -64,7 +69,7 @@ impl TransferPath {
 
     pub fn to(self) -> TierId {
         match self {
-            TransferPath::L1ToL0 | TransferPath::L2ToL0 => TierId::L0,
+            TransferPath::L1ToL0 | TransferPath::L2ToL0 | TransferPath::L0ToL0 => TierId::L0,
             TransferPath::L0ToL1 | TransferPath::L2ToL1 => TierId::L1,
             TransferPath::L1ToL2 | TransferPath::L0ToL2 => TierId::L2,
         }
@@ -88,6 +93,15 @@ impl TransferPath {
     fn index(self) -> usize {
         self as usize
     }
+}
+
+/// One fallback cost per path ([`TransferPath::ALL`], plus the same-tier L0 rewrite path).
+fn paths_costs() -> [PathCost; 7] {
+    let mut costs = [TransferPath::L0ToL0.fallback(); 7];
+    for p in TransferPath::ALL {
+        costs[p.index()] = p.fallback();
+    }
+    costs
 }
 
 /// Why a block is copied (every copy carries a reason, TS §21 rule 7).
@@ -293,10 +307,10 @@ pub struct TransferEngine {
     cancelled: HashSet<RequestId>,
     /// Queued or in-flight copies per key.
     busy: HashMap<KvKey, u32>,
-    estimates: [PathCost; 6],
+    estimates: [PathCost; 7],
     /// Each path's cost without load: the startup calibration (`seed`), else the fallback. A
     /// poll-bounded copy is read as this cost clamped to its bounds.
-    seeded: [PathCost; 6],
+    seeded: [PathCost; 7],
     /// When each path's estimate last took a sample (`None`: never, it is the seed).
     sampled_at: [Option<Duration>; 6],
     /// Per ticket id: when it was queued, then (once started) how long it waited in the queue,
@@ -320,8 +334,8 @@ impl TransferEngine {
             peak_inflight_bytes: 0,
             cancelled: HashSet::new(),
             busy: HashMap::new(),
-            estimates: TransferPath::ALL.map(TransferPath::fallback),
-            seeded: TransferPath::ALL.map(TransferPath::fallback),
+            estimates: paths_costs(),
+            seeded: paths_costs(),
             sampled_at: [None; 6],
             queued: HashMap::new(),
         }
@@ -641,7 +655,7 @@ impl TransferEngine {
 /// bytes: a copy out of it reads zeros and a copy into it lands in `dst_slot`.
 pub struct SimTransferBackend {
     clock: Arc<dyn Clock>,
-    costs: [PathCost; 6],
+    costs: [PathCost; 7],
     l1: Option<Arc<dyn KvTier>>,
     l2: Option<Arc<dyn KvTier>>,
     scratch: Vec<u8>,
@@ -664,7 +678,7 @@ impl SimTransferBackend {
     ) -> Self {
         SimTransferBackend {
             clock,
-            costs: TransferPath::ALL.map(TransferPath::fallback),
+            costs: paths_costs(),
             l1,
             l2,
             scratch: Vec::with_capacity(block_bytes),
@@ -1093,14 +1107,14 @@ mod tests {
     /// FIFO), each for its path's cost; completions are seen only at polls (no `took`).
     struct FifoStream {
         clock: Arc<dyn Clock>,
-        costs: [PathCost; 6],
+        costs: [PathCost; 7],
         free_at: Duration,
         due: HashMap<u64, Duration>,
         started: Vec<(u64, TransferPurpose)>,
     }
 
     impl FifoStream {
-        fn new(clock: Arc<dyn Clock>, costs: [PathCost; 6]) -> Self {
+        fn new(clock: Arc<dyn Clock>, costs: [PathCost; 7]) -> Self {
             FifoStream {
                 clock,
                 costs,
@@ -1160,7 +1174,7 @@ mod tests {
         };
         engine.seed(TransferPath::L0ToL1, d2h);
         engine.seed(TransferPath::L1ToL0, h2d);
-        let mut costs = TransferPath::ALL.map(TransferPath::fallback);
+        let mut costs = paths_costs();
         costs[TransferPath::L0ToL1.index()] = d2h;
         costs[TransferPath::L1ToL0.index()] = h2d;
         let mut stream = FifoStream::new(clock.clone(), costs);

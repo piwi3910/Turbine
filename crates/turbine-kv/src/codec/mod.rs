@@ -147,6 +147,32 @@ pub fn next_rung(name: &str) -> Option<&'static str> {
     registry().iter().nth(i + 1).map(|c| c.name())
 }
 
+/// The next lossier registered codec after `format` below an L0 whose page format is
+/// `l0_dtype` (`kv.dtype`): [`next_rung`], except that `l0` ranks at the L0 dtype's rung
+/// ([`tier_rung`]), so below a TurboQuant L0 its next rung skips the codecs more precise than
+/// the dtype — `fp8_e4m3` after `l0` below `tq4` would be an upgrade, and the rung after it is
+/// `tq2`.
+pub fn next_rung_in(format: &str, l0_dtype: &str) -> Option<&'static str> {
+    let i = tier_rung(format, l0_dtype)?;
+    registry().iter().nth(i + 1).map(|c| c.name())
+}
+
+/// The rung before `format` in the dtype-aware rung order of [`next_rung_in`]: `None` at the
+/// base rung, `l0` when the next-more-precise rung ranks with the L0 dtype (below a TurboQuant
+/// L0, the step up from `tq2` lands on `l0` — the dtype itself), else the registered codec
+/// ranking just below.
+pub fn prev_rung_in(format: &str, l0_dtype: &str) -> Option<&'static str> {
+    let i = tier_rung(format, l0_dtype)?;
+    let base = tier_rung(crate::tier::L0_FORMAT, l0_dtype).unwrap_or(0);
+    if i <= base {
+        return None;
+    }
+    if i - 1 == base {
+        return Some(crate::tier::L0_FORMAT);
+    }
+    registry().iter().nth(i - 1).map(|c| c.name())
+}
+
 /// The lossier of two registered codec names (unregistered names count as the most precise).
 pub fn lossier(a: &'static str, b: &'static str) -> &'static str {
     if rung_index(b).unwrap_or(0) > rung_index(a).unwrap_or(0) {

@@ -236,6 +236,9 @@ pub struct SeqSlice<'a> {
     /// The pool blocks holding tokens `0..kv_len` in token order: token `p` lives in
     /// `block_table[p / block_tokens]` at slot `p % block_tokens`. May be longer than needed.
     pub block_table: &'a [BlockId],
+    /// The v2.11 `block_formats` byte of each block-table entry (`TURBINE_KVFMT_*`), parallel
+    /// to `block_table`; empty when every block holds the pool's base format.
+    pub block_formats: &'a [u8],
     /// Reduce this sequence's logits row on the device (`logits_reduce`, P2c S-4) instead of
     /// copying it whole; ignored when the executor does not reduce
     /// ([`ModelExecutor::reduces_logits`]).
@@ -496,6 +499,12 @@ pub trait ModelExecutor: Send {
     /// the pointers). Executors without TurboQuant pages ignore the call.
     fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
         let _ = tables;
+        Ok(())
+    }
+    /// The pool's block tables mix formats (P6b S-5/S-7): every paged attention reads the
+    /// batch's `block_formats` table (needs the v2.11 mixed-format attention).
+    fn set_mixed_blocks(&mut self, on: bool) -> Result<(), ModelError> {
+        let _ = on;
         Ok(())
     }
     /// Tensor-parallel prefill overlap (P5 Task 32, `parallel.tp_prefill_overlap`): prefills of

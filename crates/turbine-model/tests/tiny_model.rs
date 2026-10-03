@@ -714,6 +714,7 @@ fn forward_rejects_invalid_batches() {
         q_len,
         kv_len,
         block_table: &table,
+        block_formats: &[],
         reduce: None,
     };
     let mut run = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {
@@ -744,6 +745,7 @@ fn forward_rejects_invalid_batches() {
         &[0],
         &[SeqSlice {
             block_table: &[],
+            block_formats: &[],
             ..seq(0, 0, 1, 1)
         }],
     );
@@ -754,6 +756,7 @@ fn forward_rejects_invalid_batches() {
         &[0],
         &[SeqSlice {
             block_table: &outside,
+            block_formats: &[],
             ..seq(0, 0, 1, 1)
         }],
     );
@@ -1520,6 +1523,7 @@ fn paged_llama_single_sequence() {
             q_len: tokens.len() as u32,
             kv_len: start + tokens.len() as u32,
             block_table: &table,
+            block_formats: &[],
             reduce: None,
         }];
         exec.forward(&BatchInput {
@@ -1587,6 +1591,7 @@ fn ragged_batch_rows_match_single_sequences() {
         q_len: 20,
         kv_len: 20,
         block_table: &ta,
+        block_formats: &[],
         reduce: None,
     }];
     let positions: Vec<u32> = (0..20).collect();
@@ -1606,6 +1611,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 1,
             kv_len: 21,
             block_table: &ta,
+            block_formats: &[],
             reduce: None,
         },
         SeqSlice {
@@ -1614,6 +1620,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 17,
             kv_len: 17,
             block_table: &tb,
+            block_formats: &[],
             reduce: None,
         },
         SeqSlice {
@@ -1622,6 +1629,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 3,
             kv_len: 3,
             block_table: &tc,
+            block_formats: &[],
             reduce: None,
         },
     ];
@@ -1651,6 +1659,7 @@ fn ragged_batch_rows_match_single_sequences() {
             q_len: 1,
             kv_len: 4,
             block_table: table,
+            block_formats: &[],
             reduce: None,
         }];
         exec.forward(&BatchInput {
@@ -1760,6 +1769,7 @@ fn run_seq(
         q_len: tokens.len() as u32,
         kv_len: start + tokens.len() as u32,
         block_table: table,
+        block_formats: &[],
         reduce: None,
     }];
     let logits = exec
@@ -2448,6 +2458,7 @@ fn olmoe_decode_single_device_copy() {
                     q_len: toks.len() as u32,
                     kv_len: start + toks.len() as u32,
                     block_table: &tables[*s],
+                    block_formats: &[],
                     reduce: None,
                 });
                 tokens.extend_from_slice(toks);
@@ -2613,6 +2624,7 @@ fn paged_matches_contiguous() {
                         q_len: q_lens[s],
                         kv_len: kv_lens[s],
                         block_table: &tables[s],
+                        block_formats: &[],
                         reduce: None,
                     });
                     q_start += q_lens[s];
@@ -2785,6 +2797,7 @@ fn graph_decode_run(
             q_len: len,
             kv_len: len,
             block_table: table,
+            block_formats: &[],
             reduce: None,
         }];
         exec.forward(&BatchInput {
@@ -2806,6 +2819,7 @@ fn graph_decode_run(
                 q_len: 1,
                 kv_len: positions[s] + 1,
                 block_table: &tables[s],
+                block_formats: &[],
                 reduce: (step % 2 == 0).then_some(RowReduce {
                     top_n: 5,
                     temperature: 0.7,
@@ -3296,6 +3310,7 @@ fn check_reduced_rows(
                             q_len: q_lens[s],
                             kv_len: kv_lens[s],
                             block_table: &tables[s],
+                            block_formats: &[],
                             reduce: reduce[s],
                         };
                         q_start += q_lens[s];
@@ -3508,6 +3523,7 @@ fn check_launch_ahead(
                     q_len: q_lens[s],
                     kv_len: kv_lens[s],
                     block_table: &tables[s],
+                    block_formats: &[],
                     reduce: Some(reduce(s, step)),
                 };
                 q_start += q_lens[s];
@@ -3608,6 +3624,7 @@ fn check_launch_ahead(
             q_len: 1,
             kv_len: kv_lens[s],
             block_table: &tables[s],
+            block_formats: &[],
             reduce: Some(if s == 1 { top_k } else { reduce(s, 0) }),
         })
         .collect();
@@ -3753,6 +3770,7 @@ fn op_profile_accounts_forward() {
                 q_len: 1,
                 kv_len: PROMPT + 1,
                 block_table: table,
+                block_formats: &[],
                 reduce: None,
             })
             .collect();
@@ -3875,6 +3893,7 @@ fn single_sequence(
             q_len: tokens.len() as u32,
             kv_len: start + tokens.len() as u32,
             block_table: &table,
+            block_formats: &[],
             reduce: None,
         }];
         exec.forward(&BatchInput {
@@ -4048,6 +4067,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
             q_len: lens[0],
             kv_len: lens[0],
             block_table: &tables[0],
+            block_formats: &[],
             reduce: None,
         },
         SeqSlice {
@@ -4056,6 +4076,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
             q_len: lens[1],
             kv_len: lens[1],
             block_table: &tables[1],
+            block_formats: &[],
             reduce: None,
         },
     ];
@@ -4082,6 +4103,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
                 q_len: 1,
                 kv_len: lens[s],
                 block_table: &tables[s],
+                block_formats: &[],
                 reduce: None,
             })
             .collect();
@@ -5451,6 +5473,7 @@ fn scripted_pair(
             q_len: lens[0],
             kv_len: lens[0],
             block_table: &tables[0],
+            block_formats: &[],
             reduce: None,
         },
         SeqSlice {
@@ -5459,6 +5482,7 @@ fn scripted_pair(
             q_len: lens[1],
             kv_len: lens[1],
             block_table: &tables[1],
+            block_formats: &[],
             reduce: None,
         },
     ];
@@ -5481,6 +5505,7 @@ fn scripted_pair(
                 q_len: 1,
                 kv_len: lens[s],
                 block_table: &tables[s],
+                block_formats: &[],
                 reduce: None,
             })
             .collect();

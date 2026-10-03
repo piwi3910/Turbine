@@ -111,6 +111,7 @@ fn prefill(
         q_len: n,
         kv_len: n,
         block_table: &table,
+        block_formats: &[],
         reduce: None,
     }];
     let logits = exec
@@ -214,6 +215,7 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
                                 q_len: n,
                                 kv_len: n,
                                 block_table: &[],
+                block_formats: &[],
                                 reduce: None,
                             }],
                             n as usize,

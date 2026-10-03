@@ -173,6 +173,8 @@ pub(crate) struct HostBatch {
     pub q_indptr: Vec<u8>,
     pub kv_lens: Vec<u8>,
     pub block_table: Vec<u8>,
+    /// One `TURBINE_KVFMT_*` byte per block-table entry (v2.11); packed like the table.
+    pub block_formats: Vec<u8>,
 }
 
 fn push_i32(out: &mut Vec<u8>, v: u32) {
@@ -260,6 +262,7 @@ impl HostBatch {
         self.q_indptr.clear();
         self.kv_lens.clear();
         self.block_table.clear();
+        self.block_formats.clear();
         for (&id, &pos) in batch.tokens.iter().zip(batch.positions) {
             push_i32(&mut self.ids, id);
             push_i32(&mut self.positions, pos);
@@ -276,6 +279,17 @@ impl HostBatch {
             for _ in needed..width {
                 push_i32(&mut self.block_table, 0);
             }
+            // An empty table says every block holds the pool's base format (code of the
+            // pool's dtype; BF16 = 0); padding entries are never read.
+            if s.block_formats.is_empty() {
+                self.block_formats
+                    .resize(self.block_formats.len() + needed, 0);
+            } else {
+                self.block_formats
+                    .extend_from_slice(&s.block_formats[..needed]);
+            }
+            self.block_formats
+                .resize(self.block_formats.len() + (width - needed), 0);
         }
         Ok(packed)
     }
@@ -295,6 +309,13 @@ impl HostBatch {
                 table.resize((s + 1) * new, 0);
             }
             self.block_table = table;
+            let (bold, bnew) = (p.max_blocks_per_seq as usize, width as usize);
+            let mut formats = Vec::with_capacity(p.num_seqs * bnew);
+            for s in 0..p.num_seqs {
+                formats.extend_from_slice(&self.block_formats[s * bold..(s + 1) * bold]);
+                formats.resize((s + 1) * bnew, 0);
+            }
+            self.block_formats = formats;
         }
         p.max_blocks_per_seq = width;
         p.max_kv_len = max_kv_len;
@@ -427,6 +448,8 @@ pub(crate) struct DeviceBatch {
     staging: Option<StagingPair>,
     /// The packed bytes of the synchronous path.
     scratch: Vec<u8>,
+    /// Byte offset of the `block_formats` table: the I32 arrays' full-length region.
+    formats_at: usize,
 }
 
 impl DeviceBatch {
@@ -438,6 +461,13 @@ impl DeviceBatch {
         (I32 as u64) * (2 * t + 2 * n + 1 + n * u64::from(limits.max_blocks_per_seq()))
     }
 
+    /// Bytes of the whole buffer: the I32 arrays plus the `block_formats` table (`n ×
+    /// max_blocks_per_seq` bytes, v2.11), which sits behind the I32 region at
+    /// [`DeviceBatch::bytes`].
+    pub fn total_bytes(limits: &BatchLimits) -> u64 {
+        Self::bytes(limits) + u64::from(limits.max_seqs) * u64::from(limits.max_blocks_per_seq())
+    }
+
     /// The device buffer and, when `mem` has staging, two host staging buffers of the same size.
     pub fn alloc(
         mem: &Arc<dyn DeviceMemory>,
@@ -445,9 +475,10 @@ impl DeviceBatch {
     ) -> Result<DeviceBatch, ModelError> {
         let bytes = Self::bytes(limits) as usize;
         Ok(DeviceBatch {
-            buf: DeviceBuffer::alloc(mem, bytes)?,
-            staging: StagingPair::alloc(mem, bytes)?,
+            buf: DeviceBuffer::alloc(mem, Self::total_bytes(limits) as usize)?,
+            staging: StagingPair::alloc(mem, Self::total_bytes(limits) as usize)?,
             scratch: Vec::new(),
+            formats_at: bytes,
         })
     }
 
@@ -466,24 +497,27 @@ impl DeviceBatch {
             &host.kv_lens,
             &host.block_table,
         ];
-        let total: usize = parts.iter().map(|p| p.len()).sum();
         let mem = Arc::clone(self.buf.memory());
+        let formats_at = self.formats_at;
         match self.staging.as_mut() {
             Some(pair) => {
-                let i = pair.next(&mem, total, self.buf.len())?;
+                let i = pair.next(&mem, formats_at + host.block_formats.len(), self.buf.len())?;
                 let staging = pair.buf(i);
                 let mut at = 0;
                 for part in parts {
                     staging.write(at, part)?;
                     at += part.len();
                 }
-                staging.upload(0, self.buf.slice(0, total))?;
+                staging.write(formats_at, &host.block_formats)?;
+                staging.upload(0, self.buf.slice(0, formats_at + host.block_formats.len()))?;
             }
             None => {
                 self.scratch.clear();
                 for part in parts {
                     self.scratch.extend_from_slice(part);
                 }
+                self.scratch.resize(formats_at, 0);
+                self.scratch.extend_from_slice(&host.block_formats);
                 self.buf.copy_from_host(0, &self.scratch)?;
             }
         }
@@ -514,6 +548,16 @@ impl DeviceBatch {
         self.view(
             2 * p.total_q + 2 * p.num_seqs + 1,
             &[p.num_seqs, p.max_blocks_per_seq as usize],
+        )
+    }
+
+    /// The v2.11 `block_formats` table behind the I32 region (`[num_seqs, max_blocks]` U8).
+    pub fn block_formats_view(&self, p: &Packed) -> TensorView<'_> {
+        TensorView::contiguous(
+            self.buf.whole(),
+            self.formats_at,
+            &[p.num_seqs, p.max_blocks_per_seq as usize],
+            DType::U8,
         )
     }
 }
@@ -638,6 +682,7 @@ impl SequenceKv {
             q_len: t as u32,
             kv_len,
             block_table: &self.table,
+            block_formats: &[],
             reduce: None,
         }];
         let logits = exec.forward(&BatchInput {
@@ -723,6 +768,7 @@ mod tests {
                 q_len: 1,
                 kv_len: 10,
                 block_table: &a,
+                block_formats: &[],
                 reduce: None,
             },
             SeqSlice {
@@ -731,6 +777,7 @@ mod tests {
                 q_len: 5,
                 kv_len: 5,
                 block_table: &b,
+                block_formats: &[],
                 reduce: None,
             },
         ];
@@ -841,14 +888,25 @@ mod tests {
         let storage = pool(&mem, 4);
         let kv = view(&storage, 4);
         let table = [BlockId(0), BlockId(1)];
-        let seq = |seq, q_start, q_len, kv_len, block_table| SeqSlice {
-            seq: SeqId(seq),
-            q_start,
-            q_len,
-            kv_len,
-            block_table,
-            reduce: None,
-        };
+        #[allow(clippy::too_many_arguments)]
+        fn seq<'a>(
+            seq: u64,
+            q_start: u32,
+            q_len: u32,
+            kv_len: u32,
+            block_table: &'a [BlockId],
+            block_formats: &'a [u8],
+        ) -> SeqSlice<'a> {
+            SeqSlice {
+                seq: SeqId(seq),
+                q_start,
+                q_len,
+                kv_len,
+                block_table,
+                block_formats,
+                reduce: None,
+            }
+        }
         let mut host = HostBatch::default();
         let mut pack = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {
             message(host.pack(
@@ -861,26 +919,26 @@ mod tests {
                 &limits(),
             ))
         };
-        let one = [seq(1, 0, 2, 2, &table)];
+        let one = [seq(1, 0, 2, 2, &table, &[])];
         assert!(pack(&[], &[], &one).contains("empty"));
         assert!(pack(&[1, 2], &[0], &one).contains("positions"));
         assert!(pack(&[1, 2], &[0, 1], &[]).contains("no sequences"));
         assert!(pack(&[1, 100], &[0, 1], &one).contains("vocabulary"));
         assert!(pack(&[1, 2], &[0, 2], &one).contains("position 2, expected 1"));
-        let short = [seq(1, 0, 1, 1, &table)];
+        let short = [seq(1, 0, 1, 1, &table, &[])];
         assert!(pack(&[1, 2], &[0, 1], &short).contains("cover 1 of the batch's 2"));
-        let twice = [seq(1, 0, 1, 1, &table), seq(1, 1, 1, 1, &table)];
+        let twice = [seq(1, 0, 1, 1, &table, &[]), seq(1, 1, 1, 1, &table, &[])];
         assert!(pack(&[1, 2], &[0, 0], &twice).contains("twice"));
-        let gap = [seq(1, 0, 1, 1, &table), seq(2, 2, 1, 1, &table)];
+        let gap = [seq(1, 0, 1, 1, &table, &[]), seq(2, 2, 1, 1, &table, &[])];
         assert!(pack(&[1, 2, 3], &[0, 0, 0], &gap).contains("starts at token 2"));
-        let zero = [seq(1, 0, 0, 1, &table)];
+        let zero = [seq(1, 0, 0, 1, &table, &[])];
         assert!(pack(&[1], &[0], &zero).contains("q_len 0"));
         // 9 tokens need 3 blocks of 4; the table has 2.
-        let long = [seq(1, 0, 1, 9, &table)];
+        let long = [seq(1, 0, 1, 9, &table, &[])];
         assert!(pack(&[1], &[8], &long).contains("needs 3 blocks"));
         let outside = [BlockId(4)];
-        assert!(pack(&[1], &[0], &[seq(1, 0, 1, 1, &outside)]).contains("outside the pool"));
-        assert!(pack(&[1], &[64], &[seq(1, 0, 1, 65, &table)]).contains("max_position"));
+        assert!(pack(&[1], &[0], &[seq(1, 0, 1, 1, &outside, &[])]).contains("outside the pool"));
+        assert!(pack(&[1], &[64], &[seq(1, 0, 1, 65, &table, &[])]).contains("max_position"));
         let many: Vec<u32> = vec![1; 17];
         assert!(pack(&many, &many, &one).contains("max_batch_tokens"));
 
@@ -896,7 +954,7 @@ mod tests {
             &BatchInput {
                 tokens: &[1],
                 positions: &[0],
-                seqs: &[seq(1, 0, 1, 1, &table)],
+                seqs: &[seq(1, 0, 1, 1, &table, &[])],
                 kv: &other,
             },
             &limits(),

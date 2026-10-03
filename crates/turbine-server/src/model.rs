@@ -451,6 +451,10 @@ pub struct PreparedModel {
     pub max_seq_len: u32,
     /// `kv.block_tokens`: the block size of the KV pool.
     pub block_tokens: u32,
+    /// The page classes the L0 pool grows on demand (P6b S-5, S-7): the recent window's
+    /// BF16 class with a lossy `kv.dtype`, and the ladder's lossier rungs when
+    /// `kv.ladder.l0`; empty keeps the base class only.
+    pub l0_page_classes: Vec<turbine_kv::pool::PageClass>,
     /// The L0 block pool of the pre-load budget's `kv` pool (capped by `kv.gpu.max_bytes`);
     /// the pool allocated after the weights load is at most this large.
     pub pool: BlockPoolConfig,
@@ -922,6 +926,7 @@ fn prepare_with(
         max_seq_len,
         block_tokens,
         pool,
+        l0_page_classes: l0_page_classes(&config.kv, &pool.layout),
         scheduler,
         executor_options,
         decode_graphs,
@@ -1199,6 +1204,13 @@ pub fn load(
     install_decode_graphs(prepared, executor.as_mut());
     // P6b Task 8: before the first forward (a warm-up or a decode graph reads the pointers).
     crate::tq_device::install(arch.kv_cache.tq.as_ref(), mem, executor.as_mut())?;
+    // P6b S-5/S-7: the pool's block tables mix formats (page classes) — every paged attention
+    // takes the batch's `block_formats` table.
+    if !prepared.l0_page_classes.is_empty() {
+        executor
+            .set_mixed_blocks(true)
+            .map_err(|e| model_error("executor", e))?;
+    }
     let blocks = pool_blocks(prepared, &budget)?;
     let mut pool = allocate_pool(prepared, blocks, &ledger)?;
     let reserve = acquire_reserve(prepared, &ledger, reliability)?;
@@ -1347,6 +1359,49 @@ pub(crate) fn post_load_budget(
 
 /// The L0 pool's block count after the weights load: the budget's `kv` pool, at most the
 /// pre-load size.
+/// The page classes the L0 pool grows on demand (P6b S-5, S-7): the recent window's BF16
+/// class with a lossy `kv.dtype`, and every ladder rung below the L0 base format when
+/// `kv.ladder.l0`. Page sizes follow the L0 layout's codec convention (a BF16 class holds a
+/// BF16-layout block). A one-page slab converts a single free base page, so a near-full pool
+/// can still compress.
+fn l0_page_classes(
+    kv: &turbine_core::config::KvConfig,
+    layout: &KvLayout,
+) -> Vec<turbine_kv::pool::PageClass> {
+    let base_rank = turbine_kv::codec::tier_rung("l0", kv.dtype.as_str()).unwrap_or(0);
+    let max_rank = turbine_kv::codec::tier_rung(kv.ladder.max_format.as_str(), kv.dtype.as_str());
+    let mut out: Vec<turbine_kv::pool::PageClass> = Vec::new();
+    if kv.dtype.is_lossy() && kv.recent_window_blocks > 0 {
+        let bf16 = KvLayout {
+            dtype: turbine_core::types::DType::BF16,
+            ..*layout
+        };
+        out.push(turbine_kv::pool::PageClass {
+            format: "bf16",
+            page_bytes: bf16.block_bytes(),
+        });
+    }
+    if kv.ladder.enabled && kv.ladder.l0 {
+        for c in turbine_kv::codec::registry().iter() {
+            let name = c.name();
+            if name == "l0" || name == "bf16" {
+                continue;
+            }
+            let rank = turbine_kv::codec::tier_rung(name, kv.dtype.as_str());
+            if let Some(rank) = rank
+                && rank > base_rank
+                && max_rank.is_some_and(|m| rank <= m)
+            {
+                out.push(turbine_kv::pool::PageClass {
+                    format: name,
+                    page_bytes: c.bytes_per_block(layout),
+                });
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn pool_blocks(
     prepared: &PreparedModel,
     budget: &DeviceBudget,
@@ -1369,9 +1424,34 @@ pub(crate) fn allocate_pool(
         layout: prepared.pool.layout,
         num_blocks: blocks,
     };
-    let pool = BlockPool::new(config, Arc::clone(&prepared.provider.opened.mem))
-        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?
-        .with_ledger(Arc::clone(ledger), prepared.device);
+    let mut pool = BlockPool::new(config, Arc::clone(&prepared.provider.opened.mem))
+        .map_err(|e| StartupError::new(format!("KV block pool: {e}")))?;
+    if !prepared.l0_page_classes.is_empty() {
+        // A slab holds at least one page of the biggest class (a class page larger than the
+        // base page — the recent window's BF16 pages over a TurboQuant base — needs several
+        // base pages a slab).
+        let base_page = config.layout.block_bytes().max(1);
+        let slab = prepared
+            .l0_page_classes
+            .iter()
+            .map(|c| c.page_bytes.div_ceil(base_page))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        pool = pool
+            .with_page_classes(&prepared.l0_page_classes, slab as u32)
+            .map_err(|e| StartupError::new(format!("KV page classes: {e}")))?;
+        tracing::info!(
+            event = "kv_page_classes",
+            formats = ?prepared
+                .l0_page_classes
+                .iter()
+                .map(|c| c.format)
+                .collect::<Vec<_>>(),
+            "the L0 pool grows page classes on demand (the ladder's L0 rungs, the recent window)"
+        );
+    }
+    let pool = pool.with_ledger(Arc::clone(ledger), prepared.device);
     log_pool_startup(&pool);
     Ok(pool)
 }
@@ -1415,12 +1495,19 @@ pub(crate) fn warm_up(
         .map_err(|e| StartupError::new(format!("warm-up: {e}")))?;
     let result = {
         let view = pool.view();
+        // The warm-up block's own page class (P6b S-5): a base page of a TurboQuant pool is
+        // not BF16-sized, so the append must encode into it.
+        let formats = [blocks
+            .iter()
+            .map(|b| pool.format_code(*b))
+            .collect::<Vec<u8>>()];
         let seqs = [SeqSlice {
             seq: SeqId(0),
             q_start: 0,
             q_len: 1,
             kv_len: 1,
             block_table: &blocks,
+            block_formats: &formats[0],
             reduce: None,
         }];
         exec.forward(&BatchInput {
