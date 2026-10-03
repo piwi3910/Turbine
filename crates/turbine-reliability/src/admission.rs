@@ -195,7 +195,9 @@ impl Admission {
     /// reserved) past the `kv` threshold of the next state up — so admissions alone never
     /// escalate the state, and after a load stops the queued backlog cannot push a
     /// de-escalating engine back up (the overload simulation's seed 1 went YELLOW → RED on its
-    /// backlog and recovered 64 s after the load stopped). GREEN has no headroom rule.
+    /// backlog and recovered 64 s after the load stopped). At GREEN (amendment 2026-10-02) the limit is
+    /// RED's threshold: a burst of admissions inside one controller sample cannot reach RED or
+    /// SURVIVAL.
     pub fn with_kv_headroom(mut self, kv: SignalThresholds) -> Self {
         self.kv_headroom = Some(kv);
         self
@@ -429,6 +431,8 @@ impl Admission {
             PressureState::Yellow => PressureState::Orange,
             PressureState::Orange => PressureState::Red,
             PressureState::Red => PressureState::Survival,
+            // GREEN (amendment 2026-10-02): RED's threshold, so a burst never reaches RED.
+            PressureState::Green => PressureState::Red,
             _ => return true,
         };
         let Some(limit) = kv.threshold(next) else {
@@ -948,7 +952,7 @@ mod tests {
     /// P3 S-9 amendment 2026-09-27 (KV headroom): in YELLOW, ORANGE and RED an admission or a
     /// refill waits (`kv_reservation`) when its worst-case reservation would lift
     /// `kv_utilization` past the next state's `kv` threshold (0.82 / 0.90 / 0.97 by default);
-    /// GREEN has no headroom rule, and without adaptive admission it never applies. Breaks if
+    /// GREEN caps at RED's threshold (`kv_headroom_green_burst`), and without adaptive admission the rule never applies. Breaks if
     /// admissions alone can escalate the pressure state.
     #[test]
     fn kv_headroom() {
@@ -1009,6 +1013,50 @@ mod tests {
             .unwrap();
         assert_eq!(
             plain.evaluate(&est40, PressureState::Yellow, h, 0),
+            AdmissionDecision::Admit
+        );
+    }
+
+    /// P3 S-9 amendment 2026-10-02 (GREEN headroom, 6b decision "which cap the GREEN admission
+    /// headroom uses", A): at GREEN an admission or refill queues `kv_reservation` when its
+    /// worst-case reservation would lift `kv_utilization` past RED's threshold (0.90). On the lab
+    /// 14 admissions inside one controller sample reserved 3,724 of 4,096 MiB and the state jumped
+    /// GREEN to SURVIVAL (0.9946). Breaks if a burst at GREEN can reserve past RED's threshold.
+    #[test]
+    fn kv_headroom_green_burst() {
+        let (a, ledger) = setup(1024, true);
+        let thresholds = crate::signals::default_thresholds()[&PressureSignal::KvUtilization];
+        let a = a.with_kv_headroom(thresholds);
+        let h = CircuitState::Healthy;
+        let mut held = Vec::new();
+        let mut queued = 0;
+        for _ in 0..14 {
+            // 70 blocks each: 14 of them would reserve 980 of 1,024 (0.957).
+            match a.evaluate(&est(70), PressureState::Green, h, 0) {
+                AdmissionDecision::Admit => held.push(a.reserve_kv(&est(70)).unwrap()),
+                AdmissionDecision::Queue {
+                    reason: PressureReason::KvReservation,
+                } => queued += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // RED's 0.90 of 1,024 blocks is 921: thirteen requests (910) fit, the fourteenth queues.
+        assert_eq!(held.len(), 13);
+        assert_eq!(queued, 1);
+        let usage = ledger.usage(DeviceId(0), PoolKind::Kv);
+        assert!(usage.reserved as f64 / usage.capacity as f64 <= 0.90);
+        // A GREEN refill obeys the same cap.
+        assert_eq!(
+            a.evaluate_refill(&est(70), PressureState::Green, h),
+            AdmissionDecision::Queue {
+                reason: PressureReason::KvReservation
+            }
+        );
+        // Without adaptive admission only hard capacity counts.
+        let (plain, _l) = setup(1024, false);
+        let plain = plain.with_kv_headroom(thresholds);
+        assert_eq!(
+            plain.evaluate(&est(70), PressureState::Green, h, 0),
             AdmissionDecision::Admit
         );
     }

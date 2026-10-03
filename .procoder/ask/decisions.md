@@ -3114,3 +3114,16 @@ compresses lower tiers only once slabs can take the rung's size.
 - D) Stop here: the ladder keeps demotions flowing at each tier's own format; compressed rungs stay opt-in until B/C
 
 **Decision (user, 2026-10-03): C.** Smaller L1 slabs (lower risk); slab re-sizing (B) only if compression must land sooner.
+
+## 6b: which cap the GREEN admission headroom uses (2026-10-02)
+
+Follows "GREEN→SURVIVAL admission burst" (1 A). `Admission::within_headroom` queues at YELLOW/ORANGE/RED when a
+reservation would lift `kv_utilization` past the next state's threshold (0.82 / 0.90 / 0.97); at GREEN it admits
+everything (the hole behind the 14-admission burst to 0.9946). The existing pattern at GREEN would cap at YELLOW's 0.70
+(option B, declined), so decision A needs a looser cap:
+
+- A) RED threshold (0.90): GREEN admissions may reach ORANGE but never RED or SURVIVAL (~7 % of pool capacity reserved
+  as margin at GREEN; expected no throughput change at c16)
+- B) SURVIVAL threshold (0.97): admissions alone can't enter SURVIVAL, but can still jump GREEN → RED
+
+**Decision (user, 2026-10-02): A.** At GREEN, admissions are capped at the RED threshold (0.90).
