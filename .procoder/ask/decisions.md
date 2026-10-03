@@ -3127,3 +3127,17 @@ everything (the hole behind the 14-admission burst to 0.9946). The existing patt
 - B) SURVIVAL threshold (0.97): admissions alone can't enter SURVIVAL, but can still jump GREEN → RED
 
 **Decision (user, 2026-10-02): A.** At GREEN, admissions are capped at the RED threshold (0.90).
+
+## 6b Task 17: the BF16 recent window needs per-class block addressing (2026-10-03)
+
+From `p6b-t17` (merged; `.procoder/handoff/p6b-t17.md`). The window (newest blocks of each live sequence at BF16 while
+the L0 base format is lossy) is implemented host-side and defaults off: the executor's pool view addresses only flat
+base pages, so a BF16 window page (larger than a tq4 base page) fails at the first forward. The L0 ladder keeps its
+startup refusal until this is solved.
+
+- A) Per-class block addressing through the ABI: the attention descriptor addresses each block in its page class's
+  slabs (the mixed-attention `block_formats` plumbing already exists); touches the C ABI (v2.11, unshipped) and the
+  executor pool view — the builder's recommendation
+- B) A separate side pool for window blocks
+- C) fp8-rung window: window blocks held at fp8 instead of BF16 (same page size as tq4 base? — no; fp8 pages are half
+  of BF16, so the same addressing problem, smaller)
