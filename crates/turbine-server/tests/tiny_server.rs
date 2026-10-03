@@ -993,6 +993,70 @@ fn tq_kv_serves_on_cpu() {
     assert_eq!(status["support"]["status"], "experimental", "{status}");
 }
 
+/// P6b S-5/S-7 (the GPU counterpart of kv_sim's `recent_window_holds_newest_blocks_at_bf16`,
+/// served): with `kv.dtype: tq4` and the default window, the pool grows the BF16 page class
+/// (`kv_page_classes`), a completion over the window serves, and a block that left the window
+/// is recompressed into the base format (`turbine_kv_ladder_actions_total{tier="l0",
+/// reason="recent_window"}` counts it). Breaks if the window's BF16 pages cannot be addressed
+/// by the executor (the Task 17 open item) or the window conversion never runs.
+#[test]
+fn recent_window_serves_on_cpu() {
+    let server = TinyServer::launch(&Setup {
+        kv_extra: "  dtype: tq4\n",
+        head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the tq_tables log line", || {
+        logs.lock().unwrap().contains(r#""event":"tq_tables""#)
+    });
+    wait_for(
+        Duration::from_secs(10),
+        "the kv_page_classes log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.contains(r#""event":"kv_page_classes""#) && text.contains("bf16")
+        },
+    );
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 300,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(
+        resp.json()["usage"]["completion_tokens"],
+        300,
+        "{}",
+        resp.body
+    );
+    // The window's exit conversions run on the engine's ticks: like kv_sim's
+    // `recent_window_holds_newest_blocks_at_bf16`, a following request's iterations drive
+    // them (the first request's blocks are unreferenced and outside the live windows).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Again", "max_tokens": 8,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    wait_for(
+        Duration::from_secs(20),
+        "the recent_window conversion",
+        || {
+            server.metrics().lines().any(|l| {
+                l.starts_with("turbine_kv_ladder_actions_total{")
+                    && l.contains("tier=\"l0\"")
+                    && l.contains("reason=\"recent_window\"")
+                    && l.rsplit(' ')
+                        .next()
+                        .is_some_and(|v| v.parse::<f64>().is_ok_and(|v| v >= 1.0))
+            })
+        },
+    );
+}
+
 /// P6b S-3 / S-5 (user decision 2026-10-02, "6b Task 13", 4 A): over TurboQuant L0 pages a
 /// reused prefix is served from lossy blocks, so the second run of a 201-token prompt reports
 /// its full 128-token block as both `cached_tokens` and `lossy_cached_tokens`, and

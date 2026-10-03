@@ -46,10 +46,10 @@ use turbine_tensor::{
 use crate::cards::CardProfile;
 use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
-    EmbeddingDesc, GemmDesc, KvTranscodeDesc, LogitsReduceDesc, MOE_ROUTE_BF16_LOGITS,
-    MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc, QuantizeActDesc,
-    RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns,
-    TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
+    EmbeddingDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
+    MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc,
+    QuantizeActDesc, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols,
+    SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -1591,6 +1591,11 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         v_scale: 1.0,
         block_formats: std::ptr::null(),
         tq_params: std::ptr::null(),
+        page_classes: std::ptr::null(),
+        num_page_classes: 0,
+        base_blocks: 1,
+        slab_stride: 1,
+        slab_base_blocks: 1,
     }
 }
 
@@ -1673,6 +1678,12 @@ fn copy_blocks_probe(cfg: &KvCopyConfig) -> CopyBlocksDesc {
         src_blocks: std::ptr::null(),
         dst_blocks: std::ptr::null(),
         count: 1,
+        page_classes: std::ptr::null(),
+        pair_formats: std::ptr::null(),
+        num_page_classes: 0,
+        base_blocks: 1,
+        slab_stride: 1,
+        slab_base_blocks: 1,
     }
 }
 
@@ -2523,13 +2534,16 @@ impl AttentionKernel for ShimProvider {
             )));
         };
         // P6b S-5: TurboQuant pages and mixed-format block tables travel in the ABI v2.11
-        // fields; a library below minor 11 would ignore them.
-        let mixed = cfg.dtype.tq_record_bytes().is_some() || ctx.block_formats.is_some();
+        // fields; a library below minor 11 would ignore them. The same for per-class page
+        // addressing.
+        let mixed = cfg.dtype.tq_record_bytes().is_some()
+            || ctx.block_formats.is_some()
+            || ctx.classes.is_some();
         if mixed && self.ctx.lib.abi_minor() < 11 {
             return Err(KernelError::Unsupported {
                 message: format!(
-                    "{} over {} pages or a mixed-format block table needs a kernel library of \
-                     ABI minor 11 (this one is {})",
+                    "{} over {} pages, a mixed-format block table or page classes needs a \
+                     kernel library of ABI minor 11 (this one is {})",
                     cfg.op(),
                     cfg.dtype.as_str(),
                     self.ctx.lib.abi_minor()
@@ -2543,21 +2557,56 @@ impl AttentionKernel for ShimProvider {
                 "k_new and v_new must share one token stride".into(),
             ));
         }
-        let num_blocks = ctx.kv_layer.shape.first().copied().unwrap_or(0);
-        match cfg.dtype.tq_record_bytes() {
-            // TurboQuant pages: `[num_blocks, page bytes]`, one record per (KV head, token).
-            Some(record) => dense(
-                "kv_layer",
-                &ctx.kv_layer,
-                &[num_blocks, hkv * block_tokens as usize * record as usize],
-                cfg.dtype,
-            )?,
-            None => dense(
-                "kv_layer",
-                &ctx.kv_layer,
-                &[num_blocks, 2, block_tokens as usize, hkv, d],
-                cfg.dtype,
-            )?,
+        let flat_num_blocks = ctx.kv_layer.shape.first().copied().unwrap_or(0);
+        // Per-class addressing (P6b S-5/S-7): kv_layer is this layer's region as U8 bytes, the
+        // ids address the classes. The class table is host memory read during the call only;
+        // it lives to the end of this function.
+        let mut class_table: Vec<KvPageClassDesc> = Vec::new();
+        let (num_blocks, page_classes, class_scalars) = match ctx.classes {
+            Some(c) => {
+                let region = c.base_blocks as usize * c.base_page_bytes as usize;
+                dense("kv_layer (classed)", &ctx.kv_layer, &[region], DType::U8)?;
+                for cl in c.page_classes {
+                    class_table.push(KvPageClassDesc {
+                        fmt: i32::from(cl.fmt),
+                        per_layer_bytes: i32::try_from(cl.per_layer_bytes)
+                            .map_err(|_| invalid("class page bytes overflow i32".into()))?,
+                    });
+                }
+                (
+                    c.num_blocks as usize,
+                    class_table.as_ptr(),
+                    (
+                        class_table.len() as i32,
+                        c.base_blocks as i32,
+                        c.slab_stride as i32,
+                        c.slab_base_blocks as i32,
+                    ),
+                )
+            }
+            None => (
+                flat_num_blocks,
+                std::ptr::null(),
+                (0, flat_num_blocks as i32, 1, 1),
+            ),
+        };
+        if ctx.classes.is_none() {
+            match cfg.dtype.tq_record_bytes() {
+                // TurboQuant pages: `[num_blocks, page bytes]`, one record per (KV head,
+                // token).
+                Some(record) => dense(
+                    "kv_layer",
+                    &ctx.kv_layer,
+                    &[num_blocks, hkv * block_tokens as usize * record as usize],
+                    cfg.dtype,
+                )?,
+                None => dense(
+                    "kv_layer",
+                    &ctx.kv_layer,
+                    &[num_blocks, 2, block_tokens as usize, hkv, d],
+                    cfg.dtype,
+                )?,
+            }
         }
         let num_seqs = ctx.kv_lens.shape.first().copied().unwrap_or(0);
         let max_blocks = ctx.max_blocks_per_seq as usize;
@@ -2633,6 +2682,11 @@ impl AttentionKernel for ShimProvider {
             num_q_heads: to_i32("num_q_heads", cfg.num_q_heads)?,
             num_kv_heads: to_i32("num_kv_heads", cfg.num_kv_heads)?,
             head_dim: to_i32("head_dim", cfg.head_dim)?,
+            page_classes,
+            num_page_classes: class_scalars.0,
+            base_blocks: class_scalars.1,
+            slab_stride: class_scalars.2,
+            slab_base_blocks: class_scalars.3,
             scale: ctx.scale,
             causal: i32::from(cfg.causal),
             dtype: cfg.dtype.abi_code(),
@@ -2684,18 +2738,47 @@ impl KvCopyKernel for ShimProvider {
                 ctx.pool.len()
             )));
         }
-        // Host arrays, read by the shim during the call only.
+        // Host arrays, read by the shim during the call only. With page classes, the ids
+        // address the classes and the library validates them (`block_bytes` is the base page).
         let blocks_per_layer = ctx.layer_stride_bytes / ctx.block_bytes;
         let mut src = Vec::with_capacity(ctx.pairs.len());
         let mut dst = Vec::with_capacity(ctx.pairs.len());
-        for &(s, d) in ctx.pairs {
-            for b in [s, d] {
-                if u64::from(b.0) >= blocks_per_layer {
-                    return Err(invalid(format!(
-                        "block id {} is outside the {blocks_per_layer} blocks of a layer",
-                        b.0
-                    )));
-                }
+        let mut fmts = Vec::with_capacity(ctx.pairs.len());
+        let (mut page_classes, mut num_page_classes) = (std::ptr::null(), 0i32);
+        let (mut base_blocks, mut slab_stride, mut slab_base_blocks) = (0i32, 1i32, 1i32);
+        let mut classes_host: Vec<KvPageClassDesc> = Vec::new();
+        if let Some(c) = ctx.classes {
+            let mut classes: Vec<KvPageClassDesc> = Vec::with_capacity(c.page_classes.len());
+            for cl in c.page_classes {
+                classes.push(KvPageClassDesc {
+                    fmt: i32::from(cl.fmt),
+                    per_layer_bytes: i32::try_from(cl.per_layer_bytes)
+                        .map_err(|_| invalid("class page bytes overflow i32".into()))?,
+                });
+            }
+            page_classes = classes.as_ptr();
+            num_page_classes = classes.len() as i32;
+            base_blocks = c.base_blocks as i32;
+            slab_stride = c.slab_stride as i32;
+            slab_base_blocks = c.slab_base_blocks as i32;
+            classes_host = classes;
+        }
+        for (i, &(s, d)) in ctx.pairs.iter().enumerate() {
+            if ctx.classes.is_none()
+                && (u64::from(s.0) >= blocks_per_layer || u64::from(d.0) >= blocks_per_layer)
+            {
+                return Err(invalid(format!(
+                    "block id {} is outside the {blocks_per_layer} blocks of a layer",
+                    s.0.max(d.0)
+                )));
+            }
+            if let Some(c) = ctx.classes {
+                let fmt = ctx
+                    .pair_fmts
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| c.base_code());
+                fmts.push(fmt);
             }
             src.push(to_i32("src block", s.0)?);
             dst.push(to_i32("dst block", d.0)?);
@@ -2708,7 +2791,17 @@ impl KvCopyKernel for ShimProvider {
             src_blocks: src.as_ptr(),
             dst_blocks: dst.as_ptr(),
             count: to_i32("count", ctx.pairs.len())?,
+            page_classes,
+            pair_formats: fmts.as_ptr(),
+            num_page_classes,
+            base_blocks,
+            slab_stride,
+            slab_base_blocks,
         };
+        debug_assert!(
+            ctx.classes.is_some() == !classes_host.is_empty(),
+            "the class table must cover exactly the classed calls"
+        );
         self.run(OpKind::CopyBlocks, &self.syms().copy_blocks, &d, 0)
     }
 }
@@ -3465,6 +3558,8 @@ pub(crate) mod tests {
                 block_bytes: 64,
                 num_layers: 2,
                 pairs: &[(BlockId(1), BlockId(3))],
+                classes: None,
+                pair_fmts: &[],
             })
             .expect_err("the stub implements no op");
         assert!(
@@ -3478,6 +3573,8 @@ pub(crate) mod tests {
                 block_bytes: 64,
                 num_layers: 2,
                 pairs: &[(BlockId(1), BlockId(4))],
+                classes: None,
+                pair_fmts: &[],
             })
             .expect_err("block 4 is outside a 4-block layer");
         assert!(err.to_string().contains("block id 4"), "{err}");

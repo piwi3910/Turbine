@@ -297,25 +297,57 @@ typedef struct turbine_attention_paged_desc {
    * bytes of its format at kv_layer + b * (the page bytes of dtype): BF16 and
    * FP8 pages [2, block_tokens, num_kv_heads, head_dim], TurboQuant pages as
    * TURBINE_DTYPE_TQ4 / _TQ2. A block's page must fit a page of dtype (a
-   * kernel skips one that does not). The append writes each new row in its
-   * block's format; FP8 blocks read k_scale / v_scale. Device memory, so a
-   * decode graph can capture the call. */
+   * kernel skips one that does not) — with page_classes (below), class pages
+   * sit at their class's offset instead and always carry their class's bytes.
+   * The append writes each new row in its block's format; FP8 blocks read
+   * k_scale / v_scale. Device memory, so a decode graph can capture the
+   * call. */
   const uint8_t *block_formats;
   /* v2.11: host pointer, read during the call only (its device pointers are
    * captured with the call): the TurboQuant tables of THIS layer -- tables
    * points at the layer's [num_kv_heads][2 * head_dim] slice of the model's
-   * tables (the caller offsets it; there is no layer field), codebooks and seed
-   * as for the transcode. Required when dtype is TQ4 / TQ2 or block_formats is
-   * not NULL (a table may hold TurboQuant blocks); NULL otherwise and in a
-   * _supported / _impl probe. */
+   * implementations can skip it. */
   const struct turbine_tq_params *tq_params;
+  /* v2.11 per-class page addressing (P6b S-5 / S-7), read only by a library
+   * reporting minor >= 11 and purely additive. NULL page_classes keeps the
+   * flat addressing (num_blocks = base_blocks, every block's page bytes are
+   * those of dtype at kv_layer + id * base_page_bytes). Otherwise kv_layer
+   * stays this layer's region, base_blocks * base_page_bytes long
+   * (base_page_bytes = the page bytes of dtype); num_blocks is the whole id
+   * space (base pages plus every grown slab's class pages) and ids at and
+   * above base_blocks resolve through the pool's slabs,
+   *   kv_layer + (id - base_blocks) / slab_stride * slab_base_blocks *
+   *   base_page_bytes + (id - base_blocks) % slab_stride *
+   *   page_classes[c].per_layer_bytes
+   * with c the entry whose fmt equals the block's TURBINE_KVFMT_* byte in
+   * block_formats (ids >= base_blocks are always read through
+   * block_formats). The scalar fields are pool constants that never change
+   * (a decode graph may bake them); page_classes is host memory, read during
+   * the call only. */
+  const struct turbine_kv_page_class *page_classes;
+  int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
 
+/* One page class of the pool besides the base (P6b S-5 / S-7): fmt is the
+ * TURBINE_KVFMT_* code of the class's pages, per_layer_bytes the bytes of one
+ * page in one layer's region. Host array, read during the call only (the
+ * values are pool constants; a decode graph bakes them by value). */
+typedef struct turbine_kv_page_class {
+  int32_t fmt;
+  int32_t per_layer_bytes;
+} turbine_kv_page_class;
+
 /* Forks blocks (n > 1) across all layers: for each i, block src_blocks[i] is
- * copied to dst_blocks[i] in every layer. Layer l's block b is the block_bytes
- * bytes at pool + l * layer_stride_bytes + b * block_bytes. */
+ * copied to dst_blocks[i] in every layer. With page_classes NULL, layer l's
+ * block b is the block_bytes bytes at pool + l * layer_stride_bytes +
+ * b * block_bytes. With page_classes set, block ids address page classes (the
+ * attention descriptor spells out the resolution): pair_formats[i], a host
+ * array [count], names the TURBINE_KVFMT_* class of BOTH blocks of pair i (a
+ * conversion is not a byte copy) and the copy moves the class's
+ * per_layer_bytes per layer at the resolved offsets, pool = the whole
+ * allocation with layer l at l * layer_stride_bytes. */
 typedef struct turbine_copy_blocks_desc {
   void *pool;
   /* block_bytes = per-layer block size */
@@ -325,6 +357,11 @@ typedef struct turbine_copy_blocks_desc {
   const int32_t *src_blocks;
   const int32_t *dst_blocks;
   int32_t count;
+  /* v2.11 per-class page addressing, purely additive. */
+  const struct turbine_kv_page_class *page_classes;
+  /* host array [count] of TURBINE_KVFMT_* codes; NULL with page_classes */
+  const uint8_t *pair_formats;
+  int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks;
 } turbine_copy_blocks_desc;
 
 /* turbine_moe_route_desc flags. RENORMALIZE divides the selected weights by

@@ -144,6 +144,7 @@ impl Harness {
             num_blocks: self.num_blocks,
             layer_stride_bytes: self.layout.block_bytes() / u64::from(self.layout.num_layers)
                 * u64::from(self.num_blocks),
+            classes: None,
         };
         let tables: Vec<Vec<BlockId>> = parts
             .iter()

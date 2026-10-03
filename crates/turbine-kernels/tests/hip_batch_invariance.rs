@@ -800,6 +800,7 @@ fn paged_run(
             k_scale: 1.0,
             v_scale: 1.0,
             block_formats: None,
+            classes: None,
             tq: None,
         })
         .expect("paged attention");

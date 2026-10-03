@@ -50,9 +50,9 @@ pub struct KvConfig {
     /// The newest N full blocks of each live sequence hold BF16 pages while the L0 base format
     /// is lossy (P6b S-5, the recent window; user decision 2026-10-02, "6b Task 13", 1 C);
     /// 0..=64. A block that leaves the window is recompressed in place into the L0 base
-    /// format. Only with a lossy `kv.dtype`; 0 (the default) turns the window off — a page
-    /// class larger than the base page needs the executor's per-class block addressing before
-    /// a serving path can run it (Task 17's open item).
+    /// format. Only with a lossy `kv.dtype`. Default 1 (one block, `kv.block_tokens` tokens:
+    /// it matches `kv.lossless_tail_blocks` and the newest tokens carry most of an attention
+    /// row's mass; larger values trade L0 capacity for exactness); 0 turns the window off.
     pub recent_window_blocks: u32,
     /// Whether requests without `x-turbine-kv-lossy` may reuse lossy cached blocks (P6b S-3,
     /// Q15).
@@ -82,7 +82,7 @@ impl Default for KvConfig {
             prefetch: KvPrefetchConfig::default(),
             policy_weights: KvPolicyWeights::default(),
             lossless_tail_blocks: 1,
-            recent_window_blocks: 0,
+            recent_window_blocks: 1,
             lossy_reuse: LossyReuse::Allow,
             lossy_penalty: None,
             ladder: KvLadderConfig::default(),

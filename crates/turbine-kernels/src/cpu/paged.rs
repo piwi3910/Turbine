@@ -162,6 +162,7 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
     let base = kv_format_code(ctx.cfg.dtype);
     let formats = load_formats(ctx)?;
     if ctx.cfg.dtype.tq_record_bytes().is_some()
+        || ctx.classes.is_some()
         || formats.iter().flatten().any(|f| Some(*f) != base)
     {
         return mixed(ctx, formats);
@@ -299,12 +300,12 @@ fn load_formats(ctx: &PagedAttentionContext<'_>) -> Result<Option<Vec<u8>>, Kern
     Ok(Some(offsets.iter().map(|&o| bytes[o]).collect()))
 }
 
-/// Mixed-format pages (P6b S-5): TurboQuant L0 pages, or a block table whose format codes
-/// differ from `cfg.dtype`'s. Each new row is encoded into its block by the block's format
-/// (TurboQuant records through the caller's codec, `ctx.tq`), then attention reads every block
-/// by its format through [`tq_attention`] (the rotated-domain formulation), rows of a prefill
-/// chunk included. Block `b`'s bytes are the first page bytes of its format in slot `b` of
-/// `kv_layer` (a dense view whose rows are the slots).
+/// Mixed-format pages (P6b S-5): TurboQuant L0 pages, a block table whose format codes
+/// differ from `cfg.dtype`'s, or a pool with page classes. Each new row is encoded into its
+/// block by the block's format (TurboQuant records through the caller's codec, `ctx.tq`), then
+/// attention reads every block by its format through [`tq_attention`] (the rotated-domain
+/// formulation), rows of a prefill chunk included. A block's page sits at its class's offset
+/// ([`KvPageClasses::page_offset`]; the flat slot `b` of `kv_layer` without classes).
 fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<(), KernelError> {
     let hq = ctx.cfg.num_q_heads as usize;
     let hkv = ctx.cfg.num_kv_heads as usize;
@@ -340,25 +341,88 @@ fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<()
         )));
     }
     let slot = pool.shape[1..].iter().product::<usize>() * pool.dtype.size_bytes();
-    if pool.slice.len() < num_blocks * slot {
-        return Err(invalid(format!(
-            "kv_layer slice holds {} bytes, {num_blocks} slots of {slot} need more",
-            pool.slice.len()
-        )));
-    }
+    let num_blocks: usize = match ctx.classes {
+        Some(c) => {
+            if pool.dtype != DType::U8 || pool.shape.as_slice() != [pool.slice.len()] {
+                return Err(invalid(format!(
+                    "a classed pool's kv_layer is this layer's region as U8 [region], is {} {:?}",
+                    pool.dtype.as_str(),
+                    pool.shape
+                )));
+            }
+            // The base page of the classed view, checked against the pool's constants.
+            let base_page = tq_attention::page_bytes_of(base, bt, hkv, d)
+                .ok_or_else(|| invalid(format!("unknown KV block format {base}")))?;
+            if base_page as u64 != c.base_page_bytes {
+                return Err(invalid(format!(
+                    "the pool's base page is {} bytes per layer, the config's pages are {base_page}",
+                    c.base_page_bytes
+                )));
+            }
+            c.num_blocks as usize
+        }
+        None => {
+            if pool.slice.len() < num_blocks * slot {
+                return Err(invalid(format!(
+                    "kv_layer slice holds {} bytes, {num_blocks} slots of {slot} need more",
+                    pool.slice.len()
+                )));
+            }
+            num_blocks
+        }
+    };
     let seqs = sequences(ctx, total_q, num_blocks, bt)?;
     let max_blocks = ctx.max_blocks_per_seq as usize;
     let entries = seqs.len() * max_blocks;
     let formats: Vec<u8> = formats.unwrap_or_else(|| vec![base; entries]);
+    let region = pool.slice.len();
+    // `(offset, page bytes)` of block `b` in the layer region, by the block's format code.
+    let page_at = |b: usize, fmt: u8| -> Result<(usize, usize), KernelError> {
+        if let Some(c) = ctx.classes {
+            let off = c
+                .page_offset(
+                    u32::try_from(b).map_err(|_| invalid("block id overflows usize".into()))?,
+                    fmt,
+                )
+                .ok_or_else(|| invalid(format!("block {b} is outside the pool's ids")))?;
+            let len = c.page_bytes(fmt).expect("page_offset resolved the format");
+            if off + len > region as u64 {
+                return Err(invalid(format!(
+                    "a {fmt} page at byte {off} runs past the pool's region of {region} bytes"
+                )));
+            }
+            Ok((off as usize, len as usize))
+        } else {
+            if b >= num_blocks {
+                return Err(invalid(format!(
+                    "block {b} is outside the pool of {num_blocks} blocks"
+                )));
+            }
+            Ok((b * slot, slot))
+        }
+    };
     let page_len = |fmt: u8| -> Result<usize, KernelError> {
         match tq_attention::page_bytes_of(fmt, bt, hkv, d) {
             Some(n) if n <= slot => Ok(n),
+            Some(n) if ctx.classes.is_some() => Ok(n),
             Some(n) => Err(invalid(format!(
-                "a format {fmt} page of {n} bytes does not fit a kv_layer slot of {slot}"
+                "a format {fmt} page of {n} may not exceed a base page of {slot}"
             ))),
-            None => Err(invalid(format!("unknown KV block format {fmt}"))),
+            None => Err(invalid(format!("unknown KV block with format {fmt}"))),
         }
     };
+    // Sanity: a classed pool's classes report the codec's page bytes exactly.
+    if let Some(c) = ctx.classes {
+        for cl in c.page_classes {
+            let want = tq_attention::page_bytes_of(cl.fmt, bt, hkv, d);
+            if cl.per_layer_bytes != want.unwrap_or(0) as u64 {
+                return Err(invalid(format!(
+                    "the pool's {} class holds {} bytes per layer, the codec gives {want:?}",
+                    cl.fmt, cl.per_layer_bytes
+                )));
+            }
+        }
+    }
     // Every block the batch reads, with its one format.
     let mut block_fmt: BTreeMap<usize, u8> = BTreeMap::new();
     for (s, seq) in seqs.iter().enumerate() {
@@ -400,10 +464,10 @@ fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<()
     let q = load(&ctx.q)?;
     let k_new = load(&ctx.k_new)?;
     let v_new = load(&ctx.v_new)?;
-    let slot_slice = |b: usize| pool.slice.sub(b * slot, slot);
-    let mut bytes: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    let mut bytes: BTreeMap<usize, (usize, Vec<u8>)> = BTreeMap::new();
     for &b in block_fmt.keys() {
-        bytes.insert(b, slot_slice(b).read_bytes()?);
+        let (at, len) = page_at(b, block_fmt[&b])?;
+        bytes.insert(b, (at, pool.slice.sub(at, len).read_bytes()?));
     }
     // Append: each new row, per KV head, encoded by its block's format.
     let mut touched = std::collections::BTreeSet::new();
@@ -415,7 +479,7 @@ fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<()
             let b = seq.blocks[pos / bt];
             let t = pos % bt;
             let fmt = block_fmt[&b];
-            let page = bytes.get_mut(&b).expect("read above");
+            let page = &mut bytes.get_mut(&b).expect("read above").1;
             touched.insert(b);
             let src = (seq.row + i) * token;
             for g in 0..hkv {
@@ -448,12 +512,13 @@ fn mixed(ctx: &PagedAttentionContext<'_>, formats: Option<Vec<u8>>) -> Result<()
         }
     }
     for b in &touched {
-        slot_slice(*b).write_bytes(&bytes[b])?;
+        let (at, page) = &bytes[b];
+        pool.slice.sub(*at, page.len()).write_bytes(page)?;
     }
 
     // Attend over every block by its format.
     let mut pages: Vec<&[u8]> = vec![&[]; num_blocks];
-    for (&b, page) in &bytes {
+    for (&b, (_, page)) in &bytes {
         pages[b] = &page[..page_len(block_fmt[&b])?];
     }
     let mut q_indptr = vec![0usize];
@@ -535,6 +600,7 @@ mod tests {
             k_scale: scales.0,
             v_scale: scales.1,
             block_formats: None,
+            classes: None,
             tq: None,
         })?;
         Ok((
@@ -720,6 +786,7 @@ mod tests {
             k_scale: 1.0,
             v_scale: 1.0,
             block_formats: None,
+            classes: None,
             tq: None,
         })
         .expect("paged attention");
@@ -861,6 +928,8 @@ mod tests {
                 block_bytes: block_bytes as u64,
                 num_layers: layers as u32,
                 pairs: &[(BlockId(3), BlockId(7))],
+                classes: None,
+                pair_fmts: &[],
             })
             .expect("copy_blocks");
         let after = buf.whole().read_bytes().expect("read");
@@ -890,6 +959,8 @@ mod tests {
                 block_bytes: 16,
                 num_layers: 3,
                 pairs: &[(BlockId(0), BlockId(1))],
+                classes: None,
+                pair_fmts: &[],
             })
             .expect_err("an overflowing extent is refused");
         assert!(err.to_string().contains("exceed"), "{err}");
@@ -981,6 +1052,7 @@ mod tests {
                 k_scale,
                 v_scale,
                 block_formats: Some(formats_t.view()),
+                classes: None,
                 tq: Some(TqPaged {
                     params: &params,
                     encode,
@@ -1064,5 +1136,253 @@ mod tests {
         let reference = tq_attention::prefill(&qv, &layer, &params, Formulation::DecodeThenAttend)
             .expect("reference");
         assert_close(&got, &reference, 1e-4);
+    }
+
+    /// P6b S-5/S-7 per-class addressing (the recent window's shape: a TurboQuant `tq4` base
+    /// whose newest block is a BF16 class page — larger than a base page, so the flat
+    /// addressing cannot hold it). One sequence of 32 tokens: block 5 a base `tq4` page
+    /// (tokens 0..16), block 8 the BF16 class page of slab 0 (tokens 16..32). The append
+    /// writes each half in its block's class at the class offset and attention reads them the
+    /// same way: the pages match independently encoded ones byte for byte and the output
+    /// matches the decode-then-attend reference. Breaks if a page is addressed flat (the class
+    /// page would land at `8 * base_page`, outside the region) or the classes are ignored.
+    #[test]
+    fn classed_pages_append_and_read_at_their_class_offsets() {
+        use turbine_kv::codec::turboquant::codebook::codebook;
+        use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
+        use turbine_kv::codec::turboquant::{Tq4Codec, encode_record};
+        use turbine_tensor::{KvPageClass, KvPageClasses};
+
+        use crate::cpu::tq_attention::{self, Formulation, MixedPagedLayer};
+
+        const SEED: u64 = 0x0123_4567_89ab_cdef;
+        fn encode(fmt: u8, k: &[f32], v: &[f32], h: &TqHeadTables, record: &mut [u8]) {
+            assert_eq!(fmt, KV_FMT_TQ4);
+            encode_record(Tq4Codec::WIDTHS, k, v, &h.k_signs, &h.v_signs, record);
+        }
+        let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
+        let (hq, hkv, d, bt, t) = (4usize, 2usize, 128usize, 16usize, 32usize);
+        let params = TqParams {
+            heads: (0..hkv as u32)
+                .map(|h| TqHeadTables {
+                    k_signs: rademacher(SEED, 0, h, SignKind::K, d),
+                    v_signs: rademacher(SEED, 0, h, SignKind::V, d),
+                })
+                .collect(),
+            codebooks: [codebook(1), codebook(2), codebook(3), codebook(4)].map(<[f32]>::to_vec),
+        };
+        let base_page = tq_attention::page_bytes_of(KV_FMT_TQ4, bt, hkv, d).expect("tq4 page");
+        let class_page = tq_attention::page_bytes_of(KV_FMT_BF16, bt, hkv, d).expect("bf16 page");
+        // 8 base pages, slabs of 4 (each holds one BF16 class page plus slack), so the id
+        // space runs 0..10 and id 8 is slab 0's class page.
+        let (base_blocks, slab_base, slab_stride) = (8u32, 4u32, 1u32);
+        let num_blocks = base_blocks + 2 * slab_stride;
+        let region = base_blocks as usize * base_page;
+        let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
+        codes[8] = KV_FMT_BF16;
+        let classes = KvPageClasses {
+            num_blocks,
+            base_blocks,
+            base_page_bytes: base_page as u64,
+            slab_stride,
+            slab_base_blocks: slab_base,
+            page_classes: &[KvPageClass {
+                fmt: KV_FMT_BF16,
+                per_layer_bytes: class_page as u64,
+            }],
+            class_codes: &codes,
+        };
+        assert_eq!(classes.page_offset(8, KV_FMT_BF16), Some(0));
+        assert_eq!(
+            classes.page_offset(9, KV_FMT_BF16),
+            Some(u64::from(slab_base * base_page as u32)),
+        );
+        assert_eq!(
+            classes.page_offset(5, KV_FMT_TQ4),
+            Some(5 * base_page as u64)
+        );
+
+        let cfg = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            num_q_heads: hq as u32,
+            num_kv_heads: hkv as u32,
+            head_dim: d as u32,
+            dtype: DType::Tq4,
+            block_tokens: Some(bt as u32),
+            causal: true,
+        };
+        let table = [5i32, 8];
+        let formats = [KV_FMT_TQ4, KV_FMT_BF16];
+        let bf = |x: &[f32]| -> Vec<f32> {
+            x.iter()
+                .map(|v| half::bf16::from_f32(*v).to_f32())
+                .collect()
+        };
+        let qv = bf(&seeded(61, t * hq * d));
+        let kv = bf(&seeded(62, t * hkv * d));
+        let vv = bf(&seeded(63, t * hkv * d));
+        let q = tensor(&mem, &[t, hq, d], DType::BF16, &qv);
+        let kn = tensor(&mem, &[t, hkv, d], DType::BF16, &kv);
+        let vn = tensor(&mem, &[t, hkv, d], DType::BF16, &vv);
+        let out = Tensor::empty(&mem, &[t, hq, d], DType::F32).expect("out");
+        let table_t = i32_tensor_2d(&mem, 1, &table);
+        let q_indptr = i32_tensor(&mem, &[0, t as i32]);
+        let kv_lens = i32_tensor(&mem, &[t as i32]);
+        let formats_t = Tensor::empty(&mem, &[1, 2], DType::U8).expect("formats");
+        formats_t
+            .view()
+            .slice
+            .write_bytes(&formats)
+            .expect("formats");
+        let pool = Tensor::empty(&mem, &[region], DType::U8).expect("pool");
+        cpu_reference_provider()
+            .attention()
+            .expect("attention family")
+            .execute_paged(&mut PagedAttentionContext {
+                cfg,
+                q: q.view(),
+                k_new: kn.view(),
+                v_new: vn.view(),
+                out: out.view(),
+                kv_layer: pool.view(),
+                block_table: table_t.view(),
+                q_indptr: q_indptr.view(),
+                kv_lens: kv_lens.view(),
+                max_q_len: t as u32,
+                max_kv_len: t as u32,
+                max_blocks_per_seq: 2,
+                scale: 1.0 / (d as f32).sqrt(),
+                k_scale: 1.0,
+                v_scale: 1.0,
+                block_formats: Some(formats_t.view()),
+                classes: Some(classes),
+                tq: Some(TqPaged {
+                    params: &params,
+                    encode,
+                    seed: SEED,
+                    device: None,
+                }),
+            })
+            .expect("classed paged attention");
+        let bytes = pool.view().slice.read_bytes().expect("pool");
+        let row = |x: &[f32], pos: usize, g: usize| x[(pos * hkv + g) * d..][..d].to_vec();
+        let rec = Tq4Codec::WIDTHS.record_bytes();
+
+        // The tq4 base page (tokens 0..16 of block 5), encoded here from the rows.
+        let mut want_tq = vec![0u8; base_page];
+        for tok in 0..bt {
+            for g in 0..hkv {
+                let at = (g * bt + tok) * rec;
+                encode(
+                    KV_FMT_TQ4,
+                    &row(&kv, tok, g),
+                    &row(&vv, tok, g),
+                    &params.heads[g],
+                    &mut want_tq[at..at + rec],
+                );
+            }
+        }
+        assert_eq!(&bytes[5 * base_page..6 * base_page], &want_tq[..]);
+
+        // The BF16 class page (tokens 16..32) at the class offset of slab 0, byte for byte.
+        let mut want_bf = vec![0u8; class_page];
+        for tok in 0..bt {
+            for g in 0..hkv {
+                for (half, x) in [(0, row(&kv, bt + tok, g)), (1, row(&vv, bt + tok, g))] {
+                    let base = ((half * bt + tok) * hkv + g) * d;
+                    for (j, val) in x.iter().enumerate() {
+                        want_bf[(base + j) * 2..(base + j) * 2 + 2]
+                            .copy_from_slice(&half::bf16::from_f32(*val).to_le_bytes());
+                    }
+                }
+            }
+        }
+        assert_eq!(&bytes[..class_page], &want_bf[..]);
+        // A flat addressing would have written the class page at 8 * base_page: that region
+        // (base page 7's tail and the slab-1 ids) stays untouched except where pages live.
+        assert!(
+            bytes[8 * base_page..].iter().all(|&b| b == 0),
+            "the class page leaked into the flat offset"
+        );
+
+        // Attention reads both pages at their class offsets: the decode-then-attend reference
+        // over the independently built pages.
+        let mut pages: Vec<&[u8]> = vec![&[]; num_blocks as usize];
+        pages[5] = &want_tq;
+        pages[8] = &want_bf;
+        let layer = MixedPagedLayer {
+            num_q_heads: hq,
+            num_kv_heads: hkv,
+            head_dim: d,
+            block_tokens: bt,
+            pages: &pages,
+            block_table: &[5, 8],
+            block_formats: &formats,
+            max_blocks_per_seq: 2,
+            q_indptr: &[0, t],
+            kv_lens: &[t],
+            k_scale: 1.0,
+            v_scale: 1.0,
+            scale: 1.0 / (d as f32).sqrt(),
+            causal: true,
+        };
+        let reference = tq_attention::prefill(&qv, &layer, &params, Formulation::DecodeThenAttend)
+            .expect("reference");
+        let got = load(&out.view()).expect("out");
+        assert_close(&got, &reference, 1e-4);
+    }
+
+    /// `copy_blocks` over a classed pool: the pair copies the class's page bytes at the class
+    /// offsets in every layer (block 8, the BF16 class page of slab 0, to block 9, slab 1's),
+    /// and nothing else moves.
+    #[test]
+    fn classed_copy_moves_a_class_page() {
+        use turbine_tensor::{KvPageClass, KvPageClasses};
+
+        let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
+        let (base_page, class_page) = (64usize, 256usize);
+        let (base_blocks, slab_base, slab_stride) = (8u32, 4u32, 1u32);
+        let num_blocks = base_blocks + 2 * slab_stride;
+        let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
+        codes[8] = KV_FMT_BF16;
+        codes[9] = KV_FMT_BF16;
+        let classes = KvPageClasses {
+            num_blocks,
+            base_blocks,
+            base_page_bytes: base_page as u64,
+            slab_stride,
+            slab_base_blocks: slab_base,
+            page_classes: &[KvPageClass {
+                fmt: KV_FMT_BF16,
+                per_layer_bytes: class_page as u64,
+            }],
+            class_codes: &codes,
+        };
+        let region = base_blocks as usize * base_page;
+        let layers = 2usize;
+        let buf = DeviceBuffer::alloc(&mem, layers * region).expect("pool");
+        let before: Vec<u8> = (0..buf.len()).map(|i| (i % 251) as u8).collect();
+        buf.whole().write_bytes(&before).expect("fill");
+        cpu_reference_provider()
+            .kv_copy()
+            .expect("kv_copy family")
+            .execute(&mut KvCopyContext {
+                pool: buf.whole(),
+                layer_stride_bytes: region as u64,
+                block_bytes: base_page as u64,
+                num_layers: layers as u32,
+                pairs: &[(BlockId(8), BlockId(9))],
+                classes: Some(classes),
+                pair_fmts: &[KV_FMT_BF16],
+            })
+            .expect("classed copy");
+        let after = buf.whole().read_bytes().expect("read");
+        let mut want = before.clone();
+        for layer in 0..layers {
+            let src = layer * region;
+            want.copy_within(src..src + class_page, src + class_page);
+        }
+        assert_eq!(after, want);
+        assert_ne!(after, before);
     }
 }

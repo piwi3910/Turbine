@@ -36,20 +36,47 @@ impl KvCopyKernel for CpuReference {
                 ctx.pool.len()
             )));
         }
-        for &(src, dst) in ctx.pairs {
-            for b in [src.0, dst.0] {
-                if b as usize >= blocks_per_layer {
-                    return Err(invalid(format!(
-                        "block id {b} is outside the {blocks_per_layer} blocks of a layer"
-                    )));
+        // With classes, a pair copies one class's page bytes at the class offsets (the caller
+        // refuses pairs whose blocks differ in class).
+        let flat = |b: u32, layer: usize| layer * layer_stride + b as usize * block_bytes;
+        let classed = |b: u32, fmt: u8, layer: usize| -> Result<(usize, usize), KernelError> {
+            let Some(c) = ctx.classes else {
+                return Ok((flat(b, layer), block_bytes));
+            };
+            let off = c.page_offset(b, fmt).ok_or_else(|| {
+                invalid(format!(
+                    "block id {b} is outside the pool's {} ids",
+                    c.num_blocks
+                ))
+            })?;
+            let len = c.page_bytes(fmt).expect("page_offset resolved the format") as usize;
+            Ok((layer * layer_stride + off as usize, len))
+        };
+        let fmt_of = |i: usize| -> Result<u8, KernelError> {
+            match ctx.classes {
+                None => Ok(0),
+                Some(c) => {
+                    let fmt = ctx.pair_fmts.get(i).copied().unwrap_or(c.base_code());
+                    let src_ok = c.page_offset(ctx.pairs[i].0.0, fmt).is_some();
+                    let dst_ok = c.page_offset(ctx.pairs[i].1.0, fmt).is_some();
+                    if !src_ok || !dst_ok {
+                        return Err(invalid(format!(
+                            "copy pair {i}: a block is outside the pool's {} ids",
+                            c.num_blocks
+                        )));
+                    }
+                    Ok(fmt)
                 }
             }
-        }
+        };
         for layer in 0..layers {
-            for &(src, dst) in ctx.pairs {
-                let at = |b: u32| layer * layer_stride + b as usize * block_bytes;
-                let bytes = ctx.pool.sub(at(src.0), block_bytes).read_bytes()?;
-                ctx.pool.sub(at(dst.0), block_bytes).write_bytes(&bytes)?;
+            for (i, &(src, dst)) in ctx.pairs.iter().enumerate() {
+                let fmt = fmt_of(i)?;
+                let (sat, slen) = classed(src.0, fmt, layer)?;
+                let (dat, dlen) = classed(dst.0, fmt, layer)?;
+                let len = slen.min(dlen);
+                let bytes = ctx.pool.sub(sat, len).read_bytes()?;
+                ctx.pool.sub(dat, len).write_bytes(&bytes)?;
             }
         }
         Ok(())

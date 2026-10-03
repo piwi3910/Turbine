@@ -35,11 +35,14 @@ pub(crate) fn check_pool(kv: &KvPoolView<'_>, layout: &KvLayout) -> Result<(), M
             kv.layout
         )));
     }
-    let per_layer = u64::from(kv.num_blocks) * layer_block_bytes(layout);
+    // The base region sizes each layer; `num_blocks` is the whole id space (with page
+    // classes, more than the base blocks).
+    let base_blocks = kv.classes.as_ref().map_or(kv.num_blocks, |c| c.base_blocks);
+    let per_layer = u64::from(base_blocks) * layer_block_bytes(layout);
     if kv.num_blocks == 0 || kv.layer_stride_bytes < per_layer {
         return Err(invalid(format!(
             "KV pool of {} blocks needs a layer stride of at least {per_layer} bytes, has {}",
-            kv.num_blocks, kv.layer_stride_bytes
+            base_blocks, kv.layer_stride_bytes
         )));
     }
     let needed = u64::from(layout.num_layers.saturating_sub(1)) * kv.layer_stride_bytes + per_layer;
@@ -55,10 +58,21 @@ pub(crate) fn check_pool(kv: &KvPoolView<'_>, layout: &KvLayout) -> Result<(), M
 
 /// Layer `layer` of the pool as the dense `[num_blocks, 2, block_tokens, kv_heads, head_dim]`
 /// tensor the paged attention op takes; TurboQuant pages (P6b S-5), whose records are not
-/// elements, as `[num_blocks, layer_block_bytes]` bytes of their dtype. The pool must have
-/// passed [`check_pool`].
+/// elements, as `[num_blocks, layer_block_bytes]` bytes of their dtype. With page classes
+/// (P6b S-5/S-7), the layer's whole region as U8 bytes `[layer_stride_bytes]` — a consumer
+/// resolves every block id through the view's [`KvPageClasses`]. The pool must have passed
+/// [`check_pool`].
 pub(crate) fn kv_layer<'a>(kv: &KvPoolView<'a>, layer: usize) -> TensorView<'a> {
     let l = &kv.layout;
+    if let Some(_c) = kv.classes {
+        let bytes = kv.layer_stride_bytes as usize;
+        return TensorView::contiguous(
+            kv.storage.slice(layer * bytes, bytes),
+            0,
+            &[bytes],
+            DType::U8,
+        );
+    }
     let block = layer_block_bytes(l) as usize;
     let bytes = kv.num_blocks as usize * block;
     let slice = kv
@@ -109,12 +123,36 @@ pub fn copy_blocks(
     }
     let pairs: Vec<(BlockId, BlockId)> = src.iter().copied().zip(dst.iter().copied()).collect();
     let cfg = copy_config(layout);
+    // With page classes, a pair copies one class's page: both blocks must share the class (the
+    // fork allocates the tail destination in the source's class), and the codes come from the
+    // view's per-id table.
+    let fmt = |b: BlockId| -> u8 {
+        kv.classes
+            .as_ref()
+            .and_then(|c| c.class_codes.get(b.0 as usize).copied())
+            .unwrap_or_else(|| kv.classes.as_ref().map_or(0, |c| c.base_code()))
+    };
+    let pair_fmts: Vec<u8> = src.iter().map(|&b| fmt(b)).collect();
+    if kv.classes.is_some() {
+        for (i, (&s, &d)) in src.iter().zip(dst.iter()).enumerate() {
+            if fmt(s) != fmt(d) {
+                return Err(invalid(format!(
+                    "copy_blocks: pair {i} copies between page classes ({a} and {b}); a \
+                     conversion is not a byte copy",
+                    a = fmt(s),
+                    b = fmt(d)
+                )));
+            }
+        }
+    }
     registry.kv_copy(&cfg).execute(&mut KvCopyContext {
         pool: kv.storage.whole(),
         layer_stride_bytes: kv.layer_stride_bytes,
         block_bytes: cfg.block_bytes,
         num_layers: layout.num_layers,
         pairs: &pairs,
+        classes: kv.classes,
+        pair_fmts: &pair_fmts,
     })?;
     Ok(())
 }
@@ -624,12 +662,7 @@ impl SequenceKv {
 
     /// The pool as the executor reads it.
     pub fn view(&self) -> KvPoolView<'_> {
-        KvPoolView {
-            storage: &self.storage,
-            layout: self.layout,
-            num_blocks: self.num_blocks,
-            layer_stride_bytes: u64::from(self.num_blocks) * layer_block_bytes(&self.layout),
-        }
+        KvPoolView::flat(&self.storage, self.layout, self.num_blocks)
     }
 
     /// Runs one Phase 1 step of the sequence on `exec`: `tokens[i]` at `positions[i]`.
@@ -737,12 +770,7 @@ mod tests {
     }
 
     fn view(storage: &DeviceBuffer, blocks: u32) -> KvPoolView<'_> {
-        KvPoolView {
-            storage,
-            layout: layout(),
-            num_blocks: blocks,
-            layer_stride_bytes: u64::from(blocks) * layer_block_bytes(&layout()),
-        }
+        KvPoolView::flat(storage, layout(), blocks)
     }
 
     fn message(r: Result<Packed, ModelError>) -> String {

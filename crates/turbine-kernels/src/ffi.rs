@@ -198,6 +198,24 @@ pub(crate) struct AttentionPagedDesc {
     pub block_formats: *const u8,
     /// v2.11: host pointer to this layer's TurboQuant tables (read during the call only).
     pub tq_params: *const TqParamsDesc,
+    /// v2.11 per-class page addressing: the pool's page classes (read during the call only);
+    /// NULL = flat base pages (then `base_blocks == num_blocks`).
+    pub page_classes: *const KvPageClassDesc,
+    /// v2.11 per-class page addressing: the whole id space, base pages, base pages per slab
+    /// and class page ids per slab (`num_blocks`, `base_blocks` and `slab_stride` /
+    /// `slab_base_blocks` of the pool).
+    pub num_page_classes: i32,
+    pub base_blocks: i32,
+    pub slab_stride: i32,
+    pub slab_base_blocks: i32,
+}
+
+/// `turbine_kv_page_class` (v2.11): one page class besides the base.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KvPageClassDesc {
+    pub fmt: i32,
+    pub per_layer_bytes: i32,
 }
 
 /// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.
@@ -211,6 +229,14 @@ pub(crate) struct CopyBlocksDesc {
     pub src_blocks: *const i32,
     pub dst_blocks: *const i32,
     pub count: i32,
+    /// v2.11 per-class page addressing: the pool's page classes and the pairs' shared
+    /// `TURBINE_KVFMT_*` codes (both NULL/0 with flat pools).
+    pub page_classes: *const KvPageClassDesc,
+    pub pair_formats: *const u8,
+    pub num_page_classes: i32,
+    pub base_blocks: i32,
+    pub slab_stride: i32,
+    pub slab_base_blocks: i32,
 }
 
 /// `TURBINE_MOE_ROUTE_RENORMALIZE`: `MoeRouteDesc::flags` bit dividing the selected weights by

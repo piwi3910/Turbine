@@ -157,6 +157,7 @@ fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> K
         layout,
         num_blocks: blocks,
         layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers) * u64::from(blocks),
+        classes: None,
     }
 }
 

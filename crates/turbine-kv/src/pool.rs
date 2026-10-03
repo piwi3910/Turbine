@@ -24,9 +24,18 @@ use smallvec::SmallVec;
 use turbine_core::types::{BlockId, DType, DeviceId, KvLayout};
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::ledger::{Ledger, Reservation};
-use turbine_tensor::{DeviceBuffer, DeviceMemory, DevicePtr, KvPoolView, MemoryError};
+use turbine_tensor::{
+    DeviceBuffer, DeviceMemory, DevicePtr, KvPageClasses, KvPoolView, MemoryError,
+};
 
 use crate::table::BlockTable;
+
+/// The `TURBINE_KVFMT_*` codes (`turbine-kernels`' ABI v2.11 block-format codes, mirrored so
+/// `turbine-kv` stays free of the kernel crate).
+const KV_FMT_BF16: u8 = 0;
+const KV_FMT_FP8_E4M3: u8 = 1;
+const KV_FMT_TQ4: u8 = 2;
+const KV_FMT_TQ2: u8 = 3;
 
 /// A class of L0 pages of one KV format (P6b S-5): `page_bytes` is one page over every layer
 /// (a base-class page is `layout.block_bytes()`).
@@ -49,8 +58,9 @@ pub struct PageClassUsage {
     pub bytes: u64,
 }
 
-/// The `TURBINE_KVFMT_*` code of a page-class name under an L0 `dtype`: `l0` and `bf16` name
-/// the base class, the other names their registered codec's code.
+/// The `TURBINE_KVFMT_*` code of a page-class name under an L0 `dtype`: `l0` names the base
+/// class, the others their format's code (`bf16` is code 0 even on a TurboQuant base pool —
+/// the recent window's BF16 class, S-5 — while `l0` follows `dtype`).
 fn class_code(format: &str, dtype: DType) -> u8 {
     let base = match dtype {
         DType::F8E4M3 => 1,
@@ -59,9 +69,10 @@ fn class_code(format: &str, dtype: DType) -> u8 {
         _ => 0,
     };
     match format {
-        "fp8_e4m3" => 1,
-        "tq4" => 2,
-        "tq2" => 3,
+        "bf16" => KV_FMT_BF16,
+        "fp8_e4m3" => KV_FMT_FP8_E4M3,
+        "tq4" => KV_FMT_TQ4,
+        "tq2" => KV_FMT_TQ2,
         _ => base,
     }
 }
@@ -86,6 +97,13 @@ struct ClassState {
     free: Vec<BlockId>,
     /// Keyed pages at reference count 0.
     cached: u32,
+}
+
+impl ClassState {
+    /// The `TURBINE_KVFMT_*` code of the class's pages.
+    fn code(&self, dtype: DType) -> u8 {
+        class_code(self.class.format, dtype)
+    }
 }
 
 /// The base pages carved into slabs, and the non-base classes grown into them.
@@ -168,6 +186,13 @@ pub struct BlockPool {
     reclaimed: Vec<BlockId>,
     /// Base-class pages of the allocation (`num_blocks`); ids `0..base_blocks`.
     base_blocks: u32,
+    /// Whole id space: base pages plus every slab's class pages (with classes).
+    total_ids: u32,
+    /// The executor's view of the classes ([`turbine_tensor::KvPageClass`]); empty without
+    /// classes.
+    page_classes: Vec<turbine_tensor::KvPageClass>,
+    /// The `TURBINE_KVFMT_*` code of every id (`total_ids`); empty without classes.
+    class_codes: Vec<u8>,
     /// Page classes other than the base (P6b L0 ladder, S-7): bumped on every page free, the
     /// back-off's `room_epoch` for L0 (a class grows from freed base pages, so any free is
     /// new room).
@@ -219,6 +244,9 @@ impl BlockPool {
             reclaim_order: VecDeque::new(),
             reclaimed: Vec::new(),
             base_blocks: cfg.num_blocks,
+            total_ids: cfg.num_blocks,
+            page_classes: Vec::new(),
+            class_codes: Vec::new(),
             room_epoch: 0,
             slabs: None,
         })
@@ -276,6 +304,15 @@ impl BlockPool {
         }
         self.refcounts.resize(ids as usize, 0);
         self.keyed.resize(ids as usize, false);
+        self.total_ids = ids as u32;
+        self.page_classes = states
+            .iter()
+            .map(|c| turbine_tensor::KvPageClass {
+                fmt: class_code(c.class.format, self.layout.dtype),
+                per_layer_bytes: c.per_layer,
+            })
+            .collect();
+        self.class_codes = vec![self.base_code(); ids as usize];
         self.slabs = Some(Slabs {
             slab_blocks,
             stride,
@@ -416,6 +453,10 @@ impl BlockPool {
             s.classes[ci]
                 .free
                 .extend((start..start + pps).rev().map(BlockId));
+            let code = s.classes[ci].code(self.layout.dtype);
+            for id in start..start + pps {
+                self.class_codes[id as usize] = code;
+            }
         }
         let mut out = SmallVec::with_capacity(n as usize);
         for _ in 0..n {
@@ -433,6 +474,7 @@ impl BlockPool {
     /// Returns block `b` (reference count 0, not cached) to its class's free pages; a slab
     /// whose last page this was goes back to the base class.
     fn free_page(&mut self, b: BlockId) {
+        let base_code = class_code(self.base_format(), self.layout.dtype);
         self.room_epoch += 1;
         let Some((slab, ci, _)) = self.class_page(b) else {
             self.free.push(b);
@@ -450,6 +492,9 @@ impl BlockPool {
             let first = slab as u32 * s.slab_blocks;
             self.free
                 .extend((first..first + s.slab_blocks).rev().map(BlockId));
+            for id in first..first + s.slab_blocks {
+                self.class_codes[id as usize] = base_code;
+            }
         }
     }
 
@@ -691,8 +736,10 @@ impl BlockPool {
     }
 
     /// A table for a forked sequence (`n > 1`): full blocks are shared by reference count;
-    /// a partial tail block gets a fresh block, returned as `(src, dst)` for the engine to copy
-    /// with `copy_blocks`. All-or-nothing: `Exhausted` leaves the pool unchanged.
+    /// a partial tail block gets a fresh block of the tail's own page class (a byte copy of a
+    /// class page into a base page would hold the wrong bytes), returned as `(src, dst)` for
+    /// the engine to copy with `copy_blocks`. All-or-nothing: `Exhausted` leaves the pool
+    /// unchanged.
     pub fn fork(
         &mut self,
         table: &BlockTable,
@@ -700,7 +747,14 @@ impl BlockPool {
         let block_tokens = self.layout.block_tokens.max(1);
         let partial_tail = !table.tokens.is_multiple_of(block_tokens) && !table.blocks.is_empty();
         let tail = if partial_tail {
-            Some(self.allocate(1)?[0])
+            let src = *table.blocks.last().expect("partial tail exists");
+            let tail = if self.class_page(src).is_some() {
+                let fmt = self.format_of(src);
+                self.allocate_in(fmt, 1)?[0]
+            } else {
+                self.allocate(1)?[0]
+            };
+            Some(tail)
         } else {
             None
         };
@@ -747,16 +801,41 @@ impl BlockPool {
             .collect()
     }
 
-    /// The device storage and layout for the executor (the base class's addressing over the
-    /// whole allocation).
+    /// The device storage and layout for the executor: the base class's addressing plus, with
+    /// page classes, the per-class resolution of the ids above the base ([`KvPageClasses`]).
+    /// `num_blocks` is the whole id space.
     pub fn view(&self) -> KvPoolView<'_> {
-        let num_blocks = self.base_blocks;
         let per_layer_block = self.layout.layer_block_bytes();
+        let layer_stride_bytes = u64::from(self.base_blocks) * per_layer_block;
+        let classes = self.slabs.as_ref().map(|s| KvPageClasses {
+            num_blocks: self.total_ids,
+            base_blocks: self.base_blocks,
+            base_page_bytes: per_layer_block,
+            slab_stride: s.stride,
+            slab_base_blocks: s.slab_blocks,
+            page_classes: &self.page_classes,
+            class_codes: &self.class_codes,
+        });
         KvPoolView {
             storage: &self.storage,
             layout: self.layout,
-            num_blocks,
-            layer_stride_bytes: u64::from(num_blocks) * per_layer_block,
+            num_blocks: self.total_ids,
+            layer_stride_bytes,
+            classes,
+        }
+    }
+
+    /// The `TURBINE_KVFMT_*` code of the base class (`kv.dtype`).
+    pub fn base_code(&self) -> u8 {
+        class_code(self.base_format(), self.layout.dtype)
+    }
+
+    /// The page bytes of block `b` in one layer's region (`view().classes` resolution, or the
+    /// base page when the pool is flat).
+    pub fn page_per_layer(&self, b: BlockId) -> u64 {
+        match self.class_page(b) {
+            Some((_, ci, _)) => self.slabs.as_ref().expect("class page").classes[ci].per_layer,
+            None => self.layout.layer_block_bytes(),
         }
     }
 }
