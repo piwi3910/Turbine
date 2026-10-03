@@ -1915,6 +1915,8 @@ fn check_labels(line: &str) {
         "no_room",
         // The tier's rewrites backed off after a `no_room` until a slab frees.
         "no_room_backoff",
+        // A demotion stored at the tier's format: no slot of the rung's size was free.
+        "rung_no_slot",
     ];
     const CODECS: &[&str] = &["l0", "fp8_e4m3", "tq4", "tq2"];
     let ladder = line.starts_with("turbine_kv_ladder_actions");

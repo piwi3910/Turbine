@@ -270,4 +270,9 @@ impl KvTier for MemTier {
     fn room_epoch(&self) -> u64 {
         self.lock().room_epoch
     }
+
+    /// No slot sizes: bytes are the only limit.
+    fn free_slots(&self, _format: &'static str, _bytes: u64) -> u64 {
+        u64::MAX
+    }
 }

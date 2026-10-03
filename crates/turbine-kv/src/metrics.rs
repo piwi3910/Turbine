@@ -85,9 +85,12 @@ impl EvictReason {
 /// (`fill_high_water`) or instead of being dropped from the lowest tier (`would_drop`), a
 /// demotion stored at the tier's ladder rung instead of its configured format
 /// (`new_demotion`), the tier's rung for new demotions stepping back up after the dwell
-/// (`rung_step_up`), a copy evicted at the lossiest rung (`floor_evict`), and a tier's rewrites
+/// (`rung_step_up`), a copy evicted at the lossiest rung (`floor_evict`), a tier's rewrites
 /// backed off after one found no room for its new format (`no_room_backoff`, once per back-off;
-/// user decision "6b Task 16: ladder proof results — four open points", 3 A).
+/// user decision "6b Task 16: ladder proof results — four open points", 3 A), and a demotion
+/// stored at the tier's own format because no slot of the rung's size was free
+/// (`rung_no_slot`; user decision "6b: ladder-on regression — demotions into a tier whose rung
+/// changed", A).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LadderReason {
@@ -97,16 +100,18 @@ pub enum LadderReason {
     RungStepUp,
     FloorEvict,
     NoRoomBackoff,
+    RungNoSlot,
 }
 
 impl LadderReason {
-    pub const ALL: [LadderReason; 6] = [
+    pub const ALL: [LadderReason; 7] = [
         LadderReason::FillHighWater,
         LadderReason::WouldDrop,
         LadderReason::NewDemotion,
         LadderReason::RungStepUp,
         LadderReason::FloorEvict,
         LadderReason::NoRoomBackoff,
+        LadderReason::RungNoSlot,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -117,6 +122,7 @@ impl LadderReason {
             LadderReason::RungStepUp => "rung_step_up",
             LadderReason::FloorEvict => "floor_evict",
             LadderReason::NoRoomBackoff => "no_room_backoff",
+            LadderReason::RungNoSlot => "rung_no_slot",
         }
     }
 }
@@ -744,7 +750,8 @@ mod tests {
                 "new_demotion",
                 "rung_step_up",
                 "floor_evict",
-                "no_room_backoff"
+                "no_room_backoff",
+                "rung_no_slot"
             ]
         );
     }

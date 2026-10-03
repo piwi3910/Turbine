@@ -714,4 +714,39 @@ impl KvTier for L2NvmeTier {
     fn room_epoch(&self) -> u64 {
         self.lock().room_epoch
     }
+
+    /// Counts what [`store`](Self::store) would find: a free slot of `format` that fits, a new
+    /// slab below the slab limit, or at the limit an empty slab of another format.
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        let len = bytes as usize;
+        if len == 0 || len > self.slot_bytes {
+            return 0;
+        }
+        let s = self.lock();
+        if s.health.is_degraded() {
+            return 0;
+        }
+        let slot = if format == crate::tier::L0_FORMAT {
+            self.slot_bytes
+        } else {
+            len.div_ceil(ALIGN) * ALIGN
+        };
+        let per_slab = (self.slots_per_slab * self.slot_bytes) / slot;
+        let mut n = s.free.get(format).map_or(0, |f| {
+            f.iter()
+                .filter(|&&(slab, _)| len <= s.slabs[slab].slot_bytes)
+                .count()
+        });
+        if s.slabs.len() < self.max_slabs {
+            n += (self.max_slabs - s.slabs.len()) * per_slab;
+        } else {
+            n += s
+                .slabs
+                .iter()
+                .filter(|x| x.taken == 0 && x.format != format)
+                .count()
+                * per_slab;
+        }
+        n as u64
+    }
 }

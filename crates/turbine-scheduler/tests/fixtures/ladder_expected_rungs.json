@@ -36,19 +36,19 @@
     "to": "tq2"
   },
   {
-    "step": 5127,
+    "step": 5121,
     "tier": "l2",
     "from": "tq2",
     "to": "tq4"
   },
   {
-    "step": 5786,
+    "step": 5775,
     "tier": "l2",
     "from": "tq4",
     "to": "fp8_e4m3"
   },
   {
-    "step": 6399,
+    "step": 6355,
     "tier": "l2",
     "from": "fp8_e4m3",
     "to": "l0"

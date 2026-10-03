@@ -701,6 +701,10 @@ impl KvTier for MirroredTier {
     fn room_epoch(&self) -> u64 {
         self.local.room_epoch()
     }
+
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        self.local.free_slots(format, bytes)
+    }
 }
 
 /// The transfer backend of one pump in `static` mode (module comment): starts each copy on the

@@ -116,4 +116,9 @@ impl KvTier for L0Tier {
     fn room_epoch(&self) -> u64 {
         0
     }
+
+    /// L0 is the block pool: copies into it are promotions into blocks allocated for them.
+    fn free_slots(&self, _format: &'static str, _bytes: u64) -> u64 {
+        u64::MAX
+    }
 }
