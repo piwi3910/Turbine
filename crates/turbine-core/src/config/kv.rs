@@ -192,6 +192,11 @@ impl Default for KvGpuConfig {
 pub struct KvCpuConfig {
     pub enabled: bool,
     pub max_bytes: ByteSize,
+    /// Bytes per pinned slab (decision "6b: after the demotion fallback — C"): 128 MiB, small
+    /// enough that a slab of one block format empties in a handful of evictions and is
+    /// reformatted for a copy of another format, so formats mix inside one `max_bytes`. Every
+    /// slab holds whole slots of one size (the largest is the L0-format block).
+    pub slab_bytes: ByteSize,
     /// Codec of the blocks L1 holds (P6b S-2): a `kv_format` registry name, checked at startup
     /// with the tier ordering (not more precise than L0).
     pub format: ModuleName,
@@ -202,6 +207,7 @@ impl Default for KvCpuConfig {
         KvCpuConfig {
             enabled: true,
             max_bytes: ByteSize::gib(64),
+            slab_bytes: ByteSize::mib(128),
             format: ModuleName::fixed("l0"),
         }
     }
@@ -359,6 +365,12 @@ impl KvConfig {
                 "must be greater than 0 when kv.cpu.enabled is true",
             ));
         }
+        if self.cpu.enabled && self.cpu.slab_bytes.0 == 0 {
+            return Err(invalid(
+                "kv.cpu.slab_bytes",
+                "must be greater than 0 when kv.cpu.enabled is true",
+            ));
+        }
         self.validate_nvme()?;
         if !(self.demote_min_value >= 0.0 && self.demote_min_value.is_finite()) {
             return Err(invalid(
@@ -507,8 +519,9 @@ impl KvConfig {
     }
 
     /// Rules that need the model's KV block size, checked at startup once the model config is
-    /// parsed (exit 2): the in-flight bound holds one block and an enabled L2 slab holds one
-    /// 4 KiB-rounded slot. Slots per slab are `slab_bytes / slot_bytes`, rounded down.
+    /// parsed (exit 2): the in-flight bound holds one block, an enabled L1 slab holds one
+    /// L0-format block, and an enabled L2 slab holds one 4 KiB-rounded slot. Slots per slab are
+    /// `slab_bytes / slot_bytes`, rounded down.
     pub fn validate_block_bytes(&self, block_bytes: u64) -> Result<(), ConfigError> {
         if self.transfer.max_inflight_bytes.0 < block_bytes {
             return Err(invalid(
@@ -516,6 +529,15 @@ impl KvConfig {
                 format!(
                     "must be at least one KV block ({block_bytes} bytes), got {}",
                     self.transfer.max_inflight_bytes
+                ),
+            ));
+        }
+        if self.cpu.enabled && self.cpu.slab_bytes.0 < block_bytes {
+            return Err(invalid(
+                "kv.cpu.slab_bytes",
+                format!(
+                    "must hold at least one {block_bytes}-byte L0-format block, got {}",
+                    self.cpu.slab_bytes
                 ),
             ));
         }
@@ -599,5 +621,29 @@ mod tests {
             let err = parse(&format!("{base}kv: {{dtype: {bad}}}\n")).expect_err(bad);
             assert_eq!(err.key(), Some("kv.dtype"), "{bad}: {err}");
         }
+    }
+
+    /// The L1 slab size is configurable (`kv.cpu.slab_bytes`) and defaults to 128 MiB
+    /// (decision "6b: after the demotion fallback — C"): small enough that a slab of one
+    /// block format empties in a handful of evictions and is reformatted for a copy of
+    /// another format, so formats mix inside one `kv.cpu.max_bytes`.
+    #[test]
+    fn kv_cpu_slab_bytes_key() {
+        let base = "model: {path: /models/m}\n";
+        let default = parse(base).expect("defaults");
+        assert_eq!(default.kv.cpu.slab_bytes, ByteSize::mib(128));
+        let bigger = parse(&format!("{base}kv: {{cpu: {{slab_bytes: 256MiB}}}}\n"))
+            .expect("slab_bytes parses");
+        assert_eq!(bigger.kv.cpu.slab_bytes, ByteSize::mib(256));
+        // A zero slab holds no slots; refused when L1 is enabled.
+        let err = parse(&format!("{base}kv: {{cpu: {{slab_bytes: 0}}}}\n")).expect_err("zero");
+        assert_eq!(err.key(), Some("kv.cpu.slab_bytes"), "{err}");
+        // A slab smaller than one L0-format block holds no slots either.
+        let cfg = parse(base).expect("defaults");
+        let err = cfg
+            .kv
+            .validate_block_bytes(ByteSize::mib(128).0 + 1)
+            .expect_err("slab below one block");
+        assert_eq!(err.key(), Some("kv.cpu.slab_bytes"), "{err}");
     }
 }

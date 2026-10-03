@@ -543,6 +543,66 @@ fn l1_reuses_an_empty_slab_for_another_slot_size() {
     );
 }
 
+/// Decision "6b: after the demotion fallback — C": at the production default slab size
+/// (`kv.cpu.slab_bytes`, 128 MiB) one evictions-budget empties a whole slab, which is then
+/// reformatted for a copy of a new format while the other slab's old-format slots stay
+/// occupied — at the former 1 GiB slabs the same evictions freed no slab and the new-format
+/// copy was refused with `Full` (L1 held only `l0` slots and never mixed). Real Llama-3.2-3B
+/// block sizes: 14,680,064 B at `l0`, 4,128,768 B at `tq4`.
+#[test]
+fn l1_default_slab_size_stores_a_new_format_block_beside_occupied_old_format_slots() {
+    const L0_BLOCK: usize = 14_680_064;
+    const TQ4_BLOCK: usize = 4_128_768;
+    let slab = usize::try_from(turbine_core::config::KvCpuConfig::default().slab_bytes.0)
+        .expect("slab bytes fit usize");
+    let cfg = L1Config {
+        enabled: true,
+        max_bytes: 2 * slab as u64,
+        slab_bytes: slab as u64,
+        block_bytes: L0_BLOCK as u64,
+        memory_kind: MemoryKind::Dedicated,
+    };
+    let l1 = L1PinnedTier::new(cfg, Arc::new(HostPinned::new(u64::MAX)), clock());
+    let per_slab = slab / L0_BLOCK; // 9 slots of 128 MiB (73 at the old 1 GiB)
+    let n = per_slab * 2;
+    let l0_block = vec![0u8; L0_BLOCK];
+    for i in 0..n as u8 {
+        l1.put(key(i), TierBlockRef::Host(&l0_block)).unwrap();
+    }
+    assert_eq!(l1.slab_count(), 2);
+    assert_eq!(
+        l1.put(key(200), TierBlockRef::Host(&l0_block)),
+        Err(TierError::Full),
+        "the tier is full of l0 slots"
+    );
+    // A fixed evictions budget — one 128 MiB slab of l0 blocks — empties a whole slab at the
+    // 128 MiB default (its slab holds 9); at the old 1 GiB slabs the same budget freed 9 of a
+    // 73-slot slab and the tier had no room for a new format.
+    const NEW_SLAB: usize = 128 * 1024 * 1024;
+    let budget = NEW_SLAB / L0_BLOCK;
+    for i in 0..budget as u8 {
+        l1.evict(&key(i))
+            .expect("evicting one new-slab's worth of l0 blocks");
+    }
+    assert!(
+        l1.contains(&key(per_slab as u8)),
+        "old-format slots stay occupied"
+    );
+    let tq4_block = vec![7u8; TQ4_BLOCK];
+    l1.put(key(100), TierBlockRef::Host(&tq4_block))
+        .expect("a new-format block is stored beside occupied old-format slots");
+    let mut out = vec![0u8; TQ4_BLOCK];
+    l1.get(&key(100), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, tq4_block);
+    // The formats now mix: a second new-format block joins the reformatted slab, and the
+    // surviving old-format blocks are still readable.
+    l1.put(key(101), TierBlockRef::Host(&tq4_block)).unwrap();
+    let mut old = vec![0u8; L0_BLOCK];
+    l1.get(&key(per_slab as u8), TierBlockMut::Host(&mut old))
+        .unwrap();
+    assert_eq!(old, l0_block);
+}
+
 #[test]
 fn l1_passes_the_contract_suite() {
     let alloc = Arc::new(HostPinned::new(u64::MAX));

@@ -83,8 +83,6 @@ use crate::engine::EngineCommand;
 use crate::engine::tp_tiers::TierDriver;
 use crate::model::StartupError;
 
-/// Bytes per L1 pinned slab (P4 S-5: grown lazily in 1 GiB slabs).
-pub const L1_SLAB_BYTES: u64 = 1 << 30;
 /// Bytes each calibration copy moves per path (P4 S-6).
 pub const CALIBRATION_BYTES: u64 = 64 << 20;
 /// Physical L0 fill (referenced plus cached blocks over the pool) above which cached blocks are
@@ -505,7 +503,7 @@ impl KvOrchestrator {
         let host_codec = HostCodec::of(&s.identity, &format);
         if world > 1
             && s.cfg.cpu.enabled
-            && s.cfg.cpu.max_bytes.0 / u64::from(world) < L1_SLAB_BYTES
+            && s.cfg.cpu.max_bytes.0 / u64::from(world) < s.cfg.cpu.slab_bytes.0
         {
             // Each rank pins its share in whole slabs: a share below one slab holds none.
             tracing::warn!(
@@ -513,9 +511,9 @@ impl KvOrchestrator {
                 tier = "l1",
                 ranks = world,
                 max_bytes = s.cfg.cpu.max_bytes.0,
-                slab_bytes = L1_SLAB_BYTES,
+                slab_bytes = s.cfg.cpu.slab_bytes.0,
                 "kv.cpu.max_bytes / tensor_parallel_size is below one L1 slab per rank; L1 holds \
-                 nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
+                 nothing (raise kv.cpu.max_bytes to at least one slab per rank)"
             );
         }
         // One logical block: every rank's (or stage's) shard of it this process copies, in
@@ -543,7 +541,7 @@ impl KvOrchestrator {
                             enabled: true,
                             max_bytes: (u128::from(s.cfg.cpu.max_bytes.0) * u128::from(bytes)
                                 / u128::from(total)) as u64,
-                            slab_bytes: L1_SLAB_BYTES,
+                            slab_bytes: s.cfg.cpu.slab_bytes.0,
                             block_bytes: bytes,
                             memory_kind: s.memory_kind,
                         },
@@ -3432,7 +3430,7 @@ mod tests {
         };
         kv.cpu.enabled = l1;
         // Each of the two ranks pins one slab (zero-filled lazily by the allocator).
-        kv.cpu.max_bytes = ByteSize(2 * L1_SLAB_BYTES);
+        kv.cpu.max_bytes = ByteSize(2 * kv.cpu.slab_bytes.0);
         kv.nvme.enabled = true;
         kv.nvme.path = dir.path().join("kv");
         kv.nvme.max_bytes = ByteSize(16 << 20);
@@ -5112,7 +5110,7 @@ mod tests {
     fn pipeline_stages_round_trip_through_l1_and_l2() {
         let dir = TempDir::new("turbine-kv-stages");
         let mut kv = kv_config(&dir, true);
-        kv.cpu.max_bytes = ByteSize(8 * L1_SLAB_BYTES);
+        kv.cpu.max_bytes = ByteSize(8 * kv.cpu.slab_bytes.0);
         let whole = KvLayout {
             num_layers: 4,
             ..layout()

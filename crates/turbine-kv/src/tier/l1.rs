@@ -33,7 +33,7 @@ pub struct L1Config {
     pub enabled: bool,
     /// `kv.cpu.max_bytes`.
     pub max_bytes: u64,
-    /// Bytes per pinned slab (1 GiB in production).
+    /// Bytes per pinned slab (`kv.cpu.slab_bytes`, 128 MiB default).
     pub slab_bytes: u64,
     /// Bytes of one block at the L0 format: the largest slot and the capacity unit.
     pub block_bytes: u64,

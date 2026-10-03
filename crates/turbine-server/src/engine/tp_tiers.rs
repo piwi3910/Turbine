@@ -64,8 +64,7 @@ use turbine_kv::transfer::{
 use turbine_kv::{BlockPool, KvMetrics};
 
 use crate::kv_orchestrator::{
-    BlockAddresses, CopyDevice, CopyStreamBackend, IoPoolBackend, KvShard, L1_SLAB_BYTES,
-    tp_kv_format,
+    BlockAddresses, CopyDevice, CopyStreamBackend, IoPoolBackend, KvShard, tp_kv_format,
 };
 use crate::model::{PreparedModel, StartupError};
 
@@ -81,15 +80,15 @@ pub(crate) fn static_rank_kv(kv: &mut KvConfig, rank: u32, tp: u32) {
     kv.cpu.max_bytes = ByteSize(kv.cpu.max_bytes.0 / tp);
     kv.nvme.max_bytes = ByteSize(kv.nvme.max_bytes.0 / tp);
     kv.nvme.path = kv.nvme.path.join(format!("rank-{rank}"));
-    if kv.cpu.enabled && kv.cpu.max_bytes.0 < L1_SLAB_BYTES {
+    if kv.cpu.enabled && kv.cpu.max_bytes.0 < kv.cpu.slab_bytes.0 {
         tracing::warn!(
             event = "kv_l1_share_below_slab",
             tier = "l1",
             rank,
             max_bytes = kv.cpu.max_bytes.0,
-            slab_bytes = L1_SLAB_BYTES,
+            slab_bytes = kv.cpu.slab_bytes.0,
             "kv.cpu.max_bytes / tensor_parallel_size is below one L1 slab per rank; L1 holds \
-             nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
+             nothing (raise kv.cpu.max_bytes to at least one slab per rank)"
         );
     }
 }
@@ -258,7 +257,7 @@ impl WorkerTiers {
                     L1Config {
                         enabled: true,
                         max_bytes: kv.cpu.max_bytes.0,
-                        slab_bytes: L1_SLAB_BYTES,
+                        slab_bytes: kv.cpu.slab_bytes.0,
                         block_bytes: shard_bytes,
                         memory_kind,
                     },
