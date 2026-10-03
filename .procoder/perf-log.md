@@ -985,3 +985,34 @@ Medians, 128 MiB against 1 GiB: tok/s 307.9 against 291.2 (+5.7 %); later-turn T
 - L2 untouched (the decision named L1 only): nothing here argues for following — L2's larger slabs hold more blocks per slab and showed no no_room increase.
 - Transient (flagged for the lead): the first 1 GiB run crashed mid-bench with `engine thread panicked: release of unreferenced KV block BlockId(146)` (fatal exit 3, bench 153/39) — not reproduced in 6 subsequent full runs on either arm (0 panics in all server logs); one-off on the pre-merge p6b-stack ladder path.
 - Labbook set `phase-6b-kv-compression`, runs `p6b-slabs:mt3:llama:slab{1g,128}:r{1,2,3}`.
+
+### The lossless tail in the lossy-tier capacity (branch `p6b-tq4enc`, 4848c98)
+
+The t17 quick tier failed `turbine-server --test kv_gpu lossy_tier_reuse{,_tq4}` ("L1 holds
+0.83 x full size: not encoded"). The lab dump (job turbine-lab-test-1003223847-3666bf94, log
+`target/tq4enc/diag-lossy.log`) shows the tq4 demotion encoding is exact and unregressed: of the
+42 blocks 29 one-shot fillers demoted, 28 were **stale lossless-tail blocks** — every finished
+sequence tags its last full block, and a finished sequence cannot grow out of the tag — stored
+raw at the L0 format per spec S-2 (user decision 2026-09-28, Q13). What changed is the eviction
+order: 028f465 (user decision 2026-10-02, "6b: OLMoE tq4 — lossless last block in eviction
+order", 1 A) prices a tail block's retrieval like its history's, so under `cost_aware` the tails
+(memory term still 3.56× a tq4 slot) now demote **first**: 28 stale tails + 14 encoded blocks.
+The tq4 lower-tier `supported` evidence is untouched (all 14 non-tail copies encoded at exactly
+4,128,768 B; the codec is unchanged since 2c3c1f0).
+
+Capacity consequence on one-shot-heavy workloads: up to one raw 14 MiB L1 slot per finished
+sequence (3.56× a tq4 slot), and with the ladder the L0 sweep skips tail-tagged blocks forever —
+consistent with the mt3 ladder-on runs ending "almost every stored copy still l0". Fix options
+A (tail tags expire with the latest finished sequence), B (keep, document) and C (per-session
+tails) are in `.procoder/handoff/p6b-tq4enc.md`; recommendation A.
+
+The two lab tests now run with `kv.lossless_tail_blocks=0` — they predate the tail rule and
+never meant to exercise it; the tail's behaviour stays pinned by
+`document_lists_copies_per_codec` and `last_block_is_scored_like_its_history`. Verified on the
+lab after the change (labbook `p6b-tq4enc:kv_gpu:*`): the fp8 arm passes end to end (L1 = 42 x
+7,340,032 exactly, worst first-8 |delta logprob| 0.050) and the tq4 arm's byte assertion passes
+(L1 = 42 x 4,128,768 exactly) — the encoding is exact — while its accuracy head bound misses by
+0.002 (worst first-8 0.2518 against the t9-calibrated 0.25; with the tail exempted, all of A's
+cached blocks are tq4, where at t9 its lossless tail block was still exact). The tq4 tier's
+bound is a gate decision: options and the recommendation are in
+`.procoder/handoff/p6b-tq4enc.md`.
