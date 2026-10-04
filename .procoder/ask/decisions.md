@@ -3219,3 +3219,28 @@ follow-ups that overlap 5p's efficiency territory.
    - B) Leave the script alone; 5p starts on its complete spec+plan without the gate
 
 **Decision (user, 2026-10-04): 1 A, 2 A, 3 A.** Amend the 5p spec/plan for the 6b reality; fold the fitting 6b efficiency follow-ups into 5p as tasks; add the 5p name to the track gate (gate = spec+plan COMPLETE).
+
+## Candidate items from the Paiton R9700 write-up (recorded, not tasked, 2026-10-04)
+
+Source: r/ROCm post + the Eliovp-BV paiton-vllm-plugin README (Qwen3.8-27B, MXFP4/3-bit W3A4 + DFlash2 speculative
+decoding on one R9700, stock vLLM + plugin). Compared against Turbine on 2026-10-04: prefix caching, 4-bit KV, RAM/SSD
+tiers, cached_tokens, YaRN long context and TP are already covered (several via 6b); the candidates below are the
+delta. Recorded as candidates for the phases that own them — none is tasked yet.
+
+1. **Phase 8 (speculative decoding) inputs**: evaluate a trained FP8 draft model (DFlash2/Eagle-style) beside
+   self-speculation; track speculative acceptance length as a first-class metric; reference bar: 174 tok/s
+   single-stream decode on a 27B at ~4.1 acceptance (one R9700, vLLM+plugin).
+2. **Quantization follow-up: rotated sub-4-bit weights** (W3Rot-INT3-style, RDNA4-tuned rotation — the weights-side
+   analogue of TurboQuant's rotation). Their measured cost: MMLU-Pro −2.9 vs MXFP4, math/coding within noise. Needs
+   our packaging + accuracy gates (spec S-17 style) before any supported row.
+3. **Eval tooling: long-context needle tests** (their shape: 80 prompts at 61K; 4 planted facts at 300K/500K) and a
+   cache-answer-equivalence check (log-likelihood delta + top-token match vs a cold read) for any cached-serving
+   claim.
+4. **Phase 5p design input**: their prefill chunks end where a later request can resume from the cache — measured
+   cost ~3 % on long prefills, 7–13 % on short (a 2K prompt takes two steps); benefit 6.1× whole-session and up to
+   12× later-turn TTFT. Feed this trade-off into the token-granular reuse design (S-4/S-5).
+5. **Far-future candidate: weight offloading** — the 2.4 GiB embedding table pinned in system RAM with a fallback
+   when RAM is short. We tier KV to host RAM but have no weight-offloading story; relevant only when a model does
+   not fit one card and TP is not an option.
+6. **Packaging idea (2b/NVFP4-adjacent)**: they ship an NVFP4 target checkpoint and convert to MXFP4 in a runtime
+   cache on first serve. If NVFP4 ever lands (phase-2b), a convert-on-first-serve path is the pattern.

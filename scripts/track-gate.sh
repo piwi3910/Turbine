@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
-# Track start gate (umbrella phase-6-8-expansion S-1, amended by the Phase 6 split of 2026-09-28):
-# a track's implementation starts only when
-#   1. the previous track closed (a `supported` amd support-matrix row carries its feature),
+# Track start gate (umbrella phase-6-8-expansion S-1, amended by the Phase 6 split of 2026-09-28
+# and the Phase 5p start of 2026-10-04): a track's implementation starts only when
+#   1. the previous track closed (a `supported` amd support-matrix row carries its feature) —
+#      not for the interlude: phase-5p-serving-efficiency starts on its spec and plan being
+#      COMPLETE alone (decision "Phase 5p start: amendment scope and the track gate",
+#      2026-10-04, 3 A; the "previous track closed" rule does not apply to it),
 #   2. its spec passes `procoder spec check` (COMPLETE) and reads `Status: complete`,
-#   3. its spec's "## In scope" section stays inside the umbrella scope (S-6, S-7, S-8).
+#   3. its spec's "## In scope" section stays inside the umbrella scope (S-6, S-7, S-8),
+#   4. for the interlude, its plan passes `procoder plan check` (COMPLETE) and reads
+#      `Status: complete` (the phase 6–8 tracks' plans are written by their own phases).
 # Order: phase-6a-quantization → phase-6b-kv-compression → (phase-5p) → phase-7-model-families →
 #        phase-8-speculative-decoding. NVIDIA rows never count (phase-2b-nvidia is deferred).
-# Usage: scripts/track-gate.sh <phase-6a-quantization|phase-6b-kv-compression|phase-7-model-families|phase-8-speculative-decoding>
+# Usage: scripts/track-gate.sh <phase-5p-serving-efficiency|phase-6a-quantization|phase-6b-kv-compression|phase-7-model-families|phase-8-speculative-decoding>
 # Env:   TURBINE_PROCODER_LAUNCHER  procoder launcher (default: the 3.7.0 plugin launcher)
-#        TURBINE_SPEC_DIR           spec directory (default: .procoder/specs)
+#        TURBINE_SPEC_DIR           spec directory (default: .procoder/specs); the plan of the
+#                                   interlude is read from the sibling `plans` directory
 #        TURBINE_SUPPORT_MATRIX     file holding `turbine-server --support-matrix --output text`
 #                                   (default: produced with `cargo run -q -p turbine-server`)
 # Exit:  0 gate passed, 1 gate failed (every failure printed), 2 usage.
 set -euo pipefail
 
-tracks="phase-6a-quantization|phase-6b-kv-compression|phase-7-model-families|phase-8-speculative-decoding"
+tracks="phase-5p-serving-efficiency|phase-6a-quantization|phase-6b-kv-compression|phase-7-model-families|phase-8-speculative-decoding"
 track="${1:-}"
 case "$track" in
-phase-6a-quantization | phase-6b-kv-compression | phase-7-model-families | phase-8-speculative-decoding) ;;
+phase-5p-serving-efficiency | phase-6a-quantization | phase-6b-kv-compression | phase-7-model-families | phase-8-speculative-decoding) ;;
 *)
 	echo "usage: $0 <$tracks>" >&2
 	exit 2
@@ -57,6 +63,9 @@ closed_rows() {
 }
 
 case "$track" in
+phase-5p-serving-efficiency)
+	# The interlude: no order check (the "previous track closed" rule does not apply to it).
+	;;
 phase-6b-kv-compression)
 	[ "$(closed_rows quantized)" -gt 0 ] ||
 		fail "phase-6a-quantization has not closed: no supported amd row with a quantized weight format or fp8_e4m3 KV"
@@ -70,6 +79,19 @@ phase-8-speculative-decoding)
 		fail "phase-7-model-families has not closed: no supported amd row for a Phase 7 family"
 	;;
 esac
+
+# The interlude (phase-5p) also gates on its plan (decision 2026-10-04, 3 A): plan check
+# COMPLETE and the plan's own `Status: complete` line. The phase 6–8 tracks' plans do not
+# exist until their phases start, so the plan check belongs to the interlude only.
+if [ "$track" = phase-5p-serving-efficiency ]; then
+	plan="$spec_dir/../plans/$track.md"
+	if plan_out="$("$launcher" plan check "$track" 2>&1)" && printf '%s\n' "$plan_out" | grep -q 'COMPLETE'; then
+		:
+	else
+		fail "procoder plan check is not COMPLETE: $(printf '%s' "$plan_out" | head -n 1)"
+	fi
+	grep -qx 'Status: complete' "$plan" || fail "plan Status line is not 'Status: complete'"
+fi
 
 if [ ! -f "$spec" ]; then
 	fail "$spec does not exist; write it with /procoder:spec $track"
