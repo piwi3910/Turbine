@@ -341,6 +341,11 @@ __global__ void moe_gather_kernel(const Bf16 *x, const int32_t *sorted_rows,
 // One block per token: its local rows sorted by gathered position (ascending
 // position is ascending expert id), then each column accumulates them in that
 // order with the reference's roundings.
+// One token's combine over a kBlock-column slice (grid y): every CTA of a
+// token sorts the same order (cheap at top_k), then combines only its slice,
+// so a batch-1 step has one CTA per 256 columns instead of one for the whole
+// hidden row. The per-element add order (ascending routed position) is the
+// one-thread version's, so the outputs are unchanged.
 __global__ void moe_scatter_kernel(const Bf16 *down, const int32_t *pos,
                                    const float *topk_weights, int32_t hidden,
                                    int32_t top_k, Bf16 *out) {
@@ -372,8 +377,10 @@ __global__ void moe_scatter_kernel(const Bf16 *down, const int32_t *pos,
   const int32_t n = order_n;
   if (n == 0)
     return;
+  const int32_t c0 = static_cast<int32_t>(blockIdx.y) * kBlock;
   Bf16 *row = out + t * hidden;
-  for (int32_t c = threadIdx.x; c < hidden; c += blockDim.x) {
+  for (int32_t c = c0 + threadIdx.x; c < min(c0 + kBlock, hidden);
+       c += blockDim.x) {
     float o = bf16_to_f32(row[c]);
     for (int32_t k = 0; k < n; ++k) {
       const float y =
@@ -446,9 +453,11 @@ int32_t launch_moe_scatter(turbine_ctx *ctx, const void *down,
   if (num_tokens == 0)
     return TURBINE_OK;
   hipLaunchKernelGGL(moe_scatter_kernel,
-                     dim3(static_cast<unsigned>(num_tokens)), dim3(kBlock), 0,
-                     ctx->stream, static_cast<const Bf16 *>(down), pos,
-                     topk_weights, hidden, top_k, static_cast<Bf16 *>(out));
+                     dim3(static_cast<unsigned>(num_tokens),
+                          static_cast<unsigned>((hidden + kBlock - 1) / kBlock)),
+                     dim3(kBlock), 0, ctx->stream,
+                     static_cast<const Bf16 *>(down), pos, topk_weights, hidden,
+                     top_k, static_cast<Bf16 *>(out));
   return check_hip(ctx, hipGetLastError(), "moe scatter kernel launch");
 }
 
