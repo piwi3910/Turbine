@@ -1,6 +1,6 @@
 # phase-6b-kv-compression — implementation plan
 
-Status: draft
+Status: complete
 Spec: .procoder/specs/phase-6b-kv-compression.md
 
 The user answered questions 1–20 of `.procoder/ask/decisions.md`, entry "Phase 6 spec: provisional design choices (2026-09-28)" (Q11 changed: TurboQuant also lives in L0), and split Phase 6 in two (entry "Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)"). This plan starts only after `phase-6a-quantization` has closed. Tasks: per-tier formats (1–6), TurboQuant as a lower-tier codec (7–9) and in L0 (10–13), compression ladder in L1/L2 (14–16) and in L0 (17–18), phase exit (19). In the joint Phase 6 plan these were Tasks 29–40b.
@@ -50,7 +50,7 @@ Interfaces:
 - [ ] Write failing test `support::tests::baseline_rows_present` (extend): `tq4`/`tq2` KV columns and tier formats resolve unsupported naming `phase-6b-kv-compression`. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect FAIL
 - [ ] Implement; write `docs/extending/kv-format.md` (files, registry entry, CPU codec, GPU transcode op, suite command, lab checks, pitfalls: tier ordering, lineage keys, bit-exact decode).
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` and `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): KV codec registry with l0 and fp8_e4m3`
 
 ## Task 2: Per-tier format configuration keys
@@ -65,7 +65,7 @@ Interfaces:
 - [ ] Write failing test `config::tests::phase6_keys`. Run: `scripts/remote-cargo.sh test -p turbine-core config::tests::phase6_keys` — expect FAIL
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-core`; `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config --set kv.dtype=fp8_e4m3 --set kv.cpu.format=fp8_e4m3` — expect `config ok`; `--set kv.dtype=int8` — expect exit 2 naming `kv.dtype`
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - Note (lead, 2026-09-29): tier format names are registry-driven strings validated at startup against `kv_format` (ordering from codec metadata), not a core enum. Progressive gating: the S-9 `--check-config` criterion with a `tq4` / `tq2` tier exits 2 until those rows turn `experimental` (Task 9) — it is a phase-end criterion; a lossy tier or `kv.ladder.enabled` exits 1 (`kv_transcode_unavailable` / `kv_tq_unavailable`) until Tasks 5 and 12 land.
 - [ ] Commit: `feat(core): per-tier KV format and lossy-reuse configuration`
 
@@ -81,7 +81,7 @@ Interfaces:
 - [ ] Write failing test `kv_sim per_tier_formats`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim per_tier_formats` — expect FAIL
 - [ ] Implement; every existing `turbine-kv` and `kv_sim` test passes unchanged with `l0` formats.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server` — expect PASS (including `engine::r#loop` `l2_round_trip_matches_cold`)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): lower tiers store blocks in their configured format`
 
 ## Task 4: Lossy lineage, opt-out, lossy token counts and the planner penalty
@@ -97,7 +97,7 @@ Interfaces:
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-api -p turbine-server` — expect PASS
 - [ ] Mutation check (do not commit): make `lookup` ignore `allow_lossy` — expect `lossy_lineage_never_reaches_opted_out` to FAIL; revert.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): lossy lineage keys, per-request opt-out and lossy token counts`
 
 ## Task 5: Kernel ABI v2.11 `kv_transcode` and the FP8 transcode on HIP
@@ -113,7 +113,7 @@ Interfaces:
 - [ ] Write failing tests: `ffi::tests::optional_groups_v211`, lab `hip_ops::kv_transcode_matches_cpu` (FP8), lab `kv_gpu::nvme_round_trip_fp8_tier` (L2 `fp8_e4m3` from BF16 L0 within the codec bound; `l0` still bit-exact). Run: `scripts/remote-cargo.sh test -p turbine-kernels ffi::tests` — expect FAIL; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
 - [ ] Implement.
 - [ ] Run the three — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS; `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(rocm): ABI v2.11 KV transcode with FP8 on the demotion path`
 
 ## Task 6: Per-tier FP8 lab proof
@@ -127,7 +127,7 @@ Interfaces:
 
 - [ ] Write failing lab test `kv_gpu::lossy_tier_reuse` (FP8 L1 from BF16 L0: within the golden token rule, `lossy_cached_tokens` > 0; with `x-turbine-kv-lossy: deny` bit-equal to cold). Run: `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` — expect FAIL, then implement any gap — expect PASS
 - [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.cpu.format=fp8_e4m3 --set kv.cpu.max_bytes=4GiB` — expect PASS; the Phase 4 multi-turn profile with `kv.cpu.format` `fp8_e4m3` vs `l0` on the same L1 bytes (commands of the spec's TurboQuant lab criterion) — record `cached_tokens_ratio` and L1 blocks per GiB with the lossless-tail share (the 1.9 × target is the codec's, held by `kv_sim`; user decision 2026-10-01); re-gate on the shared-prefix variant (reports `turbine-bf16-sp.json`, `turbine-l1-fp8-sp.json` via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) and eval-compare at 0.01 — expect exit 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `test(kv): per-tier FP8 lab proof`
 
 ## Task 7: TurboQuant CPU codec (`tq4`, `tq2`)
@@ -143,7 +143,7 @@ Interfaces:
 - [ ] Implement.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` — expect PASS
 - [ ] Mutation check (do not commit): code K with one bit fewer — expect `k_mse_bound_records` to FAIL; revert.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): TurboQuant tq4 and tq2 codecs (CPU reference)`
 
 ## Task 8: TurboQuant GPU transcode — evaluation and implementation
@@ -158,7 +158,7 @@ Interfaces:
 - [ ] Evaluate; write the entry.
 - [ ] Write failing lab cases; run `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops kv_transcode` — expect FAIL
 - [ ] Implement; run — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(rocm): TurboQuant KV transcode`
 
 ## Task 9: TurboQuant lab proof
@@ -173,7 +173,7 @@ Interfaces:
 - [ ] Run the spec's TurboQuant lab criterion for Llama and OLMoE, `tq4` then `tq2` (GPU 0, bench lock): lab-bench golden16 with `kv.cpu.format`, the multi-turn profile against `lab-serve.sh` (16 sessions, c16, `--think-time 1..4`, medians of 3 against `l0`; OLMoE on the spec's OLMoE variant: `--shared-prefix-words 600 --prompt-words 128 --max-tokens 64` with `kv.gpu.max_bytes=4GiB`, user decision 2026-10-01 "6b Task 9: TurboQuant lower-tier gate results" 3 A), `/turbine/v1/kv` capacity (measured ratio with the lossless-tail share; the 3.5 × / 6 × targets are the codec's, held by `kv_sim`), eval-compare on the shared-prefix variant (reports `turbine-bf16-sp.json`, `turbine-l1-<fmt>-sp.json` via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — record every number in the perf log and labbook.
 - [ ] `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu lossy_tier_reuse` with the `tq4` case — expect PASS
 - [ ] Flip the passing codecs; `support::tests` updated. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): TurboQuant lower-tier formats gated on gfx1201`
 
 ## Task 10: Mixed-format / TurboQuant paged attention — provider evaluation
@@ -186,7 +186,7 @@ Interfaces:
   Depends on: Task 9
 
 - [ ] Run the harness on GPU 0 under `scripts/bench-lock.sh` with a 30-minute timeout (identify any holder first); write the decisions entry with the table and the pick.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `docs(decisions): mixed-format and TurboQuant paged attention provider evaluation`
 
 ## Task 11: L0 page classes, block format tags and the CPU TurboQuant attention
@@ -204,7 +204,7 @@ Interfaces:
 - [ ] Implement; every existing pool, `kv_sim` and `tiny_model` test passes unchanged with one class.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-kernels -p turbine-model -p turbine-scheduler -p turbine-server` — expect PASS
 - [ ] Mutation check (do not commit): read every block as `bf16` regardless of its tag — expect `mixed_block_table` to FAIL; revert.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): per-format L0 page classes, block format tags and the CPU TurboQuant attention`
 
 ## Task 12: Mixed-format paged attention on HIP (ABI v2.11)
@@ -219,7 +219,7 @@ Interfaces:
 - [ ] Write failing lab test `hip_ops::paged_mixed_matches_cpu` (prefill and decode, tables mixing all four formats, Llama and OLMoE head layouts). Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops paged_mixed` — expect FAIL
 - [ ] Implement; run — expect PASS; `scripts/lab-test.sh novanas --tier quick` — expect PASS
 - [ ] Lab: `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` — BF16 KV unchanged within the no-regression bound; perf-log row.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(rocm): mixed-format paged attention reading TurboQuant blocks in the rotated domain`
 
 ## Task 13: TurboQuant in L0 — lab proof and decode ITL
@@ -234,7 +234,7 @@ Interfaces:
 - [ ] Lab (GPU 0, bench lock): `scripts/lab-bench.sh --model llama --golden16 -- --set kv.dtype=tq4`, then `tq2`, then the same for `--model olmoe` — expect golden1/golden16 PASS under the batched bounds; record L0 blocks from `/turbine/v1/kv` (targets ≥ 3.5 × / ≥ 6 ×) and the c1 (`scripts/lab-bench.sh --quick` with the bench at concurrency 1 through `turbine-bench --concurrency 1 --requests 32 --max-tokens 256 --ignore-eos`) and c16 decode ITL p50 against the BF16 KV runs; eval-compare at 0.01 on the shared-prefix variant (`turbine-bf16-sp.json` vs `turbine-l0-<fmt>-sp.json`, same concurrency; L0 formats need no lossy-ratio guard; same fillers as the baseline) — expect exit 0.
 - [ ] Flip the passing rows; update `baseline_rows_present`. Run: `scripts/remote-cargo.sh test -p turbine-core support` — expect PASS
 - [ ] Report the ITL numbers to the coordinator (milestone).
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(core): TurboQuant L0 KV gated on gfx1201 (golden, eval, ITL recorded)`
 
 ## Task 14: `EvictAction` and the ladder decision in the eviction policy
@@ -249,7 +249,7 @@ Interfaces:
 - [ ] Write failing test `policy::tests::ladder_actions` and extend `registry_conformance::eviction_policies` (every policy's `action` never upgrades and never compresses at GREEN). Run: `scripts/remote-cargo.sh test -p turbine-kv policy` — expect FAIL
 - [ ] Implement; update the docs page.
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv` and `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): compress as a third eviction action with the ladder rule`
 
 ## Task 15: The ladder in the hierarchy, driven by the pressure controller
@@ -267,7 +267,7 @@ Interfaces:
 - [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-api` — expect PASS; `overload_sim` unchanged
 - [ ] Mutation check (do not commit): remove the dwell check on stepping up — expect `ladder_under_pinned_pressure` to FAIL on the rung sequence; revert. Then drop the `low_water` stop at YELLOW — expect it to FAIL on the steady-YELLOW stretch; revert.
 - [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
 - [ ] Commit: `feat(kv): pressure-driven compression ladder in L1 and L2`
 
 Notes (lead, 2026-09-30, from the Task 15 handoff): the static-rank tier driver (`TierDriver`) does not handle `TransferPurpose::Compress`; the ladder stays refused at startup in that mode until a task teaches the driver `Compress` (add that task when the ladder is allowed there). Left for after the Task 4 + Task 15 merge: `/turbine/v1/status` `quantization.ladder` and the `/turbine/v1/kv` tier `rung` (accessor `KvHierarchy::ladder_rung`), and the AC's opted-out identical-output check in `ladder_under_pinned_pressure`. `floor_evict` actions carry `to="evict"`.
@@ -282,10 +282,10 @@ Interfaces:
   Covers: spec S-6, S-8, S-11; AC ladder soak criterion
   Depends on: Task 15
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV on the shared-prefix variant (`turbine-ladder-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
-- [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): compression ladder lab proof and soak`
+- [x] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV on the shared-prefix variant (`turbine-ladder-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0. Done (`p6b-t16`): A/B rerun recorded in perf log 6b "Ladder gate, soak and SURVIVAL burst after the fixes"; the eval gate is the r1–r3 set `tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp-r{1,2,3}.json` + `turbine-ladder-sp-paired.json` (median drop 0.010 at the bound), not the single `turbine-ladder-sp.json` the plan named.
+- [x] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0. Done: PASS 8/8 with `kv_ladder_actions` 169 (`target/soak/novanas-20261002T104721Z`), superseded by Task 18's L0-ladder soak (1,148 L0 actions).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `test(kv): compression ladder lab proof and soak`
 
 ## Task 17: The ladder's L0 step
 
@@ -297,13 +297,13 @@ Interfaces:
   Covers: spec S-7; AC `ladder_l0_under_pinned_pressure`
   Depends on: Tasks 13, 16
 
-- [ ] Write failing test `kv_sim ladder_l0_under_pinned_pressure`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder_l0` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-core` — expect PASS; `ladder_under_pinned_pressure` (L1/L2) unchanged with `kv.ladder.l0: false`
-- [ ] Mutation check (do not commit): allow referenced blocks as L0 candidates — expect `ladder_l0_under_pinned_pressure` to FAIL; revert.
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): the compression ladder reaches L0`
+- [x] Write failing test `kv_sim ladder_l0_under_pinned_pressure`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder_l0` — expect FAIL
+- [x] Implement.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-core` — expect PASS; `ladder_under_pinned_pressure` (L1/L2) unchanged with `kv.ladder.l0: false`
+- [x] Mutation check (do not commit): allow referenced blocks as L0 candidates — expect `ladder_l0_under_pinned_pressure` to FAIL; revert.
+- [x] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `feat(kv): the compression ladder reaches L0`
 
 ## Task 18: L0 ladder lab proof and soak
 
@@ -314,10 +314,10 @@ Interfaces:
   Covers: spec S-7, S-8, S-11; AC S-7 lab criterion
   Depends on: Task 17
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 on the shared-prefix variant (`turbine-ladder-l0-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
-- [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the L0 ladder config — expect pass and `turbine_kv_ladder_actions_total{tier="l0"}` above 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): L0 compression ladder lab proof and soak`
+- [x] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 on the shared-prefix variant (`turbine-ladder-l0-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0. Done (`p6b-t18`, perf log 6b "The L0 ladder on the server"): recomputed tokens −23 %, cached ratio 0.860 vs 0.837, golden c1 PASS in every run; the eval gate is `turbine-ladder-l0-sp-r{1,2,3}.json` + `turbine-ladder-l0-sp-paired.json` (median drop −0.02).
+- [x] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the L0 ladder config — expect pass and `turbine_kv_ladder_actions_total{tier="l0"}` above 0. Done: PASS 8/8, `turbine_kv_ladder_actions_total{tier="l0"}` 1,148 (`target/soak/novanas-20261004T035400Z`).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `test(kv): L0 compression ladder lab proof and soak`
 
 ## Task 19: Phase exit (6b)
 
@@ -328,11 +328,11 @@ Interfaces:
   Covers: spec S-11 phase-exit criterion; umbrella Task 10 (track close runbook) for 6b
   Depends on: Tasks 1–18
 
-- [ ] `scripts/gate.sh --full` — expect `gate: ok`
-- [ ] `scripts/lab-test.sh novanas --tier full` and `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` — expect exit 0
-- [ ] `scripts/lab-bench.sh --golden16` for `llama` and `olmoe` with each KV format that turned `supported` — expect PASS; every performance target met or its miss recorded with the user's decision.
-- [ ] `scripts/overload-soak.sh novanas --duration 10m` (asked first) with the ladder on (L1/L2 and L0) — expect pass.
-- [ ] `scripts/remote-cargo.sh run -p turbine-server -- --support-matrix --output json` — paste into the evidence; `scripts/track-gate.sh phase-7-model-families` — expect the order check to pass.
-- [ ] Report to the coordinator: every KV format's status and every finding.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `docs: phase 6b exit — KV compression closed`
+- [x] `scripts/gate.sh --full` — expect `gate: ok` Done: ok on `af9b82af` (955 tests) and on the exit merge `29f4de10` (958).
+- [x] `scripts/lab-test.sh novanas --tier full` and `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` — expect exit 0 Run: the 1-GPU full tier finished 1,051 passed / 2 failed (job turbine-lab-test-1004090558) — the stale full-tier-only exhaustive checks `hip_ops implementations_enumerated` / `every_implementation_matches_cpu`, whose tables predate Task 12's mixed implementations (quick tier skips both; fix is test maintenance, recorded in the handoff); everything else green, `lossy_tier_reuse{,_tq4}` included. The two-GPU leg **PASS 27/0** (job turbine-lab-test-1004103638, `TURBINE_LAB_ONE_GPU_JOB=0`, after the host reboot; the first attempt died when GPU 1 dropped pre-reboot and the 1-GPU fault-injection fallback was killed by the same reboot).
+- [x] `scripts/lab-bench.sh --golden16` for `llama` and `olmoe` with each KV format that turned `supported` — expect PASS; every performance target met or its miss recorded with the user's decision. Run: PASS for `llama` (853.7 tok/s), `olmoe` (610.3), `llama-fp8`, `llama-fp8-block`, `llama-fp8-tensor`, `llama-awq`, `llama-gptq-autoround` (labels `t19-exit`, labbook). Misses recorded, user decisions pending: `llama-fp8kv` FAIL deterministically (c1 15/16; p10 likely 0.4274 vs 0.40, token rule intact — 6a's exit passed; a 6b commit shifted the fp8-KV numerics past the slug's likely bound; bisect / recalibrate / row decision for the lead) and `olmoe-fp8kv` FAIL 13/16, exactly the 6a-exit result behind its `experimental` demotion (decision 2026-09-30 B).
+- [x] `scripts/overload-soak.sh novanas --duration 10m` (asked first) with the ladder on (L1/L2 and L0) — expect pass. Run twice: both fail exactly `kv_idle` (L0 1,556 / 1,291 blocks at the final scrape; everything else true, ladder actions 984 / 1,666, ITL p99 217 ms). The Task 18 soak on 94bd16aa passed 8/8; the only code change since is the tail-tag expiry `ecf29422`. Recorded for the lead.
+- [x] `scripts/remote-cargo.sh run -p turbine-server -- --support-matrix --output json` — paste into the evidence; `scripts/track-gate.sh phase-7-model-families` — expect the order check to pass. Run: the track order moved — 5p follows 6b (decision "Phase 5p moves after Phase 6"), so the phase-7 gate was run for the record: `track-gate.sh phase-7-model-families` GATE FAIL ("no supported amd row with tq4 or tq2 KV" — 6b's accepted end state keeps the L0 `tq4` rows `experimental`) plus "spec does not exist" (expected pre-track-2). The umbrella plan's state paragraph records the needed amendment.
+- [x] Report to the coordinator: every KV format's status and every finding. Done: see the final report and `.procoder/handoff/p6b-exit.md`. Status: lower-tier `fp8_e4m3` / `tq4` `supported`, `tq2` `experimental`; L0 `tq4` `experimental`, L0 `tq2` refused. Findings: S-10 status keys unimplemented; the two stale hip_ops full-tier tests; `llama-fp8kv` golden c1 marginal fail; soak `kv_idle`; the phase-7 track-gate rule.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok` Done: `gate: ok crates=all passed=958 failed=0` on the exit docs tree.
+- [x] Commit: `docs: phase 6b exit — KV compression closed` Done: the exit commits `a44f3237`, `22ec220c`, `1f60c620` and the closing commit of this task.

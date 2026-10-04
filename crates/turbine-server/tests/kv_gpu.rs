@@ -895,13 +895,49 @@ fn nvme_round_trip_fp8_tier() {
 /// the first 8 tokens' logprobs within 0.3 and at least 90 % of all positions within 0.5 (the
 /// FP8 KV golden's bounds are 0.15 / 0.55).
 fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
-    assert_within_bounds(cold, warm, label, (0.3, 0.5, 0.9));
+    assert_within_bounds(cold, warm, label, HeadBound::Flat(0.3), 0.5, 0.9);
 }
 
-/// [`assert_within_codec_bound`] with explicit bounds: (first 8 tokens' worst |Δ|, per-position
-/// |Δ| limit, share of positions within it).
-fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (f64, f64, f64)) {
-    let (head_bound, pos_bound, share) = bounds;
+/// The first 8 answer tokens' head bound. `GoldenSplit` is exactly how `turbine-golden compare`
+/// judges the slug's batched bounds (user decision 2026-10-03, "6b: stale lossless-tail tags and
+/// the tq4 lab bound", 2): a position whose cold (reference) logprob is above `floor` is judged
+/// against `likely`, at or below it against `tail`.
+#[derive(Clone, Copy)]
+enum HeadBound {
+    Flat(f64),
+    GoldenSplit { likely: f64, tail: f64, floor: f64 },
+}
+
+impl HeadBound {
+    /// The bound for one position's cold (reference) logprob.
+    fn bound_at(&self, reference: f64) -> f64 {
+        match self {
+            HeadBound::Flat(b) => *b,
+            HeadBound::GoldenSplit {
+                likely,
+                tail,
+                floor,
+            } => {
+                if reference > *floor {
+                    *likely
+                } else {
+                    *tail
+                }
+            }
+        }
+    }
+}
+
+/// [`assert_within_codec_bound`] with explicit bounds: the first 8 tokens' head [`HeadBound`],
+/// the per-position |Δ| limit, the share of positions within it.
+fn assert_within_bounds(
+    cold: &IdAnswer,
+    warm: &IdAnswer,
+    label: &str,
+    head_bound: HeadBound,
+    pos_bound: f64,
+    share: f64,
+) {
     assert_eq!(warm.completion_tokens, cold.completion_tokens);
     let diff: Vec<f64> = cold
         .logprobs
@@ -909,19 +945,54 @@ fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (
         .zip(&warm.logprobs)
         .map(|(c, w)| (c - w).abs())
         .collect();
-    let head = diff.iter().take(8).cloned().fold(0.0, f64::max);
+    let head: Vec<(usize, f64)> = diff.iter().take(8).copied().enumerate().collect();
+    let head_worst = head.iter().map(|(_, d)| *d).fold(0.0, f64::max);
+    let likely = head
+        .iter()
+        .filter(|(i, _)| cold.logprobs[*i] > -2.0)
+        .count();
     let within = diff.iter().filter(|d| **d <= pos_bound).count() as f64 / diff.len().max(1) as f64;
     let worst = diff.iter().cloned().fold(0.0, f64::max);
     println!(
-        "{label}: worst of the first 8 |Δ logprob| {head:.3}, {within:.2} within {pos_bound}, \
+        "{label}: worst of the first 8 |Δ logprob| {head_worst:.3} ({likely} of 8 likely), \
+         {within:.2} within {pos_bound}, \
          worst {worst:.3} (cached {}, lossy cached {})",
         warm.cached_tokens, warm.lossy_cached_tokens
     );
-    assert!(head <= head_bound, "first tokens differ by {head}");
+    for (i, d) in &head {
+        let bound = head_bound.bound_at(cold.logprobs[*i]);
+        assert!(
+            d <= &bound,
+            "first tokens differ: position {i} |Δ| {d:.3} over {bound:.3}"
+        );
+    }
     assert!(
         within >= share,
         "only {within} of the positions are within {pos_bound}"
     );
+}
+
+/// The golden head bound splits by the reference logprob exactly as `turbine-golden compare`
+/// does: above the floor (−2) a position is judged likely (0.25), at the floor exactly or below
+/// it tail (0.75) — the same `>` comparison against `likely_logprob_floor` as the gate.
+/// Breaks if the split keys on the warm logprob, if −2 counts as likely, or if the tiers'
+/// bounds are swapped.
+#[test]
+fn golden_head_bound_splits_likely_from_tail() {
+    let bound = HeadBound::GoldenSplit {
+        likely: 0.25,
+        tail: 0.75,
+        floor: -2.0,
+    };
+    assert_eq!(
+        bound.bound_at(0.0),
+        0.25,
+        "a likely position gets the likely bound"
+    );
+    // Exactly at the floor is tail, matching compare.rs's `lp > floor`.
+    assert_eq!(bound.bound_at(-2.0), 0.75);
+    assert_eq!(bound.bound_at(-2.5), 0.75);
+    assert_eq!(HeadBound::Flat(0.3).bound_at(-9.0), 0.3);
 }
 
 /// P6b S-2 / S-3 / S-8 (plan Task 6): with `kv.cpu.format: fp8_e4m3` below the BF16 pool, blocks
@@ -933,7 +1004,7 @@ fn assert_within_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str, bounds: (
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse() {
-    lossy_tier_reuse_with("fp8_e4m3", (0.3, 0.5, 0.9));
+    lossy_tier_reuse_with("fp8_e4m3", (HeadBound::Flat(0.3), 0.5, 0.9));
 }
 
 /// [`lossy_tier_reuse`] with L1 at TurboQuant 4-bit (P6b Task 8: the tables are uploaded and the
@@ -944,16 +1015,27 @@ fn lossy_tier_reuse_tq4() {
     lossy_tier_reuse_with("tq4", TQ4_TIER_BOUNDS);
 }
 
-/// The `tq4` tier's bound (P6b Task 9), taken from the gates that judged it: S-8 judges lossy KV by
-/// golden with the slug's batched bounds (Llama `tolerance.json`: 0.25 for a likely token, 0.75
-/// for the tail), and `scripts/lab-bench.sh --golden16` with `kv.cpu.format=tq4` passed them; the
-/// shared-prefix GSM8K gate (lossy cached ratio 0.927) then showed that reuse at that level costs
-/// no accuracy (median 0.775 against BF16 0.780, McNemar n.s.). So the first 8 answer tokens
-/// (greedy, likely) stay within 0.25 of the cold run and 90 % of the 64 positions within 0.75
-/// (a greedy flip later in the answer moves the positions after it; the FP8 tier's 0.3 / 0.5 / 0.9
-/// is tighter because FP8 is). Breaks if the TurboQuant tier perturbs reuse beyond what golden
-/// accepts from batch composition.
-const TQ4_TIER_BOUNDS: (f64, f64, f64) = (0.25, 0.75, 0.9);
+/// The `tq4` tier's bound (P6b Task 9; head bound per user decision 2026-10-03, "6b: stale
+/// lossless-tail tags and the tq4 lab bound", 2), taken from the gates that judged it: S-8
+/// judges lossy KV by golden with the slug's batched bounds (Llama `tolerance.json`), and
+/// `scripts/lab-bench.sh --golden16` with `kv.cpu.format=tq4` passed them; the shared-prefix
+/// GSM8K gate (lossy cached ratio 0.927) then showed that reuse at that level costs no accuracy
+/// (median 0.775 against BF16 0.780, McNemar n.s.). The head is judged exactly as
+/// `turbine-golden compare` judges: a position whose cold logprob is above the
+/// `likely_logprob_floor` (−2) against 0.25, at or below it against 0.75 — the t9 flat 0.25
+/// assumed an exact tail block, and the all-lossy worst case measured 0.2518 on a cold-unlikely
+/// position. 90 % of the 64 positions stay within 0.75 (a greedy flip later in the answer moves
+/// the positions after it; the FP8 tier's 0.3 / 0.5 / 0.9 is tighter because FP8 is). Breaks if
+/// the TurboQuant tier perturbs reuse beyond what golden accepts from batch composition.
+const TQ4_TIER_BOUNDS: (HeadBound, f64, f64) = (
+    HeadBound::GoldenSplit {
+        likely: 0.25,
+        tail: 0.75,
+        floor: -2.0,
+    },
+    0.75,
+    0.9,
+);
 
 /// P6b Task 8 smoke: `kv.dtype: tq4` serves on the GPU (tables uploaded to the executor before
 /// the first forward, the mixed-format attention reads them): a request answers its tokens with
@@ -982,7 +1064,7 @@ fn tq_kv_serves_on_the_device() {
     println!("tq_kv_serves_on_the_device ok: {:?}", answer.text);
 }
 
-fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
+fn lossy_tier_reuse_with(format: &str, bounds: (HeadBound, f64, f64)) {
     if !require_backend("hip") {
         return;
     }
@@ -994,15 +1076,12 @@ fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
             format!("kv.cpu.format={format}"),
             "kv.cpu.max_bytes=2GiB".to_string(),
             "kv.nvme.enabled=false".to_string(),
-            // The lossless tail (S-2, a finished sequence's last full blocks demote at the L0
-            // format) is orthogonal to what this test judges — that a capacity demotion into a
-            // lossy tier is encoded. With the default 1, every finished filler keeps its last
-            // full block tail-tagged for its (one-shot) life, and since the tail block scores
-            // like its history (user decision 2026-10-02, "6b: OLMoE tq4 — lossless last block
-            // in eviction order") those 28 stale tails were 28 of the first 42 demotions,
-            // stored raw: 0.83 x full size, "not encoded". The tail's own behaviour is pinned
-            // by `document_lists_copies_per_codec` and `last_block_is_scored_like_its_history`;
-            // the open question of stale tails' cost is `p6b-tq4enc`.
+            // The lossless tail (S-2: the latest finished sequence's last full blocks demote at
+            // the L0 format, tags expiring with a later finish) is orthogonal to what this test
+            // judges. It stays at 0 here on purpose: with the tail at its default, A's own tail
+            // block demotes raw and comes back exact, which would soften the all-lossy worst
+            // case the accuracy bound is held to. The tail's own behaviour is pinned by
+            // `document_lists_copies_per_codec` and `last_block_is_scored_like_its_history`.
             "kv.lossless_tail_blocks=0".to_string(),
         ],
     );
@@ -1043,7 +1122,14 @@ fn lossy_tier_reuse_with(format: &str, bounds: (f64, f64, f64)) {
         warm.lossy_cached_tokens > 0,
         "no reused block was served from a lossy copy: {warm:?}"
     );
-    assert_within_bounds(&cold, &warm, &format!("{format} lossy L1 reuse"), bounds);
+    assert_within_bounds(
+        &cold,
+        &warm,
+        &format!("{format} lossy L1 reuse"),
+        bounds.0,
+        bounds.1,
+        bounds.2,
+    );
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
         0.0

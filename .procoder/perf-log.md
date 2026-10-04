@@ -1132,3 +1132,51 @@ against a calibration of 187.7 ms, GREEN 0 s into the cool-down, 4,665 × 200, 2
 `queue_timeout`, 0 client-dropped. `turbine_kv_ladder_actions_total{tier="l0"}` 1,148 —
 712 `l0 → fp8_e4m3` rewrites at `fill_high_water`, 435 `no_room_backoff`, 1 `rung_step_up` —
 so the S-7 soak criterion (above 0) is met; every tier's ladder actions sum to 6,790.
+
+### Stale tail tags expire, the tq4 lab bound splits like golden (decisions "6b: stale lossless-tail tags and the tq4 lab bound" 1 A, 2; branch `p6b-smallfix`)
+
+Both follow-ups from the tq4enc entry above, host-only (no lab run of this branch):
+
+- **Tail-tag expiry (1 A).** `KvHierarchy.tail` now holds only the latest finished sequence's
+  last `kv.lossless_tail_blocks` full blocks: a later finish replaces the set (`tail.clear()`
+  before re-tagging). The one-raw-L1-slot-per-finished-sequence cost on one-shot-heavy
+  workloads and the ladder's permanent L0-sweep skip on those blocks are gone; an expired tail
+  demotes, evicts and ladders like any other block, while a growing sequence keeps the S-2
+  guarantee (its newest demoted block stays exact until the turn that grows it finishes). The
+  set itself is bounded at N. Pinned host-side:
+  `a_later_finish_expires_the_previous_sequence_tail` (expired tail demotes encoded, latest
+  tail raw; mutation: dropping the `clear()` fails it) and
+  `a_growing_sequence_keeps_its_tail_exact_until_the_turn_finishes`; kv_sim
+  `per_tier_formats` re-pinned (at most one raw lower-tier copy, at least one expired tail
+  encoded; the fp8/tq4 capacity factors unchanged). Both ladder ACs
+  (`ladder_under_pinned_pressure`, `ladder_l0_under_pinned_pressure`) pass without a fixture
+  re-bless.
+- **The tq4 lab bound (2).** `lossy_tier_reuse_tq4`'s head bound was the flat 0.25 — golden's
+  _likely_ bound, calibrated at t9 against a run whose lossless-tail block was still exact. It
+  now applies the gate's actual likely/tail split per position (0.25 above the
+  `likely_logprob_floor` −2, else the tail bound 0.75), the same rule
+  `turbine-golden compare` uses; nothing else relaxed (the 90 %-within-0.75 share and the FP8
+  arm's tighter 0.3 / 0.5 / 0.9 stay). The all-lossy worst case that measured 0.2518 sits
+  within the split rule as it does within golden at c16. The split logic is unit-pinned
+  host-side (`golden_head_bound_splits_likely_from_tail`); the lab test itself is verified at
+  its next lab pass (the phase-exit pass takes it).
+
+### Phase 6b summary (exit, 2026-10-04; stack tip `af9b82af` + `p6b-smallfix` (tail-tag expiry, tq4 bound split))
+
+What the phase shipped:
+
+- **Per-tier formats.** L1/L2 store blocks in their own codec. Lower-tier `fp8_e4m3` (Task 6: shared-prefix eval drop 0.005, kv_gpu green) and `tq4` (Task 9 + the promotion-path and lossless-last-block fixes: OLMoE 0.8625 vs `l0` 0.8624, Llama 0.9075 vs 0.9007) are `supported`; `tq2` failed the eval on both models (drop 0.060 / 0.025) and stays `experimental` as a capacity rung. The fixed c16 bench is unchanged by any tier format (Llama 849.6–850.3 tok/s against the 854.2 6a-exit baseline; the prompts share no full block, so no lossy block is read).
+- **TurboQuant.** `tq4` in L1 holds 2.96× the blocks of `l0` per GiB measured; as the L0 format it holds 3.56× (targets ≥ 3.5× / 6× met on `kv_sim` and in `/turbine/v1/kv`). L0 `tq4` is `experimental` (Task 13 failed its golden and OLMoE eval gates), reached in production only through the ladder's L0 rung; L0 `tq2` is refused (`kv_tq2_l0_refused`, GSM8K 0.15–0.20). The BF16 recent window (Task 17, per-class page addressing) restored the newest-block exactness that made the ladder's L0 rung servable.
+- **The compression ladder** (Tasks 14–16, L0 step Task 18): opt-in (`kv.ladder.enabled`, default false), rung order `l0` → `fp8_e4m3` → `tq4` (`max_format`, `tq2` failed its gate) → evict, from YELLOW on and under capacity pressure, with back-off on a tier without room, rung-slot fallback so demotions keep flowing, and GREEN-only step-up after the dwell. Multi-turn A/B with the L0 step: recomputed tokens −23 %, cached ratio 0.860 vs 0.837, at tok/s 233 vs 304 and later-turn TTFT p99 35.1 vs 12.4 s — the documented trade accepted by user decision 2026-10-04 A. Both shared-prefix eval gates pass with the ladder on (Task 16 median drop 0.010 at the bound; Task 18 median −0.02), and both 10-minute soaks pass with ladder actions well above 0 (Task 18 L0: 1,148 actions, 712 rewrites).
+- **Serving fixes the phase forced:** planner copy timing (poll-bounded `CopyTime::Within`, clamped to calibrated costs), pinned D2H batching, the promotion copy kernel (ABI v2.11 H2D kernel, default; ~2× the copy engine under decode compute), queued-prefix demotion, copy ahead, the GREEN admission headroom cap at RED's 0.90 (no GREEN → SURVIVAL burst; the soak's rejections move to `queue_timeout`), the step-time drift window fixes (age-out + minimum judged steps; steps overlapping a KV copy are not judged), the lossless-last-block eviction score, expiring tail tags (`p6b-smallfix`), and 128 MiB L1 slabs. Kernel ABI v2.11 (unshipped before 6b): KV transcode + TurboQuant transcode, the mixed-format paged attention (own `turbine_hip_mixed` decode, staged CK prefill), per-class page addressing, and the copy kernel — each with a recorded provider evaluation.
+
+Open at exit: the ladder-on tail/throughput regression keeps its shape with the L0 step (the on-arm sits at ORANGE far longer; follow-up, not a blocker — decision 2026-10-04 A); OLMoE `l0`'s L1 `rung_no_slot` churn on the ladder workload is covered by the 128 MiB slab decision but not re-measured end to end; `/turbine/v1/status` does not yet carry `quantization.tier_formats` / `quantization.ladder` (S-10, carried from Task 15 — see the plan's Task 19 report). Labbook set `phase-6b-kv-compression` holds every run cited above.
+
+Exit runs (Task 19, 2026-10-04, merge `29f4de10` = `af9b82af` + `p6b-smallfix`; logs under `target/t19/` on the workstation):
+
+- `scripts/gate.sh --full`: **ok** on `af9b82af` (955 tests) and again on the merge (958) — `gate: ok crates=all failed=0`.
+- `scripts/lab-test.sh novanas --tier full` (job turbine-lab-test-1004090558): 1,051 passed, **2 failed** — `hip_ops::implementations_enumerated` and `hip_ops::every_implementation_matches_cpu`, both full-tier-only exhaustive checks whose expected implementation tables predate Task 12's mixed paged attention (the library enumerates 7 `attention_prefill_paged` implementations, the test expects 4; the exhaustive-match test has no mixed scenario, so the mixed implementations "never ran"). The quick tier skips both, so the full tier is the first run to see it. Everything else green, including `kv_gpu lossy_tier_reuse{,_tq4}` (the smallfix bound split holds end to end on the R9700), both ladder kv_sim traces, and `paged_mixed_matches_cpu`.
+- `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` (`TURBINE_LAB_ONE_GPU_JOB=0`; job turbine-lab-test-1004103638, after the host reboot the lead ran this morning — GPU 1 had dropped after the previous boot): **PASS, 27 passed / 0 failed** — the Phase 0 inventory, the Phase 5 two-GPU lists (hostmem, tp2, rccl) and the fault-injection suite.
+- `scripts/lab-bench.sh --golden16 --label t19-exit` for the 9 models: **PASS** for `llama` (853.7 tok/s, 1.00× the 6a-exit baseline), `olmoe` (610.3), `llama-fp8` (977.3), `llama-fp8-block` (1059.7), `llama-fp8-tensor` (976.5), `llama-awq` (1258.1), `llama-gptq-autoround` (1265.9). **FAIL for `llama-fp8kv`**, deterministically (two runs, bit-identical verdicts): golden c1 15/16 (need 14 — every prompt's token rule holds; p10 exceeds the strict likely bound 0.4274 vs 0.40, tail 0.8230 vs 2.44, identical 32-token prefix), c16 the same. The 6a exit passed this gate at 829.7 tok/s (2026-09-30), so a 6b commit moved the fp8-KV paged path's numerics just past the slug's likely bound — not bisected here. **`olmoe-fp8kv` FAIL 13/16**, exactly the 6a-exit result behind its `experimental` demotion (user decision 2026-09-30 B) — unchanged, not a new miss.
+- 10-minute ladder soak × 2 (`--shared-prefix-share 0.5`, L1 4 GiB, L2 16 GiB, `kv.ladder.enabled` + `l0` + `max_format=tq4`): both runs **fail exactly one check, `kv_idle`** — at the final scrape L0 still holds 1,556 / 1,291 blocks and L1 134 / 108, where the Task 18 soak on tree 94bd16aa (same flags) drained to idle and passed 8/8. Every other check is true in both runs (ITL p99 217 ms against calibrations 186 / 183, GREEN 0 s into the cool-down, `streams_complete`, 0 client-dropped, ladder actions 984 / 1,666 with the L0 share above 0). The only code change between the passing and failing trees is `p6b-smallfix`'s tail-tag expiry (`ecf29422`) — suspect recorded for the lead, not diagnosed here.
+- Support matrix and track gates: the full `--support-matrix --output json` is on the workstation (`target/t19/support-matrix.json`); `--check-config` with `kv.dtype=tq4 --kv.cpu.format=tq4 --kv.ladder.enabled=true` prints `support: experimental (amd/*/*/bf16/tq4/none)`, `config ok`, and `kv.cpu.format: zstd` exits 2 naming the key. `scripts/track-gate.sh phase-6b-kv-compression` → **GATE PASS**; `phase-5p-serving-efficiency` is not an argument the script accepts (it gates the phase 6–8 tracks; 5p's order evidence is 6b's close); `phase-7-model-families` → GATE FAIL "no supported amd row with tq4 or tq2 KV" — the umbrella's phase-7 start rule cannot pass after 6b's accepted end state (the L0 `tq4` rows stay `experimental`, user decisions 2026-10-02 / 2026-10-04 A) and needs amending before track 2.

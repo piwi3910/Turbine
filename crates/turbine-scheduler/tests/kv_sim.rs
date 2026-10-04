@@ -12,7 +12,7 @@ use turbine_core::types::{
 };
 use turbine_kv::directory::KvBlock;
 use turbine_kv::hierarchy::{HierarchyConfig, KvHierarchy, PrefetchTarget};
-use turbine_kv::identity::KvFormat;
+use turbine_kv::identity::{KvFormat, KvKey};
 use turbine_kv::metrics::KvMetrics;
 use turbine_kv::tier::{KvTier, MemTier, TierId};
 use turbine_kv::transfer::SimTransferBackend;
@@ -421,9 +421,11 @@ fn demotion_under_pressure() {
 }
 
 /// P6b S-1, S-2: L1 stores blocks in `kv.cpu.format` and L2 in `kv.nvme.format`, except the
-/// last full block of each finished sequence (`kv.lossless_tail_blocks: 1`), which keeps the L0
-/// format through both tiers; each tier accounts a copy at its codec's size, and a promoted
-/// block comes back at the L0 format.
+/// last full block of the latest finished sequence (`kv.lossless_tail_blocks: 1`), which keeps
+/// the L0 format through both tiers while its tag is held — the tags expire with a later finish
+/// (user decision 2026-10-03, "6b: stale lossless-tail tags and the tq4 lab bound", 1 A), so an
+/// earlier sequence's tail demotes encoded. Each tier accounts a copy at its codec's size, and
+/// a promoted block comes back at the L0 format.
 #[test]
 fn per_tier_formats() {
     let mut kv = KvConfig::default();
@@ -448,33 +450,49 @@ fn per_tier_formats() {
     for _ in 0..60 {
         d.step();
     }
-    // Every sequence ran 6 full blocks (96- and 98-token prompts): block 5 is its tail.
+    // Every sequence ran 6 full blocks (96- and 98-token prompts): block 5 is its tail. Expiry
+    // (user decision 2026-10-03, "6b: stale lossless-tail tags and the tq4 lab bound", 1 A):
+    // only the latest finished sequence's tail keeps its tag — at most one block carries the
+    // L0 format below L0; every earlier sequence's tail demoted encoded.
     let tail = |b: &KvBlock| b.token_range.start == 80;
     let mut seen = std::collections::HashMap::new();
+    let mut raw: HashSet<KvKey> = HashSet::new();
     for b in d.kv().directory().iter() {
         for loc in &b.locations {
-            let want = match loc.tier {
-                TierId::L0 => "l0",
-                _ if tail(b) => "l0",
-                TierId::L1 => "fp8_e4m3",
-                _ => "tq4",
-            };
-            assert_eq!(
-                loc.format,
-                want,
-                "{:?} copy of block {:?} (tail {})",
-                loc.tier,
-                b.token_range,
-                tail(b)
-            );
+            if loc.tier != TierId::L0 {
+                if loc.format == "l0" {
+                    raw.insert(b.key);
+                }
+            } else if !tail(b) {
+                assert_eq!(
+                    loc.format, "l0",
+                    "{:?} copy of block {:?}",
+                    loc.tier, b.token_range
+                );
+            }
             *seen.entry((loc.tier, loc.format)).or_insert(0) += 1;
         }
     }
-    for (tier, format) in [
-        (TierId::L1, "fp8_e4m3"),
-        (TierId::L2, "tq4"),
-        (TierId::L2, "l0"),
-    ] {
+    assert!(
+        raw.len() <= 1,
+        "only the latest finished sequence's tail keeps its tag: {raw:?}"
+    );
+    let encoded_tail = d
+        .kv()
+        .directory()
+        .iter()
+        .filter(|b| tail(b))
+        .filter(|b| {
+            b.locations
+                .iter()
+                .any(|l| l.tier != TierId::L0 && l.format != "l0")
+        })
+        .count();
+    assert!(
+        encoded_tail > 0,
+        "an expired tail demoted encoded: {seen:?}"
+    );
+    for (tier, format) in [(TierId::L1, "fp8_e4m3"), (TierId::L2, "tq4")] {
         assert!(
             seen.get(&(tier, format)).is_some_and(|n| *n > 0),
             "no {format} copy in {tier:?}: {seen:?}"
