@@ -222,6 +222,18 @@ pub(crate) struct EngineLoop {
     /// Requests that ended this turn, reported to the KV hierarchy after `complete`
     /// (`true`: cancelled or failed).
     kv_done: Vec<(RequestId, bool)>,
+    /// Requests whose tail copies ran in the iteration in flight (overlap scheduling): their
+    /// source references go back when that iteration completes.
+    tail_done: Vec<RequestId>,
+    /// Each planned sequence's last table block ([`EngineLoop::note_table_blocks`]).
+    last_table_block: HashMap<SeqId, BlockId>,
+    /// Choice 0's final partial block per request that finished at sampling time
+    /// (`sample_choice`, serial and pipelined paths): published before the iteration's
+    /// `complete` releases the finished tables, dropped when the iteration failed.
+    pending_publishes: Vec<KvPublish>,
+    /// Requests whose host state goes at the end of the turn (P5p S-5: their finishing
+    /// iteration still commits).
+    retire_later: Vec<RequestId>,
     /// Admitted requests that released their prefix while queued and whose new attach waits for
     /// promotions ([`EngineLoop::reattach_released`]).
     reattaching: HashSet<RequestId>,
@@ -256,6 +268,14 @@ struct HeldSubmission {
 
 /// The KV one plan item wrote, committed when the iteration succeeds: request, table, tokens.
 type KvCommit = (RequestId, SmallVec<[BlockId; 16]>, Vec<u32>);
+/// Choice 0's final partial block of one finished request: published before the scheduler
+/// releases the finished tables (P5p S-5).
+type KvPublish = (RequestId, BlockId, Vec<u32>);
+
+/// The sequences of an outcome's normal finishes (a failed iteration finishes nothing).
+fn finished_of(outcome: &IterationOutcome) -> Vec<SeqId> {
+    outcome.finished.iter().map(|(s, _)| *s).collect()
+}
 
 /// What `sample` needs of one launched row, fixed when its batch is built (under overlap
 /// scheduling the scheduler has moved on by the time the row is sampled).
@@ -313,6 +333,9 @@ struct InFlight {
     /// The full blocks the iteration writes (Phase 4), held (one pool reference each) from its
     /// ahead completion until it is collected: committed on success, then released.
     commits: Vec<KvCommit>,
+    /// The finished requests' final partial blocks (P5p S-5), held (one pool reference on the
+    /// block) the same way: published on success, then released.
+    publishes: Vec<KvPublish>,
 }
 
 impl EngineLoop {
@@ -375,6 +398,10 @@ impl EngineLoop {
             kv: p.kv,
             held: HashMap::new(),
             kv_done: Vec::new(),
+            tail_done: Vec::new(),
+            last_table_block: HashMap::new(),
+            pending_publishes: Vec::new(),
+            retire_later: Vec::new(),
             reattaching: HashSet::new(),
             pipeline: p.pipeline,
             pipe: VecDeque::new(),
@@ -447,6 +474,7 @@ impl EngineLoop {
         self.kv_before_plan();
         let mut plan = self.sched.plan(&mut self.pool, &limits);
         self.kv.after_plan(&mut self.pool);
+        self.note_table_blocks(&plan);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -471,6 +499,9 @@ impl EngineLoop {
         let copies = self.kv.copy_mark();
         let outcome = self.execute(&mut plan);
         let failed = outcome.failed.is_some();
+        if failed {
+            self.pending_publishes.clear();
+        }
         if !failed {
             // Only KV the forward pass wrote successfully enters the cache; the tables are
             // still held (before `complete` releases finished sequences). A recovery retry may
@@ -478,8 +509,21 @@ impl EngineLoop {
             for (id, blocks, tokens) in self.kv_commits(&plan) {
                 self.kv.commit(&mut self.pool, id, &blocks, &tokens);
             }
+            // The finished requests' partial tails publish before the tables release.
+            for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
+                self.kv.publish_tail(&mut self.pool, id, block, &tokens);
+            }
         }
+        let tail_requests: Vec<RequestId> = plan
+            .tail_copies
+            .iter()
+            .filter_map(|(s, _, _)| self.seqs.get(s).map(|(id, _)| *id))
+            .collect();
         self.sched.complete(&mut self.pool, outcome);
+        // The tail copies of this iteration ran: their source references go back.
+        for id in tail_requests {
+            self.kv.tail_copied(&mut self.pool, id);
+        }
         if !failed {
             self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
@@ -660,10 +704,24 @@ impl EngineLoop {
                 for (id, blocks, tokens) in self.kv_commits(&f.plan) {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
                 }
+                // The finished requests' partial tails publish before the tables release.
+                for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
+                    self.kv.publish_tail(&mut self.pool, id, block, &tokens);
+                }
+                let tail_requests: Vec<RequestId> = f
+                    .plan
+                    .tail_copies
+                    .iter()
+                    .filter_map(|(s, _, _)| self.seqs.get(s).map(|(id, _)| *id))
+                    .collect();
                 self.sched.complete(&mut self.pool, outcome);
+                for id in tail_requests {
+                    self.kv.tail_copied(&mut self.pool, id);
+                }
                 self.observe(&f.plan, cadence.as_secs_f64(), f.copies);
             }
             Err(error) => {
+                self.pending_publishes.clear();
                 let outcome = self.pipe_failure(f.plan.iteration, error);
                 self.sched.complete(&mut self.pool, outcome);
             }
@@ -1341,12 +1399,61 @@ impl EngineLoop {
         out
     }
 
+    /// Remembers each planned sequence's last table block: a finish captured at sampling time
+    /// ([`EngineLoop::sample_choice`]) publishes it (P5p S-5). One id per sequence, updated
+    /// before every executed iteration; `forget` drops the entries.
+    fn note_table_blocks(&mut self, plan: &IterationPlan) {
+        for item in &plan.items {
+            if let Some(&b) = item.block_table.blocks.last() {
+                self.last_table_block.insert(item.seq, b);
+            }
+        }
+    }
+
+    /// The finishes' publish candidates from `plan` (overlap scheduling, captured before the
+    /// late completion releases the tables): only live requests (a failed request's finish
+    /// never publishes), with their choice-0 tokens.
+    fn publishes_of(&self, plan: &IterationPlan, finished: &[SeqId]) -> Vec<KvPublish> {
+        let bt = self.pool.layout().block_tokens.max(1);
+        let mut out = Vec::new();
+        for seq in finished {
+            let Some(&(id, 0)) = self.seqs.get(seq) else {
+                continue;
+            };
+            if self.requests.get(&id).is_some_and(|r| r.done) {
+                continue;
+            }
+            let Some(item) = plan.items.iter().find(|i| i.seq == *seq) else {
+                continue;
+            };
+            let end = item.block_table.tokens;
+            let Some(&block) = item
+                .block_table
+                .blocks
+                .get((end.div_ceil(bt).saturating_sub(1)) as usize)
+            else {
+                continue;
+            };
+            let Some(r) = self.requests.get(&id) else {
+                continue;
+            };
+            let Some(tokens) = (0..end).map(|p| r.token_at(0, p)).collect() else {
+                continue;
+            };
+            out.push((id, block, tokens));
+        }
+        out
+    }
+
     /// After `complete`: the requests that ended this turn, then pending reclaim requests and
     /// session TTLs.
     fn kv_end_turn(&mut self) {
         for (id, cancelled) in std::mem::take(&mut self.kv_done) {
             self.reattaching.remove(&id);
             self.kv.request_done(&mut self.pool, id, cancelled);
+        }
+        for id in std::mem::take(&mut self.retire_later) {
+            self.forget(id);
         }
         self.kv.end_turn(&mut self.pool);
         self.release_queued_prefixes();
@@ -1588,8 +1695,26 @@ impl EngineLoop {
 
     /// The `n` > 1 fork copies of `plan` (`ModelExecutor::copy_blocks`), ordered before its
     /// forward on the stream.
+    /// The fork copies (`n` > 1) and the copy-on-write tail copies (P5p S-5): one
+    /// `copy_blocks` call, fork pairs first, then tail pairs — every pair within one page
+    /// class (the private block follows its source's).
     fn fork_copies(&mut self, plan: &IterationPlan) -> Result<(), IterationError> {
-        let (src, dst): (Vec<_>, Vec<_>) = plan.forks.iter().filter_map(|f| f.copy).unzip();
+        let mut src: Vec<_> = plan
+            .forks
+            .iter()
+            .filter_map(|f| f.copy)
+            .map(|c| c.0)
+            .collect();
+        let mut dst: Vec<_> = plan
+            .forks
+            .iter()
+            .filter_map(|f| f.copy)
+            .map(|c| c.1)
+            .collect();
+        for (_, s, d) in &plan.tail_copies {
+            src.push(*s);
+            dst.push(*d);
+        }
         if src.is_empty() {
             return Ok(());
         }
@@ -1982,13 +2107,25 @@ impl EngineLoop {
                 }
             }
             let outcome = self.ahead_outcome(&prev);
+            // The finished requests' partial tails are held the same way as the commits (one
+            // reference on the block) and published in `finish` on success: the completion
+            // below releases their tables.
+            prev.publishes = self.publishes_of(&prev.plan, &finished_of(&outcome));
+            for (_, block, _) in &prev.publishes {
+                self.pool.incref(*block);
+            }
             self.sched.complete(&mut self.pool, outcome);
+            // The tail copies of the completed iteration ran: their sources go back.
+            for id in std::mem::take(&mut self.tail_done) {
+                self.kv.tail_copied(&mut self.pool, id);
+            }
             self.in_flight = Some(prev);
         }
         let limits = self.read_snapshot()?;
         self.kv_before_plan();
         let plan = self.sched.plan(&mut self.pool, &limits);
         self.kv.after_plan(&mut self.pool);
+        self.note_table_blocks(&plan);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
         }
@@ -2092,11 +2229,20 @@ impl EngineLoop {
             launch_time: Duration::ZERO,
             copies: self.kv.copy_mark(),
             commits: Vec::new(),
+            publishes: Vec::new(),
         };
         next.phase = phase_of(&next.plan);
         if let Err(error) = self.fork_copies(&next.plan) {
             return self.launch_failed(next, prev, error);
         }
+        // The tail copies of this plan will have run once the iteration completes (overlap
+        // scheduling completes it next turn).
+        self.tail_done.extend(
+            next.plan
+                .tail_copies
+                .iter()
+                .filter_map(|(s, _, _)| self.seqs.get(s).map(|(id, _)| *id)),
+        );
         let built = match self.build_batch(&next.plan, prev.as_ref()) {
             Ok(Build::Ready(built)) => built,
             Ok(Build::NeedsHost) => {
@@ -2275,6 +2421,7 @@ impl EngineLoop {
     /// work: sampling, detokenisation, events. Finishes it learns go to the next completion.
     fn finish(&mut self, mut p: InFlight) -> Result<(), String> {
         let commits = std::mem::take(&mut p.commits);
+        let publishes = std::mem::take(&mut p.publishes);
         let ok = self.collect_in_flight(p);
         // The held KV enters the cache only when the iteration that wrote it succeeded; the
         // hold is dropped either way.
@@ -2283,6 +2430,12 @@ impl EngineLoop {
                 self.kv.commit(&mut self.pool, id, &blocks, &tokens);
             }
             self.pool.release(&blocks);
+        }
+        for (id, block, tokens) in publishes {
+            if ok {
+                self.kv.publish_tail(&mut self.pool, id, block, &tokens);
+            }
+            self.pool.release(&[block]);
         }
         Ok(())
     }
@@ -2418,6 +2571,24 @@ impl EngineLoop {
         let all_finished = r.all_finished();
         if let Some(reason) = step.finish {
             outcome.finished.push((seq, reason));
+            // P5p S-5 (serial and pipelined paths; overlap captures at its ahead completion,
+            // where the finished table is still held): choice 0's final block publishes when
+            // the iteration's KV commits — its table is released only at `complete`.
+            if choice == 0
+                && !self.overlap
+                && let Some(&block) = self.last_table_block.get(&seq)
+            {
+                // The newest token is never fed: its KV is not written, so it is not part of
+                // the published entry's tokens.
+                let end =
+                    (r.prompt_len() + r.choices[choice].generated.len() as u32).saturating_sub(1);
+                if let Some(tokens) = (0..end)
+                    .map(|p| r.token_at(0, p))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    self.pending_publishes.push((id, block, tokens));
+                }
+            }
         }
         self.stages.add(Stage::Detokenize, step.detokenize);
         self.stages.mark(Stage::Sample);
@@ -2580,7 +2751,11 @@ impl EngineLoop {
             .get(&id)
             .is_some_and(|r| r.done && !r.has_held())
         {
-            self.forget(id);
+            // The host state goes at the end of the turn, not here: the finishing iteration's
+            // KV still commits (and its partial tail publishes) after this — its sequence's
+            // tokens and table are read by `kv_commits` below (P5p S-5; a request that ended
+            // at its prefill committed nothing before).
+            self.retire_later.push(id);
         }
     }
 
@@ -2590,6 +2765,7 @@ impl EngineLoop {
         if let Some(r) = self.requests.remove(&id) {
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
+                self.last_table_block.remove(&c.seq);
             }
         }
     }
@@ -3148,7 +3324,10 @@ mod tests {
             let (cold, cached) = run_one(&tx, request(&prompt, 8));
             assert_eq!(cached, 0, "nothing is cached before the first run");
             let (warm, cached) = run_one(&tx, request(&prompt, 8));
-            assert_eq!(cached, 32, "two full blocks are reused (overlap {overlap})");
+            assert_eq!(
+                cached, 38,
+                "two full blocks + 6 tail tokens are reused (overlap {overlap})"
+            );
             assert_eq!(
                 warm, cold,
                 "reused KV gives the cold run's tokens (overlap {overlap})"
@@ -3164,9 +3343,157 @@ mod tests {
 
             let kv = serde_json::to_value(shared.docs().unwrap().kv).unwrap();
             assert_eq!(kv["hit_rate"]["prompt_tokens"], 120, "{kv}");
-            assert_eq!(kv["hit_rate"]["cached_tokens"], 32, "{kv}");
+            assert_eq!(kv["hit_rate"]["cached_tokens"], 38, "{kv}");
             assert_eq!(kv["policy"], "cost_aware", "{kv}");
-            assert!(metric(&reg, "turbine_kv_prefix_cached_tokens_total") >= 32.0);
+            assert!(metric(&reg, "turbine_kv_prefix_cached_tokens_total") >= 38.0);
+            drop(tx);
+            handle.join().unwrap().unwrap();
+        }
+    }
+
+    /// P5p S-5 (`partial_prefix_reuse_matches_cold`): a finished request publishes its partial
+    /// tail, a later request reuses up to the last written token through one copy-on-write tail
+    /// copy, and every output stays bitwise equal to the same engine cold and to a
+    /// `kv.partial_prefix_reuse: false` engine. Covers tail reuses of 1..=15 tokens of a
+    /// 16-token partial block, a divergence inside a cached full block, and the split of a
+    /// matched full block at an exact block boundary (48 = 46 + 2). Breaks if a tail copy
+    /// changes an output or the reported `cached_tokens` misses the reused tokens.
+    #[test]
+    fn partial_prefix_reuse_matches_cold() {
+        for overlap in [false, true] {
+            let (_dir, spec, tokenizer) = tiny();
+            let exec = if overlap {
+                tiny_reducing_executor(&spec, 4)
+            } else {
+                tiny_executor(&spec, 4)
+            };
+            let kv_on = KvConfig {
+                partial_prefix_reuse: true,
+                ..KvConfig::default()
+            };
+            let t = engine_with_kv(
+                exec,
+                Arc::clone(&tokenizer),
+                params(4, 64),
+                overlap,
+                kv_on,
+                |_, _, _| None,
+            );
+            let TestEngine {
+                engine,
+                tx,
+                shared,
+                reg,
+                ..
+            } = t;
+            let handle = std::thread::spawn(move || engine.run());
+
+            // The base prompt: 40 tokens = two full 16-token blocks + 8 tokens; 8 generated
+            // tokens leave the last block at 47 written tokens — a 15-token partial entry.
+            let base: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+            let cold = run_one(&tx, request(&base, 8));
+            assert_eq!(cold.1, 0, "nothing is cached before the first run");
+
+            // The same prompt reuses the entry's 8 shared tokens: 32 + 8 = 38 cached, the
+            // covered arm of the planner's cap.
+            let warm = run_one(&tx, request(&base, 8));
+            assert_eq!(warm.1, 38, "the partial tail is reused (overlap {overlap})");
+            assert_eq!(warm.0, cold.0, "a tail copy gives the cold run's tokens");
+
+            // One token longer: 39 of its 41 tokens come from the cache, 2 recomputed. Its
+            // cold reference comes from a salted run (a salt shares nothing).
+            let mut longer = base.clone();
+            longer.push(261);
+            let mut salted_long = request(&longer, 8);
+            salted_long.cache_salt = Some("long-cold".into());
+            let long_cold = run_one(&tx, salted_long);
+            assert_eq!(long_cold.1, 0, "the salted run is cold");
+            let long = run_one(&tx, request(&longer, 8));
+            assert_eq!(long.1, 39, "the tail reuse caps at prompt - 2");
+            assert_eq!(
+                long.0, long_cold.0,
+                "the warm 41-token run matches its cold run"
+            );
+
+            // A divergence inside the cached region: two full blocks + 2 of the entry (the
+            // divergence sits at token 34).
+            let mut diverged = base.clone();
+            diverged[34] += 100;
+            let d_cold = run_one(&tx, request(&diverged, 8));
+            assert_eq!(
+                d_cold.1, 34,
+                "first diverged run: the two shared full blocks + the 2 tokens of base's \
+                 tail before the divergence"
+            );
+            let d_warm = run_one(&tx, request(&diverged, 8));
+            assert_eq!(
+                d_warm.1, 38,
+                "32 full blocks + the 6 matched tokens past them"
+            );
+            assert_eq!(d_warm.0, d_cold.0);
+
+            // A block-aligned prompt of 48 tokens publishes nothing; sent again it splits the
+            // matched full block at the cutoff (the planner's covered arm at an exact
+            // multiple): 46 cached, 2 recomputed.
+            let aligned: Vec<u32> = std::iter::once(256).chain(97..144).collect();
+            let a_cold = run_one(&tx, request(&aligned, 1));
+            assert_eq!(
+                a_cold.1, 40,
+                "the aligned prompt shares the cached 32 tokens + 8 of base's tail"
+            );
+            let a_warm = run_one(&tx, request(&aligned, 1));
+            assert_eq!(a_warm.1, 46, "the matched block splits at the boundary");
+            assert_eq!(a_warm.0, a_cold.0);
+
+            // The KV document names the switch and the partial entries.
+            let kv = serde_json::to_value(shared.docs().unwrap().kv).unwrap();
+            assert_eq!(
+                kv["partial_prefix_reuse"], true,
+                "the summary flattens into the document: {kv}"
+            );
+            assert!(
+                kv["tiers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["partial_entries"].as_u64().unwrap_or(0) > 0),
+                "the published entry is counted: {kv}"
+            );
+            assert!(metric(&reg, "turbine_kv_partial_reuse_total{outcome=\"reused\"}") >= 4.0);
+            assert!(
+                metric(&reg, "turbine_kv_partial_reused_tokens_total")
+                    >= 38.0 - 32.0 + (39.0 - 32.0) + 6.0 + (46.0 - 32.0),
+                "the reused tokens add up"
+            );
+
+            drop(tx);
+            handle.join().unwrap().unwrap();
+
+            // With the switch off the same prompts give the Phase 4 block-granular attaches and
+            // the same tokens.
+            let (_dir, spec, tokenizer) = tiny();
+            let kv_off = KvConfig {
+                partial_prefix_reuse: false,
+                ..KvConfig::default()
+            };
+            let t = engine_with_kv(
+                tiny_executor(&spec, 4),
+                Arc::clone(&tokenizer),
+                params(4, 64),
+                false,
+                kv_off,
+                |_, _, _| None,
+            );
+            let TestEngine { engine, tx, .. } = t;
+            let handle = std::thread::spawn(move || engine.run());
+            let off = run_one(&tx, request(&base, 8));
+            assert_eq!(off, (cold.0.clone(), 0), "cold run of the off engine");
+            let off2 = run_one(&tx, request(&base, 8));
+            assert_eq!(off2.1, 32, "block-granular only");
+            assert_eq!(off2.0, cold.0);
+            let off_long = run_one(&tx, request(&longer, 8));
+            assert_eq!(off_long.1, 32);
+            assert_eq!(off_long.0, long_cold.0, "the off engine matches too");
             drop(tx);
             handle.join().unwrap().unwrap();
         }
@@ -3212,10 +3539,16 @@ mod tests {
         let (cold, _) = run_one(&tx, request(&prompt, 8));
         // A second run hits the cached blocks: the reuse evidence demotion needs.
         let (again, cached) = run_one(&tx, request(&prompt, 8));
-        assert_eq!((again.as_slice(), cached), (cold.as_slice(), 32));
+        assert_eq!(
+            (again.as_slice(), cached),
+            (cold.as_slice(), 38),
+            "two full blocks + 6 tail tokens (P5p)"
+        );
         // Everything unreferenced leaves L0 at the end of the next turn.
         reclaim.demote(0.0);
-        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        // A prompt sharing nothing with the cached one: a sharing filler would tail-copy from
+        // it instead of allocating, and the no-evidence block the demote reclaims would stay.
+        let _ = run_one(&tx, request(&[250, 9, 8], 2));
         let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
         let started = Instant::now();
         while metric(&reg, demoted) < 2.0 {
@@ -3226,6 +3559,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let (warm, cached) = run_one(&tx, request(&prompt, 8));
+        // The published tail left with the drop reclaims take at RED; the two full blocks come
+        // back from L2 (the partial entry is L0-only and is never in L2).
         assert_eq!(cached, 32, "both blocks came back from L2");
         assert_eq!(
             warm, cold,
@@ -3290,14 +3625,19 @@ mod tests {
             let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
             let _ = run_one(&tx, request(&prompt, 8));
             let (_, cached) = run_one(&tx, request(&prompt, 8));
-            assert_eq!(cached, 32, "the reuse evidence demotion needs");
+            assert_eq!(
+                cached, 38,
+                "the reuse evidence demotion needs (P5p: + the tail)"
+            );
             assert_eq!(
                 metric(&reg, unjudged),
                 0.0,
                 "no copy ran yet (overlap {overlap})"
             );
             reclaim.demote(0.0);
-            let _ = run_one(&tx, request(&[256, 1, 2], 2));
+            // A prompt sharing nothing with the cached one: a sharing filler would tail-copy from
+            // it instead of allocating, and the no-evidence block the demote reclaims would stay.
+            let _ = run_one(&tx, request(&[250, 9, 8], 2));
             let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
             let deadline = Instant::now() + Duration::from_secs(20);
             while metric(&reg, demoted) < 2.0 {
@@ -3423,9 +3763,14 @@ mod tests {
         let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
         let _ = run_one(&tx, request(&prompt, 8));
         let (_, cached) = run_one(&tx, request(&prompt, 8));
-        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        assert_eq!(
+            cached, 38,
+            "the reuse evidence demotion needs (P5p: + the tail)"
+        );
         reclaim.demote(0.0);
-        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        // A prompt sharing nothing with the cached one: a sharing filler would tail-copy from
+        // it instead of allocating, and the no-evidence block the demote reclaims would stay.
+        let _ = run_one(&tx, request(&[250, 9, 8], 2));
         let deadline = Instant::now() + Duration::from_secs(20);
         while metric(&reg, demoted) < 2.0 {
             assert!(
@@ -4696,6 +5041,17 @@ mod tests {
 
         let prompt: Vec<u32> = std::iter::once(256).chain(1..100).collect();
         let (cold, _) = run_one(&tx, request(&prompt, 8));
+        // The cold run's partial tail publishes at its finish turn, possibly after its final
+        // event reached us: wait for it, or Q and H attach before the entry exists and the
+        // counts below race (P5p S-5).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while metric(&reg, "turbine_kv_partial_entries") < 1.0 {
+            assert!(
+                Instant::now() < deadline,
+                "the cold run's partial tail never published"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // R holds the only running slot: paused behind a full channel, with its KV.
         let other: Vec<u32> = std::iter::once(256).chain(150..189).collect();
         let (mut slow, admitted) = submit_with(&tx, request(&other, 20), 4);
@@ -4731,21 +5087,34 @@ mod tests {
         }
         assert_eq!(controller.state(), PressureState::Yellow);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while metric(&reg, detached) < 6.0 || metric(&reg, demoted) < 6.0 {
+        // Five of Q's six blocks demote: the sixth (block 0) is the pending tail copy's source
+        // of the queued head H (its prompt shares that block's first token), and a source stays
+        // referenced until its copy's iteration runs (P5p S-5).
+        while metric(&reg, detached) < 6.0 || metric(&reg, demoted) < 5.0 {
             assert!(
                 Instant::now() < deadline,
-                "Q's prefix was not released and demoted: {} released, {} demoted",
+                "Q's prefix was not released and demoted: {} released, {} demoted, reused {}, entries {}",
                 metric(&reg, detached),
-                metric(&reg, demoted)
+                metric(&reg, demoted),
+                metric(&reg, r#"turbine_kv_partial_reuse_total{outcome="reused"}"#),
+                metric(&reg, "turbine_kv_partial_entries")
             );
             tick(&ctl, 0.5);
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert_eq!(metric(&reg, detached), 6.0, "only Q's own blocks");
-        assert_eq!(
-            held_blocks(&shared.docs().unwrap()),
-            held - 6,
-            "the released blocks left the referenced ones"
+        // Q's six shared blocks and (when its attach saw the published tail) its private tail
+        // block — all held by Q alone. The tail's presence races the cold run's finish turn,
+        // so only the six shared blocks are exact.
+        assert!(
+            metric(&reg, detached) >= 6.0,
+            "only Q's own blocks: {}",
+            metric(&reg, detached)
+        );
+        assert!(
+            held_blocks(&shared.docs().unwrap()) <= held - 6,
+            "the released blocks left the referenced ones ({} held before, now {})",
+            held,
+            held_blocks(&shared.docs().unwrap())
         );
 
         // R and H end; Q is admitted, attaches again (from L2 or recomputed) and matches the
@@ -4958,10 +5327,15 @@ mod tests {
         let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
         let (cold, _) = run_one(&tx, request(&prompt, 8));
         let (_, cached) = run_one(&tx, request(&prompt, 8));
-        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        assert_eq!(
+            cached, 38,
+            "the reuse evidence demotion needs (P5p: + the tail)"
+        );
         // Both blocks leave L0 for L2.
         reclaim.demote(0.0);
-        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        // A prompt sharing nothing with the cached one: a sharing filler would tail-copy from
+        // it instead of allocating, and the no-evidence block the demote reclaims would stay.
+        let _ = run_one(&tx, request(&[250, 9, 8], 2));
         let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
         let deadline = Instant::now() + Duration::from_secs(20);
         while metric(&reg, demoted) < 2.0 {

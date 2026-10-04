@@ -37,6 +37,14 @@ pub struct KvTierDocument {
     /// `capacity_bytes` over the codec's `bytes / blocks`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub formats: BTreeMap<&'static str, FormatUsage>,
+    /// P5p S-5: the L0-only partial entries the tier holds (L0 only; the lower tiers hold
+    /// full blocks).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub partial_entries: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// One codec's share of a tier (`formats` of [`KvTierDocument`]).
@@ -78,6 +86,8 @@ pub struct TierState {
 pub struct KvSummary {
     pub policy: &'static str,
     pub prefix_sharing: bool,
+    /// P5p S-4/S-5: the token-granular match and its copy-on-write tail.
+    pub partial_prefix_reuse: bool,
     pub block_tokens: u32,
     pub block_bytes: u64,
     pub unified_memory: bool,
@@ -130,6 +140,7 @@ impl KvDocument {
                 blocks_free: pool.free_blocks(),
                 state: None,
                 formats: BTreeMap::new(),
+                partial_entries: 0,
             }],
             summary: None,
         }

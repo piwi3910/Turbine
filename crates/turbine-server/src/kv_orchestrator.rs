@@ -580,14 +580,9 @@ impl KvOrchestrator {
         turbine_kv::policy::registry()
             .select(s.cfg.policy.as_str(), "kv.policy")
             .map_err(|e| StartupError::new(e.to_string()))?;
-        // P5p Task 7 staging: the hierarchy's token-granular reuse stays off until Task 8
-        // wires the executor side (tail copies, `publish_tail`) and turns it on from the
-        // config; a partial plan without its executor would reuse tokens whose KV is garbage.
-        let mut h_cfg = HierarchyConfig::from_config(s.cfg, block_bytes, s.memory_kind)
-            .map_err(|e| StartupError::new(e.to_string()))?;
-        h_cfg.partial_prefix_reuse = false;
         let h = KvHierarchy::new(
-            h_cfg,
+            HierarchyConfig::from_config(s.cfg, block_bytes, s.memory_kind)
+                .map_err(|e| StartupError::new(e.to_string()))?,
             s.identity,
             format,
             pool.total_blocks(),
@@ -872,6 +867,23 @@ impl KvOrchestrator {
     pub fn request_done(&mut self, pool: &mut BlockPool, request: RequestId, cancelled: bool) {
         self.reattaching.remove(&request);
         self.h.request_done(pool, request, cancelled);
+    }
+
+    /// A request finished normally: its last block, when partial, is published as an L0-only
+    /// partial entry (P5p S-5; [`KvHierarchy::publish_tail`]).
+    pub fn publish_tail(
+        &mut self,
+        pool: &mut BlockPool,
+        request: RequestId,
+        block: BlockId,
+        tokens: &[u32],
+    ) {
+        self.h.publish_tail(pool, request, block, tokens);
+    }
+
+    /// The tail copies of a completed iteration executed: their source references go back.
+    pub fn tail_copied(&mut self, pool: &mut BlockPool, request: RequestId) {
+        self.h.tail_copied(pool, request);
     }
 
     /// End of an iteration: pending reclaim requests, session TTLs and predicted-resume

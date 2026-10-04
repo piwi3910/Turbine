@@ -1338,6 +1338,14 @@ impl KvHierarchy {
     ) {
         pool.release(&attach.blocks);
         if let Some(r) = self.requests.get_mut(&request) {
+            // The pending tail copy's source pin goes with the prefix: the request never
+            // planned its first iteration, so the copy never ran, and a pinned source entry
+            // would sit as a referenced child over the leaf-first reclaim of the released
+            // blocks. The re-attach plans a new tail (and takes a new reference) if it matches
+            // one again.
+            if let Some(src) = r.tail_src.take() {
+                pool.release(&[src]);
+            }
             for key in r.keys.iter().skip(r.committed) {
                 self.dir.clear_pending(key);
             }
@@ -1512,6 +1520,11 @@ impl KvHierarchy {
                 tokens: tokens[i * bt..(i + 1) * bt].into(),
                 lineage,
             };
+            // A full block outranks an opportunistic partial entry: at capacity, one leaf
+            // partial entry makes room (P5p S-5; its L0 slot the next tick frees).
+            if self.dir.len() >= self.dir.max_entries() {
+                self.dir.evict_one_partial(bt as u32);
+            }
             match self.dir.insert(kv) {
                 Ok(()) => {
                     pool.set_keyed(block);
@@ -3450,6 +3463,7 @@ impl KvHierarchy {
     /// Session TTLs, expiry and predicted-resume prefetch    /// Session TTLs, expiry and predicted-resume prefetch; call once per iteration.
     pub fn tick(&mut self, pool: &mut BlockPool) {
         self.sync_l0_refs(pool);
+        self.drain_evicted_partials(pool);
         self.window_maintain(pool);
         let now = self.now();
         for action in self.sessions.sweep(now, self.l0_state) {
@@ -3647,6 +3661,8 @@ impl KvHierarchy {
                 u.bytes += self.format_bytes(l.format);
             }
         }
+        let partials = self.dir.partial_count(self.cfg.block_tokens) as u64;
+        self.metrics.partial_entries.set(partials as i64);
         let mut tiers = vec![KvTierDocument {
             tier: TierId::L0.as_str(),
             dtype,
@@ -3655,6 +3671,7 @@ impl KvHierarchy {
             blocks_total: pool.total_blocks(),
             blocks_used: pool.used_blocks(),
             blocks_free: pool.free_blocks(),
+            partial_entries: partials,
             state: Some(TierState {
                 enabled: true,
                 capacity_bytes: u64::from(pool.total_blocks()) * bb,
@@ -3691,6 +3708,7 @@ impl KvHierarchy {
                     est_bandwidth_bytes_per_second: t.and_then(|t| t.est_bandwidth()),
                 }),
                 formats: formats.remove(&id).unwrap_or_default(),
+                partial_entries: 0,
             });
         }
         KvDocument {
@@ -3698,6 +3716,7 @@ impl KvHierarchy {
             summary: Some(KvSummary {
                 policy: self.policy.name(),
                 prefix_sharing: self.cfg.prefix_sharing,
+                partial_prefix_reuse: self.cfg.partial_prefix_reuse,
                 block_tokens: self.cfg.block_tokens,
                 block_bytes: bb,
                 unified_memory: self.cfg.memory_kind == MemoryKind::Unified,

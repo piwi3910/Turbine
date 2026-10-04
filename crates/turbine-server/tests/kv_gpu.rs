@@ -567,6 +567,90 @@ fn prefix_reuse_matches_cold_fp8_kv() {
     prefix_reuse_matches_cold_with(&fp8_kv_sets());
 }
 
+/// P5p S-5 (`prefix_reuse_partial_block_matches_cold`): a finished primer publishes its partial
+/// tail; a later prompt sharing it reuses up to the last written token through one tail copy,
+/// and every token and logprob stays bit-equal to the cold run. Covers tail reuses of 1, 2,
+/// 17, 64, 100, 126 and 127 tokens into a 128-token block and one divergence inside a shared
+/// full block. Breaks if a mid-block warm prefill leaves the cold run's bits or the reported
+/// `cached_tokens` misses the reused tokens.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn prefix_reuse_partial_block_matches_cold() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    const BLOCK: u32 = 128;
+    // Tokens of a primer's partial tail the target reuses (the primer ends tail tokens into
+    // its fourth block), and one divergence inside the third shared block.
+    const TAILS: [u32; 7] = [1, 2, 17, 64, 100, 126, 127];
+    const EXTRA: u32 = 8;
+    let cases: Vec<(Vec<u32>, Vec<u32>, u32)> = TAILS
+        .iter()
+        .zip(1u32..)
+        .flat_map(|(&tail, i)| {
+            let shared = token_ids(100 + i, 3 * BLOCK);
+            let primer = [shared.as_slice(), &token_ids(200 + i, tail)].concat();
+            // The target continues the primer's tail with fresh tokens (its own suffix).
+            let target = [primer.as_slice(), &token_ids(400 + i, EXTRA)].concat();
+            let want = 3 * BLOCK + tail;
+            vec![(primer.clone(), target, want), (primer, Vec::new(), 0)]
+        })
+        .chain(std::iter::once({
+            // One divergence inside the third shared block: the target shares the primer's
+            // first 3*BLOCK + DIVERGE − 1 tokens, then differs.
+            const DIVERGE: u32 = 70;
+            let shared = token_ids(100 + 99, 3 * BLOCK);
+            let primer = [shared.as_slice(), &token_ids(200 + 99, 100)].concat();
+            let mut target = primer[..(3 * BLOCK + DIVERGE - 1) as usize].to_vec();
+            let last = target.last_mut().unwrap();
+            *last = (*last + 7) % 100_000;
+            target.extend(token_ids(500, 8));
+            (primer, target, 3 * BLOCK + DIVERGE - 1)
+        }))
+        .collect();
+    let cold_sets: [String; 1] = ["kv.partial_prefix_reuse=false".to_string()];
+    let cold: Vec<IdAnswer> = {
+        let server = LabServer::start(&model_dir, &cold_sets);
+        let mut out = Vec::new();
+        for (_, t, _) in &cases {
+            out.push(server.complete_ids(t, ANSWER_TOKENS));
+        }
+        out
+    };
+    let server = LabServer::start(&model_dir, &[]);
+    let mut failed = Vec::new();
+    for ((primer, target, want), cold) in cases.iter().zip(&cold) {
+        let warm = server.complete_ids(target, ANSWER_TOKENS);
+        let label = format!("prompt {} want {want}", target.len());
+        println!(
+            "{label}: cached {} cold {:?} warm {:?}",
+            warm.cached_tokens, cold.text, warm.text
+        );
+        if !primer.is_empty() && target.len() > primer.len() {
+            // A target that continues the primer reuses its full blocks + its whole tail,
+            // capped at prompt - 2 (EXTRA >= 2 keeps the cap above the tail).
+            assert_eq!(
+                warm.cached_tokens,
+                u64::from(*want),
+                "{label}: the tail reuses up to the last written token"
+            );
+        }
+        if warm.output() != cold.output()
+            || warm
+                .logprobs
+                .iter()
+                .zip(&cold.logprobs)
+                .any(|(w, c)| w.to_bits() != c.to_bits())
+        {
+            failed.push(label);
+        }
+    }
+    assert!(failed.is_empty(), "warm differs from cold: {failed:?}");
+    println!("prefix_reuse_partial_block_matches_cold ok");
+}
+
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn prefix_reuse_suffix_lengths_match_cold() {
@@ -634,12 +718,15 @@ fn prefix_reuse_suffix_lengths_match_cold_with(sets: &[String]) {
             warm.prompt_tokens, warm.cached_tokens, cold.text, warm.text
         );
         assert_eq!(cold.completion_tokens, u64::from(ANSWER_TOKENS));
-        // At least two prompt tokens are prefilled (turbine_kv::planner::MIN_RECOMPUTE_TOKENS).
-        let reused = blocks.min((blocks * BLOCK + suffix - 2) / BLOCK);
+        // P5p S-4/S-5: the reuse cap is token-granular — every cached token but
+        // `MIN_RECOMPUTE_TOKENS` (the primer's tail diverges from the target's suffix here, so
+        // only the shared full blocks attach; a shared final block splits at the boundary).
+        let prompt = blocks * BLOCK + suffix;
+        let want = (blocks * BLOCK).min(prompt - 2);
         assert_eq!(
             warm.cached_tokens,
-            u64::from(reused * BLOCK),
-            "blocks {blocks} suffix {suffix}: the warm run reuses the shared blocks"
+            u64::from(want),
+            "blocks {blocks} suffix {suffix}: the warm run reuses the shared tokens"
         );
         assert_eq!(warm.prompt_tokens, u64::from(blocks * BLOCK + suffix));
         if warm.output() != cold.output() {

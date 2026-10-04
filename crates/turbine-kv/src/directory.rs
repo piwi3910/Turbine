@@ -335,6 +335,31 @@ impl KvDirectory {
         std::mem::take(&mut self.evicted)
     }
 
+    /// Makes room for a full block: evicts the least recently used leaf partial entry of any
+    /// parent when the directory is at capacity, handing its L0 slot to the caller through
+    /// [`KvDirectory::evicted_partials`] (P5p S-5: a shareable, tierable full block is worth
+    /// more than an opportunistic partial entry). False when there is no leaf partial entry.
+    pub fn evict_one_partial(&mut self, block_tokens: u32) -> bool {
+        if self.blocks.len() < self.max_entries {
+            return false;
+        }
+        let victim = self
+            .blocks
+            .values()
+            .filter(|b| b.is_partial(block_tokens) && b.child_count == 0)
+            .min_by_key(|b| b.last_access)
+            .map(|b| b.key);
+        match victim {
+            Some(k) => {
+                if let Some(b) = self.remove(&k) {
+                    self.evicted.push(b);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many partial entries the directory holds.
     pub fn partial_count(&self, block_tokens: u32) -> usize {
         self.blocks
