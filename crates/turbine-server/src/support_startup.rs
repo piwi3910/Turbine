@@ -238,8 +238,9 @@ pub struct KvFormatUnavailable {
 
 /// Refuses, before binding (exit 1), the KV formats whose kernel group the provider lacks (P6b
 /// S-1, S-5, S-7): TurboQuant L0 pages (`kv.dtype: tq4|tq2`) on a GPU backend need the loaded
-/// library's ABI v2.11 mixed-format paged attention (`kv_tq_unavailable`), the ladder's L0 step
-/// its per-block format tags, which no provider wires yet (`kv_tq_unavailable`); a lower tier
+/// library's ABI v2.11 mixed-format paged attention (`kv_tq_unavailable`), and so does the
+/// ladder's L0 step (`kv.ladder.l0`): its rewritten classes are read through the same
+/// per-block format tags and per-class page addressing (`kv_tq_unavailable`); a lower tier
 /// not stored at the L0 format needs the ABI v2.11 KV transcode (`kv_transcode_unavailable`).
 /// `library`: whether the loaded kernel library has the v2.11 group (`None` before the library
 /// is loaded: those checks wait for the second call). The ladder's L1/L2 rungs
@@ -265,10 +266,15 @@ pub fn kv_format_availability(
             kv.dtype.as_str()
         )));
     }
-    if kv.ladder.enabled && kv.ladder.l0 {
+    // The ladder's L0 step: its lossy rung classes are read through the same ABI v2.11
+    // per-block format tags and per-class page addressing as TurboQuant L0 pages (P6b S-7,
+    // per-class addressing per `p6b-window`), so the same availability check applies. The
+    // ladder's rewrites of a classed pool still need the v2.11 transcode on a copy-stream
+    // backend — a rewrite fails and the hierarchy backs off (runtime, not startup).
+    if kv.ladder.enabled && kv.ladder.l0 && vendor(cfg) != "cpu" && library == Some(false) {
         return Err(tq(
-            "kv.ladder.l0 (with kv.ladder.enabled) needs the ABI v2.10 mixed-format paged \
-             attention, which no kernel provider implements yet; set kv.ladder.l0: false"
+            "kv.ladder.l0 (with kv.ladder.enabled) needs the ABI v2.11 mixed-format paged \
+             attention, which the kernel library does not provide"
                 .to_string(),
         ));
     }
@@ -591,12 +597,23 @@ mod tests {
         assert!(err.to_string().contains("lossy"), "{err}");
         ladder.kv.ladder.max_format = name("fp8_e4m3");
         assert!(before_discovery(&ladder).is_ok());
-        assert_eq!(
-            kv_format_availability(&ladder, None).unwrap_err().code,
-            "kv_tq_unavailable"
-        );
-        // The L1/L2 ladder runs its rewrites on the device transcode (P6b S-6): allowed with a
-        // library that has it, refused (naming kv.ladder.max_format) with one that has not.
+        // The L0 ladder (`kv.ladder.l0`, the default) serves its lossy rung classes through the
+        // ABI v2.11 mixed-format paged attention (P6b S-7, per-class addressing): nothing is
+        // known before the library is loaded, the cpu reference provider has it, and a library
+        // with the v2.11 group has it; one without is refused naming the key.
+        assert_eq!(kv_format_availability(&ladder, None), Ok(()));
+        assert_eq!(kv_format_availability(&ladder, Some(true)), Ok(()));
+        let err = kv_format_availability(&ladder, Some(false)).unwrap_err();
+        assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
+        assert!(err.message.contains("kv.ladder.l0"), "{err:?}");
+        // The cpu backend reads the rung classes itself and its reference provider has the
+        // v2.11 transcode: the L0 ladder starts there whatever a GPU library has.
+        let mut cpu_ladder = config("cpu", llama.path());
+        cpu_ladder.kv.ladder.enabled = true;
+        cpu_ladder.kv.ladder.l0 = true;
+        assert_eq!(kv_format_availability(&cpu_ladder, Some(true)), Ok(()));
+        // The L1/L2 ladder runs its rewrites on the device transcode (P6b S-6): a library
+        // without it is refused naming kv.ladder.max_format even with the L0 step off.
         ladder.kv.ladder.l0 = false;
         assert_eq!(kv_format_availability(&ladder, None), Ok(()));
         assert_eq!(kv_format_availability(&ladder, Some(true)), Ok(()));

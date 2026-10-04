@@ -1066,6 +1066,50 @@ fn kv_dtype_tq2_exits_2_before_bind() {
     }
 }
 
+/// P6b S-7 / S-9: the L0 compression ladder starts once per-class block addressing landed
+/// (the Task 17 refusal is lifted): `--check-config --set kv.dtype=tq4 --set
+/// kv.cpu.format=tq4 --set kv.ladder.enabled=true` exits 0 printing the resolved row and
+/// `config ok` (`kv.ladder.l0` defaults true); `kv.ladder.enabled` without any lower tier is
+/// still exit 2 naming `kv.ladder.enabled`. Breaks if the L0 ladder is refused at startup
+/// again or the AC's keys are not wired.
+#[test]
+fn check_config_accepts_the_l0_ladder() {
+    let cfg = TempConfig::new("l0-ladder", "model:\n  path: /m\n");
+    for set in [
+        "kv.ladder.enabled=true",
+        "kv.dtype=tq4 --set kv.cpu.format=tq4 --set kv.ladder.enabled=true",
+    ] {
+        let args = format!("--check-config --set {set}");
+        let out = wait_with_timeout(
+            spawn_server(&args.split(' ').collect::<Vec<_>>(), &cfg.path),
+            Duration::from_secs(20),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{set}: stderr: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("config ok"),
+            "{set}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    let out = wait_with_timeout(
+        spawn_server(
+            &[
+                "--check-config",
+                "--set",
+                "kv.ladder.enabled=true",
+                "--set",
+                "kv.cpu.enabled=false",
+            ],
+            &cfg.path,
+        ),
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("kv.ladder.enabled"), "{stderr}");
+}
+
 /// Phase 2m S-4 / S-11: `model.tool_call_parser: hermes` (and `mistral`) names a registered
 /// tool format, so `--check-config` accepts it (main refused it); an unregistered format is
 /// still exit 2 naming the registered ones.
