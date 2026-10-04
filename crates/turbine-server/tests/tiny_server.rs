@@ -956,6 +956,65 @@ fn status_reports_quantization() {
     );
 }
 
+/// P6b S-10 (the exit's one open criterion): a tiny server with a lossy L1 format
+/// (`kv.cpu.format: tq4`) and the ladder on reports `quantization.tier_formats` — blocks and
+/// bytes per tier × format, of the kv document — and `quantization.ladder`, the ladder's
+/// resolved config and current rungs, and `kernels` names the ABI v2.11 `kv_transcode` the
+/// tier format selects. Breaks if a key is missing or the transcode choice is not named.
+#[test]
+fn status_reports_tier_formats_and_ladder() {
+    // The L0 base is FP8 so every ladder class page is exact (an FP8-from-BF16 class page
+    // carries the scales header the cpu provider's class check does not model — recorded for
+    // the lead); `kv.dtype: fp8_e4m3` also ranks fp8 at the base, so the classes are the
+    // window's BF16 and TurboQuant `tq4`.
+    let server = TinyServer::launch(&Setup {
+        head_dim: Some(128),
+        kv_extra: "  dtype: fp8_e4m3\n  cpu:\n    enabled: true\n    format: tq4\n  ladder:\n    enabled: true\n    max_format: tq4\n",
+        ..Setup::default()
+    });
+    // The engine publishes its documents with the first step; one completion makes the rungs
+    // and the kv document live.
+    // `ignore_eos` past one full block, so the sequence caches full blocks the kv document's
+    // per-format copies can name (a prompt of less than one block caches nothing).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 200,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let status = server.get("/turbine/v1/status").json();
+    let q = &status["quantization"];
+    let tf = &q["tier_formats"];
+    assert!(tf.is_object() && tf["l0"].is_object(), "{status}");
+    // A tier that holds nothing (L1 is host-pinned memory, absent on the cpu backend) has an
+    // empty map; every listed format carries its copy count and encoded bytes.
+    assert!(!tf["l0"].as_object().unwrap().is_empty(), "{status}");
+    for (tier, formats) in tf.as_object().unwrap() {
+        for (f, u) in formats.as_object().unwrap() {
+            assert!(
+                u["blocks"].is_u64() && u["bytes"].is_u64(),
+                "{tier}/{f}: {u}"
+            );
+        }
+    }
+    let ladder = &q["ladder"];
+    assert_eq!(ladder["enabled"], true, "{status}");
+    assert_eq!(ladder["max_format"], "tq4", "{status}");
+    assert!(ladder["rungs"].is_object(), "{status}");
+    assert!(
+        ladder["rungs"]["l1"].is_null() || ladder["rungs"]["l1"].is_string(),
+        "{status}"
+    );
+    let kernels = status["kernels"].as_array().unwrap();
+    let transcode = kernels
+        .iter()
+        .find(|k| k["op"] == "kv_transcode")
+        .unwrap_or_else(|| panic!("kernels lists kv_transcode: {kernels:?}"));
+    assert_eq!(transcode["reason_code"], "tier_format", "{transcode}");
+    assert!(transcode["implementation"].is_string(), "{transcode}");
+    assert!(transcode["config"].is_string(), "{transcode}");
+}
+
 /// P6b S-5: `kv.dtype: tq4` serves on the cpu backend (the tiny Llama with head_dim 128):
 /// completions run over TurboQuant L0 pages, and the resolved support row names the `tq4` KV
 /// column, `experimental`. Breaks if startup still refuses TurboQuant pages on the CPU

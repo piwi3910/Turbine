@@ -3087,6 +3087,35 @@ impl KvHierarchy {
         }
     }
 
+    /// The ladder's state (P6b S-10): the resolved config and each local tier's current rung
+    /// ([`Self::ladder_rung`]; `None` = the tier's base format). `/turbine/v1/status` reports
+    /// it under `quantization.ladder`.
+    pub fn ladder_document(&self) -> crate::document::LadderDoc {
+        let rungs = TierId::LOCAL
+            .into_iter()
+            .map(|t| {
+                (
+                    t.as_str().to_owned(),
+                    self.ladder_rung(t).map(str::to_owned),
+                )
+            })
+            .collect();
+        match &self.cfg.ladder {
+            Some(l) => crate::document::LadderDoc {
+                enabled: true,
+                l0: self.cfg.ladder_l0,
+                max_format: Some(l.max_format.to_owned()),
+                rungs,
+            },
+            None => crate::document::LadderDoc {
+                enabled: false,
+                l0: self.cfg.ladder_l0,
+                max_format: None,
+                rungs,
+            },
+        }
+    }
+
     /// The rung new demotions into `tier` take (`None` when the ladder is off or the tier is
     /// not enabled).
     pub fn ladder_rung(&self, tier: TierId) -> Option<&'static str> {

@@ -56,7 +56,7 @@ use turbine_kernels::{
     KernelProvider, KvCodecFns, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
 };
 use turbine_kv::codec::{CodecParams, KvCodec};
-use turbine_kv::document::HitWindow;
+use turbine_kv::document::{HitWindow, LadderDoc};
 use turbine_kv::hierarchy::{
     AttachOutcome, AttachRequest, HierarchyConfig, KvHierarchy, KvReclaimHandle, PrefetchAccepted,
     PrefetchError, PrefetchTarget, PrefixAttach,
@@ -905,6 +905,13 @@ impl KvOrchestrator {
     pub fn document(&self, pool: &BlockPool) -> KvDocument {
         let now = self.clock.now_mono().as_secs();
         self.h.document(pool, self.hits.totals(now))
+    }
+
+    /// The compression ladder's state (P6b S-10): the resolved config and each local tier's
+    /// current rung ([`KvHierarchy::ladder_document`]). The status document reports it under
+    /// `quantization.ladder`.
+    pub fn ladder_document(&self) -> LadderDoc {
+        self.h.ladder_document()
     }
 
     /// Seeds every enabled path's estimate from one 64 MiB copy through the production copy
@@ -1829,6 +1836,17 @@ impl KvCodecFns for CodecTable {
 /// The codecs of the enabled lower tiers (`kv.cpu.format`, `kv.nvme.format`) and, with the
 /// compression ladder on (P6b S-6), every rung below them down to `kv.ladder.max_format`: new
 /// demotions take a tier's current rung and the ladder rewrites copies into each of them.
+/// The lossy codec `name` as a transcode format (`None` for `l0` and unknown names).
+pub(crate) fn transcode_format(name: &str) -> Option<KvTranscodeFormat> {
+    [
+        KvTranscodeFormat::Fp8E4m3,
+        KvTranscodeFormat::Tq4,
+        KvTranscodeFormat::Tq2,
+    ]
+    .into_iter()
+    .find(|f| f.as_str() == name)
+}
+
 pub(crate) fn tier_formats(cfg: &KvConfig) -> Vec<&str> {
     let mut out: Vec<&str> = [
         (cfg.cpu.enabled, cfg.cpu.format.as_str()),
@@ -1934,13 +1952,7 @@ struct RewriteLane {
 impl DeviceTranscode {
     /// The codec `name` as a transcode format (`None` for `l0` and unknown names).
     fn format_of(name: &str) -> Option<KvTranscodeFormat> {
-        [
-            KvTranscodeFormat::Fp8E4m3,
-            KvTranscodeFormat::Tq4,
-            KvTranscodeFormat::Tq2,
-        ]
-        .into_iter()
-        .find(|f| f.as_str() == name)
+        transcode_format(name)
     }
 
     fn config(&self, name: &str, decode: bool) -> Option<KvTranscodeConfig> {
