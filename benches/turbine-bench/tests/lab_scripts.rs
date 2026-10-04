@@ -2392,8 +2392,9 @@ fn lab_serve_holder_self_terminates_without_a_job() {
     assert!(!src.contains("-ge 3600"), "the one-hour wait is the bug");
 }
 
-/// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28): `scripts/track-gate.sh` against a
-/// stub procoder launcher, temporary track specs and support-matrix files.
+/// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28, and the Phase 5p start, 2026-10-04):
+/// `scripts/track-gate.sh` against a stub procoder launcher, temporary track specs and
+/// support-matrix files.
 #[cfg(unix)]
 mod track_gate_script {
     use std::path::{Path, PathBuf};
@@ -2418,8 +2419,13 @@ mod track_gate_script {
     const SPEC_6B: &str = "# phase-6b-kv-compression\n\nStatus: complete\n\n## In scope\n\n- [S-1] kv.cpu.format and kv.nvme.format.\n- [S-2] TurboQuant tq4 and tq2.\n- [S-3] The compression ladder.\n\n## Out of scope\n\n- NVFP4 KV.\n";
     const SPEC_7: &str = "# phase-7-model-families\n\nStatus: complete\n\n## In scope\n\n- [S-1] Qwen3 dense and Qwen3 MoE.\n- [S-2] gpt-oss-20b.\n- [S-3] Qwen3.5/3.6 hybrids with Gated DeltaNet; linear-attention kernel provider on AMD: to be evaluated.\n- [S-4] Mistral and Mixtral.\n";
     const SPEC_8: &str = "# phase-8-speculative-decoding\n\nStatus: complete\n\n## In scope\n\n- [S-1] Llama-3.2-1B-Instruct drafts for Llama-3.2-3B-Instruct behind a Proposer trait.\n\n## Out of scope\n\n- MTP heads, EAGLE heads, DFlash drafters.\n";
+    // The interlude between 6 and 7 (decision "Phase 5p start: amendment scope and the track
+    // gate", 2026-10-04, 3 A): the gate is its spec AND plan COMPLETE — the "previous track
+    // closed" rule does not apply to it.
+    const SPEC_5P: &str = "# phase-5p-serving-efficiency\n\nStatus: complete\n\n## In scope\n\n- [S-1] stage-share and the lab-bench flags.\n- [S-4] token-granular prefix reuse through a copy-on-write tail block.\n- [S-7] the cache_aware scheduling policy.\n- [S-10] jump-forward structured output.\n\n## Out of scope\n\n- NVIDIA, multi-node and pipeline-parallel serving.\n";
+    const PLAN_5P: &str = "# phase-5p-serving-efficiency — implementation plan\n\nStatus: complete\n\n## Goal\n\nMeasure first, then token-granular reuse, then the policy, then jump-forward.\n";
 
-    /// A temp directory with `specs/` and a stub launcher, removed on drop.
+    /// A temp directory with `specs/`, `plans/` and a stub launcher, removed on drop.
     struct Gate {
         dir: PathBuf,
     }
@@ -2430,11 +2436,13 @@ mod track_gate_script {
                 std::env::temp_dir().join(format!("turbine-track-gate-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("specs")).unwrap();
-            // Stub procoder launcher: COMPLETE iff the spec says `Status: complete`.
+            std::fs::create_dir_all(dir.join("plans")).unwrap();
+            // Stub procoder launcher: `spec check` / `plan check` COMPLETE iff the file says
+            // `Status: complete` (the plan lives beside the spec directory, as in the tree).
             let launcher = dir.join("launcher.sh");
             std::fs::write(
                 &launcher,
-                "#!/usr/bin/env bash\nf=\"$TURBINE_SPEC_DIR/$3.md\"\nif grep -qx 'Status: complete' \"$f\"; then echo \"spec $3: COMPLETE\"; else echo \"spec $3: NOT ready\"; exit 1; fi\n",
+                "#!/usr/bin/env bash\nkind=\"$1\"; name=\"$3\"\nif [ \"$kind\" = spec ]; then f=\"$TURBINE_SPEC_DIR/$name.md\"; else f=\"$(dirname \"$TURBINE_SPEC_DIR\")/plans/$name.md\"; fi\nif grep -qx 'Status: complete' \"$f\"; then echo \"$kind $name: COMPLETE\"; else echo \"$kind $name: NOT ready\"; exit 1; fi\n",
             )
             .unwrap();
             use std::os::unix::fs::PermissionsExt;
@@ -2443,6 +2451,10 @@ mod track_gate_script {
         }
         fn spec(&self, track: &str, body: &str) -> &Self {
             std::fs::write(self.dir.join("specs").join(format!("{track}.md")), body).unwrap();
+            self
+        }
+        fn plan(&self, track: &str, body: &str) -> &Self {
+            std::fs::write(self.dir.join("plans").join(format!("{track}.md")), body).unwrap();
             self
         }
         fn matrix(&self, name: &str, rows: &[&str]) -> PathBuf {
@@ -2493,6 +2505,43 @@ mod track_gate_script {
         let (code, out) = g.run("phase-6a-quantization", &baseline);
         assert_eq!(code, Some(1), "{out}");
         assert!(out.contains("does not exist"), "{out}");
+
+        // 5p is the interlude between 6 and 7 (decision "Phase 5p start: amendment scope and
+        // the track gate", 2026-10-04, 3 A): the gate is its spec AND plan COMPLETE — the
+        // "previous track closed" rule does not apply, so the BF16-only baseline (no
+        // quantized row, no tq row) is enough, and an NVIDIA row changes nothing.
+        g.spec("phase-5p-serving-efficiency", SPEC_5P);
+        g.plan("phase-5p-serving-efficiency", PLAN_5P);
+        let (code, out) = g.run("phase-5p-serving-efficiency", &baseline);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(
+            out.contains("GATE PASS phase-5p-serving-efficiency"),
+            "{out}"
+        );
+        // A draft plan (its launcher check not COMPLETE) fails the interlude, as does a
+        // missing plan file.
+        g.plan(
+            "phase-5p-serving-efficiency",
+            &PLAN_5P.replace("Status: complete", "Status: draft"),
+        );
+        let (code, out) = g.run("phase-5p-serving-efficiency", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("plan check is not COMPLETE"), "{out}");
+        std::fs::remove_file(g.dir.join("plans").join("phase-5p-serving-efficiency.md")).unwrap();
+        let (code, out) = g.run("phase-5p-serving-efficiency", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("plan check is not COMPLETE"), "{out}");
+        g.plan("phase-5p-serving-efficiency", PLAN_5P);
+        // A draft spec fails as for every track.
+        g.spec(
+            "phase-5p-serving-efficiency",
+            &SPEC_5P.replace("Status: complete", "Status: draft"),
+        );
+        let (code, out) = g.run("phase-5p-serving-efficiency", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("not COMPLETE"), "{out}");
+        g.spec("phase-5p-serving-efficiency", SPEC_5P);
+        g.plan("phase-5p-serving-efficiency", PLAN_5P);
 
         // 6a: needs no earlier track; its In scope must cover the formats and name no NVFP4.
         g.spec("phase-6a-quantization", SPEC_6A);
