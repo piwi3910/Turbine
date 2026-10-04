@@ -1,6 +1,6 @@
 # phase-6b-kv-compression — implementation plan
 
-Status: draft
+Status: complete
 Spec: .procoder/specs/phase-6b-kv-compression.md
 
 The user answered questions 1–20 of `.procoder/ask/decisions.md`, entry "Phase 6 spec: provisional design choices (2026-09-28)" (Q11 changed: TurboQuant also lives in L0), and split Phase 6 in two (entry "Phase 6 split: 6a quantization, 6b KV compression (2026-09-28)"). This plan starts only after `phase-6a-quantization` has closed. Tasks: per-tier formats (1–6), TurboQuant as a lower-tier codec (7–9) and in L0 (10–13), compression ladder in L1/L2 (14–16) and in L0 (17–18), phase exit (19). In the joint Phase 6 plan these were Tasks 29–40b.
@@ -282,10 +282,10 @@ Interfaces:
   Covers: spec S-6, S-8, S-11; AC ladder soak criterion
   Depends on: Task 15
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV on the shared-prefix variant (`turbine-ladder-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
-- [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): compression ladder lab proof and soak`
+- [x] Lab (GPU 0, bench lock): the multi-turn profile with the ladder config and with `kv.ladder.enabled: false` on the same bytes — record recomputed tokens, `cached_tokens_ratio`, rung metrics; eval-compare at 0.01 against BF16 KV on the shared-prefix variant (`turbine-ladder-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0. Done (`p6b-t16`): A/B rerun recorded in perf log 6b "Ladder gate, soak and SURVIVAL burst after the fixes"; the eval gate is the r1–r3 set `tests/eval/llama-3.2-3b-instruct/turbine-ladder-sp-r{1,2,3}.json` + `turbine-ladder-sp-paired.json` (median drop 0.010 at the bound), not the single `turbine-ladder-sp.json` the plan named.
+- [x] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the ladder config — expect verdict pass and `turbine_kv_ladder_actions_total` > 0. Done: PASS 8/8 with `kv_ladder_actions` 169 (`target/soak/novanas-20261002T104721Z`), superseded by Task 18's L0-ladder soak (1,148 L0 actions).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `test(kv): compression ladder lab proof and soak`
 
 ## Task 17: The ladder's L0 step
 
@@ -297,13 +297,13 @@ Interfaces:
   Covers: spec S-7; AC `ladder_l0_under_pinned_pressure`
   Depends on: Tasks 13, 16
 
-- [ ] Write failing test `kv_sim ladder_l0_under_pinned_pressure`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder_l0` — expect FAIL
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-core` — expect PASS; `ladder_under_pinned_pressure` (L1/L2) unchanged with `kv.ladder.l0: false`
-- [ ] Mutation check (do not commit): allow referenced blocks as L0 candidates — expect `ladder_l0_under_pinned_pressure` to FAIL; revert.
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): the compression ladder reaches L0`
+- [x] Write failing test `kv_sim ladder_l0_under_pinned_pressure`. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim ladder_l0` — expect FAIL
+- [x] Implement.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-kv -p turbine-scheduler -p turbine-server -p turbine-core` — expect PASS; `ladder_under_pinned_pressure` (L1/L2) unchanged with `kv.ladder.l0: false`
+- [x] Mutation check (do not commit): allow referenced blocks as L0 candidates — expect `ladder_l0_under_pinned_pressure` to FAIL; revert.
+- [x] Lab: `scripts/lab-test.sh novanas --tier quick` — expect PASS
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `feat(kv): the compression ladder reaches L0`
 
 ## Task 18: L0 ladder lab proof and soak
 
@@ -314,10 +314,10 @@ Interfaces:
   Covers: spec S-7, S-8, S-11; AC S-7 lab criterion
   Depends on: Task 17
 
-- [ ] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 on the shared-prefix variant (`turbine-ladder-l0-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0.
-- [ ] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the L0 ladder config — expect pass and `turbine_kv_ladder_actions_total{tier="l0"}` above 0.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(kv): L0 compression ladder lab proof and soak`
+- [x] Lab (GPU 0, bench lock): the multi-turn profile with `kv.ladder.l0: true` against `false` on the same budget — record recomputed tokens, `cached_tokens_ratio`, rung metrics, golden c1; eval-compare at 0.01 on the shared-prefix variant (`turbine-ladder-l0-sp.json`, via `turbine-golden eval --tasks tests/eval/gsm8k-200-shared-prefix.jsonl` for the BF16-KV baseline and the candidate (same concurrency; tier formats and the ladder also the same `--filler-requests`/`--filler-words`, the candidate with `--min-lossy-cached-ratio`; recipe: `.procoder/handoff/p6b-eval-prefix.md`)) — expect exit 0. Done (`p6b-t18`, perf log 6b "The L0 ladder on the server"): recomputed tokens −23 %, cached ratio 0.860 vs 0.837, golden c1 PASS in every run; the eval gate is `turbine-ladder-l0-sp-r{1,2,3}.json` + `turbine-ladder-l0-sp-paired.json` (median drop −0.02).
+- [x] Soak (ask the coordinator first): `scripts/overload-soak.sh novanas --duration 10m` with the L0 ladder config — expect pass and `turbine_kv_ladder_actions_total{tier="l0"}` above 0. Done: PASS 8/8, `turbine_kv_ladder_actions_total{tier="l0"}` 1,148 (`target/soak/novanas-20261004T035400Z`).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `test(kv): L0 compression ladder lab proof and soak`
 
 ## Task 19: Phase exit (6b)
 
