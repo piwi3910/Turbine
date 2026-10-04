@@ -104,6 +104,29 @@ pub(crate) fn record_quantization(
 /// TurboQuant pages (`kv.dtype: tq4 | tq2`, P6b S-5) carry the tables of every layer under the
 /// seed of their KV namespace ([`crate::kv_tq`]); on one device only (`sharded`: a tensor,
 /// expert or pipeline rank is refused with `kv_tq_unavailable`, never served as BF16 pages).
+/// The TurboQuant tables of a classed pool without TurboQuant pages (P6b S-7): the pool grows
+/// page classes for the recent window (a lossy base format with `kv.recent_window_blocks`) or
+/// the ladder's L0 rungs (`kv.ladder.l0`), and the v2.11 mixed-format paged attention
+/// descriptor carries the layer's tables whenever a block table mixes formats — TurboQuant
+/// pages among them or not. The tables come from the pool's own namespace seed, so a ladder
+/// tq4 rung page decodes with the signs its encode used; for a pool that cannot hold a
+/// TurboQuant block (fp8 pages, the window's BF16 class) they are never read and only satisfy
+/// the descriptor. `None` keeps a flat pool table-free.
+fn classed_tables(
+    config: &Config,
+    arch: &turbine_model::config::ModelArchConfig,
+) -> Result<Option<turbine_model::kv_scales::TqKv>, StartupError> {
+    let classed = config.kv.dtype.is_lossy() && config.kv.recent_window_blocks > 0
+        || (config.kv.ladder.enabled && config.kv.ladder.l0);
+    if !classed {
+        return Ok(None);
+    }
+    let layout = arch.kv_layout(config.kv.block_tokens);
+    let identity = model_identity(&config.model.path)?.with_rope(&arch.rope_identity());
+    let seed = crate::kv_tq::seed(&identity, layout);
+    Ok(Some(crate::tq_device::host_tables(seed, &layout)))
+}
+
 fn kv_cache(
     config: &Config,
     index: &SafetensorsIndex,
@@ -112,7 +135,11 @@ fn kv_cache(
 ) -> Result<KvCache, StartupError> {
     let num_layers = arch.num_layers;
     match config.kv.dtype {
-        KvDtypeChoice::Bf16 => return Ok(KvCache::bf16()),
+        KvDtypeChoice::Bf16 => {
+            let mut cache = KvCache::bf16();
+            cache.tq = classed_tables(config, arch)?;
+            return Ok(cache);
+        }
         KvDtypeChoice::Fp8E4m3 => {}
         other => {
             let unavailable = |why: String| {
@@ -146,8 +173,9 @@ fn kv_cache(
             return Ok(cache);
         }
     }
-    let cache = KvCache::fp8_from_checkpoint(index, num_layers)
+    let mut cache = KvCache::fp8_from_checkpoint(index, num_layers)
         .map_err(|e| model_error("kv.dtype fp8_e4m3 scales", e))?;
+    cache.tq = classed_tables(config, arch)?;
     let from_checkpoint = cache
         .k_scales
         .iter()
@@ -1203,6 +1231,8 @@ pub fn load(
     .map_err(|e| model_error("executor", e))?;
     install_decode_graphs(prepared, executor.as_mut());
     // P6b Task 8: before the first forward (a warm-up or a decode graph reads the pointers).
+    // A classed pool (the recent window, the ladder's L0 rungs) carries its tables in
+    // `kv_cache` too — see [`classed_tables`].
     crate::tq_device::install(arch.kv_cache.tq.as_ref(), mem, executor.as_mut())?;
     // P6b S-5/S-7: the pool's block tables mix formats (page classes) — every paged attention
     // takes the batch's `block_formats` table.

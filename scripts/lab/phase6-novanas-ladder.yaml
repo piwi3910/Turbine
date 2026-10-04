@@ -9,8 +9,12 @@
 # (Task 9, perf log 6b), so this config does not let a reused block reach it.
 # A/B on the same bytes:
 #   --set kv.ladder.enabled=false   (the tiers keep every copy at l0)
+# Task 18 (the ladder's L0 step, P6b S-7): the candidate adds
+#   --set kv.ladder.l0=true
+# (the config keeps l0: false so the Task 16 recipe is unchanged; the L0 rung classes are
+# read by the v2.11 mixed-format paged attention). The baseline arm keeps
+# kv.ladder.enabled=false.
 # The overload soak (spec S-6 AC: L1 4 GiB, L2 16 GiB):
-#   --set kv.cpu.max_bytes=4GiB --set kv.nvme.max_bytes=16GiB
 # L2 lives under /home/piwi/turbine-kv-ladder (wiped at startup).
 server:
   listen: 0.0.0.0:18000

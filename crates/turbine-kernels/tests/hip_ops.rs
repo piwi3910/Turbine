@@ -7225,8 +7225,11 @@ fn paged_mixed_staged_skips_single_pass() {
 /// per-class resolution can address it. One 24-token prefill (a partial tail in the class
 /// page) and one decode row ride along: the HIP provider's own choice against the CPU provider
 /// with the same classed descriptor — output within the mixed tolerance, the pool after the
-/// append byte for byte. Breaks if a classed pool is addressed flat (the class page would fall
-/// outside the base region), or the class constants are misread.
+/// append byte for byte. A following decode-only leg (the OPEN probe of `p6b-window`, now
+/// deterministic) re-appends both rows into slots the history init pre-wrote and is held to
+/// the same checks. Breaks if a classed pool is addressed flat (the class page would fall
+/// outside the base region), the class constants are misread, or the classed decode kernel
+/// resolves a class page wrong.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_mixed_classed_matches_cpu() {
@@ -7247,12 +7250,16 @@ fn paged_mixed_classed_matches_cpu() {
         class_page > base_page,
         "the window's class page is the bigger one"
     );
-    let (base_blocks, slab_base, slab_stride) = (8u32, class_page.div_ceil(base_page) as u32, 1u32);
+    // Slab k's class pages reuse the bytes of base pages [k x slab_base, (k+1) x slab_base) —
+    // the pool retires exactly those base ids when it carves (`convertible_slabs`), so the
+    // history base blocks must sit outside both slabs' byte ranges: 10 and 11 above 8.
+    let (base_blocks, slab_base, slab_stride) =
+        (12u32, class_page.div_ceil(base_page) as u32, 1u32);
     let num_blocks = base_blocks + 2 * slab_stride;
     let region = base_blocks as usize * base_page;
     let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
-    codes[8] = KV_FMT_BF16;
-    codes[9] = KV_FMT_BF16;
+    codes[12] = KV_FMT_BF16;
+    codes[13] = KV_FMT_BF16;
     let classes = KvPageClasses {
         num_blocks,
         base_blocks,
@@ -7274,10 +7281,10 @@ fn paged_mixed_classed_matches_cpu() {
         block_tokens: Some(bt as u32),
         causal: true,
     };
-    // Tokens 0..16 in base block 5 (tq4), 16..24 in class block 8 (bf16): a partial tail in
-    // the window class. Sequence 1 (a decode row riding along) starts in class block 9
-    // (bf16, tokens 0..16) and appends its row into base block 6 (tq4).
-    let table = [5i32, 8, 9, 6];
+    // Tokens 0..16 in base block 10 (tq4), 16..24 in class block 12 (bf16): a partial tail in
+    // the window class. Sequence 1 (a decode row riding along) starts in class block 13
+    // (bf16, tokens 0..16) and appends its row into base block 11 (tq4).
+    let table = [10i32, 12, 13, 11];
     let formats = [KV_FMT_TQ4, KV_FMT_BF16, KV_FMT_BF16, KV_FMT_TQ4];
     let q_lens = [17usize, 1];
     let kv_lens = [24usize, 17];
@@ -7287,17 +7294,20 @@ fn paged_mixed_classed_matches_cpu() {
     let (k_scale, v_scale) = (0.07f32, 0.11f32);
     let mut streams: [Rng; 4] = std::array::from_fn(|_| Rng(97));
     let [hist_rng, q_rng, k_rng, v_rng] = &mut streams;
-    // History pages: block 5 tq4, block 8 bf16 (tokens 16..24 only written by the append).
+    // History pages: block 10 tq4, block 11 tq4, block 9 bf16 (tokens 16..24 only written by
+    // the append).
     let slab1 = slab_base as usize * base_page;
     let bf_at = |half: usize, g: usize, t: usize| slab1 + ((half * bt + t) * hkv + g) * d * 2;
     let mut raw = vec![0u8; region];
     let rec = Tq4Codec::WIDTHS.record_bytes();
     use turbine_kv::codec::turboquant::Tq4Codec;
     for g in 0..hkv {
-        for t in 0..bt {
-            let (k, v) = (hist_rng.normal(d, 1.0), hist_rng.normal(d, 1.0));
-            let at = 5 * base_page + (g * bt + t) * rec;
-            tq_encode_record(KV_FMT_TQ4, &k, &v, &params.heads[g], &mut raw[at..at + rec]);
+        for b in [10usize, 11] {
+            for t in 0..bt {
+                let (k, v) = (hist_rng.normal(d, 1.0), hist_rng.normal(d, 1.0));
+                let at = b * base_page + (g * bt + t) * rec;
+                tq_encode_record(KV_FMT_TQ4, &k, &v, &params.heads[g], &mut raw[at..at + rec]);
+            }
         }
         for t in 0..bt {
             for (half, vals) in [
@@ -7379,7 +7389,7 @@ fn paged_mixed_classed_matches_cpu() {
             [&q_hip, &k_hip, &v_hip, &o_hip, &pool_hip],
             [&bt_hip, &ip_hip, &kv_hip],
             &f_hip,
-            Some(layer_tables),
+            Some(layer_tables.clone()),
         ),
         (
             p.cpu.attention().expect("cpu attention"),
@@ -7446,11 +7456,104 @@ fn paged_mixed_classed_matches_cpu() {
         DType::BF16,
     );
 
-    // OPEN (Task 18): a decode-only call over this pool state diverged from the CPU provider
-    // on one q head (hip 0.0 vs cpu NaN) in a probe with a synthetic constant q row re-appended
-    // into an already-written slot; the staged prefill rows and the byte-exact append above
-    // pin the classed addressing, and the served decode is held by the tq4+window golden run
-    // (lab-bench). Root-cause the isolated-decode probe there before relying on it.
+    // The decode leg (the OPEN probe of `p6b-window`, now deterministic): a decode-only call
+    // over the same pool state, both appends landing on slots the history init pre-wrote —
+    // the re-append-into-a-written-slot case the ad-hoc probe tripped on. The pool stays byte
+    // exact and the rows match the CPU provider within the BF16 tolerance. Breaks if the
+    // classed decode kernel resolves a class page wrong or skips the new row.
+    let (k2_hip, k2_cpu) = twin(
+        &p,
+        &[2, hkv, d],
+        DType::BF16,
+        &k_rng.normal(2 * hkv * d, 1.0),
+    );
+    let (v2_hip, v2_cpu) = twin(
+        &p,
+        &[2, hkv, d],
+        DType::BF16,
+        &v_rng.normal(2 * hkv * d, 1.0),
+    );
+    let (q2_hip, q2_cpu) = twin(
+        &p,
+        &[2, Q_HEADS, d],
+        DType::BF16,
+        &q_rng.normal(2 * Q_HEADS * d, 1.0),
+    );
+    let (o2_hip, o2_cpu) = twin(
+        &p,
+        &[2, Q_HEADS, d],
+        DType::BF16,
+        &vec![0.0; 2 * Q_HEADS * d],
+    );
+    let indptr2 = [0f32, 1.0, 2.0];
+    let kvf2 = [25f32, 18.0];
+    let (ip2_hip, ip2_cpu) = twin(&p, &[3], DType::I32, &indptr2);
+    let (kv2_hip, kv2_cpu) = twin(&p, &[2], DType::I32, &kvf2);
+    for (kernel, [q, k, v, o, pool], [btt, ip, kv], f, device) in [
+        (
+            p.hip.attention().expect("hip attention"),
+            [&q2_hip, &k2_hip, &v2_hip, &o2_hip, &pool_hip],
+            [&bt_hip, &ip2_hip, &kv2_hip],
+            &f_hip,
+            Some(layer_tables.clone()),
+        ),
+        (
+            p.cpu.attention().expect("cpu attention"),
+            [&q2_cpu, &k2_cpu, &v2_cpu, &o2_cpu, &pool_cpu],
+            [&bt_cpu, &ip2_cpu, &kv2_cpu],
+            &f_cpu,
+            None,
+        ),
+    ] {
+        let mut ctx = PagedAttentionContext {
+            cfg: AttentionConfig {
+                kind: AttentionKind::DecodePaged,
+                ..cfg
+            },
+            q: q.view(),
+            k_new: k.view(),
+            v_new: v.view(),
+            out: o.view(),
+            kv_layer: pool.view(),
+            block_table: btt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kv.view(),
+            max_q_len: 1,
+            max_kv_len: 25,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (d as f32).sqrt(),
+            k_scale,
+            v_scale,
+            block_formats: Some(f.view()),
+            classes: Some(classes),
+            tq: Some(TqPaged {
+                params: &params,
+                encode: tq_encode_record,
+                seed: SEED,
+                device,
+            }),
+        };
+        kernel
+            .execute_paged(&mut ctx)
+            .expect("classed decode attention");
+    }
+    let bytes2 = |t: &Tensor| t.view().slice.read_bytes().expect("read back");
+    let (hip_pool2, cpu_pool2) = (bytes2(&pool_hip), bytes2(&pool_cpu));
+    let first2 = hip_pool2.iter().zip(&cpu_pool2).position(|(h, c)| h != c);
+    assert!(
+        first2.is_none(),
+        "classed pool after decode append: byte {first2:?} differs (block {:?})",
+        first2.map(|b| b / base_page)
+    );
+    let got2 = read(&o2_hip);
+    let want2 = read(&o2_cpu);
+    assert_close(
+        "paged_mixed_classed_matches_cpu: decode rows vs the CPU provider",
+        "turbine_hip_mixed",
+        &got2,
+        &want2,
+        DType::BF16,
+    );
 }
 
 /// Lab perf (P6b Task 12, in `SLOW_TESTS`): decode µs of `turbine_hip_mixed` over `tq4`, `tq2`

@@ -1133,3 +1133,31 @@ fn phase6b_tier_lab_config_loads() {
     assert_eq!(tier.kv.dtype, base.kv.dtype);
     assert_eq!(tier.model.path, base.model.path);
 }
+
+/// The L0 compression ladder serves on the GPU (P6b S-7, plan Task 18): a BF16 pool with the
+/// ladder's rung page classes (`kv.ladder.l0`, `max_format: tq4`) and L1 enabled reaches
+/// /ready — the v2.11 mixed-format paged attention descriptor carries the layer's TurboQuant
+/// tables whenever a block table mixes formats, though `kv.dtype` is `bf16`, so the tables
+/// must be uploaded under the pool's namespace seed before the warm-up forward — and a
+/// completion returns text. Breaks if the mixed pool starts without the executor's tables or
+/// the classed decode diverges.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn l0_ladder_serves_on_gpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let sets = [
+        "kv.ladder.enabled=true".to_string(),
+        "kv.ladder.l0=true".to_string(),
+        "kv.ladder.max_format=tq4".to_string(),
+        "kv.cpu.enabled=true".to_string(),
+        "kv.cpu.max_bytes=1GiB".to_string(),
+    ];
+    let server = LabServer::start(&model_dir, &sets);
+    let (text, tokens, _) = server.complete(&prompt(7, 350), ANSWER_TOKENS);
+    assert_eq!(tokens, u64::from(ANSWER_TOKENS));
+    assert!(!text.trim().is_empty(), "empty completion: {text:?}");
+}
