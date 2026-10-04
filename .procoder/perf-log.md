@@ -1132,3 +1132,31 @@ against a calibration of 187.7 ms, GREEN 0 s into the cool-down, 4,665 × 200, 2
 `queue_timeout`, 0 client-dropped. `turbine_kv_ladder_actions_total{tier="l0"}` 1,148 —
 712 `l0 → fp8_e4m3` rewrites at `fill_high_water`, 435 `no_room_backoff`, 1 `rung_step_up` —
 so the S-7 soak criterion (above 0) is met; every tier's ladder actions sum to 6,790.
+
+### Stale tail tags expire, the tq4 lab bound splits like golden (decisions "6b: stale lossless-tail tags and the tq4 lab bound" 1 A, 2; branch `p6b-smallfix`)
+
+Both follow-ups from the tq4enc entry above, host-only (no lab run of this branch):
+
+- **Tail-tag expiry (1 A).** `KvHierarchy.tail` now holds only the latest finished sequence's
+  last `kv.lossless_tail_blocks` full blocks: a later finish replaces the set (`tail.clear()`
+  before re-tagging). The one-raw-L1-slot-per-finished-sequence cost on one-shot-heavy
+  workloads and the ladder's permanent L0-sweep skip on those blocks are gone; an expired tail
+  demotes, evicts and ladders like any other block, while a growing sequence keeps the S-2
+  guarantee (its newest demoted block stays exact until the turn that grows it finishes). The
+  set itself is bounded at N. Pinned host-side:
+  `a_later_finish_expires_the_previous_sequence_tail` (expired tail demotes encoded, latest
+  tail raw; mutation: dropping the `clear()` fails it) and
+  `a_growing_sequence_keeps_its_tail_exact_until_the_turn_finishes`; kv_sim
+  `per_tier_formats` re-pinned (at most one raw lower-tier copy, at least one expired tail
+  encoded; the fp8/tq4 capacity factors unchanged). Both ladder ACs
+  (`ladder_under_pinned_pressure`, `ladder_l0_under_pinned_pressure`) pass without a fixture
+  re-bless.
+- **The tq4 lab bound (2).** `lossy_tier_reuse_tq4`'s head bound was the flat 0.25 — golden's
+  _likely_ bound, calibrated at t9 against a run whose lossless-tail block was still exact. It
+  now applies the gate's actual likely/tail split per position (0.25 above the
+  `likely_logprob_floor` −2, else the tail bound 0.75), the same rule
+  `turbine-golden compare` uses; nothing else relaxed (the 90 %-within-0.75 share and the FP8
+  arm's tighter 0.3 / 0.5 / 0.9 stay). The all-lossy worst case that measured 0.2518 sits
+  within the split rule as it does within golden at c16. The split logic is unit-pinned
+  host-side (`golden_head_bound_splits_likely_from_tail`); the lab test itself is verified at
+  its next lab pass (the phase-exit pass takes it).
