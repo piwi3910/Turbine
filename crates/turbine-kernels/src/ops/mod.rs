@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType};
-use turbine_tensor::{DevicePtr, DeviceSlice, TensorView};
+use turbine_tensor::{DevicePtr, DeviceSlice, KvPageClasses, TensorView};
 
 use crate::KernelError;
 use crate::cards::CardProfile;
@@ -864,6 +864,12 @@ pub struct PagedAttentionContext<'a> {
     /// when `cfg.dtype` is TurboQuant or `block_formats` is `Some` (on a GPU provider with
     /// [`TqPaged::device`]).
     pub tq: Option<TqPaged<'a>>,
+    /// P6b S-5/S-7 (ABI v2.11 per-class addressing): the pool's page classes. `None` = every
+    /// block id is a flat base page (a block's bytes are the first page bytes of its format at
+    /// `kv_layer + b × page_bytes(dtype)`); `Some` resolves every id through
+    /// [`KvPageClasses::page_offset`] instead, and `kv_layer` is then this layer's region
+    /// ([`KvPoolView::layer_stride_bytes`] bytes of U8) rather than a dense page view.
+    pub classes: Option<KvPageClasses<'a>>,
 }
 
 /// Block format code of a BF16 page (the v2.11 `block_formats` byte).
@@ -935,6 +941,12 @@ pub struct KvCopyContext<'a> {
     pub block_bytes: u64,
     pub num_layers: u32,
     pub pairs: &'a [(BlockId, BlockId)],
+    /// Per-class addressing (P6b S-5/S-7): the pool's page classes; `None` = flat base pages
+    /// (every block's `block_bytes` bytes at `l · layer_stride_bytes + b · block_bytes`).
+    pub classes: Option<KvPageClasses<'a>>,
+    /// With `classes`: one `TURBINE_KVFMT_*` code per pair — the page class of BOTH blocks (a
+    /// conversion is not a byte copy; the caller refuses such pairs). Empty when flat.
+    pub pair_fmts: &'a [u8],
 }
 
 /// MoE routing of `num_tokens` tokens.

@@ -565,7 +565,7 @@ fn header_declares_the_v211_copy_kernel() {
 }
 
 /// Kernel ABI v2.11 mixed-format paged attention (P6b Task 12): the paged attention descriptor
-/// ends with the device `block_formats` table and the layer's `tq_params` (after the v2.9 FP8
+/// carries the device `block_formats` table and the layer's `tq_params` (after the v2.9 FP8
 /// scales), and the TurboQuant page dtypes keep the codes of `DType::{Tq4, Tq2}`. Breaks if the
 /// fields move (a library would read a block format as a pointer) or a dtype code drifts.
 #[test]
@@ -582,11 +582,44 @@ fn header_declares_the_v211_mixed_paged_attention_fields() {
     );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let decl = "float scale; int32_t causal, dtype; float k_scale, v_scale; \
-                const uint8_t *block_formats; const struct turbine_tq_params *tq_params; \
-                } turbine_attention_paged_desc;";
+                const uint8_t *block_formats; const struct turbine_tq_params *tq_params;";
     let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(&decl),
         "turbine_kernels.h lacks the v2.11 paged attention fields {decl}"
+    );
+}
+
+/// Kernel ABI v2.11 per-class page addressing (P6b S-5/S-7, the recent window on the GPU): the
+/// paged attention descriptor ends with the host `page_classes` table and the pool's slab
+/// constants, `turbine_kv_page_class` holds `{fmt, per_layer_bytes}`, and the copy-blocks
+/// descriptor carries the same table plus the pairs' `pair_formats`. Breaks if a field moves (a
+/// library would read a slab constant as another field).
+#[test]
+fn header_declares_the_v211_per_class_page_fields() {
+    let code = strip_comments(&header());
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let class = "typedef struct turbine_kv_page_class { int32_t fmt; int32_t per_layer_bytes; \
+                 } turbine_kv_page_class;";
+    let class = class.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&class),
+        "turbine_kernels.h lacks turbine_kv_page_class {class}"
+    );
+    let attn = "const struct turbine_kv_page_class *page_classes; int32_t num_page_classes, \
+                base_blocks, slab_stride, slab_base_blocks; \
+                } turbine_attention_paged_desc;";
+    let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&attn),
+        "turbine_kernels.h lacks the per-class attention fields {attn}"
+    );
+    let copy = "const struct turbine_kv_page_class *page_classes; const uint8_t *pair_formats; \
+                int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
+                } turbine_copy_blocks_desc;";
+    let copy = copy.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&copy),
+        "turbine_kernels.h lacks the per-class copy-blocks fields {copy}"
     );
 }

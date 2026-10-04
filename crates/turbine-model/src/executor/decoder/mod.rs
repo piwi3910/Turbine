@@ -1887,6 +1887,7 @@ impl DecoderExecutor {
                     // window's BF16 class) the table's bytes say which format each block
                     // holds; TurboQuant pages take the layer's tables and codec.
                     block_formats: self.mixed_blocks.then(|| w.meta.block_formats_view(p)),
+                    classes: kv.classes,
                     tq: self.cfg.kv_cache.tq_paged(model_layer).map(|t| TqPaged {
                         device: self
                             .tq_device
@@ -2519,6 +2520,7 @@ mod tests {
             num_blocks: blocks,
             layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers)
                 * u64::from(blocks),
+            classes: None,
         };
         let greedy = RowReduce {
             top_n: 1,

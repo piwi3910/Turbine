@@ -101,11 +101,12 @@ constexpr int32_t kCkPagedkvPage = 128;
 // Grid y (sequences) and z (KV heads) limits of the Turbine kernel.
 constexpr int32_t kMaxGridYZ = 65535;
 
-// A descriptor only the mixed-format implementations take: TurboQuant pages
-// or a block_formats table (ABI v2.11).
+// A descriptor only the mixed-format implementations take: TurboQuant pages,
+// a block_formats table, or per-class page addressing (ABI v2.11; the classed
+// resolution lives in the mixed kernels).
 bool mixed(const turbine_attention_paged_desc *d) {
   return d->dtype == TURBINE_DTYPE_TQ4 || d->dtype == TURBINE_DTYPE_TQ2 ||
-         d->block_formats != nullptr;
+         d->block_formats != nullptr || d->page_classes != nullptr;
 }
 
 bool supported(const turbine_attention_paged_desc *d) {

@@ -221,6 +221,7 @@ impl Pool {
             num_blocks: self.blocks,
             layer_stride_bytes: self.layout.block_bytes() / u64::from(self.layout.num_layers)
                 * u64::from(self.blocks),
+            classes: None,
         }
     }
 }

@@ -144,9 +144,24 @@ __device__ inline int32_t seq_of_row(const int32_t *q_indptr, int32_t num_seqs,
   return lo;
 }
 
+// Per-class page addressing (ABI v2.11, P6b S-5 / S-7): the pool constants a
+// launch needs, passed by value (a decode graph bakes them; the values are
+// pool constants and never change). per_fmt[f] is the page bytes of format
+// f's page class, 0 when the pool grows no such class; without page_classes
+// (a flat pool) base_blocks == num_blocks and only the flat addressing runs.
+struct Pages {
+  int64_t base_page; // the page bytes of dtype (one base page of a layer)
+  int32_t base_blocks;
+  int32_t num_blocks;
+  int32_t slab_stride;
+  int32_t slab_base_blocks;
+  int64_t per_fmt[4];
+};
+
 // Where a token's page is: the block's byte offset in kv_layer and its format,
-// or a negative offset when the block is missing, outside the pool, or of a
-// format that does not fit a page of dtype.
+// or a negative offset when the block is missing, outside the pool, or (a
+// flat pool) of a format that does not fit a page of dtype. A classed pool
+// resolves ids at and above base_blocks through the slabs.
 struct Where {
   int64_t base;
   int fmt;
@@ -155,17 +170,29 @@ struct Where {
 __device__ inline Where where_of(const int32_t *block_table,
                                  const uint8_t *block_formats, int base_fmt,
                                  int32_t seq, int32_t page, int32_t max_blocks,
-                                 int32_t num_blocks, int64_t slot,
-                                 int32_t bt, int32_t hkv) {
+                                 Pages p, int32_t bt, int32_t hkv) {
   if (page >= max_blocks)
     return {-1, 0};
   const int64_t e = static_cast<int64_t>(seq) * max_blocks + page;
   const int32_t block = block_table[e];
   const int fmt = block_formats != nullptr ? block_formats[e] : base_fmt;
   const int64_t bytes = page_bytes_of(fmt, bt, hkv);
-  if (block < 0 || block >= num_blocks || bytes == 0 || bytes > slot)
+  if (block < 0 || block >= p.num_blocks || bytes == 0)
     return {-1, fmt};
-  return {static_cast<int64_t>(block) * slot, fmt};
+  if (block < p.base_blocks) {
+    if (bytes > p.base_page)
+      return {-1, fmt}; // a flat pool skips a page that does not fit
+    return {static_cast<int64_t>(block) * p.base_page, fmt};
+  }
+  const int64_t per = p.per_fmt[fmt & 3];
+  if (per == 0)
+    return {-1, fmt};
+  const int64_t rel = block - p.base_blocks;
+  const int64_t off =
+      rel / p.slab_stride * static_cast<int64_t>(p.slab_base_blocks) *
+          p.base_page +
+      rel % p.slab_stride * per;
+  return {off, fmt};
 }
 
 // ---- append ----
@@ -175,7 +202,7 @@ __global__ void mixed_append_plain_kernel(
     const Bf16 *k_new, const Bf16 *v_new, uint8_t *kv, const int32_t *table,
     const uint8_t *formats, int base_fmt, const int32_t *q_indptr,
     const int32_t *kv_lens, int32_t num_seqs, int32_t max_blocks,
-    int32_t num_blocks, int64_t slot, int32_t bt, int32_t hkv,
+    Pages p, int32_t bt, int32_t hkv,
     int64_t new_stride, float k_scale, float v_scale) {
   const int32_t row = blockIdx.x;
   const int32_t s = seq_of_row(q_indptr, num_seqs, row);
@@ -188,7 +215,7 @@ __global__ void mixed_append_plain_kernel(
   if (pos < 0)
     return;
   const Where w = where_of(table, formats, base_fmt, s, pos / bt, max_blocks,
-                           num_blocks, slot, bt, hkv);
+                           p, bt, hkv);
   if (w.base < 0 || (w.fmt != kFmtBf16 && w.fmt != kFmtFp8))
     return;
   const int32_t t = pos % bt;
@@ -220,7 +247,7 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_append_tq_kernel(
     const Bf16 *k_new, const Bf16 *v_new, uint8_t *kv, const int32_t *table,
     const uint8_t *formats, int base_fmt, const int32_t *q_indptr,
     const int32_t *kv_lens, int32_t num_seqs, int32_t total_q,
-    int32_t max_blocks, int32_t num_blocks, int64_t slot, int32_t bt,
+    int32_t max_blocks, Pages p, int32_t bt,
     int32_t hkv, int64_t new_stride, const float *tables, const float *cb_k,
     const float *cb_v) {
   using R = tq::Record<KB, VB>;
@@ -244,7 +271,7 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_append_tq_kernel(
     int64_t at = -1;
     if (row - row0 < q_len && pos >= 0) {
       const Where w = where_of(table, formats, base_fmt, s, pos / bt,
-                               max_blocks, num_blocks, slot, bt, hkv);
+                               max_blocks, p, bt, hkv);
       if (w.base >= 0 && w.fmt == FMT)
         at = w.base +
              (static_cast<int64_t>(head) * bt + pos % bt) * R::kBytes;
@@ -483,7 +510,7 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
     const Bf16 *q, const uint8_t *kv, const int32_t *table,
     const uint8_t *formats, int base_fmt, const int32_t *q_indptr,
     const int32_t *kv_lens, int32_t num_seqs, int32_t row0, int32_t max_blocks,
-    int32_t num_blocks, int64_t slot, int32_t bt, int32_t hkv, int32_t group,
+    Pages p, int32_t bt, int32_t hkv, int32_t group,
     int64_t q_stride, float scale, float k_scale, float v_scale,
     int32_t causal, int32_t single_only, int32_t has_tq, const float *tables,
     CodebookPtrs codebooks, const float *prep, float *part_o,
@@ -555,7 +582,7 @@ __global__ void __launch_bounds__(kThreads) mixed_attn_kernel(
     int32_t fmt = kFmtBf16;
     if (valid) {
       const Where w = where_of(table, formats, base_fmt, seq, key / bt,
-                               max_blocks, num_blocks, slot, bt, hkv);
+                               max_blocks, p, bt, hkv);
       fmt = w.fmt;
       valid = w.base >= 0 && (has_tq || fmt == kFmtBf16 || fmt == kFmtFp8);
       const int32_t t = key % bt;
@@ -846,7 +873,7 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_stage_kernel(
     const uint8_t *kv, Bf16 *staged, int32_t *staged_table,
     int32_t *staged_kv_lens, const int32_t *table, const uint8_t *formats,
     int base_fmt, const int32_t *q_indptr, const int32_t *kv_lens, int32_t g0,
-    int32_t pages, int32_t max_blocks, int32_t num_blocks, int64_t slot,
+    int32_t pages, int32_t max_blocks, Pages pg,
     int32_t bt, int32_t hkv, float k_scale, float v_scale,
     const float *tables, CodebookPtrs codebooks) {
   __shared__ union {
@@ -867,7 +894,7 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_stage_kernel(
   if (single || static_cast<int64_t>(p) * bt >= kv_lens[s])
     return;
   const Where w = where_of(table, formats, base_fmt, s, p, max_blocks,
-                           num_blocks, slot, bt, hkv);
+                           pg, bt, hkv);
   if (w.base < 0)
     return;
   Bf16 *out = staged + static_cast<int64_t>(dst) * 2 * bt * hkv * kD;
@@ -900,6 +927,22 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_stage_kernel(
 int64_t slot_bytes(const turbine_attention_paged_desc *d) {
   return page_bytes_of(format_of_dtype(d->dtype), d->block_tokens,
                        d->num_kv_heads);
+}
+
+__host__ inline Pages pages_of(const turbine_attention_paged_desc *d) {
+  Pages p{};
+  p.base_page = slot_bytes(d);
+  p.num_blocks = d->num_blocks;
+  p.base_blocks = d->page_classes != nullptr ? d->base_blocks : d->num_blocks;
+  p.slab_stride = d->slab_stride > 0 ? d->slab_stride : 1;
+  p.slab_base_blocks = d->slab_base_blocks > 0 ? d->slab_base_blocks : 1;
+  for (int32_t i = 0; d->page_classes != nullptr && i < d->num_page_classes;
+       ++i) {
+    const int f = d->page_classes[i].fmt;
+    if (f >= 0 && f < 4)
+      p.per_fmt[f] = d->page_classes[i].per_layer_bytes;
+  }
+  return p;
 }
 
 bool has_tq(const turbine_attention_paged_desc *d) {
@@ -952,7 +995,6 @@ int32_t launch_paged_append_mixed(turbine_ctx *ctx,
                                   const turbine_attention_paged_desc *d) {
   const int base = format_of_dtype(d->dtype);
   const uint8_t *formats = d->block_formats;
-  const int64_t slot = slot_bytes(d);
   auto *kv = static_cast<uint8_t *>(d->kv_layer);
   const auto *k_new = static_cast<const Bf16 *>(d->k_new);
   const auto *v_new = static_cast<const Bf16 *>(d->v_new);
@@ -961,7 +1003,7 @@ int32_t launch_paged_append_mixed(turbine_ctx *ctx,
                        dim3(static_cast<unsigned>(d->total_q)), dim3(256), 0,
                        ctx->stream, k_new, v_new, kv, d->block_table, formats,
                        base, d->q_indptr, d->kv_lens, d->num_seqs,
-                       d->max_blocks_per_seq, d->num_blocks, slot,
+                       d->max_blocks_per_seq, pages_of(d),
                        d->block_tokens, d->num_kv_heads, d->new_stride_token,
                        d->k_scale, d->v_scale);
     if (int32_t rc = check_hip(ctx, hipGetLastError(),
@@ -977,7 +1019,7 @@ int32_t launch_paged_append_mixed(turbine_ctx *ctx,
     hipLaunchKernelGGL(kernel, grid, dim3(tq::kThreads), 0, ctx->stream,
                        k_new, v_new, kv, d->block_table, formats, base,
                        d->q_indptr, d->kv_lens, d->num_seqs, d->total_q,
-                       d->max_blocks_per_seq, d->num_blocks, slot,
+                       d->max_blocks_per_seq, pages_of(d),
                        d->block_tokens, d->num_kv_heads, d->new_stride_token,
                        tables_of(d), cb.p[kb - 1], cb.p[vb - 1]);
     return check_hip(ctx, hipGetLastError(),
@@ -1031,7 +1073,6 @@ int32_t run_paged_mixed_attention(turbine_ctx *ctx,
       1, std::min<int32_t>(kMaxSplits,
                            (d->max_kv_len + kSplitMin - 1) / kSplitMin));
   const int base = format_of_dtype(d->dtype);
-  const int64_t slot = slot_bytes(d);
   const CodebookPtrs cb = codebooks_of(d);
   const int32_t single = single_only ? 1 : 0;
   int32_t rc = TURBINE_OK;
@@ -1055,7 +1096,7 @@ int32_t run_paged_mixed_attention(turbine_ctx *ctx,
           dim3(kThreads), 0, ctx->stream, static_cast<const Bf16 *>(d->q),
           static_cast<const uint8_t *>(d->kv_layer), d->block_table,
           d->block_formats, base, d->q_indptr, d->kv_lens, d->num_seqs, row0,
-          d->max_blocks_per_seq, d->num_blocks, slot, d->block_tokens, hkv,
+          d->max_blocks_per_seq, pages_of(d), d->block_tokens, hkv,
           group, d->q_stride_token, d->scale, d->k_scale, d->v_scale,
           d->causal, single, tq_on ? 1 : 0, tables_of(d), cb, prep, part_o,
           part_ml);
@@ -1084,7 +1125,7 @@ int32_t launch_paged_stage_mixed(turbine_ctx *ctx,
       static_cast<const uint8_t *>(d->kv_layer), static_cast<Bf16 *>(staged),
       staged_table, staged_kv_lens, d->block_table, d->block_formats,
       format_of_dtype(d->dtype), d->q_indptr, d->kv_lens, g0, pages,
-      d->max_blocks_per_seq, d->num_blocks, slot_bytes(d), d->block_tokens,
+      d->max_blocks_per_seq, pages_of(d), d->block_tokens,
       d->num_kv_heads, d->k_scale, d->v_scale, tables_of(d), codebooks_of(d));
   return check_hip(ctx, hipGetLastError(), "paged mixed staging launch");
 }

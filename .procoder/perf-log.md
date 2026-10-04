@@ -1025,3 +1025,25 @@ Investigation of the "release of unreferenced KV block BlockId(146)" transient a
 - An L0 rewrite whose block's copy gains a holder (an attach) or is replaced (a recompute re-publishes a new L0 page) while it runs took over anyway: it filed the rewritten page and silently dropped the referenced source's location — the source page stranded outside the directory (`evict_cached` no-ops on a referenced page), or a live page released. Dormant today (the recent window defaults off and `kv.ladder.l0` is refused at startup), live the moment either switches on. `on_copy_done` now completes a rewrite only when the directory's L0 location is still the page it rewrote and that page is unreferenced; the rewritten page goes back otherwise. The old page's `l0_keys` mapping now goes with the page (a stale entry let the mirror attribute a new holder's refcount to the recompressed copy — masked in tests by HashMap order, so its dedicated mutation check is inconclusive; noted in the handoff). Red first: `hierarchy::tests::an_l0_rewrite_over_an_attached_copy_keeps_the_old_page_serving` (attach served the rewrite's page), `a_rewrite_completions_old_page_forgets_only_itself`.
 
 No lab run: the fixes are host-side refcount logic covered on the cpu backend (engine stress, kv_sim, hierarchy units); the transient itself did not reproduce in 6 lab runs before this branch. A ladder-on mt3 ×3 watch is worthwhile at the next lab visit, and before `kv.recent_window_blocks` defaults on.
+
+### The BF16 recent window on the GPU (Task 17 follow-up; branch `p6b-window`)
+
+Per-class page addressing through the ABI v2.11 descriptors (`page_classes` + the pool's slab
+constants on the paged-attention and copy-blocks descriptors; NULL keeps the flat addressing
+byte-identical), so the recent window's BF16 pages — larger than a TurboQuant base page — are
+addressable. `kv.recent_window_blocks` defaults to 1.
+
+- Lab kernels (`hip_ops::paged_mixed_classed_matches_cpu`, job
+  turbine-lab-test-1004004436-387b5582): a tq4 base pool with BF16 class pages (3.5× a base
+  page) appends byte for byte identically on HIP and CPU, and the staged prefill rows match
+  the CPU provider within the BF16 tolerance (max |Δ| 1.56e-2). A decode-only probe over the
+  same pool state diverged from the CPU provider (hip 0.0 vs cpu NaN on one q head, synthetic
+  constant q row re-appended into a written slot) and is left OPEN for Task 18; the served
+  decode below is the proof that matters.
+- Served (`lab-bench --quick --model llama -- --set kv.dtype=tq4`, GPU 0, window default 1,
+  run `target/lab-bench/9e1180e-llama/`): golden c1 **15/16 prompts with full 32-token
+  identical prefixes** (Task 13's tq4 gate was 0/16); p09 diverges at token 6 (margin 0.113)
+  and p10 at token 27. The c1 verdict is still FAIL by the tolerance's letter — the strict
+  every-prompt logprob bound does not hold on all 16 — which is Task 18's gate call
+  (golden c16 + eval), not this branch's. Quick throughput 853.1 tok/s, ITL p50 15.7 ms,
+  TTFT p50 248 ms, decode_fwd 15.4 ms, 64/64 ok.
