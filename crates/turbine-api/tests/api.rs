@@ -1939,6 +1939,18 @@ fn check_labels(line: &str) {
             "result" => TIERS.contains(&v) || v == "miss",
             "reason" => REASONS.contains(&v),
             "path" => PATHS.contains(&v),
+            "outcome" if line.starts_with("turbine_kv_partial_reuse") => {
+                // P5p S-4/S-5: how each token-granular comparison ended.
+                [
+                    "reused",
+                    "no_candidate",
+                    "not_resident",
+                    "planner_cutoff",
+                    "lossy_source",
+                    "disabled",
+                ]
+                .contains(&v)
+            }
             "outcome" => ["used", "wasted", "cancelled", "rejected"].contains(&v),
             "le" => true,
             _ => false,

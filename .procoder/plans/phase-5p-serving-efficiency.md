@@ -186,12 +186,12 @@ Interfaces:
   Covers: S-5 ACs `kv_sim partial_tail_reuse`, `kv_sim cancellation_before_tail_copy`, `kv_sim cancellation_releases_kv`, `kv_sim demotion_under_pressure`
   Depends on: Task 6
 
-- [ ] Write failing test `kv_sim partial_tail_reuse` as the spec's S-5 criterion lists (multi-turn simulated workload; reuse up to the last written token, capped at `prompt − 2`; one tail copy per reusing request in its first iteration; shared blocks never written; the private block reserved; token-granular `cached_prefix_tokens`; no partial entry demoted with L1 on; every reference back to 0; with the switch off the run equals the Phase 4 result via `SimReport::plan_digest`). Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim partial_tail_reuse` — expect FAIL
-- [ ] Write failing test `kv_sim cancellation_before_tail_copy`: requests cancelled, timed out and SURVIVAL-requeued between attach and their first iteration release `src` and `dst` within one iteration. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim cancellation_before_tail_copy` — expect FAIL
-- [ ] Implement; `publish_tail` stores only tokens whose KV is written (prompt + generated − the newest, never-fed token) and only for a normal finish; partial entries go through `insert_partial`. The private tail block is allocated in the source's page class, and a pinned kv_sim assertion covers "the ladder does not rewrite a referenced tail block" (red pre-fix for the class allocation if the pool view is still flat).
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-kv && scripts/remote-cargo.sh test -p turbine-scheduler` — expect PASS (including `prefix_reuse_refcounts`, `demotion_under_pressure`, `cancellation_releases_kv`, `one_off_overload_does_not_demote`, `overload_sim`)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv,scheduler): copy-on-write tail block for token-granular prefix reuse`
+- [x] Write failing test `kv_sim partial_tail_reuse` as the spec's S-5 criterion lists (multi-turn simulated workload; reuse up to the last written token, capped at `prompt − 2`; one tail copy per reusing request in its first iteration; shared blocks never written; the private block reserved; token-granular `cached_prefix_tokens`; no partial entry demoted with L1 on; every reference back to 0; with the switch off the run equals the Phase 4 result via `SimReport::plan_digest`). Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim partial_tail_reuse` — expect FAIL
+- [x] Write failing test `kv_sim cancellation_before_tail_copy`: requests cancelled, timed out and SURVIVAL-requeued between attach and their first iteration release `src` and `dst` within one iteration. Run: `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim cancellation_before_tail_copy` — expect FAIL
+- [x] Implement; `publish_tail` stores only tokens whose KV is written (prompt + generated − the newest, never-fed token) and only for a normal finish; partial entries go through `insert_partial`. The private tail block is allocated in the source's page class, and a pinned kv_sim assertion covers "the ladder does not rewrite a referenced tail block" (red pre-fix for the class allocation if the pool view is still flat).
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-kv && scripts/remote-cargo.sh test -p turbine-scheduler` — PASS (whole workspace green)
+- [x] Gate: `scripts/gate.sh` — `gate: ok`
+- [x] Commit: `feat(kv,scheduler): copy-on-write tail block for token-granular prefix reuse`
 
 ## Task 8: Token-granular reuse in the engine, on every rank — landing (S-5, S-6)
 

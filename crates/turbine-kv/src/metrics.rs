@@ -254,6 +254,14 @@ pub struct KvMetrics {
     /// granularity and scope"): blocks requests in the admission queue released for pressure
     /// reclaim at YELLOW/ORANGE, counting only those no other request held.
     pub queued_prefix_detached_blocks: Counter,
+    /// `turbine_kv_partial_reuse_total{outcome}` (P5p S-4/S-5): how each lookup that reached
+    /// the token-granular comparison ended.
+    pub partial_reuse: Family<Labels1, Counter>,
+    /// `turbine_kv_partial_reused_tokens_total` (P5p S-5): prompt tokens reused through tail
+    /// copies.
+    pub partial_reused_tokens: Counter,
+    /// `turbine_kv_partial_entries` (P5p S-5): partial entries currently in the directory.
+    pub partial_entries: Gauge,
 }
 
 /// 10 µs .. ~42 s in ×4 steps: covers pinned copies of one block through slow NVMe reads.
@@ -290,6 +298,9 @@ impl KvMetrics {
             ladder_actions: Family::default(),
             copy_ahead: Family::default(),
             queued_prefix_detached_blocks: Counter::default(),
+            partial_reuse: Family::default(),
+            partial_reused_tokens: Counter::default(),
+            partial_entries: Gauge::default(),
         }
     }
 
@@ -421,6 +432,21 @@ impl KvMetrics {
             "KV blocks queued requests released for pressure reclaim (reason queued_prefix)",
             m.queued_prefix_detached_blocks.clone(),
         );
+        reg.register(
+            "turbine_kv_partial_reuse",
+            "Token-granular prefix comparisons by how they ended",
+            m.partial_reuse.clone(),
+        );
+        reg.register(
+            "turbine_kv_partial_reused_tokens",
+            "Prompt tokens reused through copy-on-write tail copies",
+            m.partial_reused_tokens.clone(),
+        );
+        reg.register(
+            "turbine_kv_partial_entries",
+            "Partial entries currently in the KV directory",
+            m.partial_entries.clone(),
+        );
         m.init_labels();
         m
     }
@@ -513,6 +539,9 @@ impl KvMetrics {
                 .recompute_tokens
                 .get_or_create(&[("reason", r.as_str())]);
         }
+        for o in PartialOutcome::ALL {
+            let _ = self.partial_reuse.get_or_create(&[("outcome", o.as_str())]);
+        }
         for o in PrefetchOutcome::ALL {
             let _ = self.prefetch.get_or_create(&[("outcome", o.as_str())]);
         }
@@ -536,6 +565,17 @@ impl KvMetrics {
         }
         for _ in m.blocks.len()..m.keys.len() {
             self.lookup(None);
+        }
+    }
+
+    /// One lookup that reached the token-granular comparison ended with `o`; when it reused,
+    /// `tokens` prompt tokens went through a tail copy (P5p S-5).
+    pub fn partial_outcome(&self, o: PartialOutcome, tokens: u32) {
+        self.partial_reuse
+            .get_or_create(&[("outcome", o.as_str())])
+            .inc();
+        if tokens > 0 {
+            self.partial_reused_tokens.inc_by(u64::from(tokens));
         }
     }
 

@@ -580,9 +580,14 @@ impl KvOrchestrator {
         turbine_kv::policy::registry()
             .select(s.cfg.policy.as_str(), "kv.policy")
             .map_err(|e| StartupError::new(e.to_string()))?;
+        // P5p Task 7 staging: the hierarchy's token-granular reuse stays off until Task 8
+        // wires the executor side (tail copies, `publish_tail`) and turns it on from the
+        // config; a partial plan without its executor would reuse tokens whose KV is garbage.
+        let mut h_cfg = HierarchyConfig::from_config(s.cfg, block_bytes, s.memory_kind)
+            .map_err(|e| StartupError::new(e.to_string()))?;
+        h_cfg.partial_prefix_reuse = false;
         let h = KvHierarchy::new(
-            HierarchyConfig::from_config(s.cfg, block_bytes, s.memory_kind)
-                .map_err(|e| StartupError::new(e.to_string()))?,
+            h_cfg,
             s.identity,
             format,
             pool.total_blocks(),

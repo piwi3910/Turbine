@@ -550,6 +550,8 @@ pub struct KvSimDriver {
     estimates: HashMap<RequestId, ResourceEstimate>,
     prefilled: HashMap<RequestId, u32>,
     attached: HashMap<RequestId, AttachRecord>,
+    /// Tokens the finished requests sampled (`generated_of` also answers after `forget`).
+    done_generated: HashMap<RequestId, Vec<u32>>,
     violations: Vec<String>,
 }
 
@@ -591,6 +593,7 @@ impl KvSimDriver {
             estimates: HashMap::new(),
             prefilled: HashMap::new(),
             attached: HashMap::new(),
+            done_generated: HashMap::new(),
             violations: Vec::new(),
         }
     }
@@ -711,6 +714,12 @@ impl KvSimDriver {
             self.exec.duration(&plan)
         };
         let outcome = self.execute(&plan);
+        // The tail copies ran with the forks before the forward: the sources go back.
+        for (seq, _, _) in &plan.tail_copies {
+            if let Some(id) = self.seq_request.get(seq).copied() {
+                self.kv.tail_copied(&mut self.pool, id);
+            }
+        }
         self.clock.advance(duration);
         // The KV the plan wrote is committed before `complete` releases finished tables.
         for item in &plan.items {
@@ -732,6 +741,33 @@ impl KvSimDriver {
         }
         let finished: Vec<SeqId> = outcome.finished.iter().map(|(s, _)| *s).collect();
         self.record_samples(&outcome);
+        // A normal finish publishes the last block when partial (P5p S-5), before `complete`
+        // releases the finished tables.
+        for seq in &finished {
+            let Some(id) = self.seq_request.get(seq).copied() else {
+                continue;
+            };
+            let Some(r) = self.reqs.get(&id) else {
+                continue;
+            };
+            let bt = self.sched.params().block_tokens;
+            let written = r.prompt.len() + r.generated.len().saturating_sub(1);
+            let full = written / bt.max(1) as usize;
+            let Some(item) = plan.items.iter().find(|i| i.seq == *seq) else {
+                continue;
+            };
+            let Some(&block) = item.block_table.blocks.get(full) else {
+                continue;
+            };
+            let tokens: Vec<u32> = r
+                .prompt
+                .iter()
+                .chain(&r.generated)
+                .copied()
+                .take(written)
+                .collect();
+            self.kv.publish_tail(&mut self.pool, id, block, &tokens);
+        }
         self.sched.complete(&mut self.pool, outcome);
         for seq in finished {
             if let Some(id) = self.seq_request.get(&seq).copied() {
@@ -769,6 +805,24 @@ impl KvSimDriver {
     /// What `id` was attached when it was handed to the scheduler.
     pub fn attached(&self, id: RequestId) -> Option<&AttachRecord> {
         self.attached.get(&id)
+    }
+
+    /// The tokens `id` sampled, also after it finished.
+    pub fn generated_of(&self, id: RequestId) -> Option<&[u32]> {
+        self.reqs
+            .get(&id)
+            .map(|r| r.generated.as_slice())
+            .or_else(|| self.done_generated.get(&id).map(|v| v.as_slice()))
+    }
+
+    /// The sequence of a request the driver still tracks (not yet finished or cancelled).
+    pub fn seq_of(&self, id: RequestId) -> Option<SeqId> {
+        if !self.reqs.contains_key(&id) {
+            return None;
+        }
+        self.seq_request
+            .iter()
+            .find_map(|(s, r)| (*r == id).then_some(*s))
     }
 
     /// The estimate `id` was submitted to the scheduler with.
@@ -932,7 +986,9 @@ impl KvSimDriver {
     }
 
     fn forget(&mut self, id: RequestId) {
-        self.reqs.remove(&id);
+        if let Some(r) = self.reqs.remove(&id) {
+            self.done_generated.insert(id, r.generated);
+        }
         self.attaching.retain(|x| *x != id);
     }
 }

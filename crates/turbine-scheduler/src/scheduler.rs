@@ -197,12 +197,16 @@ pub struct IterationPlan {
     pub preempted: Vec<(SeqId, PreemptReason)>,
     pub dropped: Vec<(RequestId, CancelReason)>,
     pub forks: Vec<ForkOp>,
+    /// Copy-on-write tail copies (P5p S-5), one per request that reuses a token-granular tail,
+    /// planned with the sequence's first prefill chunk: `(seq, src, dst)` executed before the
+    /// forward, with the fork copies.
+    pub tail_copies: Vec<(SeqId, BlockId, BlockId)>,
 }
 
 impl IterationPlan {
     /// Nothing to execute: the caller sleeps until a submission or cancellation (rule 4).
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.forks.is_empty()
+        self.items.is_empty() && self.forks.is_empty() && self.tail_copies.is_empty()
     }
 
     pub fn prefill_tokens(&self) -> u32 {
@@ -377,6 +381,12 @@ struct SeqEntry {
     /// Iteration of the last plan with an item of this sequence (0: none). With micro-batches
     /// the least recently stepped decodes go first, so a capped micro-batch starves none.
     last_step: u64,
+    /// The sequence's pending copy-on-write tail copy `(src, dst)` (P5p S-5), set at admission
+    /// from the prefix's [`turbine_kv::hierarchy::TailCopy`]; planned into the iteration that
+    /// carries the sequence's first prefill chunk, and cleared wherever the table drops before
+    /// it could be planned (preemption, finish, removal) — the copy must never fire against a
+    /// stale table.
+    tail_pending: Option<(BlockId, BlockId)>,
 }
 
 /// A plan awaiting `complete`.
@@ -426,12 +436,15 @@ fn request_kv_blocks(r: &SchedRequest, block_tokens: u32) -> u64 {
 
 /// The blocks a request's worst-case KV reservation covers: `request_kv_blocks` minus the full
 /// blocks of its attached cached prefix (P4 S-3: `cached_prefix_tokens` feeds the estimate), which
-/// other requests' reservations already paid for or which were cached unreferenced.
+/// other requests' reservations already paid for or which were cached unreferenced. Only full
+/// blocks are excluded (P5p S-5): the private tail block counts against the reservation like any
+/// block the request writes.
 fn reserved_kv_blocks(r: &SchedRequest, block_tokens: u32) -> u64 {
+    let bt = block_tokens.max(1);
     let cached = r
         .cached_prefix
         .as_ref()
-        .map_or(0, |a| a.blocks.len() as u64);
+        .map_or(0, |a| u64::from(a.cached_tokens / bt));
     request_kv_blocks(r, block_tokens).saturating_sub(cached)
 }
 
@@ -697,6 +710,7 @@ impl Scheduler {
                     awaiting_fork: false,
                     pause_pending: false,
                     last_step: 0,
+                    tail_pending: None,
                 },
             );
         }
@@ -1750,6 +1764,11 @@ impl Scheduler {
         e.table.tokens += len;
         *budget -= len;
         in_plan.insert(id);
+        // The copy-on-write tail copy (P5p S-5) rides with the sequence's first prefill chunk;
+        // the engine executes it with the fork copies before the forward.
+        if let Some((src, dst)) = e.tail_pending.take() {
+            plan.tail_copies.push((seq, src, dst));
+        }
         plan.items.push(BatchItem {
             seq,
             kind: BatchKind::Prefill { start, len },
@@ -1826,6 +1845,9 @@ impl Scheduler {
                     blocks: a.blocks,
                     tokens: a.cached_tokens,
                 };
+                // The tail copy is planned with the sequence's first prefill chunk; wherever
+                // the table drops before that, the pending copy is dropped with it.
+                e.tail_pending = a.tail_copy.map(|t| (t.src, t.dst));
             }
         }
         debug_assert!(
@@ -1864,6 +1886,8 @@ impl Scheduler {
             let e = self.seqs.get_mut(&seq).expect("sequence tracked");
             let table = std::mem::take(&mut e.table);
             pool.release(&table.blocks);
+            // The pending tail copy dies with the table it copied into.
+            e.tail_pending = None;
             if matches!(
                 e.state,
                 RequestState::Prefilling | RequestState::Decoding | RequestState::Paused
@@ -1904,6 +1928,7 @@ impl Scheduler {
         if !hold_for_forks {
             let table = std::mem::take(&mut e.table);
             pool.release(&table.blocks);
+            e.tail_pending = None;
         }
         self.retire_if_done(id);
     }
@@ -1949,6 +1974,7 @@ impl Scheduler {
         for seq in &r.req.seqs {
             if let Some(mut e) = self.seqs.remove(seq) {
                 pool.release(&e.table.blocks);
+                e.tail_pending = None;
                 if e.state.is_live() {
                     e.set_state(terminal, *seq);
                 }
@@ -2961,6 +2987,7 @@ mod tests {
                     partial_tokens: 0,
                     reason: PlanReason::AllL0,
                 },
+                tail_copy: None,
             }
         }
 
