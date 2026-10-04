@@ -7249,7 +7249,7 @@ fn paged_mixed_classed_matches_cpu() {
     );
     let (base_blocks, slab_base, slab_stride) = (
         8u32,
-        ((class_page + base_page - 1) / base_page) as u32,
+        class_page.div_ceil(base_page) as u32,
         1u32,
     );
     let num_blocks = base_blocks + 2 * slab_stride;
