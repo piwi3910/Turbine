@@ -3197,3 +3197,25 @@ recorded (ladder perf trade, FP8 c1 ITL, MXFP4 prefill, OLMoE 0.982×, slab mixi
 - B) Hold; main stays at the 6a state until a later go
 
 **Decision (user, 2026-10-04): A.** Merge `p6b-stack` into local `main` now, no push.
+
+## Phase 5p start: amendment scope and the track gate (2026-10-04)
+
+Context: the 5p spec (complete) and plan (draft, 14 tasks: measurement first, then token-granular reuse 6–8,
+cache_aware policy 9, multi-token append 10, jump-forward 11–12, exit 13) predate 6a/6b landing. 6b also left
+follow-ups that overlap 5p's efficiency territory.
+
+1. Amendment: the spec/plan need a pass for the 6b reality (the ladder, recent window, per-class addressing, lower-tier
+   formats, tail-tag expiry and the slab size all interact with token-granular reuse and cache-aware scheduling; two
+   stale citations to fix).
+   - A) Amend spec+plan for 6b interactions and seed the follow-ups below as 5p tasks where they fit
+   - B) Amend for interactions only; follow-ups stay recorded, not tasked
+2. The 6b recorded follow-ups (ladder serving-cost trade, FP8 c1 ITL, MXFP4 prefill kernel, OLMoE 0.982×, slab mixing
+   B-style) — fold the ones that fit into 5p's task list:
+   - A) Fold them in (5p becomes the efficiency catch-all)
+   - B) Keep 5p as originally scoped (the follow-ups stay recorded for later)
+3. Track gate: `scripts/track-gate.sh` accepts only 6a/6b/7/8; 5p is an interlude with a complete spec+plan:
+   - A) Add the 5p name to the track gate (gate = spec+plan COMPLETE; the "previous track closed" rule doesn't apply to
+     the interlude)
+   - B) Leave the script alone; 5p starts on its complete spec+plan without the gate
+
+**Decision (user, 2026-10-04): 1 A, 2 A, 3 A.** Amend the 5p spec/plan for the 6b reality; fold the fitting 6b efficiency follow-ups into 5p as tasks; add the 5p name to the track gate (gate = spec+plan COMPLETE).
