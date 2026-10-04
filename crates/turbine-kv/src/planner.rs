@@ -54,6 +54,10 @@ pub struct KvPlan {
     pub promote: Vec<(TierId, u32)>,
     pub recompute_tokens: u32,
     pub reason: PlanReason,
+    /// P5p S-4/S-5: tokens reused beyond the matched full blocks through a tail copy of the
+    /// block at `cutoff_blocks()` (a matched full block, or the directory's partial match
+    /// when the cutoff keeps every matched block).
+    pub partial_tokens: u32,
 }
 
 impl KvPlan {
@@ -102,6 +106,10 @@ pub struct PlanInputs<'a> {
     /// P6b S-3: false (`x-turbine-kv-lossy: deny`) — no block from the first lossy one on is
     /// reused.
     pub allow_lossy: bool,
+    /// P5p S-4: tokens the directory matched beyond the matched full blocks (the token
+    /// comparison of the last block, [`crate::directory::PrefixMatch::partial`]); 0 when the
+    /// comparison found nothing.
+    pub partial_tokens: u32,
 }
 
 impl PlanInputs<'_> {
@@ -161,6 +169,48 @@ impl PlanInputs<'_> {
         best
     }
 
+    /// The token-granular extension of a chosen whole-block cutoff (P5p S-4, S-5): reuse the
+    /// first `partial_tokens` of the block at the cutoff through a tail copy, capped so
+    /// `full + partial` stays within [`reuse_cap_tokens`] and within the matched coverage.
+    /// Fires only when the cache reaches the end of the prompt: a partial candidate matched
+    /// beyond the full blocks, or the prompt ends exactly on the cached full blocks and the
+    /// block at the cutoff is itself the tail source. A prompt that continues past what the
+    /// cache covers, with nothing matched beyond the full blocks, keeps the Phase 4
+    /// whole-block plan.
+    ///
+    /// The source must be an L0-resident exact copy: a matched full block below the cutoff
+    /// (its tier is L0 and it is served exact), or the directory's partial match (L0-resident
+    /// and exact by construction). One would give the first output token its logits; the cap
+    /// keeps the warm prefill at least [`MIN_RECOMPUTE_TOKENS`] tokens, so it stays
+    /// prefill-shaped.
+    fn extend_partial(&self, plan: &mut KvPlan) {
+        let b = self.block_tokens.max(1);
+        let covered = self.matched.len() as u32 * b + self.partial_tokens;
+        if self.partial_tokens == 0 && covered != self.prompt_tokens {
+            return;
+        }
+        let k = plan.cutoff_blocks() as usize;
+        let eligible = if k < self.matched.len() {
+            self.matched[k] == TierId::L0 && self.penalty(k).is_none()
+        } else {
+            self.partial_tokens > 0
+        };
+        if !eligible {
+            return;
+        }
+        let used = k as u32 * b;
+        let cap = reuse_cap_tokens(self.prompt_tokens);
+        if used >= cap {
+            return;
+        }
+        let p = (cap - used).min(b).min(covered - used);
+        if p == 0 {
+            return;
+        }
+        plan.partial_tokens = p;
+        plan.recompute_tokens -= p;
+    }
+
     fn plan(&self, k: usize, reason: PlanReason) -> KvPlan {
         let mut reuse_l0 = 0;
         let mut promote: Vec<(TierId, u32)> = Vec::new();
@@ -178,6 +228,7 @@ impl PlanInputs<'_> {
             promote,
             recompute_tokens: self.prompt_tokens - k as u32 * self.block_tokens,
             reason,
+            partial_tokens: 0,
         }
     }
 }
@@ -203,6 +254,12 @@ pub fn reuse_cap(prompt_tokens: u32, block_tokens: u32) -> usize {
     (prompt_tokens.saturating_sub(MIN_RECOMPUTE_TOKENS) / block_tokens.max(1)) as usize
 }
 
+/// The most tokens a plan may reuse (whole blocks plus the partial tail): [`MIN_RECOMPUTE_TOKENS`]
+/// stay to prefill (P5p S-5).
+pub fn reuse_cap_tokens(prompt_tokens: u32) -> u32 {
+    prompt_tokens.saturating_sub(MIN_RECOMPUTE_TOKENS)
+}
+
 /// Chooses the cutoff minimising [`plan_cost`]. At least [`MIN_RECOMPUTE_TOKENS`] prompt tokens
 /// are always recomputed; blocks at or behind a degraded tier are never
 /// retrieved; at L0 RED or above only the leading L0 blocks are reused (no promotion into L0);
@@ -220,7 +277,9 @@ pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
         .min(exact);
     let matched = &inp.matched[..cap];
     if matched.is_empty() {
-        return inp.plan(0, PlanReason::NoMatch);
+        let mut plan = inp.plan(0, PlanReason::NoMatch);
+        inp.extend_partial(&mut plan);
+        return plan;
     }
     let l0_prefix = matched.iter().take_while(|t| **t == TierId::L0).count();
     let usable = matched
@@ -241,7 +300,9 @@ pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
     } else {
         PlanReason::AllL0
     };
-    inp.plan(best, reason)
+    let mut plan = inp.plan(best, reason);
+    inp.extend_partial(&mut plan);
+    plan
 }
 
 #[cfg(test)]
@@ -270,6 +331,7 @@ mod tests {
             copy_bytes: &[],
             lossy_penalty: &[],
             allow_lossy: true,
+            partial_tokens: 0,
         }
     }
 
@@ -314,13 +376,16 @@ mod tests {
             "the same prefix at GREEN is retrieved"
         );
 
-        // A fully cached prompt that is an exact multiple of the block: the last block is
-        // recomputed so the first output token has logits.
+        // A fully cached prompt that is an exact multiple of the block: the last
+        // MIN_RECOMPUTE_TOKENS are recomputed so the first output token has logits. Phase 4
+        // recomputed the whole last block (16 here); P5p token-granular reuse (S-4/S-5, user
+        // decision 2026-09-28) amends exactly this case to a tail copy of the block's first
+        // `B − MIN_RECOMPUTE_TOKENS` tokens.
         let all = [L0; 4];
         let p = plan_prefix(&inputs(&all, 64));
         assert_eq!(
-            (p.reuse_l0, p.recompute_tokens, p.reason),
-            (3, 16, PlanReason::AllL0)
+            (p.reuse_l0, p.recompute_tokens, p.partial_tokens, p.reason),
+            (3, 2, 14, PlanReason::AllL0)
         );
         assert_eq!(plan_prefix(&inputs(&[], 40)).reason, PlanReason::NoMatch);
         assert_eq!(
@@ -483,5 +548,96 @@ mod tests {
         let mut inp = inputs(&l0, 34);
         inp.lossy_penalty = &costly;
         assert_eq!(plan_prefix(&inp).cutoff_blocks(), 2);
+    }
+    /// P5p S-4/S-5 (`token_granular_cap`): the planner's reuse cap is token-granular — a
+    /// prompt one token past a block boundary recomputes [`MIN_RECOMPUTE_TOKENS`] tokens by
+    /// splitting a matched block through a tail copy; without a partial candidate (and when
+    /// the prompt is not an exact multiple of the block) the plan is the Phase 4 whole-block
+    /// minimum. The warm prefill is never shorter than [`MIN_RECOMPUTE_TOKENS`]. Breaks if
+    /// the extension reuses past [`MIN_RECOMPUTE_TOKENS`], past the matched coverage, or
+    /// changes the Phase 4 plan when no partial candidate exists.
+    #[test]
+    fn token_granular_cap() {
+        use TierId::L0;
+        // A fully cached prompt: `matched` holds every full block of the prompt, L0-resident,
+        // plus `partial_tokens` matched beyond them (the trailing chunk, or 0 when the
+        // prompt ends on a block boundary).
+        for (prompt, full, partial) in [
+            (129u32, 0u32, 127u32),
+            (130, 1, 0),
+            (255, 1, 125),
+            (256, 1, 126),
+            (257, 1, 127),
+        ] {
+            let matched = vec![L0; (prompt / 128) as usize];
+            let mut inp = inputs(&matched, prompt);
+            inp.block_tokens = 128;
+            inp.partial_tokens = prompt % 128;
+            let p = plan_prefix(&inp);
+            assert_eq!(
+                (p.cutoff_blocks(), p.partial_tokens, p.recompute_tokens),
+                (full, partial, prompt - full * 128 - partial),
+                "prompt {prompt}"
+            );
+            assert!(
+                p.recompute_tokens >= MIN_RECOMPUTE_TOKENS,
+                "prompt {prompt}"
+            );
+        }
+
+        // Without a partial candidate the plan is the whole-block minimum (the Phase 4
+        // behaviour, judged on cost and on the cutoff itself).
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        for case in 0..200 {
+            let n = (next(&mut seed) % 40) as usize;
+            let tiers: Vec<TierId> = (0..n)
+                .map(|_| match next(&mut seed) % 3 {
+                    0 => TierId::L0,
+                    1 => TierId::L1,
+                    _ => TierId::L2,
+                })
+                .collect();
+            let prompt = n as u32 * 16 + 1 + (next(&mut seed) % 200) as u32;
+            let mut inp = inputs(&tiers, prompt);
+            inp.partial_tokens = 0;
+            inp.prefill_tps = 500.0 + (next(&mut seed) % 20_000) as f64;
+            inp.l2_to_l0 = Some(PathCost {
+                latency_s: (next(&mut seed) % 100) as f64 * 1e-3,
+                bandwidth_bps: 1e8 + (next(&mut seed) % 50) as f64 * 1e8,
+            });
+            let plan = plan_prefix(&inp);
+            let brute = (0..=reuse_cap(prompt, 16).min(n))
+                .map(|k| plan_cost(&inp, k))
+                .fold(f64::INFINITY, f64::min);
+            let chosen = plan_cost(&inp, plan.cutoff_blocks() as usize);
+            assert!(
+                chosen <= brute + 1e-12,
+                "case {case}: chose {chosen}, brute force {brute}"
+            );
+            assert_eq!(
+                plan.recompute_tokens,
+                prompt - plan.cutoff_blocks() * 16,
+                "case {case}"
+            );
+            assert_eq!(plan.partial_tokens, 0, "case {case}");
+            assert!(plan.recompute_tokens >= MIN_RECOMPUTE_TOKENS);
+        }
+
+        // The split source must be an L0-resident exact copy: an L1-resident matched block is
+        // never split (the tail copy is a device-side copy), and a lossy-served block neither.
+        let mut inp = inputs(&[TierId::L1], 130);
+        inp.block_tokens = 128;
+        inp.partial_tokens = 2;
+        let p = plan_prefix(&inp);
+        assert_eq!(p.cutoff_blocks(), 1, "the L1 block is retrieved whole");
+        assert_eq!(p.partial_tokens, 0, "an L1 source is never split");
+
+        // A lossy-served L0 block is never the split source either.
+        let mut inp = inputs(&[TierId::L0], 130);
+        inp.block_tokens = 128;
+        inp.lossy_penalty = &[Some(0.5)];
+        inp.partial_tokens = 2;
+        let p = plan_prefix(&inp);
+        assert_eq!((p.cutoff_blocks(), p.partial_tokens), (1, 0));
     }
 }

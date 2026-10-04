@@ -1026,6 +1026,7 @@ impl KvHierarchy {
             copy_bytes: &copy_bytes,
             lossy_penalty: &penalties,
             allow_lossy,
+            partial_tokens: m.partial.as_ref().map_or(0, |p| p.tokens),
         };
         let mut plan = plan_prefix(&inputs);
         // The planner's inputs and costs, for the `kv_plan` DEBUG event: the cost of no reuse,
@@ -1799,6 +1800,7 @@ impl KvHierarchy {
                     promote: Vec::new(),
                     recompute_tokens: prompt - p.attach.cached_tokens,
                     reason: PlanReason::TierDegraded,
+                    partial_tokens: 0,
                 };
                 self.metrics
                     .plan(PlanReason::TierDegraded, p.attach.plan.recompute_tokens);
@@ -3481,6 +3483,7 @@ fn truncated_plan(
         promote,
         recompute_tokens: prompt_tokens - used.len() as u32 * block_tokens,
         reason,
+        partial_tokens: 0,
     }
 }
 

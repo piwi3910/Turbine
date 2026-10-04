@@ -2958,6 +2958,7 @@ mod tests {
                     reuse_l0: blocks.len() as u32,
                     promote: Vec::new(),
                     recompute_tokens: 0,
+                    partial_tokens: 0,
                     reason: PlanReason::AllL0,
                 },
             }

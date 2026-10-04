@@ -1049,6 +1049,7 @@ mod tests {
             copy_bytes: &[],
             lossy_penalty: &[],
             allow_lossy: true,
+            partial_tokens: 0,
         });
         assert_eq!(
             (plan.cutoff_blocks(), plan.reason),
@@ -1363,6 +1364,7 @@ mod tests {
             copy_bytes: &[],
             lossy_penalty: &[],
             allow_lossy: true,
+            partial_tokens: 0,
         });
         assert_eq!(plan.reason, PlanReason::RetrieveCheaper);
 
