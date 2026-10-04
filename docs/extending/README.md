@@ -35,4 +35,4 @@ Every pluggable part of Turbine is one file (or directory) plus one entry in a s
 - **Lab checks** — the GPU suites (`scripts/lab-test.sh novanas`), the per-slice measurement (`scripts/lab-bench.sh --gpu 0 --model llama|olmoe`: golden c1 / c16 and throughput within 3% tok/s and 10% TTFT p50 of the last row of `.procoder/perf-log.md`) and the golden gate a module needs before landing, under the lab rules of `AGENTS.md`.
 - **Pitfalls** — what breaks quietly at that point.
 
-`cargo test -p turbine-model --test docs_extending` keeps these pages honest: every page exists with its four sections, and every path and test it names exists in the tree.
+`cargo test -p turbine-model --test docs_extending` keeps these pages honest: every page exists with its four sections, and every path and test it names exists in the tree. It also keeps the status page [`docs/support-matrix.md`](../support-matrix.md) — the human view of `turbine_core::support::SUPPORT_MATRIX` — true: the `docs_support_matrix_*` tests require it to carry every matrix row, the gfx1201 resolutions, the tier formats and the deferred / parallel refusals exactly as the code resolves them.

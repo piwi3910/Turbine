@@ -7,8 +7,17 @@
 //! filter whose every `::` segment is a test function or module in the tree. The `Registry
 //! entry` section names at least one existing file and the `Conformance suite` section at least
 //! one test command, so a page cannot drop either.
+//!
+//! `docs/support-matrix.md` is the human view of `turbine_core::support::SUPPORT_MATRIX`; the
+//! `docs_support_matrix_*` tests render the table, the gfx1201 resolution, the tier formats and
+//! the deferred / parallel refusals from code and require the page to carry exactly those.
 
 use std::path::{Path, PathBuf};
+
+use turbine_core::support::{
+    self, DEFERRED_VENDORS, KvFormatColumn, PARALLEL_REFUSALS, SUPPORT_MATRIX, SpeculativeColumn,
+    SupportKey, TIER_FORMAT_REFUSALS, WeightFormatColumn,
+};
 
 /// The thirteen extension points, one page each.
 const PAGES: [&str; 13] = [
@@ -267,4 +276,272 @@ fn docs_checker_rejects_what_does_not_exist() {
     assert!(check_test_command("cargo test -p").is_err());
     let spans = code_spans("a `x` b `y`\n```\n`z`\n```\n");
     assert_eq!(spans, ["x", "y"]);
+}
+
+/// The text of `docs/support-matrix.md`.
+fn support_matrix_doc() -> String {
+    std::fs::read_to_string(root().join("docs/support-matrix.md")).expect("docs/support-matrix.md")
+}
+
+/// The text from `heading` up to the next `## `, `### ` or end of file (the existing `section`
+/// helper stops at `## ` only).
+fn table_under<'a>(text: &'a str, heading: &str) -> &'a str {
+    let start = text
+        .find(heading)
+        .unwrap_or_else(|| panic!("{heading} not found"))
+        + heading.len();
+    let rest = &text[start..];
+    let end = ["\n### ", "\n## "]
+        .iter()
+        .filter_map(|s| rest.find(s))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The stable part of a refusal reason this page must name: the `phase-*` track it names, else
+/// the `reason_code:` prefix.
+fn reason_anchor(reason: &str) -> Option<String> {
+    if let Some(i) = reason.find("phase-") {
+        let rest = &reason[i..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(rest.len());
+        return Some(rest[..end].trim_end_matches('-').to_string());
+    }
+    let code = reason.split(':').next().unwrap_or("");
+    if !code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    {
+        return Some(code.to_string());
+    }
+    None
+}
+
+/// The line with runs of whitespace collapsed to one space: the formatter pads table cells to
+/// align the columns, so the comparison ignores that padding.
+fn squash(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Fails unless the doc's table rows (the lines starting with `` | ` ``) are exactly `expected`,
+/// in order, each doc line starting with the expected prefix (the page may append prose notes).
+fn expect_table(failures: &mut Vec<String>, what: &str, doc_rows: &[&str], expected: &[String]) {
+    if doc_rows.len() != expected.len() {
+        failures.push(format!(
+            "{what}: the page has {} table rows, the code says {}\nthe code's table:\n{}",
+            doc_rows.len(),
+            expected.len(),
+            expected.join("\n")
+        ));
+        return;
+    }
+    for (i, expected) in expected.iter().enumerate() {
+        if !squash(doc_rows[i]).starts_with(&squash(expected)) {
+            failures.push(format!(
+                "{what} row {i}: expected {expected:?}, found {:?}",
+                doc_rows[i]
+            ));
+        }
+    }
+}
+
+fn table_rows(body: &str) -> Vec<&str> {
+    body.lines().filter(|l| l.starts_with("| `")).collect()
+}
+
+/// docs/support-matrix.md carries every `SUPPORT_MATRIX` row (key, status and, for a refusal,
+/// the reason anchor) and no contradiction: a status changed in code, a row added or dropped,
+/// or an edited status in the page turns this red.
+#[test]
+fn docs_support_matrix_rows_match_code() {
+    let doc = support_matrix_doc();
+    let body = section(&doc, "## Every row of the table");
+    let expected: Vec<String> = SUPPORT_MATRIX
+        .iter()
+        .map(|r| {
+            let v = r.view();
+            format!(
+                "| `{}/{}/{}/{}/{}/{}` | {}",
+                v.vendor,
+                v.arch,
+                v.architecture,
+                v.weight_format,
+                v.kv_format,
+                v.speculative,
+                v.status
+            )
+        })
+        .collect();
+    let mut failures = Vec::new();
+    let doc_rows = table_rows(body);
+    if doc_rows.len() != expected.len() {
+        failures.push(format!(
+            "row table: the page has {} rows, SUPPORT_MATRIX has {}\nexpected:\n{}",
+            doc_rows.len(),
+            expected.len(),
+            expected.join("\n")
+        ));
+        return;
+    }
+    for (i, (row, expected)) in SUPPORT_MATRIX.iter().zip(expected.iter()).enumerate() {
+        let line = squash(doc_rows[i]);
+        if !line.starts_with(&squash(expected)) {
+            failures.push(format!("row {i}: expected {expected:?}, found {line:?}"));
+            continue;
+        }
+        if let Some(reason) = row.status.reason()
+            && let Some(anchor) = reason_anchor(reason)
+            && !line.contains(&anchor)
+        {
+            failures.push(format!(
+                "row {i}: the reason anchor `{anchor}` is missing: {line}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The gfx1201 resolution tables are `support::resolve` over every weight × KV combination, per
+/// architecture: an edited status or a resolution change in the rows shows up here.
+#[test]
+fn docs_support_matrix_gfx1201_tables_match_resolution() {
+    let doc = support_matrix_doc();
+    let mut failures = Vec::new();
+    for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+        let doc_rows = table_rows(table_under(&doc, &format!("### {architecture}")));
+        let expected: Vec<String> = WeightFormatColumn::ALL
+            .iter()
+            .map(|w| {
+                let mut line = format!("| `{}`", w.as_str());
+                for kv in KvFormatColumn::ALL {
+                    let key = SupportKey::for_model(
+                        "amd",
+                        "gfx1201",
+                        architecture,
+                        *w,
+                        kv,
+                        SpeculativeColumn::None,
+                    );
+                    line.push_str(&format!(" | {}", support::resolve(&key).as_str()));
+                }
+                line.push_str(" |");
+                line
+            })
+            .collect();
+        expect_table(&mut failures, architecture, &doc_rows, &expected);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The lower-tier format table is `TIER_FORMAT_REFUSALS` plus the formats that are `supported`
+/// by default (`l0` and the KV columns proven as lower tiers).
+#[test]
+fn docs_support_matrix_tier_formats_match_code() {
+    let doc = support_matrix_doc();
+    let doc_rows = table_rows(section(&doc, "## Lower-tier KV formats"));
+    let mut expected: Vec<String> = Vec::new();
+    for format in ["l0", "fp8_e4m3", "tq4"] {
+        let status = support::check_tier_format("kv.cpu.format", format).unwrap();
+        expected.push(format!("| `{format}` | {}", status.as_str()));
+    }
+    for refusal in TIER_FORMAT_REFUSALS {
+        expected.push(format!(
+            "| `{}` | {}",
+            refusal.format,
+            refusal.status.as_str()
+        ));
+    }
+    let mut failures = Vec::new();
+    expect_table(&mut failures, "tier formats", &doc_rows, &expected);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The deferred-vendor and parallel-refusal sections name every entry of `DEFERRED_VENDORS` and
+/// `PARALLEL_REFUSALS` with its status and reason code.
+#[test]
+fn docs_support_matrix_deferred_and_parallel_match_code() {
+    let doc = support_matrix_doc();
+    let mut failures = Vec::new();
+    let deferred = section(&doc, "## Deferred vendors");
+    for (vendor, reason) in DEFERRED_VENDORS {
+        let needle = format!("| `{vendor}` |");
+        let line = deferred
+            .lines()
+            .find(|l| squash(l).contains(&needle))
+            .unwrap_or_else(|| {
+                failures.push(format!("deferred vendor `{vendor}`: no table row"));
+                ""
+            });
+        if !line.contains("unsupported") {
+            failures.push(format!(
+                "deferred vendor `{vendor}`: status not `unsupported`: {line:?}"
+            ));
+        }
+        if let Some(anchor) = reason_anchor(reason)
+            && !line.contains(&anchor)
+        {
+            failures.push(format!(
+                "deferred vendor `{vendor}`: reason anchor `{anchor}` missing: {line:?}"
+            ));
+        }
+    }
+    let parallel = section(&doc, "## Parallel-mode refusals");
+    for refusal in PARALLEL_REFUSALS {
+        let code = refusal.reason.split(':').next().unwrap_or("");
+        let line = parallel
+            .lines()
+            .find(|l| {
+                let line = squash(l);
+                line.contains(refusal.architecture) && line.contains(refusal.modes)
+            })
+            .unwrap_or_else(|| {
+                failures.push(format!(
+                    "parallel refusal {} {}: no table row",
+                    refusal.architecture, refusal.modes
+                ));
+                ""
+            });
+        if !code.is_empty() && !line.contains(code) {
+            failures.push(format!(
+                "parallel refusal {} {}: reason code `{code}` missing",
+                refusal.architecture, refusal.modes
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The checker itself: the reason anchor picks the track or the code, not prose.
+#[test]
+fn docs_support_matrix_reason_anchors() {
+    assert_eq!(
+        reason_anchor(
+            "this quantized weight format is not validated yet (track phase-6a-quantization)"
+        )
+        .as_deref(),
+        Some("phase-6a-quantization")
+    );
+    assert_eq!(
+        reason_anchor("kv_tq2_l0_refused: TurboQuant 2-bit L0 pages fail the quality gate")
+            .as_deref(),
+        Some("kv_tq2_l0_refused")
+    );
+    assert_eq!(reason_anchor("no reason at all"), None);
+    expect_table(
+        &mut Vec::new(),
+        "x",
+        &["| `a` | supported | note |"],
+        &["| `a` | supported".to_string()],
+    );
+    let mut failures = Vec::new();
+    expect_table(
+        &mut failures,
+        "x",
+        &["| `a` | experimental | note |"],
+        &["| `a` | supported".to_string()],
+    );
+    assert!(failures.len() == 1 && failures[0].contains("expected"));
 }
