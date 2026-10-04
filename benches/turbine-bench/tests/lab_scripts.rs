@@ -1509,11 +1509,11 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
     }
 }
 
-/// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the new
+/// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the
 /// --with-tests / --skip-tests / --golden16 / --quick flags and the GPU-0-only guard (GPU 1's
-/// PCIe link is not throughput-comparable). lab-bench.sh has no --dry-run: a well-formed
-/// invocation immediately reaches for the host (rsync, then ssh, via scripts/remote-cargo.sh),
-/// so these usage cases only cover what must be rejected before any host contact.
+/// PCIe link is not throughput-comparable). These usage cases cover what must be rejected
+/// before any host contact (the well-formed invocations are covered by the --dry-run tests
+/// below, P5p S-1).
 #[test]
 fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     for (tag, args) in [
@@ -1534,33 +1534,38 @@ fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     );
 }
 
-/// The new flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
-/// in the test above) for --gpu 0 (the default, spelled out) and every combination of them.
-/// lab-bench.sh has no --dry-run and reaches for the host immediately after parsing, so this
-/// only checks that parsing succeeded (no "usage:" on stderr), not what happens next: what it
-/// reaches for after that (scripts/remote-cargo.sh, which resolves this checkout through `git`)
-/// is exercised for real by a human running it, not safe to assert on here since this same test
-/// binary also runs from a host-synced tree that excludes .git (scripts/remote-cargo.sh, every
-/// lab-*.sh upload).
+/// The flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
+/// in the test above) for --gpu 0 (the default, spelled out) and every combination of them,
+/// including the P5p --concurrency / --multi-turn / --multi-turn-sessions. Each runs as a dry
+/// run: exit 0, no host contacted (P5p S-1).
 #[test]
 fn lab_bench_new_flags_are_not_usage_errors() {
     for (tag, args) in [
-        ("flags-default", &["--gpu", "0"][..]),
-        ("flags-with-tests", &["--with-tests"][..]),
-        ("flags-skip-tests", &["--skip-tests"][..]),
-        ("flags-golden16", &["--golden16"][..]),
-        ("flags-quick", &["--quick"][..]),
+        ("flags-default", &["--dry-run", "--gpu", "0"][..]),
+        ("flags-with-tests", &["--dry-run", "--with-tests"][..]),
+        ("flags-skip-tests", &["--dry-run", "--skip-tests"][..]),
+        ("flags-golden16", &["--dry-run", "--golden16"][..]),
+        ("flags-quick", &["--dry-run", "--quick"][..]),
         (
             "flags-all",
-            &["--gpu", "0", "--with-tests", "--golden16", "--quick"][..],
+            &[
+                "--dry-run",
+                "--gpu",
+                "0",
+                "--with-tests",
+                "--golden16",
+                "--quick",
+            ][..],
+        ),
+        ("flags-conc", &["--dry-run", "--concurrency", "1"][..]),
+        ("flags-mt", &["--dry-run", "--multi-turn"][..]),
+        (
+            "flags-mt64",
+            &["--dry-run", "--multi-turn-sessions", "64"][..],
         ),
     ] {
-        let (out, _) = lab_script("lab-bench.sh", tag, args);
-        assert!(
-            !stderr(&out).contains("usage:"),
-            "{tag}: rejected as a usage error: {}",
-            stderr(&out)
-        );
+        let text = dry_run("lab-bench.sh", tag, args);
+        assert!(!text.is_empty(), "{tag}: nothing printed");
     }
 }
 
@@ -2650,4 +2655,75 @@ mod track_gate_script {
         assert_eq!(code, Some(1), "{out}");
         assert!(out.contains("EAGLE"), "{out}");
     }
+}
+
+/// P5p S-1 (plan Task 2): `lab-bench.sh --dry-run` prints, in order, the remote build, the
+/// server start (with any `-- --set` overrides), the golden c1 compare, the throughput bench
+/// at `--concurrency`, the stage-share call over the before/after scrapes, the multi-turn
+/// profile when asked (`--multi-turn-sessions <n>` implies it, saturated at the session
+/// count), and the server stop — and contacts no host.
+#[test]
+fn lab_bench_dry_run_passes_flags() {
+    let text = dry_run(
+        "lab-bench.sh",
+        "bench-dry",
+        &[
+            "--dry-run",
+            "--concurrency",
+            "1",
+            "--quick",
+            "--multi-turn-sessions",
+            "64",
+            "--",
+            "--set",
+            "scheduler.policy=cache_aware",
+        ],
+    );
+    // Order, by first occurrence.
+    let mut last = 0;
+    for line in [
+        "remote-cargo.sh build -q --release -p turbine-server -p turbine-bench",
+        "--set scheduler.policy=cache_aware",
+        "compare --url http://127.0.0.1:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl --concurrency 1",
+        "--concurrency 1 --requests 64 --prompt-words 512 --max-tokens 256 --ignore-eos",
+        "stage-share --before",
+        "--profile multi-turn --sessions 64 --turns 8 --shared-prefix-words 2000 --concurrency 64 --session-hints",
+        "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log",
+    ] {
+        let at = text
+            .find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in:\n{text}"));
+        assert!(at > last, "{line:?} out of order in:\n{text}");
+        last = at;
+    }
+    // The stage-share call names both scrapes.
+    assert!(
+        text.contains("--after"),
+        "stage-share needs the after scrape:\n{text}"
+    );
+}
+
+/// P5p S-1: the new flags parse (--dry-run exits 0 without contacting a host) and the
+/// standard workload is unchanged: without --concurrency the throughput bench runs at 16 and
+/// without the multi-turn flags no multi-turn step is printed.
+#[test]
+fn lab_bench_dry_run_defaults_are_unchanged() {
+    let text = dry_run(
+        "lab-bench.sh",
+        "bench-dry-default",
+        &["--dry-run", "--quick"],
+    );
+    assert!(
+        text.contains("--concurrency 16 --requests 64"),
+        "default concurrency is 16:\n{text}"
+    );
+    assert!(
+        !text.contains("--profile multi-turn"),
+        "no multi-turn step by default:\n{text}"
+    );
+    // The host share is measured on every run.
+    assert!(
+        text.contains("stage-share --before"),
+        "the host share is always measured:\n{text}"
+    );
 }
