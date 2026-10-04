@@ -3255,3 +3255,13 @@ The decision "Phase 5p" (item 4) fixed the rule before the measurement: overlap 
 The rule's outcome: **no c1 value exceeds 0.05 — S-3 / Task 4 is closed without code.** At c1 the whole host side of a Llama decode step is ~0.05 ms of 12.7 ms; even giving the engine perfect overlap of it moves ITL by well under the run-to-run noise. The measured c16 share (1.9 %) confirms the 2026-09-27 profile's 1.5 % estimate; its largest components are prepare/emit bookkeeping that scales with batch rows, not the serial launch-ahead gap S-3 targets. The multi-turn baselines recorded in the same runs: standard (16 sessions, c8) cached 0.9065, later-turn TTFT p50 80 ms; saturated (64 sessions, c64, `max_running_requests=16`) cached 0.9097, first-turn TTFT p50 3 731 ms, later-turn TTFT p50 10 736 ms — the medians every later 5p task compares with. No new question is opened; S-4 (token-granular prefix reuse) is next per the phase order.
 
 **Decision (user, 2026-10-04): A.** A decode-bandwidth task joins 5p: profile the batch-1 kernel timeline, close the ~45 0ap with fused batch-1 kernels and per-shape GEMV tuning (cf. the perf-gemm-table work).
+
+## 5p Tasks 5–6: two lead calls (2026-10-04)
+
+From `p5p-t6` (merged d753e5cf). (1) A Phase 4-era test pinned whole-block reuse (64 → 3+16) where the S-4 AC now
+pins the token-granular rule (3+14+2); the builder followed the AC and documented — accepted, the old test pinned the
+behaviour S-4 deliberately replaces. (2) Window-class BF16 L0 blocks carry the pre-existing "served lossy" tag rule, so
+token-granular splits treat them conservatively as `lossy_source` (no partial reuse through them) — **kept**: the
+conservative default is safe, and the same block leaves the window (→ base format) soon anyway; relaxing is a later
+micro-optimization if the metrics show it matters. (3) Contract §25 updated: `PartialOutcome` gains `LossySource`
+(matching children hold lossy rung-class pages or lossy lineage → no partial match), matching the implementation.

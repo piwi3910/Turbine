@@ -2516,7 +2516,7 @@ impl KvHierarchy {
 }
 // HierarchyConfig gains: pub partial_prefix_reuse: bool
 // metrics
-#[non_exhaustive] pub enum PartialOutcome { Reused, NoCandidate, NotResident, PlannerCutoff, Disabled }   // "reused", "no_candidate", "not_resident", "planner_cutoff", "disabled"
+#[non_exhaustive] pub enum PartialOutcome { Reused, NoCandidate, NotResident, PlannerCutoff, LossySource, Disabled }   // "reused", "no_candidate", "not_resident", "planner_cutoff", "lossy_source", "disabled"
 // EvictReason gains PartialL0Only ("partial_l0_only")
 ```
 
