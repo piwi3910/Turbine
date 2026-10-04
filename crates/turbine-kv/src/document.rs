@@ -46,6 +46,19 @@ pub struct FormatUsage {
     pub bytes: u64,
 }
 
+/// The compression ladder's state (P6b S-10): the resolved config and each local tier's
+/// current rung (`None` = the tier is at its base format; the tier order of
+/// [`KvHierarchy::document`]). `/turbine/v1/status` reports it under `quantization.ladder`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LadderDoc {
+    pub enabled: bool,
+    /// Whether the L0 rung is on (`kv.ladder.l0`).
+    pub l0: bool,
+    pub max_format: Option<String>,
+    /// `l0`, `l1`, `l2` → the rung new demotions take (`None` = the tier's base format).
+    pub rungs: BTreeMap<String, Option<String>>,
+}
+
 /// Phase 4 per-tier keys (P4 §Data).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TierState {

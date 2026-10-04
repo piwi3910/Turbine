@@ -650,13 +650,18 @@ async fn serve(
         }
     };
     let backend = Arc::new(
-        ModelBackend::new(&replicas[0].prepared, &inventory, &engine_metrics)
-            .with_replicas(replicas.len(), router_policy, &metrics)
-            .with_support(support)
-            .with_topology(&cluster.topology)
-            .with_parallel(cluster.parallel)
-            .with_experts(replicas.iter().map(|r| r.experts.clone()).collect())
-            .with_rank_worker(replicas[0].worker.is_some()),
+        ModelBackend::new(
+            &replicas[0].prepared,
+            &inventory,
+            &engine_metrics,
+            &replicas[0].prepared.tier_formats,
+        )
+        .with_replicas(replicas.len(), router_policy, &metrics)
+        .with_support(support)
+        .with_topology(&cluster.topology)
+        .with_parallel(cluster.parallel)
+        .with_experts(replicas.iter().map(|r| r.experts.clone()).collect())
+        .with_rank_worker(replicas[0].worker.is_some()),
     );
     let state = ApiState {
         inference: backend.clone(),

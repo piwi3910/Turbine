@@ -42,6 +42,7 @@ use turbine_device::telemetry::{
     SamplerCore, TelemetryConfig, TelemetryMetrics, TelemetrySampler, VendorTelemetry,
 };
 use turbine_device::{DeviceInventory, DiscoveryOptions};
+use turbine_kv::document::LadderDoc;
 use turbine_kv::tier::L2NvmeTier;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
@@ -111,11 +112,13 @@ pub enum Fatal {
     RankStopped(Option<String>),
 }
 
-/// The documents behind `GET /turbine/v1/scheduler` and `GET /turbine/v1/kv`.
+/// The documents behind `GET /turbine/v1/scheduler` and `GET /turbine/v1/kv`, plus the
+/// compression ladder's state for the status document's `quantization.ladder` (P6b S-10).
 #[derive(Clone, Debug)]
 pub struct EngineDocs {
     pub scheduler: SchedulerSnapshot,
     pub kv: KvDocument,
+    pub ladder: LadderDoc,
 }
 
 /// State the engine publishes for the HTTP side; `None` until the engine runs.

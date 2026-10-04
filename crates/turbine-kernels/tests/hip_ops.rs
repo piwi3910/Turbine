@@ -5160,12 +5160,16 @@ fn recorded_choices() -> Vec<(&'static str, OpConfig, String)> {
     out
 }
 
-/// Phase 2m Task 10 (kernel ABI v2.4): `libturbine_hip.so` enumerates exactly its implementation
-/// table per op (names, provider families, the host-offsets flag), and for every op config the
-/// served Llama and OLMoE models use (`tests/lab/kernel-choices-*.json`) the first
-/// implementation in library order that `turbine_impl_supports` accepts (for `moe_experts` at
-/// the first row tier of the gfx1201 profile) is the one the library's own `turbine_<op>_impl`
-/// names and the one main served. Breaks if the table drifts from the contract (§9.1) or if
+/// Phase 2m Task 10 (kernel ABI v2.4), the P6b additions (Task 12's mixed-format paged
+/// attention, the ABI v2.11 `kv_transcode` TurboQuant transcode): `libturbine_hip.so`
+/// enumerates exactly its implementation table per op (names, provider families, the
+/// host-offsets flag) — seven `attention_prefill_paged` implementations (the BF16 and FP8
+/// paths plus Task 12's three mixed ones), six `attention_decode_paged` and two
+/// `kv_transcode` (the FP8 codec and TurboQuant) — and for every op config the served Llama
+/// and OLMoE models use (`tests/lab/kernel-choices-*.json`) the first implementation in
+/// library order that `turbine_impl_supports` accepts (for `moe_experts` at the first row
+/// tier of the gfx1201 profile) is the one the library's own `turbine_<op>_impl` names and
+/// the one main served. Breaks if the table drifts from the contract (§9.1) or if
 /// enumeration and the library's own choice disagree.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
@@ -5186,6 +5190,10 @@ fn implementations_enumerated() {
         ("turbine_hip", "turbine_hip", false),
         ("ck_tile_fmha_pagedkv_fp8_staged", "ck", false),
         ("turbine_hip_fp8", "turbine_hip", false),
+        // ABI v2.11 (P6b Task 12): mixed-format pages.
+        ("ck_tile_fmha_pagedkv_mixed_staged", "ck", false),
+        ("turbine_hip_mixed_staged", "turbine_hip", false),
+        ("turbine_hip_mixed", "turbine_hip", false),
     ];
     let paged_decode = vec![
         ("ck_tile_fmha_splitkv", "ck", false),
@@ -5193,6 +5201,7 @@ fn implementations_enumerated() {
         ("turbine_hip", "turbine_hip", false),
         ("turbine_hip_fp8_decode", "turbine_hip", false),
         ("turbine_hip_fp8", "turbine_hip", false),
+        ("turbine_hip_mixed", "turbine_hip", false),
     ];
     // (name, provider, needs host offsets) in library order.
     type Impls = Vec<(&'static str, &'static str, bool)>;
@@ -5241,8 +5250,14 @@ fn implementations_enumerated() {
                 ("turbine_hip_mxfp4", "turbine_hip", false),
             ],
         ),
-        // ABI v2.11 (Phase 6b).
-        (OpKind::KvTranscode, one("turbine_hip_fp8", "turbine_hip")),
+        // ABI v2.11 (Phase 6b): the FP8 codec, then TurboQuant (tq4 / tq2).
+        (
+            OpKind::KvTranscode,
+            vec![
+                ("turbine_hip_fp8", "turbine_hip", false),
+                ("turbine_hip_tq", "turbine_hip", false),
+            ],
+        ),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -5303,8 +5318,10 @@ fn bound(p: &Pair, spec: &OpConfig, index: u32) -> Pair {
 /// One case of `every_implementation_matches_cpu`: the config an implementation must support
 /// (`moe_experts` at `rows` routed rows) and the existing `hip_ops` case that runs it against the
 /// CPU reference with that op's tolerance.
-/// A case body run with a (bound) pair.
-type CaseFn<'a> = Box<dyn Fn(&Pair, &mut Rng) + 'a>;
+/// A case body run with a (bound) pair and the bound implementation's name (a mixed-format
+/// case picks its judgement from it: the staged prefills are held to the BF16-rounded
+/// reference, the rotated decode to `cpu::tq_attention`).
+type CaseFn<'a> = Box<dyn Fn(&Pair, &str, &mut Rng) + 'a>;
 
 struct ImplCase<'a> {
     spec: OpConfig,
@@ -5312,12 +5329,14 @@ struct ImplCase<'a> {
     run: CaseFn<'a>,
 }
 
-/// Phase 2m S-5 / S-13: every implementation the library enumerates for every op, run alone
-/// through `turbine_impl_run` (a provider bound to it) on the shapes of the existing `hip_ops`
-/// cases of that op it supports (`moe_experts` at 8 and 1,024 routed rows, paged attention at 16-
-/// and 128-token pages), matches the CPU reference under that op's tolerance. Every enumerated
-/// implementation runs at least once, except `hipblaslt_grouped` where hipBLASLt has no grouped
-/// solution. Breaks if an implementation the registry can choose disagrees with the reference.
+/// Phase 2m S-5 / S-13, the P6b mixed scenario: every implementation the library enumerates
+/// for every op, run alone through `turbine_impl_run` (a provider bound to it) on the shapes
+/// of the existing `hip_ops` cases of that op it supports (`moe_experts` at 8 and 1,024
+/// routed rows, paged attention at 16- and 128-token pages, and a TurboQuant-page mixed
+/// config that only the three mixed implementations support), matches the CPU reference
+/// under that op's tolerance. Every enumerated implementation runs at least once, except
+/// `hipblaslt_grouped` where hipBLASLt has no grouped solution. Breaks if an implementation
+/// the registry can choose disagrees with the reference.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn every_implementation_matches_cpu() {
@@ -5376,7 +5395,7 @@ fn every_implementation_matches_cpu() {
     let mut cases: Vec<ImplCase<'_>> = vec![
         case(
             gemm(HIDDEN, HIDDEN, bf16),
-            Box::new(|p, rng| {
+            Box::new(|p, _name, rng| {
                 gemm_case(p, rng, 1, HIDDEN, HIDDEN, DType::BF16);
                 gemm_case(p, rng, 17, INTERMEDIATE, HIDDEN, DType::BF16);
                 gemm_case(p, rng, 17, 1024, HIDDEN, DType::F32);
@@ -5384,14 +5403,14 @@ fn every_implementation_matches_cpu() {
         ),
         case(
             attention(AttentionKind::Prefill, None, (Q_HEADS, KV_HEADS)),
-            Box::new(|p, rng| {
+            Box::new(|p, _name, rng| {
                 attention_case(p, rng, AttentionKind::Prefill, 17, 0);
                 attention_case(p, rng, AttentionKind::Prefill, 17, 100);
             }),
         ),
         case(
             attention(AttentionKind::Decode, None, (Q_HEADS, KV_HEADS)),
-            Box::new(|p, rng| attention_case(p, rng, AttentionKind::Decode, 1, 511)),
+            Box::new(|p, _name, rng| attention_case(p, rng, AttentionKind::Decode, 1, 511)),
         ),
         case(
             OpConfig::Rmsnorm(NormConfig {
@@ -5401,7 +5420,7 @@ fn every_implementation_matches_cpu() {
             // The inputs of `norm_rope_silu_embedding_add_match_cpu` (seed 3): `norm_case`'s
             // BF16 tolerance has no allowance for a rounding flip of `x·inv_rms`, which other
             // seeds hit on the ck_tile pipeline (see `add_rmsnorm_matches_cpu`).
-            Box::new(|p, _rng| norm_case(p, &mut Rng(3), 17)),
+            Box::new(|p, _name, _rng| norm_case(p, &mut Rng(3), 17)),
         ),
         case(
             OpConfig::Rope(RopeConfig {
@@ -5411,14 +5430,14 @@ fn every_implementation_matches_cpu() {
                 rotary_dim: HEAD_DIM as u32,
                 dtype: bf16,
             }),
-            Box::new(|p, rng| rope_case(p, rng, 17, 1.0)),
+            Box::new(|p, _name, rng| rope_case(p, rng, 17, 1.0)),
         ),
         case(
             OpConfig::SiluMul(ActivationConfig {
                 cols: INTERMEDIATE as u64,
                 dtype: bf16,
             }),
-            Box::new(|p, rng| silu_mul_case(p, rng, 17)),
+            Box::new(|p, _name, rng| silu_mul_case(p, rng, 17)),
         ),
         case(
             OpConfig::Embedding(EmbeddingConfig {
@@ -5426,22 +5445,22 @@ fn every_implementation_matches_cpu() {
                 vocab_rows: VOCAB as u64,
                 dtype: bf16,
             }),
-            Box::new(|p, rng| embedding_case(p, rng, 17)),
+            Box::new(|p, _name, rng| embedding_case(p, rng, 17)),
         ),
         case(
             OpConfig::Add(ElementwiseConfig { dtype: bf16 }),
-            Box::new(|p, rng| add_case(p, rng, 17)),
+            Box::new(|p, _name, rng| add_case(p, rng, 17)),
         ),
         case(
             OpConfig::CopyBlocks(KvCopyConfig {
                 num_layers: 3,
                 block_bytes: (2 * 16 * KV_HEADS * HEAD_DIM * 2) as u64,
             }),
-            Box::new(copy_blocks_case),
+            Box::new(|p, _name, rng| copy_blocks_case(p, rng)),
         ),
         case(
             OpConfig::MoeRoute(olmoe_route),
-            Box::new(move |p, rng| {
+            Box::new(move |p, _name, rng| {
                 let logits = rng.normal(37 * MOE_EXPERTS, 2.0);
                 route_case(p, olmoe_route, 37, &logits);
             }),
@@ -5451,7 +5470,7 @@ fn every_implementation_matches_cpu() {
                 vocab: 50_304,
                 top_n: 64,
             }),
-            Box::new(|p, rng| {
+            Box::new(|p, _name, rng| {
                 logits_reduce_case(p, rng, 64, 50_304, 64);
                 logits_reduce_case(p, rng, 7, 50_304, 5);
             }),
@@ -5462,7 +5481,7 @@ fn every_implementation_matches_cpu() {
             dim: (MOE_HIDDEN / 2) as u32,
             dtype: bf16,
         }),
-        Box::new(|p, rng| {
+        Box::new(|p, _name, rng| {
             sharded_norm_case(p, rng, 37, MOE_HIDDEN, 2);
         }),
     ));
@@ -5472,7 +5491,7 @@ fn every_implementation_matches_cpu() {
             full_dim: MOE_HIDDEN as u32,
             dtype: bf16,
         }),
-        Box::new(|p, rng| {
+        Box::new(|p, _name, rng| {
             sharded_norm_case(p, rng, 37, MOE_HIDDEN, 2);
         }),
     ));
@@ -5489,7 +5508,7 @@ fn every_implementation_matches_cpu() {
                 dim: dim as u32,
                 dtype: bf16,
             }),
-            Box::new(move |p, rng| add_rmsnorm_case(p, rng, rows, dim, x_stride)),
+            Box::new(move |p, _name, rng| add_rmsnorm_case(p, rng, rows, dim, x_stride)),
         ));
     }
     for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
@@ -5505,7 +5524,7 @@ fn every_implementation_matches_cpu() {
             };
             cases.push(case(
                 OpConfig::Attention(fp8),
-                Box::new(move |p, rng| {
+                Box::new(move |p, _name, rng| {
                     let (q_lens, kv_lens): (&[usize], &[usize]) = match kind {
                         AttentionKind::PrefillPaged => (&[37, 1, 70], &[37, 300, 200]),
                         _ => (&[1, 1, 1, 1], &[1, 17, 129, 513]),
@@ -5528,7 +5547,7 @@ fn every_implementation_matches_cpu() {
             ));
             cases.push(case(
                 attention(kind, Some(block_tokens), (Q_HEADS, KV_HEADS)),
-                Box::new(move |p, rng| {
+                Box::new(move |p, _name, rng| {
                     let (q_lens, kv_lens): (&[usize], &[usize]) = match kind {
                         AttentionKind::PrefillPaged => (&[37, 1, 70], &[37, 300, 200]),
                         _ => (&[1, 1, 1, 1], &[1, 17, 129, 513]),
@@ -5546,12 +5565,58 @@ fn every_implementation_matches_cpu() {
             ));
         }
     }
+    // ABI v2.11 (P6b Task 12): the mixed-format implementations take TurboQuant pages, and the
+    // BF16 / FP8 ones refuse them — this config's supporting implementations are exactly the
+    // mixed ones (`paged_mixed_matches_cpu` holds the full sweep over both head layouts, both
+    // page sizes, all three bases and the staged skip; here one batch per kind pins every
+    // mixed implementation against the CPU reference in the exhaustive run, with each one's
+    // own judgement: the staged prefills against the BF16-rounded reference, the rotated
+    // decode and `turbine_hip_mixed`'s prefill pass against `cpu::tq_attention`). Breaks if a
+    // mixed implementation the registry can choose disagrees with the reference.
+    for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+        let OpConfig::Attention(base) = attention(kind, Some(128), (Q_HEADS, KV_HEADS)) else {
+            unreachable!("an attention config")
+        };
+        let tq = AttentionConfig {
+            dtype: DType::Tq4,
+            ..base
+        };
+        cases.push(case(
+            OpConfig::Attention(tq),
+            Box::new(move |p, name, rng| {
+                let check = if name.contains("staged") {
+                    MixedCheck::Staged
+                } else {
+                    MixedCheck::Rotated
+                };
+                let batch: &[(usize, usize)] = match kind {
+                    AttentionKind::PrefillPaged => &[(37, 100), (1, 17)],
+                    _ => &[(1, 17), (1, 128)],
+                };
+                let q_lens: Vec<usize> = batch.iter().map(|&(q, _)| q).collect();
+                let kv_lens: Vec<usize> = batch.iter().map(|&(q, c)| q + c).collect();
+                paged_mixed_case(
+                    p,
+                    rng,
+                    kind,
+                    (Q_HEADS, KV_HEADS),
+                    128,
+                    &q_lens,
+                    &kv_lens,
+                    DType::Tq4,
+                    MixedFormats::Uniform,
+                    check,
+                    name,
+                );
+            }),
+        ));
+    }
     for tokens in [1usize, 128] {
         let w = &w;
         cases.push(ImplCase {
             spec: OpConfig::MoeExperts(experts_cfg),
             rows: Some((tokens * MOE_TOP_K) as u32),
-            run: Box::new(move |p, rng| {
+            run: Box::new(move |p, _name, rng| {
                 let logits = rng.normal(tokens * MOE_EXPERTS, 1.0);
                 let case = ExpertsCase {
                     tokens,
@@ -5581,7 +5646,7 @@ fn every_implementation_matches_cpu() {
                 println!("every_implementation {what}: not supported, skipped");
                 continue;
             }
-            (c.run)(&bound(&p, &c.spec, info.index), &mut rng);
+            (c.run)(&bound(&p, &c.spec, info.index), &info.name, &mut rng);
             println!("every_implementation {what}: ok");
             ran.push((op, info.name));
         }

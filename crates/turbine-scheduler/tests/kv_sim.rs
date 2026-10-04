@@ -1461,4 +1461,13 @@ fn recent_window_holds_newest_blocks_at_bf16() {
         "only the lossless tail (the newest block) stays BF16: {formats:?}"
     );
     assert_eq!(bf16 + base, formats.len());
+    // P6b exit (the ladder soak's `kv_idle` failure): at idle nothing is referenced, even with
+    // the window's BF16 class page cached — `referenced_blocks` counts classed pages too, and
+    // the pressure document's kv held bytes read it (`sync_kv_held`). Breaks if a cached
+    // classed page is reported as referenced and an idle server keeps `kv_utilization` up.
+    assert_eq!(
+        d.pool().referenced_blocks(),
+        0,
+        "idle with a classed page cached: nothing referenced"
+    );
 }

@@ -525,6 +525,10 @@ pub struct PreparedModel {
     /// Device bytes of the TurboQuant tables ([`crate::tq_device`], P6b Task 8), 0 when no
     /// TurboQuant format is configured; counted in the workspace pool next to the staging slots.
     pub tq_table_bytes: u64,
+    /// The lossy tier formats the resolved `kv` config selects (`kv_orchestrator::tier_formats`
+    /// of it; empty = every tier at `l0`): the ABI v2.11 transcode they select goes under
+    /// `kernels` in the status document (P6b S-10).
+    pub tier_formats: Vec<String>,
     /// What the KV cache depends on: the namespace of every cached block (P4 S-1).
     pub identity: ModelIdentity,
     /// The kernel crate's metrics, registered once and shared by every replica (P5).
@@ -973,6 +977,10 @@ fn prepare_with(
         workspace_bytes: workspace,
         transcode_staging_bytes: transcode_staging,
         tq_table_bytes: tq_tables,
+        tier_formats: crate::kv_orchestrator::tier_formats(&config.kv)
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         identity,
         kernel_metrics: kernel_metrics.clone(),
         shard,

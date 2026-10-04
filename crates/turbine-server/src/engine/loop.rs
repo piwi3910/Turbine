@@ -2613,7 +2613,11 @@ impl EngineLoop {
             .into_iter()
             .map(|(stage, ms)| (stage.to_string(), ms))
             .collect();
-        self.shared.publish(EngineDocs { scheduler, kv });
+        self.shared.publish(EngineDocs {
+            scheduler,
+            kv,
+            ladder: self.kv.ladder_document(),
+        });
         let pending = self
             .requests
             .values()
