@@ -7247,7 +7247,11 @@ fn paged_mixed_classed_matches_cpu() {
         class_page > base_page,
         "the window's class page is the bigger one"
     );
-    let (base_blocks, slab_base, slab_stride) = (8u32, (class_page / base_page) as u32, 1u32);
+    let (base_blocks, slab_base, slab_stride) = (
+        8u32,
+        ((class_page + base_page - 1) / base_page) as u32,
+        1u32,
+    );
     let num_blocks = base_blocks + 2 * slab_stride;
     let region = base_blocks as usize * base_page;
     let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
@@ -7429,14 +7433,35 @@ fn paged_mixed_classed_matches_cpu() {
     let got = read(&o_hip);
     let want = read(&o_cpu);
     let row_elems = Q_HEADS * d;
+    // Prefill rows run the staged implementation (BF16-rounded decode, its own rounding, as
+    // in `paged_mixed_matches_cpu`'s `MixedCheck::Staged`): the BF16 tolerance against the
+    // CPU provider's output. The decode row (sequence 1, the last row) runs
+    // `turbine_hip_mixed` and is held to the rotated bound against the same CPU output.
+    let decode_row = |row: usize| row == 17;
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
-        let bound = 4e-3 + w.abs() / 128.0;
-        assert!(
-            (g - w).abs() <= bound,
-            "element {i}: hip {g} vs cpu {w} (row {})",
-            i / row_elems
-        );
+        let row = i / row_elems;
+        if decode_row(row) {
+            let bound = 4e-3 + w.abs() / 128.0;
+            assert!(
+                (g - w).abs() <= bound,
+                "decode element {i}: hip {g} vs cpu {w} (row {row})"
+            );
+        }
     }
+    let keep = |v: &[f32]| -> Vec<f32> {
+        v.chunks(row_elems)
+            .enumerate()
+            .filter(|&(row, _)| !decode_row(row))
+            .flat_map(|(_, r)| r.iter().copied())
+            .collect()
+    };
+    assert_close(
+        "paged_mixed_classed_matches_cpu: prefill rows vs the CPU provider",
+        "turbine_hip_mixed_staged",
+        &keep(&got),
+        &keep(&want),
+        DType::BF16,
+    );
 }
 
 /// Lab perf (P6b Task 12, in `SLOW_TESTS`): decode µs of `turbine_hip_mixed` over `tq4`, `tq2`
