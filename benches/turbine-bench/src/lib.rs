@@ -8,6 +8,7 @@ pub mod multi_turn;
 pub mod open_loop;
 pub mod prompt;
 pub mod report;
+pub mod stage_share;
 
 pub use args::{BenchArgs, EndpointArg, OutputFormat, Profile, ThinkTime};
 pub use client::{BenchError, run};

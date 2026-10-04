@@ -709,3 +709,109 @@ async fn multi_turn_profile() {
         }
     }
 }
+
+/// P5p S-1: `stage_share` turns two `/metrics` scrapes into the per-stage seconds, the
+/// iteration count and the host share (every stage except `device_wait` over all eight);
+/// the CLI subcommand exits 2 naming the error when no iteration lies between the scrapes.
+/// The fixtures are the committed engine-iteration family of two scrapes; every expected
+/// number is computed by hand here (before → after per-stage deltas 0.1 / 0.2 / 30.0 /
+/// 30.0 / 0.05 / 0.1 / 0.15 / 0.3 s over 10 iterations).
+#[test]
+fn stage_share_from_metrics() {
+    use std::path::Path;
+
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let before = std::fs::read_to_string(fixtures.join("stage_share_before.txt")).unwrap();
+    let after = std::fs::read_to_string(fixtures.join("stage_share_after.txt")).unwrap();
+
+    let share = turbine_bench::stage_share::stage_share(&before, &after).unwrap();
+    assert_eq!(share.iterations, 10);
+    let want: [(&str, f64); 8] = [
+        ("schedule", 0.1),
+        ("prepare", 0.2),
+        ("launch", 30.0),
+        ("device_wait", 30.0),
+        ("sample", 0.05),
+        ("detokenize", 0.1),
+        ("emit", 0.15),
+        ("complete", 0.3),
+    ];
+    assert_eq!(share.seconds.len(), 8);
+    for (stage, seconds) in want {
+        let got = share
+            .seconds
+            .get(stage)
+            .unwrap_or_else(|| panic!("no {stage} in {:?}", share.seconds));
+        assert!((got - seconds).abs() < 1e-9, "{stage}: {got} != {seconds}");
+    }
+    // Host share: 30.9 s of the 60.9 s between the scrapes is host time (every stage but
+    // device_wait, `launch` included: its graph launch blocks while the GPU idles).
+    let expected = 30.9 / 60.9;
+    assert!(
+        (share.host_share - expected).abs() < 1e-9,
+        "host_share {} != {expected}",
+        share.host_share
+    );
+
+    // Moving 1 s from `launch` (host) to `device_wait` (GPU) lowers the share; the total is
+    // unchanged and device_wait's delta rises to 31.0.
+    let moved = after
+        .replace(
+            r#"turbine_engine_iteration_seconds_sum{stage="launch"} 30.2"#,
+            r#"turbine_engine_iteration_seconds_sum{stage="launch"} 29.2"#,
+        )
+        .replace(
+            r#"turbine_engine_iteration_seconds_sum{stage="device_wait"} 45.5"#,
+            r#"turbine_engine_iteration_seconds_sum{stage="device_wait"} 46.5"#,
+        );
+    assert_ne!(
+        moved, after,
+        "the fixture strings the replace targets moved"
+    );
+    let share2 = turbine_bench::stage_share::stage_share(&before, &moved).unwrap();
+    assert!(
+        (share2.seconds["device_wait"] - 31.0).abs() < 1e-9,
+        "{}",
+        share2.seconds["device_wait"]
+    );
+    assert!(
+        share2.host_share < share.host_share,
+        "{} not < {}",
+        share2.host_share,
+        share.host_share
+    );
+
+    // The CLI: `stage-share --before f --after f` has no iteration between its scrapes and
+    // exits 2 naming the error.
+    let exe = env!("CARGO_BIN_EXE_turbine-bench");
+    let before_path = fixtures.join("stage_share_before.txt");
+    let after_path = fixtures.join("stage_share_after.txt");
+    let out = std::process::Command::new(exe)
+        .args([
+            "stage-share",
+            "--before",
+            before_path.to_str().unwrap(),
+            "--after",
+            after_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "exit 0 on a measured interval");
+    let out = std::process::Command::new(exe)
+        .args([
+            "stage-share",
+            "--before",
+            before_path.to_str().unwrap(),
+            "--after",
+            before_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "exit 2 with no iterations");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(said.contains("NoIterations"), "{said}");
+}
