@@ -47,12 +47,14 @@ pub struct KvConfig {
     /// The last N full blocks of a sequence at demotion time leave L0 at the L0 format,
     /// whatever the tier's format (P6b S-2, user decision 2026-09-28, Q13); 0..=64.
     pub lossless_tail_blocks: u32,
-    /// The newest N full blocks of each live sequence hold BF16 pages while the L0 base format
-    /// is lossy (P6b S-5, the recent window; user decision 2026-10-02, "6b Task 13", 1 C);
-    /// 0..=64. A block that leaves the window is recompressed in place into the L0 base
-    /// format. Only with a lossy `kv.dtype`. Default 1 (one block, `kv.block_tokens` tokens:
-    /// it matches `kv.lossless_tail_blocks` and the newest tokens carry most of an attention
-    /// row's mass; larger values trade L0 capacity for exactness); 0 turns the window off.
+    /// The newest N full blocks of each live sequence hold BF16 pages while the L0 base
+    /// format is window-eligible — TurboQuant (`bf16` and `fp8_e4m3` are lossless-with-
+    /// matched-scales bases and get no window; P6b S-5, the recent window; user decision
+    /// 2026-10-02, "6b Task 13", 1 C); 0..=64. A block that leaves the window is recompressed
+    /// in place into the L0 base format. Only with a window-eligible `kv.dtype`. Default 1
+    /// (one block, `kv.block_tokens` tokens: it matches `kv.lossless_tail_blocks` and the
+    /// newest tokens carry most of an attention row's mass; larger values trade L0 capacity
+    /// for exactness); 0 turns the window off.
     pub recent_window_blocks: u32,
     /// Whether requests without `x-turbine-kv-lossy` may reuse lossy cached blocks (P6b S-3,
     /// Q15).
@@ -130,6 +132,18 @@ impl KvDtypeChoice {
     /// True for a TurboQuant format (`tq4`, `tq2`).
     pub fn is_turboquant(self) -> bool {
         matches!(self, KvDtypeChoice::Tq4 | KvDtypeChoice::Tq2)
+    }
+
+    /// True when the recent window (P6b S-5) applies to this L0 base format. The window
+    /// softens a lossy base — TurboQuant pages, whose approximation error is Turbine's own.
+    /// `bf16` and `fp8_e4m3` hold the format's reference representation (`fp8_e4m3` with the
+    /// served per-layer scales is lossless with matched scales, P6b S-1: the quantize at
+    /// append is what the FP8-KV golden reference emulates), so holding a base-format
+    /// sequence's newest blocks at BF16 would deviate from the format's defined numerics —
+    /// the window does not apply (user decision 2026-10-04, "6b exit: llama fp8-KV golden
+    /// fails deterministically", A).
+    pub fn recent_window_base(self) -> bool {
+        self.is_turboquant()
     }
 }
 

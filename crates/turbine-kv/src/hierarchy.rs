@@ -75,8 +75,9 @@ pub struct HierarchyConfig {
     /// sequence finishes (user decision 2026-10-03, "6b: stale lossless-tail tags and the tq4
     /// lab bound", 1 A), so an earlier finished sequence's tail demotes like any other block.
     pub lossless_tail_blocks: u32,
-    /// `kv.recent_window_blocks`: while the L0 base format is lossy, the newest N full blocks
-    /// of each live sequence hold BF16 pages (S-5); a block that leaves the window is
+    /// `kv.recent_window_blocks`: while the L0 base format is window-eligible (TurboQuant —
+    /// `bf16` and `fp8_e4m3` are lossless-with-matched-scales bases), the newest N full
+    /// blocks of each live sequence hold BF16 pages (S-5); a block that leaves the window is
     /// recompressed in place into the L0 base format. 0 turns the window off.
     pub recent_window_blocks: u32,
     /// The L0 page format's name (`kv.dtype`): `l0` ranks at its rung ([`codec::tier_rung`]),
@@ -197,9 +198,10 @@ impl HierarchyConfig {
     }
 }
 
-/// `kv.recent_window_blocks` as the hierarchy holds it: only with a lossy `kv.dtype` (S-5).
+/// `kv.recent_window_blocks` as the hierarchy holds it: only with a window-eligible (TurboQuant)
+/// `kv.dtype` (S-5; `bf16` and `fp8_e4m3` are lossless-with-matched-scales bases, no window).
 fn window_blocks(kv: &KvConfig) -> u32 {
-    if kv.dtype.is_lossy() {
+    if kv.dtype.recent_window_base() {
         kv.recent_window_blocks
     } else {
         0
