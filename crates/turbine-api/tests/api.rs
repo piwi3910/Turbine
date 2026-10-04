@@ -1896,6 +1896,8 @@ fn check_labels(line: &str) {
         "tier_degraded",
         "below_min_value",
         "no_room",
+        // P5p S-5: a reclaimed L0-only partial entry.
+        "partial_l0_only",
         "all_l0",
         "retrieve_cheaper",
         "recompute_cheaper",
