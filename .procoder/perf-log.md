@@ -1243,7 +1243,7 @@ Recording notes: the first c16 upload (67036a79) initially failed labbook's auto
 ### Tasks 5–6: configuration keys and the token-granular match (host-only, 2026-10-04)
 
 `feat(core): phase 5p configuration keys` (4e44d0ac) and `feat(kv): token-granular match of the
-last prefix block` (a10daf4d), both gate-clean (whole-workspace, 970 tests). Host-only landing per
+last prefix block` (555671c5), both gate-clean (whole listed scope, 973 tests). Host-only landing per
 the rotation: the lab A/B (`lab-bench.sh --multi-turn` against the S-2 baseline, the S-13 targets
 `mt_cached` ≥ 0.917 / `mt_ttft_later_p50` ≤ 72 ms) is deferred to the Task 8 landing, where the
 engine consumes `plan.partial_tokens` and the tail copies run; nothing observable changed on a
