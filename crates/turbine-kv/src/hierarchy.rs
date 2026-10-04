@@ -70,8 +70,10 @@ pub struct HierarchyConfig {
     /// S-2); `l0` keeps the L0 bytes unchanged.
     pub l1_format: &'static str,
     pub l2_format: &'static str,
-    /// `kv.lossless_tail_blocks`: the last N full blocks of a finished sequence are demoted at
-    /// the L0 format whatever the tier's format.
+    /// `kv.lossless_tail_blocks`: the last N full blocks of the latest finished sequence are
+    /// demoted at the L0 format whatever the tier's format; the tags expire when a later
+    /// sequence finishes (user decision 2026-10-03, "6b: stale lossless-tail tags and the tq4
+    /// lab bound", 1 A), so an earlier finished sequence's tail demotes like any other block.
     pub lossless_tail_blocks: u32,
     /// `kv.recent_window_blocks`: while the L0 base format is lossy, the newest N full blocks
     /// of each live sequence hold BF16 pages (S-5); a block that leaves the window is
@@ -575,7 +577,10 @@ pub struct KvHierarchy {
     layout: KvLayout,
     shards: u32,
     /// Keys within the last `lossless_tail_blocks` full blocks of the latest finished sequence
-    /// that holds them (P6b S-2): demoted at the L0 format. Entries leave with their block.
+    /// (P6b S-2): demoted at the L0 format. The set holds one sequence's tags at a time — a
+    /// later finish expires the previous sequence's (user decision 2026-10-03, "6b: stale
+    /// lossless-tail tags and the tq4 lab bound", 1 A) — and entries also leave with their
+    /// block.
     tail: HashSet<KvKey>,
     pending: HashMap<RequestId, Pending>,
     requests: HashMap<RequestId, RequestKv>,
@@ -1439,17 +1444,20 @@ impl KvHierarchy {
             for key in r.keys.iter().skip(r.committed) {
                 self.dir.clear_pending(key);
             }
-            // The sequence's last full blocks form its lossless tail (P6b S-2); its earlier
-            // blocks are no longer the tail of the latest sequence holding them.
-            // Directory entries, so a lossy-promoted attached block names its lossy entry.
+            // The sequence's last full blocks form its lossless tail (P6b S-2), and the tags
+            // expire with the latest finished sequence (user decision 2026-10-03, "6b: stale
+            // lossless-tail tags and the tq4 lab bound", 1 A): a finished sequence cannot grow
+            // out of its tail, so the tag's purpose — the newest demoted block of a growing
+            // sequence stays exact — is served while it is held, and a later finish replaces
+            // the set instead of accumulating one tag per finished sequence (the unbounded set,
+            // a raw lower-tier copy per finished sequence and the ladder's permanent L0-sweep
+            // skip on those blocks go with it). An expired block demotes and evicts like any
+            // other; entries also leave with their block (`forget`). Directory entries, so a
+            // lossy-promoted attached block names its lossy entry.
             let committed: Vec<KvKey> = (0..r.committed).map(|i| r.entry(i)).collect();
-            let cut = committed
-                .len()
-                .saturating_sub(self.cfg.lossless_tail_blocks as usize);
-            for key in &committed[..cut] {
-                self.tail.remove(key);
-            }
-            for key in &committed[cut..] {
+            self.tail.clear();
+            let take = self.cfg.lossless_tail_blocks as usize;
+            for key in committed.iter().rev().take(take) {
                 if self.dir.get(key).is_some() {
                     self.tail.insert(*key);
                 }
@@ -4393,6 +4401,117 @@ pub(crate) mod tests {
             "{l0:?}"
         );
         assert!(tier("l1").formats.is_empty());
+    }
+
+    /// The L1 format of `key`'s copy, if any.
+    fn l1_format_of(r: &Rig, key: &KvKey) -> Option<&'static str> {
+        r.h.dir
+            .get(key)
+            .and_then(|b| b.location(TierId::L1))
+            .map(|l| l.format)
+    }
+
+    /// Expiry (user decision 2026-10-03, "6b: stale lossless-tail tags and the tq4 lab bound",
+    /// 1 A): the tail set holds only the latest finished sequence's last full blocks. When a
+    /// later sequence finishes, the earlier one's tags expire — its tail block demotes encoded
+    /// from then on, and the set stays bounded at `lossless_tail_blocks`. Breaks if an expired
+    /// tail still demotes at the L0 format, or if more than the latest sequence's tail is
+    /// tagged.
+    #[test]
+    fn a_later_finish_expires_the_previous_sequence_tail() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 32 * bb, arc));
+        let mut r = rig(16, Some(l1), None, clock);
+        r.h.cfg.l1_format = "fp8_e4m3";
+        let a: Vec<u32> = (0..66).collect();
+        let b: Vec<u32> = (5_000..5_066).collect();
+        run(&mut r, &a);
+        run(&mut r, &b);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let a_keys = prefix_keys(&hasher, &a, 16);
+        let b_keys = prefix_keys(&hasher, &b, 16);
+        assert_eq!(a_keys.len(), 4);
+        assert!(
+            !r.h.tail.is_empty() && r.h.tail.iter().all(|k| b_keys.contains(k)),
+            "only the latest finished sequence's tail is tagged: {:?}",
+            r.h.tail
+        );
+
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        settle(&mut r);
+        assert_eq!(
+            l1_format_of(&r, a_keys.last().unwrap()),
+            Some("fp8_e4m3"),
+            "the expired tail demotes encoded"
+        );
+        assert_eq!(
+            l1_format_of(&r, b_keys.last().unwrap()),
+            Some(L0_FORMAT),
+            "the latest finished sequence's tail demotes at the L0 format"
+        );
+    }
+
+    /// S-2 (user decision 2026-09-28, Q13) while a sequence grows: the latest finished
+    /// sequence's tail keeps its tag — and with it its exact demotion — until the sequence's
+    /// next turn finishes and the tail re-tags to that turn's last full blocks. Breaks if a
+    /// growing sequence's newest demoted block loses its exact handling before the turn that
+    /// grows it finishes.
+    #[test]
+    fn a_growing_sequence_keeps_its_tail_exact_until_the_turn_finishes() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 32 * bb, arc));
+        let mut r = rig(16, Some(l1), None, clock);
+        r.h.cfg.l1_format = "fp8_e4m3";
+        let turn1: Vec<u32> = (0..66).collect();
+        run(&mut r, &turn1);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys1 = prefix_keys(&hasher, &turn1, 16);
+
+        // Turn 2 grows the same sequence: attach (the L0 blocks come back by reference),
+        // prefill the longer prompt, release — the request stays live.
+        let turn2: Vec<u32> = (0..98).collect();
+        let id = RequestId::new_v4();
+        let a = match attach(&mut r, id, &turn2) {
+            AttachOutcome::Ready(a) => a,
+            other => panic!("expected Ready, got {other:?}"),
+        };
+        let bt = r.pool.layout().block_tokens as usize;
+        let need = turn2.len().div_ceil(bt) - a.blocks.len();
+        let mut table: Vec<BlockId> = a.blocks.to_vec();
+        table.extend(r.pool.allocate(need as u32).expect("room for the prompt"));
+        r.h.commit_progress(&mut r.pool, id, &table, &turn2);
+        r.pool.release(&table);
+        assert!(
+            r.h.tail.contains(keys1.last().unwrap()),
+            "the growing sequence's previous tail keeps its tag"
+        );
+
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        settle(&mut r);
+        assert_eq!(
+            l1_format_of(&r, keys1.last().unwrap()),
+            Some(L0_FORMAT),
+            "the growing sequence's newest demoted block demotes exact"
+        );
+
+        // The turn finishes: the tail re-tags to its last full block and the previous one's
+        // tag is gone.
+        r.h.request_done(&mut r.pool, id, false);
+        assert!(
+            !r.h.tail.contains(keys1.last().unwrap()),
+            "the re-tagged tail expired the previous turn's: {:?}",
+            r.h.tail
+        );
+        let keys2 = prefix_keys(&hasher, &turn2, 16);
+        assert!(
+            r.h.tail.iter().all(|k| keys2.contains(k)) && !r.h.tail.is_empty(),
+            "{:?}",
+            r.h.tail
+        );
     }
 
     /// Attach (waiting for promotions), prefill and finish `prompt`; the attach.
