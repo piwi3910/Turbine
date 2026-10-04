@@ -1,5 +1,23 @@
 # Handoff: Phase 6b lead
 
+## Phase 6b CLOSED (2026-10-04) — merged into local main, paused before 5p
+
+Local `main` = 3a60ca9f (`merge phase-6b-kv-compression`), NOT pushed. `p6b-stack` = cce55fd9 (same tree). All 19 plan
+tasks done; every exit tier green (gate --full 959–961/0, full GPU tier incl. the fixed stale hip_ops tests, two-GPU
+fault-injection 27/0, golden16 × 9 with llama-fp8kv restored by the recent-window base fix, ladder soak 8/8 with
+kv_idle true after the used_bytes fix). Final gfx1201 KV rows: lower-tier fp8_e4m3 + tq4 `supported`; lower-tier tq2,
+L0 tq4 `experimental`; L0 tq2 refused; the ladder incl. its L0 step is opt-in with a documented throughput/tail trade
+(user decision 2026-10-04 A).
+
+Recorded follow-ups (not blockers): ladder serving-cost investigation; FP8 c1 ITL; MXFP4 prefill kernel; OLMoE BF16
+0.982×; slab mixing (B-style reformat) — 128 MiB slabs landed but mixing never triggered in the workloads; upstream
+ROCm items (rocm-systems#12677, rocm-libraries#12895 + PR #12900). kv_sim attach-order nondeterminism (HashMap
+iteration) noted by t17 — S-6's fixture may deserve the S-7 treatment.
+
+Next per the roadmap: `phase-5p-serving-efficiency` (its spec is not written; `scripts/track-gate.sh
+phase-5p-serving-efficiency` does not accept that name yet — the phase-7 gate rule was amended for 6b's end state).
+Paused until the user says go (the 6a-close pattern).
+
 ## PAUSED 2026-10-02 (user: "when possible lets pause our work") — START HERE
 
 Integration branch `p6b-stack` (worktree `agent-p6b-t2`), last gate ok 935 passed. Nothing of ours runs on novanas.
