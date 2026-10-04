@@ -1057,6 +1057,70 @@ fn recent_window_serves_on_cpu() {
     );
 }
 
+/// P6b S-5 (user decision 2026-10-04, "6b exit: llama fp8-KV golden fails deterministically",
+/// A): the recent window softens a LOSSY base format only. `fp8_e4m3` with the served scales
+/// is the format's lossless-with-matched-scales representation (P6b S-1, P6a S-13) — with it
+/// as the L0 base and the default `kv.recent_window_blocks: 1` the pool stays flat (no BF16
+/// window class, no window conversion), and the served tokens match a `recent_window_blocks: 0`
+/// server: the 6a bytes the FP8-KV golden was calibrated on. Breaks if the window applies to
+/// the fp8 base (the newest blocks would hold BF16 pages and shift the served numerics).
+#[test]
+fn recent_window_skips_lossless_fp8kv_base() {
+    // Serves two completions (the second drives the engine's ticks, where window exits would
+    // run) and returns their first choice's token ids plus the window observables.
+    let serve = |kv_extra: &str| {
+        let server = TinyServer::launch(&Setup {
+            kv_extra,
+            capture_logs: true,
+            ..Setup::default()
+        });
+        let resp = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 300,
+                    "ignore_eos": true, "temperature": 0, "logprobs": 20,
+                    "return_tokens_as_token_ids": true}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let resp2 = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Again", "max_tokens": 8,
+                    "ignore_eos": true, "temperature": 0}),
+        );
+        assert_eq!(resp2.status, 200, "{}", resp2.body);
+        let ids = choice_token_ids(&resp.json()["choices"][0]);
+        assert_eq!(ids.len(), 300);
+        let window_actions = server.metrics().lines().any(|l| {
+            l.starts_with("turbine_kv_ladder_actions_total{")
+                && l.contains("reason=\"recent_window\"")
+                && l.rsplit(' ')
+                    .next()
+                    .is_some_and(|v| v.parse::<f64>().is_ok_and(|v| v > 0.0))
+        });
+        let classed = server
+            .logs
+            .as_ref()
+            .expect("logs captured")
+            .lock()
+            .unwrap()
+            .contains("kv_page_classes");
+        (ids, classed, window_actions)
+    };
+
+    // The default: `kv.dtype: fp8_e4m3`, `kv.recent_window_blocks: 1`.
+    let (ids, classed, window_actions) = serve("  dtype: fp8_e4m3\n");
+    assert!(
+        !classed,
+        "the fp8 base pool must stay flat: no BF16 window class"
+    );
+    assert!(
+        !window_actions,
+        "no recent-window conversion runs on a lossless base"
+    );
+    // The same server with the window off serves the same bytes.
+    let (ids_off, _, _) = serve("  dtype: fp8_e4m3\n  recent_window_blocks: 0\n");
+    assert_eq!(ids, ids_off, "the window must not change fp8-KV numerics");
+}
+
 /// P6b S-3 / S-5 (user decision 2026-10-02, "6b Task 13", 4 A): over TurboQuant L0 pages a
 /// reused prefix is served from lossy blocks, so the second run of a 201-token prompt reports
 /// its full 128-token block as both `cached_tokens` and `lossy_cached_tokens`, and

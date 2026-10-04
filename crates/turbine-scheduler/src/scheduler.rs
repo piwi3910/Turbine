@@ -63,12 +63,13 @@ pub struct SchedulerParams {
     pub max_seq_len: u32,
     pub queue_timeout: Duration,
     /// The recent window (P6b S-5): the newest full blocks of each live sequence are allocated
-    /// in the BF16 page class while the L0 base format is lossy; a block that leaves the
-    /// window is recompressed by the KV hierarchy. `None` with the window off.
+    /// in the BF16 page class while the L0 base format is window-eligible (TurboQuant); a
+    /// block that leaves the window is recompressed by the KV hierarchy. `None` with the
+    /// window off.
     pub recent_window: Option<RecentWindow>,
 }
 
-/// The recent window (P6b S-5, `kv.recent_window_blocks` with a lossy `kv.dtype`).
+/// The recent window (P6b S-5, `kv.recent_window_blocks` with a window-eligible `kv.dtype`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RecentWindow {
     /// How many of a sequence's newest full blocks hold BF16 pages.
@@ -90,12 +91,11 @@ impl SchedulerParams {
             free_watermark: 0.01,
             max_seq_len,
             queue_timeout: cfg.reliability.admission.queue_timeout.0,
-            recent_window: (cfg.kv.dtype.is_lossy() && cfg.kv.recent_window_blocks > 0).then_some(
-                RecentWindow {
+            recent_window: (cfg.kv.dtype.recent_window_base() && cfg.kv.recent_window_blocks > 0)
+                .then_some(RecentWindow {
                     blocks: cfg.kv.recent_window_blocks,
                     format: "bf16",
-                },
-            ),
+                }),
         }
     }
 }

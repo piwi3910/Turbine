@@ -105,7 +105,8 @@ pub(crate) fn record_quantization(
 /// seed of their KV namespace ([`crate::kv_tq`]); on one device only (`sharded`: a tensor,
 /// expert or pipeline rank is refused with `kv_tq_unavailable`, never served as BF16 pages).
 /// The TurboQuant tables of a classed pool without TurboQuant pages (P6b S-7): the pool grows
-/// page classes for the recent window (a lossy base format with `kv.recent_window_blocks`) or
+/// page classes for the recent window (a window-eligible, TurboQuant base format with
+/// `kv.recent_window_blocks`) or
 /// the ladder's L0 rungs (`kv.ladder.l0`), and the v2.11 mixed-format paged attention
 /// descriptor carries the layer's tables whenever a block table mixes formats — TurboQuant
 /// pages among them or not. The tables come from the pool's own namespace seed, so a ladder
@@ -116,7 +117,7 @@ fn classed_tables(
     config: &Config,
     arch: &turbine_model::config::ModelArchConfig,
 ) -> Result<Option<turbine_model::kv_scales::TqKv>, StartupError> {
-    let classed = config.kv.dtype.is_lossy() && config.kv.recent_window_blocks > 0
+    let classed = config.kv.dtype.recent_window_base() && config.kv.recent_window_blocks > 0
         || (config.kv.ladder.enabled && config.kv.ladder.l0);
     if !classed {
         return Ok(None);
@@ -1390,7 +1391,8 @@ pub(crate) fn post_load_budget(
 /// The L0 pool's block count after the weights load: the budget's `kv` pool, at most the
 /// pre-load size.
 /// The page classes the L0 pool grows on demand (P6b S-5, S-7): the recent window's BF16
-/// class with a lossy `kv.dtype`, and every ladder rung below the L0 base format when
+/// class with a window-eligible (TurboQuant) `kv.dtype`, and every ladder rung below the L0
+/// base format when
 /// `kv.ladder.l0`. Page sizes follow the L0 layout's codec convention (a BF16 class holds a
 /// BF16-layout block). A one-page slab converts a single free base page, so a near-full pool
 /// can still compress.
@@ -1401,7 +1403,7 @@ fn l0_page_classes(
     let base_rank = turbine_kv::codec::tier_rung("l0", kv.dtype.as_str()).unwrap_or(0);
     let max_rank = turbine_kv::codec::tier_rung(kv.ladder.max_format.as_str(), kv.dtype.as_str());
     let mut out: Vec<turbine_kv::pool::PageClass> = Vec::new();
-    if kv.dtype.is_lossy() && kv.recent_window_blocks > 0 {
+    if kv.dtype.recent_window_base() && kv.recent_window_blocks > 0 {
         let bf16 = KvLayout {
             dtype: turbine_core::types::DType::BF16,
             ..*layout
