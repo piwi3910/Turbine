@@ -714,9 +714,12 @@ impl BlockPool {
                 .map_or(0, |s| s.classes.iter().map(|c| c.cached).sum::<u32>())
     }
 
-    /// Blocks with at least one holder.
+    /// Blocks with at least one holder: every allocated page less every cached unreferenced
+    /// one, the base class and the page classes alike (a classed copy the ladder's L0 rung or
+    /// the recent window left cached is not a holder; the P6b-exit soak's `kv_idle` failure
+    /// read this through `EngineLoop::sync_kv_held`).
     pub fn referenced_blocks(&self) -> u32 {
-        self.used_blocks() - self.cached
+        self.used_blocks() - self.cached_unreferenced()
     }
 
     /// Free plus cached unreferenced base blocks: what `allocate` can hand out.
@@ -1109,6 +1112,58 @@ mod tests {
         assert_eq!(p.used_blocks(), 2);
         p.release(&[BlockId(0), BlockId(1)]);
         assert_eq!(p.used_blocks(), 0);
+    }
+
+    /// P6b exit (the ladder soak's `kv_idle` failure, 2026-10-04): a cached unreferenced page
+    /// of a non-base class is not referenced. `referenced_blocks` feeds the ledger's `kv` held
+    /// bytes (`sync_kv_held`) and the pressure document's kv pool, so a phantom referenced
+    /// count keeps `kv_utilization` up and the soak's idle check false forever once the
+    /// ladder's L0 rung or the recent window leaves classed copies cached at idle. Breaks if
+    /// `referenced_blocks` subtracts only the base class's cached count.
+    #[test]
+    fn classed_cached_pages_are_not_referenced() {
+        let layout = KvLayout {
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 16,
+        };
+        let classes = [PageClass {
+            format: "tq4",
+            page_bytes: 2 * 2 * 16 * 144,
+        }];
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 23);
+        let mut p = BlockPool::new(
+            BlockPoolConfig {
+                layout,
+                num_blocks: 16,
+            },
+            mem,
+        )
+        .unwrap()
+        .with_page_classes(&classes, 4)
+        .unwrap();
+        // A live base block and a live classed page are both referenced.
+        let base = p.allocate(2).unwrap();
+        let classed = p.allocate_in("tq4", 1).unwrap();
+        assert_eq!(p.referenced_blocks(), 3);
+        // The classed page finishes and stays cached: keyed, then released.
+        p.set_keyed(classed[0]);
+        p.release(&classed);
+        assert_eq!(p.cached_unreferenced(), 1);
+        assert_eq!(
+            p.referenced_blocks(),
+            2,
+            "the cached classed page is not referenced"
+        );
+        // And so is a cached base page; the other base block stays held.
+        p.set_keyed(base[0]);
+        p.release(&[base[0]]);
+        assert_eq!(p.cached_unreferenced(), 2);
+        assert_eq!(p.referenced_blocks(), 1, "only the held block");
+        p.release(&[base[1]]);
+        assert_eq!(p.referenced_blocks(), 0, "idle: nothing referenced");
     }
 
     /// P6b S-5: page classes carved from the one allocation. A realistic layout (2 layers,
