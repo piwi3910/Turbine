@@ -24,8 +24,12 @@ lock of this branch; nothing pushed.
   and by `kv_sim recent_window_holds_newest_blocks_at_bf16` (idle with a cached BF16 window
   page → referenced 0), both red at the old subtraction — the kv_sim one reproduces the soak
   state on the cpu backend. Criterion unchanged; GPU soak rerun left to the lead.
-- `fix(scripts)` `ff855c42` — **phase-7 track gate.** `closed_rows kv_compression` accepts any
-  amd tq4/tq2 row in `supported` or `experimental` state; the failure message names exactly
+- `fix(scripts)` `ff855c42` — **phase-7 track gate.** Real-tree check (novanas, the live
+  `--support-matrix` text, `target/exitfix/support-matrix.txt`): the order check no longer
+  fails — the gate's only remaining line is "phase-7-model-families.md does not exist; write
+  it with /procoder:spec", correct before track 2 starts (the spec is written at start);
+  `lab_scripts track_gate` proves the full GATE PASS with a stub spec. `closed_rows
+  kv_compression` accepts any amd tq4/tq2 row in `supported` or `experimental` state; the failure message names exactly
   what is accepted (L0 tq4 rows `experimental`, tq2 an `experimental` lower-tier rung with no
   amd matrix row, L0 tq2 refused; a refused tq4 row still fails; the phase-7 spec owns any
   flip). `lab_scripts track_gate` covers experimental (pass), refused (fail) and supported
