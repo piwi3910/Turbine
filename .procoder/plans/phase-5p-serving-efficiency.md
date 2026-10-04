@@ -372,7 +372,21 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(kv): slab drain-and-reformat — compressed copies actually store`
 
-## Task 18: Phase exit — full suites, multi-GPU, soak, docs
+## Task 18: Decode bandwidth — batch-1 kernels toward peak memory bandwidth (S-19)
+
+Files: `crates/turbine-kernels/` (batch-1 decode path: fused rmsnorm+quantize+GEMV or per-shape GEMV selection; the gemm_tune table grows a batch-1 shape), `crates/turbine-model/src/` (the decoder's batch-1 kernel choice), `kernels/rocm/` (any new fused kernel + the impl-table entry), `benches/turbine-bench/` (the bandwidth report), `.procoder/perf-log.md`, `.procoder/specs/phase-5p-serving-efficiency.md` (S-19)
+Interfaces:
+
+- `S-19`: the batch-1 decode step's effective weight-read bandwidth (weights bytes ÷ step time) rises from the measured ~500 GB/s (0.56 × peak) toward peak; reported as `host_share`-adjacent evidence and a bandwidth figure per model; outputs bit-identical or within the golden tolerance
+  Covers: the measured roofline gap (S-2's c1 baseline: 77.8 tok/s ≈ 500 GB/s vs ~900 GB/s peak; host share 0.37 %, so the gap is inside kernel execution)
+  Depends on: Task 3
+
+- [ ] Profile: with the S-2 stage-share machinery plus rocprofv3, account the batch-1 decode step per kernel — GEMV vs norm/rope/attention vs inter-kernel gaps — on Llama and OLMoE; identify where the 45 % goes
+- [ ] Fix the dominant cause(s) test-first: fused batch-1 kernels (e.g. rmsnorm+quantize into the GEMV), per-shape GEMV selection through the gemm_tune table, fewer passes over activations; every output change stays within the golden tolerance (compare runs bit-identical preferred)
+- [ ] Landing (GPU 0): the bandwidth figure before/after per model, c1 tok/s before/after against the 77.8/126.0 baselines, golden1 PASS; the standard c16 bench within the no-regression bound
+- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+
+## Task 19: Phase exit — full suites, multi-GPU, soak, docs
 
 Files: `AGENTS.md` (Commands: `stage-share`, the new `lab-bench.sh` flags, `scheduler.policy: cache_aware`, `kv.partial_prefix_reuse`, `structured_output.jump_forward*`; project state: Phase 5p done), `examples/turbine.yaml` (final comments), `.procoder/perf-log.md` (phase summary row), `.procoder/specs/phase-5p-serving-efficiency.md` (tick criteria with evidence)
 Interfaces:
