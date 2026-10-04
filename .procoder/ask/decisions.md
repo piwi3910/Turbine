@@ -3265,3 +3265,25 @@ token-granular splits treat them conservatively as `lossy_source` (no partial re
 conservative default is safe, and the same block leaves the window (→ base format) soon anyway; relaxing is a later
 micro-optimization if the metrics show it matters. (3) Contract §25 updated: `PartialOutcome` gains `LossySource`
 (matching children hold lossy rung-class pages or lossy lineage → no partial match), matching the implementation.
+
+## Phase 5p Task 18: decode-bandwidth kernel choices and the S-19 peak correction (2026-10-05, agent under the Task 18 brief)
+
+The Task 18 profile (perf log "Task 18", traces under `target/decodebw/`) measured the card's real peak at **640 GB/s** (R9700: 256-bit, 20 Gbps GDDR6) — the S-19 draft's "~500 GB/s ≈ 0.56 × peak" assumed ~900. Spec S-19 is amended accordingly; the criterion (a recorded factor, golden-safe, c16 within bound) is unchanged. Llama's four dense GEMVs already run at 551–633 GB/s (86–99 % of peak), so the hipBLASLt table's m=1 rows are at the memory wall and no GEMV rewrite is started there.
+
+**Kernel reuse (the AGENTS.md rule, evaluated before touching the small-m MoE path):** llama.cpp has no grouped small-batch MoE GEMV for RDNA/HIP (its HIP backend runs per-expert `mul_mat` through the generic GEMM paths; its `mul_mat_vec` specializations target dense batch-1); Composable Kernel ships no grouped-expert small-m kernel (its fmha and GEMM families were already the Phase 2c evaluation). Turbine's `moe_wmma_gemv` stays; the landed changes are launch-geometry only.
+
+**Bit-exactness constraints held:** the OLMoE shapes stay batch-invariant (2026-09-27 answer (c)), so `kGemvUnroll` (it reorders the F32 chain across k) was rejected after measuring and `kGemvWaves`/scatter-CTA changes (mapping only) landed; the CK rmsnorm bucket for OLMoE's plain n=2048 was NOT taken — `rmsnorm_sharded` asserts bitwise equality against the plain kernel at 2048, and relaxing that is a Phase 5 tp constraint, not a perf call.
+
+## 5p Task 18 follow-ups: the remaining decode-bandwidth options (recorded, not tasked, 2026-10-04)
+
+After the moe_scatter fix (merged; OLMoE c1 +7.2 %, S-19 met on that leg) and the peak correction (the R9700 is
+640 GB/s, so Llama's dense GEMVs already run at 86–99 % of peak — the S-19 draft's ~900 was wrong, spec amended), the
+remaining measured options, each with its size:
+
+1. K-split small-m MoE GEMV with a fixed reduction tree: ~0.9 ms per step, but a new summation order (numerics class)
+   → needs a golden re-check
+2. Routing-chain fusion (gate/logits elementwise): ~0.4 ms
+3. CK rmsnorm at n=2048: blocked by the `rmsnorm_sharded` bitwise constraint — a numerics decision the lead must take
+   before it can be evaluated
+4. Llama side: rope+append fusion, b1 attention selection, inter-kernel gap work (the Llama GEMVs are at the wall;
+   these are the only Llama items left)
