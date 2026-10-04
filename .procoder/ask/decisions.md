@@ -3156,3 +3156,17 @@ byte-exact; the lower-tier `supported` evidence stands.
    the −2 floor) replaces the flat 0.25, matching the `turbine-golden compare` rule; t9's flat bound assumed an exact
    tail block. Builder recommendation, accepted. Test-policy detail, not a user decision (as in "Golden tolerance floor
    for quantized checkpoints", 2026-09-29).
+
+## 6b Task 18: the L0 ladder's throughput/tail trade-off (2026-10-04)
+
+From `p6b-t18` (merged; perf log, labbook). Task 18's gates all PASS: eval median −0.02 (candidate better), McNemar
+n.s., lossy ratio 0.927; golden16 with the L0 ladder c1/c16 PASS (781.1 tok/s); soak 8/8 with 1,148 L0 actions. The
+multi-turn A/B keeps the ladder-on trade-off in a stronger form: recomputed tokens −23 %, cached ratio 0.860 vs 0.837,
+but tok/s 233 vs 304 and later-turn TTFT p99 35.1 vs 12.4 s — with the L0 step added, the server spends more time at
+ORANGE (L0 rewrites occupy the rewrite lanes and the ORANGE throttle costs throughput) while cutting recompute.
+
+- A) Accept as opt-in: the ladder is off by default; Task 18's proof documents the trade; Task 19 exits the phase
+- B) Investigate the L0-step serving cost now (rewrite-lane occupancy / ORANGE dwell) before Task 19
+- C) Gate the L0 ladder further (e.g. a tok/s bound) before calling Task 18 done
+
+**Decision (user, 2026-10-04): A.** The L0 ladder is accepted as opt-in with the documented trade; the perf investigation is a follow-up, not a Task 19 blocker.
