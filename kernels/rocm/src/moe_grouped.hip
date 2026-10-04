@@ -646,7 +646,7 @@ int32_t launch_shape(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 // waves per block time the same. The scalar kernels this replaced reached ~575
 // GB/s at 4-16 tokens and fell to ~410 at 64; the 16-row LDS tiles of
 // moe_wmma_kernel (SmallBlock) ~455.
-constexpr int kGemvWaves = 4;
+constexpr int kGemvWaves = 8;
 constexpr int kGemvUnroll = 8;
 constexpr int kGemvStep = kGemvUnroll * kMma;
 
