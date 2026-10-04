@@ -7275,8 +7275,9 @@ fn paged_mixed_classed_matches_cpu() {
         causal: true,
     };
     // Tokens 0..16 in base block 5 (tq4), 16..24 in class block 8 (bf16): a partial tail in
-    // the window class. Sequence 1 (a decode row riding along) starts in class block 9 (bf16).
-    let table = [5i32, 8, 9, -1];
+    // the window class. Sequence 1 (a decode row riding along) starts in class block 9
+    // (bf16, tokens 0..16) and appends its row into base block 6 (tq4).
+    let table = [5i32, 8, 9, 6];
     let formats = [KV_FMT_TQ4, KV_FMT_BF16, KV_FMT_BF16, KV_FMT_TQ4];
     let q_lens = [17usize, 1];
     let kv_lens = [24usize, 17];
