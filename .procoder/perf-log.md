@@ -1107,14 +1107,14 @@ at a time, `--fillers-settle`; fresh server per run, arms interleaved). Every ru
 exactly its eval: `turbine_requests_total` 232, `filler_retries` 0; every candidate's lossy
 cached ratio 0.927 (`--min-lossy-cached-ratio 0.5`), cached ratio 0.931 on both sides.
 
-| Arm | Run | accuracy | lossy cached ratio |
-| --- | --- | -------- | ------------------ |
-| ladder l0 on  | r1  | 0.795    | 0.927              |
-| ladder l0 on  | r2  | 0.785    | 0.927              |
-| ladder l0 on  | r3  | 0.765    | 0.927              |
-| ladder off    | r1  | 0.755    | 0.000              |
-| ladder off    | r2  | 0.765    | 0.000              |
-| ladder off    | r3  | 0.765    | 0.000              |
+| Arm          | Run | accuracy | lossy cached ratio |
+| ------------ | --- | -------- | ------------------ |
+| ladder l0 on | r1  | 0.795    | 0.927              |
+| ladder l0 on | r2  | 0.785    | 0.927              |
+| ladder l0 on | r3  | 0.765    | 0.927              |
+| ladder off   | r1  | 0.755    | 0.000              |
+| ladder off   | r2  | 0.765    | 0.000              |
+| ladder off   | r3  | 0.765    | 0.000              |
 
 Nine candidate × baseline pairs (`scripts/eval/paired_compare.py --max-drop 0.01`): median
 drop **−0.02**, lowest exact McNemar p 0.0768 — the gate passes with the L0 ladder on, the
@@ -1180,3 +1180,21 @@ Exit runs (Task 19, 2026-10-04, merge `29f4de10` = `af9b82af` + `p6b-smallfix`; 
 - `scripts/lab-bench.sh --golden16 --label t19-exit` for the 9 models: **PASS** for `llama` (853.7 tok/s, 1.00× the 6a-exit baseline), `olmoe` (610.3), `llama-fp8` (977.3), `llama-fp8-block` (1059.7), `llama-fp8-tensor` (976.5), `llama-awq` (1258.1), `llama-gptq-autoround` (1265.9). **FAIL for `llama-fp8kv`**, deterministically (two runs, bit-identical verdicts): golden c1 15/16 (need 14 — every prompt's token rule holds; p10 exceeds the strict likely bound 0.4274 vs 0.40, tail 0.8230 vs 2.44, identical 32-token prefix), c16 the same. The 6a exit passed this gate at 829.7 tok/s (2026-09-30), so a 6b commit moved the fp8-KV paged path's numerics just past the slug's likely bound — not bisected here. **`olmoe-fp8kv` FAIL 13/16**, exactly the 6a-exit result behind its `experimental` demotion (user decision 2026-09-30 B) — unchanged, not a new miss.
 - 10-minute ladder soak × 2 (`--shared-prefix-share 0.5`, L1 4 GiB, L2 16 GiB, `kv.ladder.enabled` + `l0` + `max_format=tq4`): both runs **fail exactly one check, `kv_idle`** — at the final scrape L0 still holds 1,556 / 1,291 blocks and L1 134 / 108, where the Task 18 soak on tree 94bd16aa (same flags) drained to idle and passed 8/8. Every other check is true in both runs (ITL p99 217 ms against calibrations 186 / 183, GREEN 0 s into the cool-down, `streams_complete`, 0 client-dropped, ladder actions 984 / 1,666 with the L0 share above 0). The only code change between the passing and failing trees is `p6b-smallfix`'s tail-tag expiry (`ecf29422`) — suspect recorded for the lead, not diagnosed here.
 - Support matrix and track gates: the full `--support-matrix --output json` is on the workstation (`target/t19/support-matrix.json`); `--check-config` with `kv.dtype=tq4 --kv.cpu.format=tq4 --kv.ladder.enabled=true` prints `support: experimental (amd/*/*/bf16/tq4/none)`, `config ok`, and `kv.cpu.format: zstd` exits 2 naming the key. `scripts/track-gate.sh phase-6b-kv-compression` → **GATE PASS**; `phase-5p-serving-efficiency` is not an argument the script accepts (it gates the phase 6–8 tracks; 5p's order evidence is 6b's close); `phase-7-model-families` → GATE FAIL "no supported amd row with tq4 or tq2 KV" — the umbrella's phase-7 start rule cannot pass after 6b's accepted end state (the L0 `tq4` rows stay `experimental`, user decisions 2026-10-02 / 2026-10-04 A) and needs amending before track 2.
+
+The llama-fp8kv golden miss root-caused: the recent window on the fp8 base (2026-10-04, branch
+`p6b-fp8kvbisect`, commit `70f22e92`, from the exit merge `5bec8eea`; logs under `target/fp8kv/`
+on the workstation). The window's eligibility predicate was `KvDtypeChoice::is_lossy()` — true
+for `fp8_e4m3` — so with the default `kv.recent_window_blocks: 1` an fp8_e4m3 L0 pool went
+classed and every sequence's newest full block (for a short prompt, its only, partial block) was
+created in the BF16 page class and served unquantized, shifting the served numerics away from
+the append-time quantize the FP8-KV golden reference emulates. p10 is a ~50-token chat prompt, so
+its whole sequence sat on a BF16 window page — the deterministic likely-bound miss (0.4274 vs
+0.40) with identical 32-token prefixes, no bisect needed. Fix: the window applies to TurboQuant
+bases only (`bf16` and `fp8_e4m3` are lossless-with-matched-scales reference representations,
+user decision 2026-10-04 A); `fp8_e4m3` pools are flat again and serve the 6a bytes. Evidence:
+new cpu test `tiny_server::recent_window_skips_lossless_fp8kv_base` red pre-fix, green post-fix
+(mutation-checked); `gate.sh` ok (959 tests); `scripts/lab-bench.sh --model llama-fp8kv --label
+fp8kvfix --golden16` on novanas GPU 0 → **golden c1 PASS 16/16** (strict bounds) **and c16 PASS
+16/16** (batched bounds), bench 838.8 tok/s (6a exit: 829.7), ITL p50 15.6 ms, 200/200 ok — the
+6a Task 24 tolerance (0.40 / 2.44) unchanged, no recalibration. Recorded in labbook
+(`67de6c5f-7579-4c47-a1f1-f3dd6da70e98`).
