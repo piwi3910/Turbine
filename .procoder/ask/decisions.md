@@ -3170,3 +3170,17 @@ ORANGE (L0 rewrites occupy the rewrite lanes and the ORANGE throttle costs throu
 - C) Gate the L0 ladder further (e.g. a tok/s bound) before calling Task 18 done
 
 **Decision (user, 2026-10-04): A.** The L0 ladder is accepted as opt-in with the documented trade; the perf investigation is a follow-up, not a Task 19 blocker.
+
+## 6b exit: llama fp8-KV golden fails deterministically (2026-10-04)
+
+From the Task 19 exit (`p6b-exit`): `lab-bench --golden16 --model llama-fp8kv` FAILs c1 15/16 (p10 likely |Δ| 0.4274 vs
+the 0.40 bound from the 6a Task 24 calibration); deterministic, token rule intact. 6a's exit passed. Some 6b commit
+shifted fp8-KV numerics past the slug bound. Hypothesis to check first: the BF16 recent window may be applying to the
+fp8_e4m3 base (which the spec calls lossless-with-matched-scales, i.e. should have NO window) — the newest blocks at
+BF16 would shift exactly this kind of per-prompt margin.
+
+- A) Diagnose first: bisect to the commit, check the window-applied-to-lossless-base hypothesis (a bug → fix, window
+  must not apply when the base format is lossless-with-matched-scales); recalibrate only if the shift is a legitimate,
+  accepted semantics change; revisit the row only if it cannot be restored
+- B) Recalibrate the slug bound now (accept the shift as within lossy-KV tolerance)
+- C) Demote llama fp8-KV to `experimental` (as OLMoE's was)
