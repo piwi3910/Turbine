@@ -985,3 +985,25 @@ Medians, 128 MiB against 1 GiB: tok/s 307.9 against 291.2 (+5.7 %); later-turn T
 - L2 untouched (the decision named L1 only): nothing here argues for following — L2's larger slabs hold more blocks per slab and showed no no_room increase.
 - Transient (flagged for the lead): the first 1 GiB run crashed mid-bench with `engine thread panicked: release of unreferenced KV block BlockId(146)` (fatal exit 3, bench 153/39) — not reproduced in 6 subsequent full runs on either arm (0 panics in all server logs); one-off on the pre-merge p6b-stack ladder path.
 - Labbook set `phase-6b-kv-compression`, runs `p6b-slabs:mt3:llama:slab{1g,128}:r{1,2,3}`.
+
+### The BF16 recent window on the GPU (Task 17 follow-up; branch `p6b-window`)
+
+Per-class page addressing through the ABI v2.11 descriptors (`page_classes` + the pool's slab
+constants on the paged-attention and copy-blocks descriptors; NULL keeps the flat addressing
+byte-identical), so the recent window's BF16 pages — larger than a TurboQuant base page — are
+addressable. `kv.recent_window_blocks` defaults to 1.
+
+- Lab kernels (`hip_ops::paged_mixed_classed_matches_cpu`, job
+  turbine-lab-test-1004004436-387b5582): a tq4 base pool with BF16 class pages (3.5× a base
+  page) appends byte for byte identically on HIP and CPU, and the staged prefill rows match
+  the CPU provider within the BF16 tolerance (max |Δ| 1.56e-2). A decode-only probe over the
+  same pool state diverged from the CPU provider (hip 0.0 vs cpu NaN on one q head, synthetic
+  constant q row re-appended into a written slot) and is left OPEN for Task 18; the served
+  decode below is the proof that matters.
+- Served (`lab-bench --quick --model llama -- --set kv.dtype=tq4`, GPU 0, window default 1,
+  run `target/lab-bench/9e1180e-llama/`): golden c1 **15/16 prompts with full 32-token
+  identical prefixes** (Task 13's tq4 gate was 0/16); p09 diverges at token 6 (margin 0.113)
+  and p10 at token 27. The c1 verdict is still FAIL by the tolerance's letter — the strict
+  every-prompt logprob bound does not hold on all 16 — which is Task 18's gate call
+  (golden c16 + eval), not this branch's. Quick throughput 853.1 tok/s, ITL p50 15.7 ms,
+  TTFT p50 248 ms, decode_fwd 15.4 ms, 64/64 ok.

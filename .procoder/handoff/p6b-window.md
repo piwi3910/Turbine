@@ -1,5 +1,3 @@
-# Handoff: p6b-window (the BF16 recent window works on the GPU)
-
 Branch `p6b-window`, from `p6b-stack` 7a67569. Closes Task 17's open item (user decision
 "6b Task 17: the BF16 recent window needs per-class block addressing", **A**): the executor
 resolves every block id through its page class, so the window serves and its default is 1.
@@ -7,7 +5,7 @@ resolves every block id through its page class, so the window serves and its def
 ## The ABI delta (v2.11, purely additive — no minor bump, existing descriptors unchanged)
 
 - Header (`kernels/include/turbine_kernels.h`): new `typedef struct turbine_kv_page_class
-  { int32_t fmt; int32_t per_layer_bytes }`; `turbine_attention_paged_desc` and
+{ int32_t fmt; int32_t per_layer_bytes }`; `turbine_attention_paged_desc` and
   `turbine_copy_blocks_desc` each gain trailing `const turbine_kv_page_class *page_classes`
   plus `int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks` (the copy
   descriptor also `const uint8_t *pair_formats`, one `TURBINE_KVFMT_*` per pair — the class of
@@ -16,7 +14,7 @@ resolves every block id through its page class, so the window serves and its def
   `num_blocks` is the whole id space, `kv_layer` stays the layer's
   `base_blocks × base_page_bytes` region, and block `b` sits at `b × base_page_bytes` below
   `base_blocks`, else at `(b−base)/slab_stride × slab_base_blocks × base_page_bytes +
-  (b−base)%slab_stride × page_classes[c].per_layer_bytes`, `c` the class whose `fmt` equals
+(b−base)%slab_stride × page_classes[c].per_layer_bytes`, `c` the class whose `fmt` equals
   the block's `block_formats` byte (copy: `pair_formats[i]`). The scalars are pool constants,
   so a decode graph bakes them; `page_classes` is host memory read during the call only (the
   HIP kernels take the values by value as a `Pages` struct, `pages_of(d)`).
@@ -60,13 +58,28 @@ resolves every block id through its page class, so the window serves and its def
 ## Results
 
 - Host: turbine-tensor/-kv/-kernels lib, kv_sim 11/11, turbine-core, turbine-model,
-  turbine-server bin (engine) and tiny_server (tq + window) all green; `gate.sh` ok (see the
-  commit).
-- Lab: see `.procoder/perf-log.md` 6b "The BF16 recent window on the GPU" — the
-  `paged_mixed_classed_matches_cpu` run and `lab-bench --quick --model llama --
-  --set kv.dtype=tq4` golden c1 (Task 13's tq4 golden was 0/16; the window should improve it).
+  turbine-server bin (engine) and tiny_server (tq + window) all green; `gate.sh` ok twice
+  (948/948 both times).
+- Lab quick tier (job turbine-lab-test-1004004436): PASS except a pre-existing
+  throughput-assertion flake (`lab::pinned_copy_kernel_is_bit_exact`: copy kernel 5.54 GB/s
+  vs the 80 % bound on the copy engine's 8.00 — a contention-sensitive number, untouched by
+  this branch) and my own classed lab test while it was still wrong; after the fixes the
+  classed test passes on the R9700
+  (turbine-lab-test-1004004436 rerun + job turbine-lab-test-1004004436 for hip_ops
+  paged_mixed_classed). `paged_mixed_matches_cpu` (Task 12's AC) green with the new fields.
+- Served (perf log 6b "The BF16 recent window on the GPU"): `lab-bench --quick --model llama
+-- --set kv.dtype=tq4` — golden c1 **15/16 identical-prefix prompts** (Task 13: 0/16);
+  p09 diverges at token 6. The c1 verdict is still FAIL by the strict every-prompt bound —
+  Task 18's gate call. Quick bench 853.1 tok/s, ITL p50 15.7 ms, 64/64 ok.
 
 ## Notes for the next builder
+
+- **OPEN**: an isolated decode-only probe over the classed lab pool diverged from the CPU
+  provider (hip 0.0 vs cpu NaN on one q head; synthetic constant q row re-appended into an
+  already-written slot). The append, staging and staged prefill rows are all proven on the
+  same pool, and the served tq4+window decode answers a 15/16 golden — but root-cause the
+  probe (noted in the test, `hip_ops::paged_mixed_classed_matches_cpu`) before trusting
+  `turbine_hip_mixed` decode on classed pools beyond the served evidence.
 
 - Task 18 owns golden c16 under tq4+window and the eval gate; this task's golden is c1 only.
 - `kv.ladder.l0`'s startup refusal (Task 16) still stands; with the addressing in place the
