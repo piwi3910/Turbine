@@ -7250,12 +7250,16 @@ fn paged_mixed_classed_matches_cpu() {
         class_page > base_page,
         "the window's class page is the bigger one"
     );
-    let (base_blocks, slab_base, slab_stride) = (8u32, class_page.div_ceil(base_page) as u32, 1u32);
+    // Slab k's class pages reuse the bytes of base pages [k x slab_base, (k+1) x slab_base) —
+    // the pool retires exactly those base ids when it carves (`convertible_slabs`), so the
+    // history base blocks must sit outside both slabs' byte ranges: 10 and 11 above 8.
+    let (base_blocks, slab_base, slab_stride) =
+        (12u32, class_page.div_ceil(base_page) as u32, 1u32);
     let num_blocks = base_blocks + 2 * slab_stride;
     let region = base_blocks as usize * base_page;
     let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
-    codes[8] = KV_FMT_BF16;
-    codes[9] = KV_FMT_BF16;
+    codes[12] = KV_FMT_BF16;
+    codes[13] = KV_FMT_BF16;
     let classes = KvPageClasses {
         num_blocks,
         base_blocks,
@@ -7277,10 +7281,10 @@ fn paged_mixed_classed_matches_cpu() {
         block_tokens: Some(bt as u32),
         causal: true,
     };
-    // Tokens 0..16 in base block 5 (tq4), 16..24 in class block 8 (bf16): a partial tail in
-    // the window class. Sequence 1 (a decode row riding along) starts in class block 9
-    // (bf16, tokens 0..16) and appends its row into base block 6 (tq4).
-    let table = [5i32, 8, 9, 6];
+    // Tokens 0..16 in base block 10 (tq4), 16..24 in class block 12 (bf16): a partial tail in
+    // the window class. Sequence 1 (a decode row riding along) starts in class block 13
+    // (bf16, tokens 0..16) and appends its row into base block 11 (tq4).
+    let table = [10i32, 12, 13, 11];
     let formats = [KV_FMT_TQ4, KV_FMT_BF16, KV_FMT_BF16, KV_FMT_TQ4];
     let q_lens = [17usize, 1];
     let kv_lens = [24usize, 17];
@@ -7290,14 +7294,15 @@ fn paged_mixed_classed_matches_cpu() {
     let (k_scale, v_scale) = (0.07f32, 0.11f32);
     let mut streams: [Rng; 4] = std::array::from_fn(|_| Rng(97));
     let [hist_rng, q_rng, k_rng, v_rng] = &mut streams;
-    // History pages: block 5 tq4, block 8 bf16 (tokens 16..24 only written by the append).
+    // History pages: block 10 tq4, block 11 tq4, block 9 bf16 (tokens 16..24 only written by
+    // the append).
     let slab1 = slab_base as usize * base_page;
     let bf_at = |half: usize, g: usize, t: usize| slab1 + ((half * bt + t) * hkv + g) * d * 2;
     let mut raw = vec![0u8; region];
     let rec = Tq4Codec::WIDTHS.record_bytes();
     use turbine_kv::codec::turboquant::Tq4Codec;
     for g in 0..hkv {
-        for b in [5usize, 6] {
+        for b in [10usize, 11] {
             for t in 0..bt {
                 let (k, v) = (hist_rng.normal(d, 1.0), hist_rng.normal(d, 1.0));
                 let at = b * base_page + (g * bt + t) * rec;
