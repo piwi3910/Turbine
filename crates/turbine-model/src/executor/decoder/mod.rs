@@ -1285,19 +1285,25 @@ impl DecoderExecutor {
     }
 
     pub fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
-        let Some(tq) = self.cfg.kv_cache.tq.as_ref() else {
-            return Err(invalid(format!(
-                "TurboQuant tables for {} KV pages",
-                self.cfg.kv_cache.dtype.as_str()
-            )));
+        // The layers the tables must cover: the model's TurboQuant tables when the pages are
+        // TurboQuant; a classed pool without TurboQuant pages (the v2.11 mixed-format
+        // descriptor carries the tables whether or not a block can be TurboQuant —
+        // `set_mixed_blocks`, P6b S-7) covers this rank's layers all the same, and the signs
+        // are never read.
+        let layers = match self.cfg.kv_cache.tq.as_ref() {
+            Some(tq) => tq.layers.len(),
+            None if self.mixed_blocks => self.dims.layers,
+            None => {
+                return Err(invalid(format!(
+                    "TurboQuant tables for {} KV pages",
+                    self.cfg.kv_cache.dtype.as_str()
+                )));
+            }
         };
-        if tables.layers != tq.layers.len() || tables.kv_heads != self.dims.kv_heads {
+        if tables.layers != layers || tables.kv_heads != self.dims.kv_heads {
             return Err(invalid(format!(
                 "TurboQuant tables of {} layers x {} KV heads, the model has {} x {}",
-                tables.layers,
-                tables.kv_heads,
-                tq.layers.len(),
-                self.dims.kv_heads
+                tables.layers, tables.kv_heads, layers, self.dims.kv_heads
             )));
         }
         self.tq_device = Some(tables);

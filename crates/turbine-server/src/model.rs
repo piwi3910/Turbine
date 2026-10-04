@@ -1202,14 +1202,49 @@ pub fn load(
     )
     .map_err(|e| model_error("executor", e))?;
     install_decode_graphs(prepared, executor.as_mut());
-    // P6b Task 8: before the first forward (a warm-up or a decode graph reads the pointers).
-    crate::tq_device::install(arch.kv_cache.tq.as_ref(), mem, executor.as_mut())?;
     // P6b S-5/S-7: the pool's block tables mix formats (page classes) — every paged attention
-    // takes the batch's `block_formats` table.
+    // takes the batch's `block_formats` table. Before the tables install: the executor accepts
+    // tables without TurboQuant pages only for a mixed pool.
     if !prepared.l0_page_classes.is_empty() {
         executor
             .set_mixed_blocks(true)
             .map_err(|e| model_error("executor", e))?;
+    }
+    // P6b Task 8: before the first forward (a warm-up or a decode graph reads the pointers).
+    // A classed pool without TurboQuant L0 pages has no model `KvCache` tables: the pool grows
+    // classes for the recent window (a lossy base format) or the ladder's L0 rungs
+    // (`kv.ladder.l0`), and the v2.11 mixed-format paged attention descriptor carries the
+    // tables whenever a block table mixes formats — TurboQuant pages among them or not. A BF16
+    // pool uploads them under its own namespace seed (a tq4 rung page reads them); a non-BF16
+    // classed pool (fp8 pages, the BF16 window class) never reads a sign, so the BF16 twin's
+    // tables only satisfy the descriptor's shape.
+    if let Some(tq) = arch.kv_cache.tq.as_ref() {
+        crate::tq_device::install(Some(tq), mem, executor.as_mut())?;
+    } else if !prepared.l0_page_classes.is_empty() {
+        let layout = prepared.pool.layout;
+        let tables_layout = if layout.dtype == turbine_core::types::DType::BF16 {
+            layout
+        } else {
+            KvLayout {
+                dtype: turbine_core::types::DType::BF16,
+                ..layout
+            }
+        };
+        let tables = crate::tq_device::upload(
+            mem,
+            crate::kv_tq::seed(&prepared.identity, tables_layout),
+            &tables_layout,
+        )
+        .map_err(|e| model_error("TurboQuant tables", e))?;
+        let bytes = tables.tables.storage.len();
+        executor
+            .set_tq_device_tables(tables)
+            .map_err(|e| model_error("TurboQuant tables", e))?;
+        tracing::info!(
+            event = "tq_tables",
+            bytes,
+            "TurboQuant tables are in device memory for the mixed paged attention (page classes)"
+        );
     }
     let blocks = pool_blocks(prepared, &budget)?;
     let mut pool = allocate_pool(prepared, blocks, &ledger)?;

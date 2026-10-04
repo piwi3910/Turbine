@@ -100,7 +100,14 @@ pub fn needs_tables(formats: &[&str], layout: &KvLayout) -> bool {
 /// tables and ignores the device copy). The memory budget counts them in the workspace pool.
 pub fn reserved_bytes(cfg: &KvConfig, layout: &KvLayout) -> u64 {
     let transcode = transcode_needs_tables(cfg, layout);
-    let attention = layout.dtype.tq_record_bytes().is_some();
+    // The attention's upload: any classed pool — the recent window's BF16 class (a lossy L0
+    // base format with the window on, the default) or the ladder's rung classes
+    // (`kv.ladder.l0`) — plus TurboQuant L0 pages. The v2.11 mixed-format paged attention
+    // descriptor carries the tables whenever a block table mixes formats, TurboQuant pages
+    // among them or not.
+    let classed = (layout.dtype != DType::BF16 && cfg.recent_window_blocks > 0)
+        || (cfg.ladder.enabled && cfg.ladder.l0);
+    let attention = classed || layout.dtype.tq_record_bytes().is_some();
     (u64::from(transcode) + u64::from(attention)) * table_bytes(layout)
 }
 
@@ -235,11 +242,14 @@ mod tests {
         assert_eq!(ours, from_cache);
     }
 
-    /// The tables are reserved only when a TurboQuant format needs them, and per use: a `tq4` /
-    /// `tq2` tier under BF16 pages (the transcode), TurboQuant pages (the attention), both
-    /// (two uploads); nothing for BF16 / FP8 pages with `l0` or FP8 tiers, nor for a head
-    /// dimension the kernels do not run. Breaks if a configuration without TurboQuant pays for
-    /// tables, or one with it starts without the bytes counted.
+    /// The tables are reserved where a format or the mixed block table needs them, and per
+    /// use: a `tq4` / `tq2` tier under BF16 pages (the transcode), TurboQuant pages (the
+    /// attention), both (two uploads); a classed pool too — FP8 pages with the recent window's
+    /// BF16 class, or the L0 ladder's rung classes — because the v2.11 mixed descriptor
+    /// carries the tables whether or not a block can be TurboQuant; nothing for BF16 pages
+    /// with `l0` tiers, the window off and the ladder off, nor for a head dimension the
+    /// kernels do not run. Breaks if a configuration without any of those pays for tables, or
+    /// one with them starts without the bytes counted.
     #[test]
     fn tables_are_reserved_only_where_a_turboquant_format_needs_them() {
         let name = |s: &str| ModuleName::new(s).unwrap();
@@ -266,17 +276,38 @@ mod tests {
         assert_eq!(reserved_bytes(&kv, &narrow), 0, "head_dim 64");
         assert_eq!(
             reserved_bytes(&kv, &layout(DType::F8E4M3)),
-            0,
-            "fp8 pages are copied as their bytes"
+            one,
+            "fp8 pages carry the window class's tables"
         );
 
         let none = KvConfig::default();
         assert_eq!(reserved_bytes(&none, &layout(DType::Tq4)), one, "tq4 pages");
         assert_eq!(reserved_bytes(&none, &layout(DType::Tq2)), one, "tq2 pages");
-        assert_eq!(reserved_bytes(&none, &layout(DType::F8E4M3)), 0);
+        // FP8 pages carry the descriptor's tables for the window's BF16 class (never read:
+        // no TurboQuant block can exist in such a pool).
+        assert_eq!(reserved_bytes(&none, &layout(DType::F8E4M3)), one);
         // TurboQuant pages with a tier below them: the tier stores them as they are, so the
         // transcode needs nothing; only the attention's upload counts.
         assert_eq!(reserved_bytes(&kv, &layout(DType::Tq4)), one);
+    }
+
+    /// The L0 ladder's mixed-format paged attention carries the tables whenever the pool grows
+    /// page classes (`kv.ladder.l0`), even over BF16 pages whose rung classes hold no
+    /// TurboQuant page yet (`max_format: fp8_e4m3`): the v2.11 mixed descriptor requires them.
+    /// Breaks if a ladder-on server starts without the bytes counted (the budget then refuses,
+    /// or the executor's warm-up forward fails on the missing `TqPaged::device`).
+    #[test]
+    fn tables_are_reserved_when_the_l0_ladder_is_on() {
+        let name = |s: &str| ModuleName::new(s).unwrap();
+        let mut kv = KvConfig::default();
+        kv.ladder.enabled = true;
+        kv.ladder.l0 = true;
+        kv.ladder.max_format = name("fp8_e4m3");
+        let bf16 = layout(DType::BF16);
+        assert_eq!(reserved_bytes(&kv, &bf16), table_bytes(&bf16), "l0 ladder");
+        let mut off = kv.clone();
+        off.ladder.enabled = false;
+        assert_eq!(reserved_bytes(&off, &bf16), 0, "ladder off");
     }
 
     /// The sizes at the served models: 229 KB for Llama-3.2-3B (28 layers x 8 KV heads) and
