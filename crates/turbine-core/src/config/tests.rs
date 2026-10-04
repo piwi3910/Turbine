@@ -1536,3 +1536,92 @@ fn phase6_keys() {
         .is_ok()
     );
 }
+
+/// P5p S-11 (`phase5p_keys`): the four serving-efficiency keys have the spec's defaults and are
+/// validated statically (exit 2) naming the key: the cache-aware window is 10 ms..=60 s and
+/// `jump_forward_max_tokens` is 1..=256 with `value + 1` at most `scheduler.max_batch_tokens`.
+/// `--set` applies and the shipped example spells the keys out at their defaults. Breaks if a
+/// key is missing, defaults wrong or goes unvalidated.
+#[test]
+fn phase5p_keys() {
+    let base = "model:\n  path: /m\n";
+    let d = parse(base, &[]).unwrap();
+    assert!(d.kv.partial_prefix_reuse);
+    assert_eq!(d.scheduler.cache_aware_window, HumanDuration::from_secs(1));
+    assert!(d.structured_output.jump_forward);
+    assert_eq!(d.structured_output.jump_forward_max_tokens, 32);
+
+    // Every key is settable and read back.
+    let c = parse(
+        base,
+        &[
+            "kv.partial_prefix_reuse=false",
+            "scheduler.cache_aware_window=250ms",
+            "structured_output.jump_forward=false",
+            "structured_output.jump_forward_max_tokens=1",
+        ],
+    )
+    .unwrap();
+    assert!(!c.kv.partial_prefix_reuse);
+    assert_eq!(
+        c.scheduler.cache_aware_window,
+        HumanDuration::from_millis(250)
+    );
+    assert!(!c.structured_output.jump_forward);
+    assert_eq!(c.structured_output.jump_forward_max_tokens, 1);
+
+    // The bounds are inclusive; `value + 1` may equal max_batch_tokens.
+    assert!(parse(base, &["scheduler.cache_aware_window=10ms"]).is_ok());
+    assert!(parse(base, &["scheduler.cache_aware_window=60s"]).is_ok());
+    assert!(
+        parse(
+            base,
+            &[
+                "structured_output.jump_forward_max_tokens=256",
+                "scheduler.max_batch_tokens=257",
+                "scheduler.prefill_chunk_tokens=257",
+            ]
+        )
+        .is_ok()
+    );
+
+    for (sets, key) in [
+        (
+            &["scheduler.cache_aware_window=5ms"][..],
+            "scheduler.cache_aware_window",
+        ),
+        (
+            &["scheduler.cache_aware_window=61s"][..],
+            "scheduler.cache_aware_window",
+        ),
+        (
+            &["structured_output.jump_forward_max_tokens=0"][..],
+            "structured_output.jump_forward_max_tokens",
+        ),
+        (
+            &["structured_output.jump_forward_max_tokens=257"][..],
+            "structured_output.jump_forward_max_tokens",
+        ),
+        (
+            &[
+                "structured_output.jump_forward_max_tokens=2048",
+                "scheduler.max_batch_tokens=2048",
+            ][..],
+            "structured_output.jump_forward_max_tokens",
+        ),
+    ] {
+        assert_rejected(base, sets, key);
+    }
+
+    // The shipped example spells the keys out at their defaults and still loads.
+    let example = include_str!("../../../../examples/turbine.yaml");
+    parse(example, &[]).expect("examples/turbine.yaml must load");
+    for key in [
+        "partial_prefix_reuse:",
+        "cache_aware_window:",
+        "jump_forward:",
+        "jump_forward_max_tokens:",
+    ] {
+        assert!(example.contains(key), "examples/turbine.yaml lacks {key}");
+    }
+}

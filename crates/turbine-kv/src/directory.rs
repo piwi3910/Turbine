@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use smallvec::SmallVec;
-use turbine_core::types::{ModelFingerprint, PriorityClass};
+use turbine_core::types::{BlockId, ModelFingerprint, PriorityClass};
 
 use crate::identity::{KeyHasher, KvFormat, KvKey};
+use crate::metrics::PartialOutcome;
 use crate::tier::{KvLocation, TierId};
 
 /// Monotonic time from the engine clock.
@@ -112,6 +113,12 @@ pub struct KvBlock {
 }
 
 impl KvBlock {
+    /// True when the block holds fewer than `block_tokens` tokens: an L0-only partial entry
+    /// (P5p S-4), never demoted, prefetched or shared by reference.
+    pub fn is_partial(&self, block_tokens: u32) -> bool {
+        (self.tokens.len() as u32) < block_tokens.max(1)
+    }
+
     pub fn location(&self, tier: TierId) -> Option<KvLocation> {
         self.locations.iter().copied().find(|l| l.tier == tier)
     }
@@ -134,6 +141,19 @@ pub struct MatchedBlock {
     pub lossy: Option<&'static str>,
 }
 
+/// A token-granular match beyond the matched full blocks (P5p S-4): the first `tokens` tokens
+/// of the L0 block `block` (a partial entry, or a full block whose stored tokens share the
+/// prompt's trailing tokens) are reusable through a tail copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialMatch {
+    /// The directory entry the match was found in.
+    pub key: KvKey,
+    /// The block's L0 id (the copy the tail copy reads).
+    pub block: BlockId,
+    /// Matched tokens, at least 1.
+    pub tokens: u32,
+}
+
 /// Result of a longest-prefix lookup.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixMatch {
@@ -153,6 +173,11 @@ pub struct PrefixMatch {
     /// With `lossy_from = Some((s, f))`: the keys of every full block, equal to `keys` before
     /// `s`, then `lossy_key(keys[s], f, seed)` chained on; empty otherwise.
     pub lossy_chain: Vec<KvKey>,
+    /// P5p S-4: the token-granular match beyond the matched full blocks, when one was found.
+    pub partial: Option<PartialMatch>,
+    /// P5p S-4: how the token-granular comparison ended, when the prompt has tokens beyond
+    /// its matched full blocks (or ends exactly on them and the tail may be split).
+    pub partial_outcome: Option<PartialOutcome>,
 }
 
 impl PrefixMatch {
@@ -177,12 +202,42 @@ pub enum DirectoryError {
 /// How long a request waits on a block another request is computing before computing its own.
 pub const PENDING_WAIT: Duration = Duration::from_secs(2);
 
+/// Children of the last matched key a lookup's token-granular comparison (P5p S-4) compares,
+/// most recently used first.
+pub const PARTIAL_SCAN_LIMIT: usize = 64;
+
+/// Partial entries kept per parent key; a further insert evicts the least recently used.
+pub const PARTIAL_PER_PARENT: usize = 8;
+
+/// True when an L0 copy in the page class `tag` over `layout` holds the sequence's exact
+/// bytes (P5p S-4, the 6b interaction): the base class of a lossless-with-matched-scales L0
+/// (`bf16`, `fp8_e4m3`) or the BF16 recent-window class; a TurboQuant base class and every
+/// ladder rung class are lossy rung classes.
+fn exact_page_class(tag: &str, layout: &turbine_core::types::KvLayout) -> bool {
+    match tag {
+        crate::tier::L0_FORMAT => !matches!(
+            layout.dtype,
+            turbine_core::types::DType::Tq4 | turbine_core::types::DType::Tq2
+        ),
+        "bf16" => true,
+        _ => false,
+    }
+}
+
+/// Length of the longest common prefix of two token slices.
+fn common_prefix(a: &[u32], b: &[u32]) -> u32 {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count() as u32
+}
+
 /// Block key → metadata, with a children index for leaf-first eviction.
 pub struct KvDirectory {
     blocks: HashMap<KvKey, KvBlock>,
     children: HashMap<KvKey, SmallVec<[KvKey; 4]>>,
     pending: HashMap<KvKey, Timestamp>,
     max_entries: usize,
+    /// Partial entries evicted by [`KvDirectory::insert_partial`]'s bounds; the caller frees
+    /// their L0 slots.
+    evicted: Vec<KvBlock>,
 }
 
 impl KvDirectory {
@@ -193,6 +248,7 @@ impl KvDirectory {
             children: HashMap::new(),
             pending: HashMap::new(),
             max_entries,
+            evicted: Vec::new(),
         }
     }
 
@@ -239,6 +295,67 @@ impl KvDirectory {
         self.pending.remove(&block.key);
         self.blocks.insert(block.key, block);
         Ok(())
+    }
+
+    /// Inserts an L0-only partial entry (P5p S-4): a block holding fewer than
+    /// `kv.block_tokens` tokens whose KV is written, keyed like a full block and chained from
+    /// its parent. Beyond [`PARTIAL_PER_PARENT`] entries under one parent, and when the
+    /// directory is full, the least recently used partial entry is evicted first (its L0 slot
+    /// is handed to the caller through [`KvDirectory::evicted_partials`]).
+    pub fn insert_partial(&mut self, block: KvBlock) -> Result<(), DirectoryError> {
+        debug_assert!(
+            block.location(TierId::L0).is_some(),
+            "a partial entry is L0-only"
+        );
+        let block_tokens = block.format.layout.block_tokens;
+        let parent = block.parent;
+        // Room: drop the LRU partial entry of this parent (any parent when the entry has no
+        // parent or the directory is at capacity).
+        if self.partial_children(parent, block_tokens).count() >= PARTIAL_PER_PARENT
+            || self.blocks.len() >= self.max_entries
+        {
+            let victim = self
+                .blocks
+                .values()
+                .filter(|b| b.parent == parent && b.is_partial(block_tokens) && b.child_count == 0)
+                .min_by_key(|b| b.last_access)
+                .map(|b| b.key);
+            if let Some(k) = victim
+                && let Some(b) = self.remove(&k)
+            {
+                self.evicted.push(b);
+            }
+        }
+        self.insert(block)
+    }
+
+    /// Partial entries [`KvDirectory::insert_partial`] evicted; the caller frees their L0
+    /// slots.
+    pub fn evicted_partials(&mut self) -> Vec<KvBlock> {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// The partial-entry children of `parent` (the children index holds keyed parents only;
+    /// a root-level entry is found by scan).
+    fn partial_children(
+        &self,
+        parent: Option<KvKey>,
+        block_tokens: u32,
+    ) -> impl Iterator<Item = &KvBlock> {
+        let kids: SmallVec<[KvKey; 4]> = parent
+            .and_then(|p| self.children.get(&p).cloned())
+            .unwrap_or_default();
+        let source: Vec<&KvBlock> = if parent.is_none() {
+            self.blocks
+                .values()
+                .filter(|b| b.parent.is_none())
+                .collect()
+        } else {
+            kids.iter().filter_map(|k| self.blocks.get(k)).collect()
+        };
+        source
+            .into_iter()
+            .filter(move |b| b.is_partial(block_tokens))
     }
 
     /// Removes a block that has no children left and returns it; `None` if absent or a parent.
@@ -427,7 +544,96 @@ impl KvDirectory {
                 }
             }
         }
+        self.compare_tail(&mut m, hasher, tokens, block_tokens, allow_lossy, seed);
         m
+    }
+
+    /// The token-granular comparison of the prompt beyond its matched full blocks (P5p S-4):
+    /// the remaining prompt tokens against the stored tokens of the L0-resident children of
+    /// the last matched key (the root parent when none matched) — full blocks and partial
+    /// entries, most recently used first, at most [`PARTIAL_SCAN_LIMIT`] of them. The longest
+    /// common prefix (at least one token) fills `partial`; only children resident in an exact
+    /// page class ([`exact_page_class`]) and of exact lineage are sources.
+    fn compare_tail(
+        &self,
+        m: &mut PrefixMatch,
+        _hasher: &dyn KeyHasher,
+        tokens: &[u32],
+        block_tokens: u32,
+        _allow_lossy: bool,
+        _seed: u64,
+    ) {
+        let base = m.blocks.len() as u32 * block_tokens;
+        let remaining = &tokens[base as usize..];
+        if remaining.is_empty() {
+            return;
+        }
+        let parent = m.blocks.last().map(|b| b.key);
+        let mut kids: SmallVec<[KvKey; PARTIAL_SCAN_LIMIT]> = match parent {
+            Some(p) => self
+                .children
+                .get(&p)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
+            None => self
+                .blocks
+                .values()
+                .filter(|b| b.parent.is_none())
+                .map(|b| b.key)
+                .collect(),
+        };
+        if kids.len() > PARTIAL_SCAN_LIMIT {
+            kids.sort_by(|a, b| {
+                let at = self.blocks.get(a).map(|b| b.last_access);
+                let bt = self.blocks.get(b).map(|b| b.last_access);
+                bt.cmp(&at)
+            });
+            kids.truncate(PARTIAL_SCAN_LIMIT);
+        }
+        let mut best: Option<(KvKey, KvLocation, u32)> = None;
+        let mut lossy = false;
+        let mut not_resident = false;
+        for k in kids {
+            let Some(b) = self.blocks.get(&k) else {
+                continue;
+            };
+            let lcp = common_prefix(&b.tokens, remaining);
+            if lcp == 0 {
+                continue;
+            }
+            if b.lineage.is_lossy() {
+                lossy = true;
+                continue;
+            }
+            let Some(loc) = b.location(TierId::L0) else {
+                not_resident = true;
+                continue;
+            };
+
+            if !exact_page_class(loc.format, &b.format.layout) {
+                lossy = true;
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, _, l)| lcp > *l) {
+                best = Some((k, loc, lcp));
+            }
+        }
+        m.partial = best.map(|(key, loc, tokens)| PartialMatch {
+            key,
+            block: BlockId(loc.slot as u32),
+            tokens,
+        });
+        m.partial_outcome = Some(if m.partial.is_some() {
+            PartialOutcome::Reused
+        } else if lossy {
+            PartialOutcome::LossySource
+        } else if not_resident {
+            PartialOutcome::NotResident
+        } else {
+            PartialOutcome::NoCandidate
+        });
     }
 
     /// Registers a block a running prefill is computing (the first registration's time counts).
@@ -514,7 +720,7 @@ pub fn decay(hits: f64, at: Timestamp, now: Timestamp, half_life: Duration) -> f
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::identity::{Blake3Hasher, NamespaceKey, prefix_keys};
+    use crate::identity::{Blake3Hasher, NamespaceKey, ROOT_PARENT, prefix_keys};
     use crate::metrics::KvMetrics;
     use crate::test_log;
     use turbine_core::types::{DType, KvDtype, KvLayout, Priority};
@@ -532,6 +738,17 @@ pub(crate) mod tests {
             },
             shards: 1,
             scales: None,
+        }
+    }
+
+    /// The same small format with 128-token blocks (the production `kv.block_tokens`).
+    pub(crate) fn fmt128() -> KvFormat {
+        KvFormat {
+            layout: KvLayout {
+                block_tokens: 128,
+                ..fmt16().layout
+            },
+            ..fmt16()
         }
     }
 
@@ -740,5 +957,263 @@ pub(crate) mod tests {
         // Eviction weight of a request priority (CONFLICT C-10).
         let weights = [-3, 0, 5].map(|p| KvPriority::from_class(Priority(p).class()));
         assert_eq!(weights, [KvPriority(2.0), KvPriority(1.0), KvPriority(0.5)]);
+    }
+
+    /// P5p S-4 (`token_granular_match`): after the full-block walk, `lookup` compares the
+    /// prompt's remaining tokens with the L0-resident children of the last matched key —
+    /// full blocks and partial entries — and returns the longest common prefix; collisions
+    /// never match, an L1/L2-only candidate is `not_resident`, a lossy-class or
+    /// lossy-lineage child is `lossy_source` with no partial, the scan is bounded, and the
+    /// ninth partial entry under one parent evicts the least recently used one. Breaks if a
+    /// partial match returns another sequence's tokens, scans unbounded, or grows unbounded.
+    #[test]
+    fn token_granular_match() {
+        use turbine_core::types::BlockId;
+        let h = Blake3Hasher(NamespaceKey([5; 32]));
+
+        /// A partial entry (a block holding fewer tokens than its 128-token format) at `slot`.
+        fn partial_entry(h: &Blake3Hasher, parent: KvKey, tail: &[u32], slot: u64) -> KvBlock {
+            let mut b = block(
+                h.key(Some(&parent), tail),
+                Some(parent),
+                0,
+                tail,
+                &[l0(slot)],
+            );
+            b.format = fmt128();
+            let end = tail.len() as u32;
+            b.token_range = TokenRange { start: 0, end };
+            b
+        }
+
+        /// A full-block directory with the cached 128-token blocks of `tokens`, block
+        /// `l1_index` at L1 only.
+        fn chain(h: &Blake3Hasher, tokens: &[u32], l1_index: Option<usize>) -> KvDirectory {
+            let keys = prefix_keys(h, tokens, 128);
+            let mut dir = KvDirectory::new(256);
+            for i in 0..keys.len() {
+                let parent = (i > 0).then(|| keys[i - 1]);
+                let loc = if Some(i) == l1_index {
+                    KvLocation {
+                        tier: TierId::L1,
+                        slot: i as u64,
+                        format: crate::tier::L0_FORMAT,
+                    }
+                } else {
+                    l0(i as u64)
+                };
+                dir.insert(block(
+                    keys[i],
+                    parent,
+                    i as u32,
+                    &tokens[i * 128..i * 128 + 128],
+                    &[loc],
+                ))
+                .unwrap();
+            }
+            dir
+        }
+
+        // A cached chain of three 128-token blocks plus a 40-token partial entry under the
+        // third block's key; a prompt sharing the chain and 25 of the 40 tokens matches it
+        // with 25.
+        let cached: Vec<u32> = (0..384).collect();
+        let keys = prefix_keys(&h, &cached, 128);
+        let mut dir = chain(&h, &cached, None);
+        let tail40: Vec<u32> = (384..424).collect();
+        let pkey = h.key(Some(&keys[2]), &tail40);
+        let mut pe = partial_entry(&h, keys[2], &tail40, 9);
+        pe.token_range = TokenRange {
+            start: 384,
+            end: 424,
+        };
+        dir.insert_partial(pe).unwrap();
+        let prompt: Vec<u32> = (0..409).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(1), true, 0);
+        let p = m.partial.expect("the partial entry matches");
+        assert_eq!(
+            p.tokens, 25,
+            "the longest common prefix, not the entry's 40"
+        );
+        assert_eq!(p.key, pkey);
+        assert_eq!(p.block, BlockId(9));
+        assert_eq!(m.partial_outcome, Some(PartialOutcome::Reused));
+        assert_eq!(m.blocks.len(), 3, "the full blocks before it");
+
+        // A prompt diverging at token 70 of a cached full block matches that block with 70
+        // tokens (its stored tokens differ from the prompt's, so no full block matches).
+        let cached: Vec<u32> = (0..640).collect();
+        let keys = prefix_keys(&h, &cached, 128);
+        let mut diverged = cached.clone();
+        diverged[70] += 1000;
+        let m =
+            chain(&h, &cached, None).lookup(&h, &diverged, 128, Duration::from_secs(2), true, 0);
+        let p = m.partial.expect("the diverging block matches");
+        assert_eq!(p.tokens, 70);
+        assert_eq!(p.key, keys[0]);
+        assert_eq!(m.blocks.len(), 0, "block 0 diverges inside the first chunk");
+
+        // A prompt shorter than the cached sequence: its trailing chunk is a prefix of the
+        // next cached full block, cached only in L1 — never a partial source, reported
+        // `not_resident`.
+        let short: Vec<u32> = (0..520).collect();
+        let m =
+            chain(&h, &cached, Some(4)).lookup(&h, &short, 128, Duration::from_secs(3), true, 0);
+        assert_eq!(
+            m.blocks.len(),
+            4,
+            "the full blocks, block 4's key unreached"
+        );
+        assert_eq!(m.partial, None, "an L1 copy is never a partial source");
+        assert_eq!(m.partial_outcome, Some(PartialOutcome::NotResident));
+
+        // A colliding hasher never matches another sequence's tokens.
+        let colliding_tokens = vec![7u32; 128];
+        let mut dir = KvDirectory::new(16);
+        dir.insert(block(
+            Colliding.key(None, &colliding_tokens),
+            None,
+            0,
+            &colliding_tokens,
+            &[l0(0)],
+        ))
+        .unwrap();
+        let other: Vec<u32> = (1000..2128).collect();
+        let m = dir.lookup(&Colliding, &other, 128, Duration::from_secs(4), true, 0);
+        assert_eq!((m.blocks.len(), m.partial), (0, None));
+        assert_eq!(m.mismatches, 1, "the colliding full block is still a miss");
+
+        // A prompt shorter than one block matches a partial entry under the root parent.
+        let root_tail: Vec<u32> = (100..140).collect();
+        let mut root_entry = partial_entry(&h, ROOT_PARENT, &root_tail, 20);
+        root_entry.parent = None;
+        let mut dir = KvDirectory::new(16);
+        dir.insert_partial(root_entry).unwrap();
+        let prompt: Vec<u32> = (100..110).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(5), true, 0);
+        let p = m
+            .partial
+            .expect("a partial entry under the root parent matches");
+        assert_eq!(p.tokens, 10);
+
+        // At most PARTIAL_SCAN_LIMIT children are compared, most recently used first: a
+        // matching child ranked 71st is not scanned; once most recently used it is found.
+        let base: Vec<u32> = (0..128).collect();
+        let key0 = h.key(None, &base);
+        let mut dir = KvDirectory::new(256);
+        dir.insert(block(key0, None, 0, &base, &[l0(0)])).unwrap();
+        let kid = |tokens: &[u32], j: u64| {
+            let mut b = block(
+                h.key(Some(&key0), tokens),
+                Some(key0),
+                j as u32,
+                tokens,
+                &[l0(100 + j)],
+            );
+            b.format = fmt128();
+            b
+        };
+        for j in 0..70u64 {
+            let tokens = vec![10_000 + j as u32; 128];
+            dir.insert(kid(&tokens, j)).unwrap();
+        }
+        let matching: Vec<u32> = (128..256).collect();
+        dir.insert(kid(&matching, 70)).unwrap();
+        let touch_all = |dir: &mut KvDirectory, except: &KvKey, at: Timestamp| {
+            for b in dir.blocks.values_mut() {
+                if b.key != *except {
+                    b.last_access = at;
+                }
+            }
+        };
+        touch_all(
+            &mut dir,
+            &h.key(Some(&key0), &matching),
+            Duration::from_secs(1),
+        );
+        let prompt: Vec<u32> = (0..144).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(2), true, 0);
+        assert_eq!(
+            m.partial, None,
+            "the matching child is ranked 71st by last_access"
+        );
+        assert_eq!(
+            m.partial_outcome,
+            Some(PartialOutcome::NoCandidate),
+            "the scan compared 64 children, none matching"
+        );
+        dir.get_mut(&h.key(Some(&key0), &matching))
+            .unwrap()
+            .last_access = Duration::from_secs(3);
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(4), true, 0);
+        assert_eq!(
+            m.partial.map(|p| p.tokens),
+            Some(16),
+            "most recently used, it is scanned"
+        );
+
+        // The ninth partial entry under one parent evicts the least recently used one; the
+        // caller frees the evicted block's L0 slot.
+        let cached: Vec<u32> = (0..128).collect();
+        let key0 = h.key(None, &cached);
+        let mut dir = KvDirectory::new(64);
+        dir.insert(block(key0, None, 0, &cached, &[l0(0)])).unwrap();
+        for j in 0..9u32 {
+            let tail: Vec<u32> = (500 + j * 40..500 + j * 40 + 40).collect();
+            dir.insert_partial(partial_entry(&h, key0, &tail, 10 + j as u64))
+                .unwrap();
+            dir.get_mut(&h.key(Some(&key0), &tail)).unwrap().last_access =
+                Duration::from_secs(j as u64);
+        }
+        assert_eq!(dir.len(), 9, "the full block plus 8 partial entries");
+        let first = h.key(Some(&key0), &(500..540).collect::<Vec<u32>>());
+        assert!(dir.get(&first).is_none(), "the least recently used went");
+        let evicted = dir.evicted_partials();
+        assert_eq!(evicted.len(), 1, " the caller frees the evicted L0 slot");
+        assert_eq!(evicted[0].key, first);
+        let second = h.key(Some(&key0), &(540..580).collect::<Vec<u32>>());
+        assert!(dir.get(&second).is_some(), "the second-oldest stays");
+        let prompt: Vec<u32> = (0..128).chain(540..570).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(10), true, 0);
+        assert_eq!(m.partial.map(|p| p.tokens), Some(30));
+
+        // A TurboQuant base-class entry (the `l0` tag over TurboQuant pages) is a lossy rung
+        // class: `lossy_source`, no partial. The BF16 window class over the same pages is
+        // exact.
+        let tail: Vec<u32> = (16..56).collect();
+        let mut dir = KvDirectory::new(64);
+        dir.insert(block(key0, None, 0, &cached, &[l0(0)])).unwrap();
+        let tq_fmt = crate::identity::KvFormat {
+            dtype: KvDtype::Tq4,
+            layout: KvLayout {
+                dtype: DType::Tq4,
+                ..fmt128().layout
+            },
+            shards: 1,
+            scales: None,
+        };
+        let mut tq_entry = partial_entry(&h, key0, &tail, 30);
+        tq_entry.format = tq_fmt;
+        dir.insert_partial(tq_entry).unwrap();
+        let prompt: Vec<u32> = (0..128).chain(16..30).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(11), true, 0);
+        assert_eq!(
+            m.partial, None,
+            "TurboQuant base pages are never a partial source"
+        );
+        assert_eq!(m.partial_outcome, Some(PartialOutcome::LossySource));
+
+        let win_tail: Vec<u32> = (500..540).collect();
+        let mut win_entry = partial_entry(&h, key0, &win_tail, 31);
+        win_entry.locations[0].format = "bf16";
+        dir.insert_partial(win_entry).unwrap();
+        let prompt: Vec<u32> = (0..128).chain(500..520).collect();
+        let m = dir.lookup(&h, &prompt, 128, Duration::from_secs(12), true, 0);
+        assert_eq!(
+            m.partial.map(|p| p.tokens),
+            Some(20),
+            "the BF16 window class is an exact source"
+        );
+        assert_eq!(m.partial_outcome, Some(PartialOutcome::Reused));
     }
 }

@@ -41,19 +41,23 @@ pub enum EvictReason {
     NoRoom,
     Compressed,
     LadderFloor,
+    /// An L0-only partial entry reclaimed (P5p S-5; it demotes never, so a reclaim is its
+    /// only way out).
+    PartialL0Only,
 }
 
 impl EvictReason {
     /// Label values of `turbine_kv_evictions_total{reason}`.
-    pub const EVICTION: [EvictReason; 5] = [
+    pub const EVICTION: [EvictReason; 6] = [
         EvictReason::Capacity,
         EvictReason::Pressure,
         EvictReason::SessionExpired,
         EvictReason::Checksum,
         EvictReason::TierDegraded,
+        EvictReason::PartialL0Only,
     ];
     /// Label values of `turbine_kv_drops_total{reason}`.
-    pub const ALL: [EvictReason; 7] = [
+    pub const ALL: [EvictReason; 8] = [
         EvictReason::Capacity,
         EvictReason::Pressure,
         EvictReason::SessionExpired,
@@ -61,6 +65,7 @@ impl EvictReason {
         EvictReason::TierDegraded,
         EvictReason::BelowMinValue,
         EvictReason::NoRoom,
+        EvictReason::PartialL0Only,
     ];
     /// The compression ladder's reasons (P6b S-6).
     pub const LADDER: [EvictReason; 2] = [EvictReason::Compressed, EvictReason::LadderFloor];
@@ -76,6 +81,53 @@ impl EvictReason {
             EvictReason::NoRoom => "no_room",
             EvictReason::Compressed => "compressed",
             EvictReason::LadderFloor => "ladder_floor",
+            EvictReason::PartialL0Only => "partial_l0_only",
+        }
+    }
+}
+
+/// How a lookup's token-granular comparison of the prompt beyond its matched full blocks
+/// ended (P5p S-4, S-5): label of `turbine_kv_partial_reuse_total{outcome}`, one per lookup
+/// that reached the comparison.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PartialOutcome {
+    /// The comparison matched a child and the plan reuses (some of) its tokens through a
+    /// tail copy.
+    Reused,
+    /// No child of the last matched key shares at least one token.
+    NoCandidate,
+    /// A child would match but holds no L0 copy (its copies are all in L1/L2); a full block
+    /// below L0 is reused whole, never partially.
+    NotResident,
+    /// The comparison matched, but the plan's cutoff or the `MIN_RECOMPUTE_TOKENS` cap left
+    /// the matched tokens unused.
+    PlannerCutoff,
+    /// The matching children hold lossy rung-class pages or are of lossy lineage: their KV
+    /// is never a bit-exact source, so no partial match is returned.
+    LossySource,
+    /// `kv.partial_prefix_reuse` is `false`.
+    Disabled,
+}
+
+impl PartialOutcome {
+    pub const ALL: [PartialOutcome; 6] = [
+        PartialOutcome::Reused,
+        PartialOutcome::NoCandidate,
+        PartialOutcome::NotResident,
+        PartialOutcome::PlannerCutoff,
+        PartialOutcome::LossySource,
+        PartialOutcome::Disabled,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PartialOutcome::Reused => "reused",
+            PartialOutcome::NoCandidate => "no_candidate",
+            PartialOutcome::NotResident => "not_resident",
+            PartialOutcome::PlannerCutoff => "planner_cutoff",
+            PartialOutcome::LossySource => "lossy_source",
+            PartialOutcome::Disabled => "disabled",
         }
     }
 }

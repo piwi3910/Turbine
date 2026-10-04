@@ -1239,3 +1239,15 @@ Multi-turn profile (Llama, after the throughput bench under the same lock hold; 
 The saturated runs are the queue-saturation baseline: 512 requests against 16 running slots put first-turn TTFT at ~3.7 s and later turns at ~10.7 s. mt64-2's cached ratio (0.8038) and mt tok/s (346.3) are the low outliers of the three (its later-turn TTFT and first-turn p99 are the highest), consistent with more L0 eviction under the deepest queue; the other two arms agree closely. These medians are what the S-7 (`cache_aware`) and S-4/S-5 comparisons judge against: `mt_cached` ≥ baseline + 0.01 and `mt_ttft_later_p50` ≤ 0.95 × baseline at the standard profile.
 
 Recording notes: the first c16 upload (67036a79) initially failed labbook's auto-status because its "previous comparable run" was the same-commit c1 run (TTFT 54 ms) — patched to pass with the explanation, and `lab-bench.sh` now appends the workload flags (`conc=`, `quick`, `multi-turn`, `mt-sessions=`) to the labbook `config` param so different workloads are never comparable. The labbook `turbine-lab-bench` type gained `concurrency`, `host_share` and the four `mt_*` data points (version 5).
+
+### Tasks 5–6: configuration keys and the token-granular match (host-only, 2026-10-04)
+
+`feat(core): phase 5p configuration keys` (4e44d0ac) and `feat(kv): token-granular match of the
+last prefix block` (555671c5), both gate-clean (whole listed scope, 973 tests). Host-only landing per
+the rotation: the lab A/B (`lab-bench.sh --multi-turn` against the S-2 baseline, the S-13 targets
+`mt_cached` ≥ 0.917 / `mt_ttft_later_p50` ≤ 72 ms) is deferred to the Task 8 landing, where the
+engine consumes `plan.partial_tokens` and the tail copies run; nothing observable changed on a
+serving path yet (`kv_sim partial_match_falls_back_to_block_reuse` pins the attach to Phase 4
+until Task 7). Mutation checks: dropping the exact-class rule, the 64-child scan limit, the
+`reuse_cap_tokens` cap, or the per-parent LRU eviction each fails `directory::tests::
+token_granular_match` or `planner::tests::token_granular_cap`.

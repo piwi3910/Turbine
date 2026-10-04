@@ -40,6 +40,11 @@ pub struct KvConfig {
     pub demote_min_value: f64,
     /// `false`: no prefix lookup and no reuse (A/B switch).
     pub prefix_sharing: bool,
+    /// Token-granular prefix reuse (P5p S-4, S-5): a request may reuse a token-granular
+    /// prefix of one more L0 block (a cached partial tail or a partially matching full
+    /// block) through a private copy-on-write tail block. Ignored when `prefix_sharing`
+    /// is false.
+    pub partial_prefix_reuse: bool,
     pub transfer: KvTransferConfig,
     pub session: KvSessionConfig,
     pub prefetch: KvPrefetchConfig,
@@ -79,6 +84,7 @@ impl Default for KvConfig {
             policy: ModuleName::fixed("cost_aware"),
             demote_min_value: 0.0,
             prefix_sharing: true,
+            partial_prefix_reuse: true,
             transfer: KvTransferConfig::default(),
             session: KvSessionConfig::default(),
             prefetch: KvPrefetchConfig::default(),

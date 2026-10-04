@@ -193,6 +193,7 @@ fn setup_cfg(
         free_watermark: 0.01,
         max_seq_len: 8192,
         queue_timeout: Duration::from_secs(3600),
+        cache_aware_window: Duration::from_secs(1),
         recent_window,
     };
     let sched = Scheduler::new(params, arc.clone());
@@ -1470,4 +1471,44 @@ fn recent_window_holds_newest_blocks_at_bf16() {
         0,
         "idle with a classed page cached: nothing referenced"
     );
+}
+
+/// P5p S-4, host-side guard (`partial_match_falls_back_to_block_reuse`): the directory's new
+/// token-granular comparison sees a tail that diverges inside a cached full block and the
+/// planner extends its cutoff — but until Task 7 wires the tail copy, the attach stays
+/// Phase 4: full blocks by reference, the diverged region and everything after it prefilled,
+/// the estimate block-granular. Breaks if the partial match leaks into the attach (a partial
+/// tail copied, a block attached that the walk did not verify) or changes the recompute.
+#[test]
+fn partial_match_falls_back_to_block_reuse() {
+    let mut s = setup(256, 0, 0, KvConfig::default(), MemoryKind::Dedicated);
+    let d = &mut s.driver;
+    let prefix: Vec<u32> = (0..1024).collect();
+    d.submit(rid(1), prefix.clone(), 1);
+    drain(d);
+
+    // A prompt that diverges at token 500 (inside cached block 31): the full blocks before
+    // it are attached, everything from the divergence is prefilled.
+    let mut diverged = prefix.clone();
+    diverged[500] += 1;
+    d.submit(rid(2), diverged, 1);
+    drain(d);
+    let est = d.last_estimate(rid(2)).unwrap();
+    assert_eq!(
+        est.cached_prefix_tokens, 496,
+        "31 full blocks, block-granular until Task 7"
+    );
+    assert_eq!(d.prefilled_tokens(rid(2)), 1024 - 496);
+    assert_eq!(d.violations(), &[] as &[String]);
+
+    // A prompt shorter than the cached sequence, ending inside a cached block, behaves as in
+    // Phase 4 too: its last full block is recomputed whole.
+    let short: Vec<u32> = (0..1000).collect();
+    d.submit(rid(3), short, 1);
+    drain(d);
+    let est = d.last_estimate(rid(3)).unwrap();
+    assert_eq!(est.cached_prefix_tokens, 992);
+    assert_eq!(d.prefilled_tokens(rid(3)), 8);
+    assert_eq!(d.violations(), &[] as &[String]);
+    assert_eq!(d.pool().referenced_blocks(), 0, "references return to 0");
 }
