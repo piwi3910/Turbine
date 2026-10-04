@@ -51,11 +51,17 @@ impl TierId {
 }
 
 /// Where one copy of a block lives. `slot` is the L0 `BlockId`; for L1/L2 `slab << 32 | slot`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+/// `format` is the `kv_format` codec the copy is stored in (P6b S-1): `l0` (the L0 page bytes
+/// unchanged) for every L0 copy and for lower-tier copies kept at the L0 format.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
 pub struct KvLocation {
     pub tier: TierId,
     pub slot: u64,
+    pub format: &'static str,
 }
+
+/// The `kv_format` codec name of a copy kept at the L0 format (the identity codec).
+pub const L0_FORMAT: &str = "l0";
 
 /// The slot a `put` stored a block in (same encoding as [`KvLocation::slot`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -100,9 +106,38 @@ pub trait KvTier: Send + Sync {
     fn contains(&self, key: &KvKey) -> bool;
     /// Stores a block, replacing any block stored under `key`.
     fn put(&self, key: KvKey, src: TierBlockRef<'_>) -> Result<TierSlot, TierError>;
+    /// Stores one block encoded by codec `format`, `bytes` logical bytes (P6b S-1): tiers that
+    /// label their slots by format (L2's slab headers) or account blocks without holding their
+    /// bytes (a payload-free [`MemTier`]) override it; the others store `src` as [`put`] does.
+    ///
+    /// [`put`]: KvTier::put
+    fn put_as(
+        &self,
+        key: KvKey,
+        format: &'static str,
+        bytes: u64,
+        src: TierBlockRef<'_>,
+    ) -> Result<TierSlot, TierError> {
+        let _ = (format, bytes);
+        self.put(key, src)
+    }
     fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError>;
     fn evict(&self, key: &KvKey) -> Result<(), TierError>;
     fn degraded(&self) -> bool;
+    /// A counter that changes whenever the tier may have gained room for a block of a slot
+    /// size it had none for: a slab emptied (it can take another slot size), a slab was
+    /// released, or the tier's capacity grew back. A tier without slabs changes it whenever a
+    /// stored block's bytes are released. The compression ladder backs off a tier's rewrites
+    /// after one ended `Full` until it changes (P6b S-6; user decision "6b Task 16: ladder proof
+    /// results — four open points", 3 A).
+    fn room_epoch(&self) -> u64;
+    /// How many copies of `bytes` bytes in codec `format` the tier can store now without
+    /// evicting: its free slots of that size and format, plus the slots an empty slab it may
+    /// reformat or a slab it may still allocate would give. `u64::MAX` for a tier without slot
+    /// sizes (its byte capacity is the caller's to check). A new demotion takes a tier's ladder
+    /// rung only while this is above the copies in flight into it (P6b S-6: a slab tier whose
+    /// slabs all hold another slot size refuses every copy of the rung's size).
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64;
 }
 
 /// Pressure of a tier from its utilisation, on the Phase 3 `kv_utilization` thresholds

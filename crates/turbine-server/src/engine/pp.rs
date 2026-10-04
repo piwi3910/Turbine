@@ -133,6 +133,7 @@ impl OwnedBatch {
                 q_len: s.q_len,
                 kv_len: s.kv_len,
                 block_table: &s.block_table,
+                block_formats: &[],
                 reduce: s.reduce,
             })
             .collect()
@@ -1006,6 +1007,7 @@ pub(crate) fn load_pipeline(
         last.arch.weight_format.0.name(),
         tail.weight_bytes,
     );
+    model::record_quantization(metrics, &last.arch, tail.weight_bytes);
     tracing::info!(
         event = "pp_pipeline_ready",
         stages,
@@ -1117,7 +1119,7 @@ pub(crate) mod testing {
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
         let slots = pp::weight_slots(cfg, &s).unwrap();
         let weights = WeightLoader::load_part(
-            cfg.weight_format.0,
+            cfg.weight_format.get(),
             &index,
             &slots,
             &llama_slots(cfg),
@@ -1262,6 +1264,7 @@ mod tests {
                         q_len: tokens.len() as u32,
                         kv_len: lens[s] + tokens.len() as u32,
                         block_table: &tables[s],
+                        block_formats: &[],
                         reduce: None,
                     };
                     (tokens, positions, [slice])
@@ -1345,6 +1348,7 @@ mod tests {
                     q_len: 2,
                     kv_len: 2,
                     block_table: &tables[s],
+                    block_formats: &[],
                     reduce: None,
                 }]
             };

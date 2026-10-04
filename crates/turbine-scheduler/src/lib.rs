@@ -18,8 +18,8 @@ pub use queue::WaitingQueue;
 pub use request::{CancelReason, PreemptReason, RequestState, SchedError, SchedRequest};
 pub use scheduler::{
     BatchItem, BatchKind, ForkOp, IterationFailure, IterationLimits, IterationOutcome,
-    IterationPlan, PipelineSnapshot, Scheduler, SchedulerParams, SchedulerSnapshot, StageSnapshot,
-    SubmitError,
+    IterationPlan, PipelineSnapshot, RecentWindow, Scheduler, SchedulerParams, SchedulerSnapshot,
+    StageSnapshot, SubmitError,
 };
 pub use turbine_core::types::{BlockId, Priority, RequestId, SeqId};
 /// The reason carried by `SubmitError::Rejected`.

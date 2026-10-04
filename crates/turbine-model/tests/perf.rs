@@ -157,6 +157,7 @@ fn pool_view<'a>(storage: &'a DeviceBuffer, layout: &KvLayout, blocks: u32) -> K
         layout,
         num_blocks: blocks,
         layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers) * u64::from(blocks),
+        classes: None,
     }
 }
 
@@ -176,6 +177,7 @@ fn step(
             q_len: toks.len() as u32,
             kv_len: start + toks.len() as u32,
             block_table: table,
+            block_formats: &[],
             reduce: None,
         });
         tokens.extend_from_slice(toks);
@@ -1505,6 +1507,7 @@ fn served_step(
             q_len: toks.len() as u32,
             kv_len: start + toks.len() as u32,
             block_table: table,
+            block_formats: &[],
             reduce,
         });
         tokens.extend_from_slice(toks);

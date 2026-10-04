@@ -124,7 +124,12 @@ fn nvme_checksum_and_restart() {
     let slab = t.slab_path(0);
     let mut raw = std::fs::read(&slab).unwrap();
     assert_eq!(&raw[..8], SLAB_MAGIC);
-    assert_eq!(&raw[8..12], &1u32.to_le_bytes(), "format version 1");
+    assert_eq!(&raw[8..12], &2u32.to_le_bytes(), "format version 2");
+    assert_eq!(
+        &raw[60..76],
+        b"l0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+        "the slots' codec"
+    );
     assert_eq!(&raw[12..44], &[3u8; 32], "namespace key");
     // Slots are 8 KiB after the 4 KiB header and fill from slot 0: corrupt one byte of slot 1.
     raw[4096 + 8192 + 17] ^= 0xff;
@@ -502,6 +507,102 @@ fn l1_grows_and_shrinks() {
     );
 }
 
+/// P6b S-6: at its size limit L1 gives an empty slab of another slot size to a block of a new
+/// size (a ladder rewrite into another format), as L2 reformats an empty slab; a slab that still
+/// holds a block keeps its size. Breaks if a rewrite into a new format is refused while a slab
+/// is empty (the ladder could then never step an L1 of few slabs past its second format).
+#[test]
+fn l1_reuses_an_empty_slab_for_another_slot_size() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc.clone(), clock());
+    let half = (BLOCK / 2) as usize;
+    let quarter = (BLOCK / 4) as usize;
+    l1.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    l1.put(key(1), TierBlockRef::Host(&bytes(1)[..half]))
+        .unwrap();
+    assert_eq!(l1.slab_count(), 2);
+    // Key 0 is rewritten at half size: it moves to slab 1, slab 0 is empty.
+    l1.put(key(0), TierBlockRef::Host(&bytes(0)[..half]))
+        .unwrap();
+    // A quarter-size block takes the empty slab.
+    l1.put(key(1), TierBlockRef::Host(&bytes(1)[..quarter]))
+        .unwrap();
+    assert_eq!(l1.slab_count(), 2);
+    assert_eq!(alloc.live_buffers(), 2, "no slab beyond the limit");
+    let mut out = vec![0u8; quarter];
+    l1.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(1)[..quarter]);
+    let mut out = vec![0u8; half];
+    l1.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(0)[..half]);
+    // Both slabs hold blocks now: a third size is refused.
+    let eighth = (BLOCK / 8) as usize;
+    assert_eq!(
+        l1.put(key(2), TierBlockRef::Host(&bytes(2)[..eighth])),
+        Err(TierError::Full)
+    );
+}
+
+/// Decision "6b: after the demotion fallback — C": at the production default slab size
+/// (`kv.cpu.slab_bytes`, 128 MiB) one evictions-budget empties a whole slab, which is then
+/// reformatted for a copy of a new format while the other slab's old-format slots stay
+/// occupied — at the former 1 GiB slabs the same evictions freed no slab and the new-format
+/// copy was refused with `Full` (L1 held only `l0` slots and never mixed). Real Llama-3.2-3B
+/// block sizes: 14,680,064 B at `l0`, 4,128,768 B at `tq4`.
+#[test]
+fn l1_default_slab_size_stores_a_new_format_block_beside_occupied_old_format_slots() {
+    const L0_BLOCK: usize = 14_680_064;
+    const TQ4_BLOCK: usize = 4_128_768;
+    let slab = usize::try_from(turbine_core::config::KvCpuConfig::default().slab_bytes.0)
+        .expect("slab bytes fit usize");
+    let cfg = L1Config {
+        enabled: true,
+        max_bytes: 2 * slab as u64,
+        slab_bytes: slab as u64,
+        block_bytes: L0_BLOCK as u64,
+        memory_kind: MemoryKind::Dedicated,
+    };
+    let l1 = L1PinnedTier::new(cfg, Arc::new(HostPinned::new(u64::MAX)), clock());
+    let per_slab = slab / L0_BLOCK; // 9 slots of 128 MiB (73 at the old 1 GiB)
+    let n = per_slab * 2;
+    let l0_block = vec![0u8; L0_BLOCK];
+    for i in 0..n as u8 {
+        l1.put(key(i), TierBlockRef::Host(&l0_block)).unwrap();
+    }
+    assert_eq!(l1.slab_count(), 2);
+    assert_eq!(
+        l1.put(key(200), TierBlockRef::Host(&l0_block)),
+        Err(TierError::Full),
+        "the tier is full of l0 slots"
+    );
+    // A fixed evictions budget — one 128 MiB slab of l0 blocks — empties a whole slab at the
+    // 128 MiB default (its slab holds 9); at the old 1 GiB slabs the same budget freed 9 of a
+    // 73-slot slab and the tier had no room for a new format.
+    const NEW_SLAB: usize = 128 * 1024 * 1024;
+    let budget = NEW_SLAB / L0_BLOCK;
+    for i in 0..budget as u8 {
+        l1.evict(&key(i))
+            .expect("evicting one new-slab's worth of l0 blocks");
+    }
+    assert!(
+        l1.contains(&key(per_slab as u8)),
+        "old-format slots stay occupied"
+    );
+    let tq4_block = vec![7u8; TQ4_BLOCK];
+    l1.put(key(100), TierBlockRef::Host(&tq4_block))
+        .expect("a new-format block is stored beside occupied old-format slots");
+    let mut out = vec![0u8; TQ4_BLOCK];
+    l1.get(&key(100), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, tq4_block);
+    // The formats now mix: a second new-format block joins the reformatted slab, and the
+    // surviving old-format blocks are still readable.
+    l1.put(key(101), TierBlockRef::Host(&tq4_block)).unwrap();
+    let mut old = vec![0u8; L0_BLOCK];
+    l1.get(&key(per_slab as u8), TierBlockMut::Host(&mut old))
+        .unwrap();
+    assert_eq!(old, l0_block);
+}
+
 #[test]
 fn l1_passes_the_contract_suite() {
     let alloc = Arc::new(HostPinned::new(u64::MAX));
@@ -712,4 +813,151 @@ fn faulty_tier_degrades_to_recompute() {
         "{reasons:?}"
     );
     assert_eq!(r.pool.referenced_blocks(), 0, "no reference leaked");
+}
+
+/// P6b S-1: L2 keeps each codec's blocks in slab files of their own (header version 2 names
+/// the codec and slot size), accounts a block at its own bytes, and rewrites a slab that no
+/// block uses for another codec once every slab file exists.
+#[test]
+fn nvme_slabs_per_codec() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    for i in 0..4u8 {
+        t.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(
+        t.put_as(key(9), "fp8_e4m3", 3000, TierBlockRef::Host(&[1u8; 3000])),
+        Err(TierError::Full),
+        "the only slab file holds l0 blocks"
+    );
+    for i in 0..4u8 {
+        t.evict(&key(i)).unwrap();
+    }
+    // The emptied slab takes 4 KiB fp8 slots now: twice as many blocks.
+    for i in 0..8u8 {
+        let block = vec![i; 3000];
+        t.put_as(key(i), "fp8_e4m3", 3000, TierBlockRef::Host(&block))
+            .unwrap();
+    }
+    assert_eq!(t.used_bytes(), 8 * 3000);
+    let raw = std::fs::read(t.slab_path(0)).unwrap();
+    assert_eq!(&raw[44..52], &4096u64.to_le_bytes(), "slot size");
+    assert_eq!(&raw[52..60], &8u64.to_le_bytes(), "slot count");
+    assert_eq!(&raw[60..68], b"fp8_e4m3");
+    let mut out = vec![0u8; 3000];
+    t.get(&key(5), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, vec![5u8; 3000]);
+    assert_eq!(
+        t.put(key(20), TierBlockRef::Host(&bytes(20))),
+        Err(TierError::Full),
+        "no slab is free for an l0 block"
+    );
+}
+
+/// An L2 tier on `dir` with `slabs` slab files of `blocks` `l0` blocks each.
+fn l2_slabs(dir: &std::path::Path, blocks: u64, slabs: u64) -> L2NvmeTier {
+    let cfg = L2Config {
+        path: dir.to_path_buf(),
+        max_bytes: slabs * (4096 + blocks * 8192),
+        slab_bytes: blocks * 8192,
+        max_queue_depth: 8,
+        block_bytes: BLOCK,
+        namespace: NamespaceKey([3; 32]),
+    };
+    L2NvmeTier::open(cfg, clock(), KvMetrics::unregistered()).unwrap()
+}
+
+/// P6b S-6 edge case (user decision "6b Task 16: ladder proof results — four open points", 2 A):
+/// a rewrite of a block into another codec finds its new slot before it frees the old one, so a
+/// rewrite that finds no room (`Full`) leaves the old copy stored, readable and accounted. Breaks
+/// if the store frees the replaced slot (or drops its index entry) before it has the new one.
+#[test]
+fn nvme_rewrite_without_room_keeps_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put(key(1), TierBlockRef::Host(&bytes(1))).unwrap();
+    assert_eq!(
+        t.put_as(key(0), "fp8_e4m3", 3000, TierBlockRef::Host(&[7u8; 3000])),
+        Err(TierError::Full),
+        "the only slab file holds l0 blocks"
+    );
+    assert!(t.contains(&key(0)), "the old copy stays");
+    let mut out = vec![0u8; BLOCK as usize];
+    t.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, bytes(0), "at its old format");
+    assert_eq!(t.used_bytes(), 2 * BLOCK);
+    // Its slot is still taken: two more l0 blocks fill the slab, a fifth finds none.
+    t.put(key(2), TierBlockRef::Host(&bytes(2))).unwrap();
+    t.put(key(3), TierBlockRef::Host(&bytes(3))).unwrap();
+    assert_eq!(
+        t.put(key(4), TierBlockRef::Host(&bytes(4))),
+        Err(TierError::Full)
+    );
+}
+
+/// The other half of [`nvme_rewrite_without_room_keeps_the_copy`]: a rewrite that finds room
+/// stores the new copy and only then frees the old slot, whose emptied slab takes `l0` blocks
+/// again. Breaks if the old slot leaks or the old copy stays indexed.
+#[test]
+fn nvme_rewrite_with_room_frees_the_old_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2_slabs(dir.path(), 4, 2);
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put_as(key(0), "fp8_e4m3", 3000, TierBlockRef::Host(&[7u8; 3000]))
+        .unwrap();
+    assert_eq!(t.used_bytes(), 3000);
+    let mut out = vec![0u8; 3000];
+    t.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, vec![7u8; 3000]);
+    // Slab 0 is empty again: it holds four l0 blocks.
+    for i in 1..5u8 {
+        t.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(
+        t.put(key(5), TierBlockRef::Host(&bytes(5))),
+        Err(TierError::Full)
+    );
+}
+
+/// `room_epoch` (P6b S-6, user decision "6b Task 16: ladder proof results — four open points",
+/// 3 A): L1 changes it when a slab empties or is released and when host pressure drops below RED,
+/// never for a freed slot of a slab that still holds blocks. Breaks if the ladder's back-off
+/// could resume while no slab freed, or wait forever after one did.
+#[test]
+fn l1_room_epoch_changes_when_a_slab_frees() {
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(l1_cfg(2, MemoryKind::Dedicated), alloc, clock());
+    let e0 = l1.room_epoch();
+    for i in 0..3u8 {
+        l1.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    // Slab 0 holds keys 0 and 1, slab 1 key 2.
+    l1.evict(&key(0)).unwrap();
+    assert_eq!(l1.room_epoch(), e0, "slab 0 still holds key 1");
+    l1.evict(&key(1)).unwrap();
+    let e1 = l1.room_epoch();
+    assert_ne!(e1, e0, "slab 0 emptied");
+    l1.set_host_pressure(PressureState::Red);
+    let e2 = l1.room_epoch();
+    assert_ne!(e2, e1, "the empty slab is released");
+    l1.set_host_pressure(PressureState::Red);
+    assert_eq!(l1.room_epoch(), e2, "nothing more to release");
+    l1.set_host_pressure(PressureState::Orange);
+    assert_ne!(l1.room_epoch(), e2, "slabs may be allocated again");
+}
+
+/// L2's `room_epoch` changes when a slab's last slot frees, not for a slot of a slab still in
+/// use (see [`l1_room_epoch_changes_when_a_slab_frees`]).
+#[test]
+fn nvme_room_epoch_changes_when_a_slab_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = l2(dir.path(), 4, KvMetrics::unregistered());
+    let e0 = t.room_epoch();
+    t.put(key(0), TierBlockRef::Host(&bytes(0))).unwrap();
+    t.put(key(1), TierBlockRef::Host(&bytes(1))).unwrap();
+    t.evict(&key(0)).unwrap();
+    assert_eq!(t.room_epoch(), e0, "the slab still holds key 1");
+    t.evict(&key(1)).unwrap();
+    assert_ne!(t.room_epoch(), e0, "the slab emptied");
 }

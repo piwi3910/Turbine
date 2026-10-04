@@ -103,6 +103,15 @@ impl ShardedL1Tier {
         self.shards.iter().map(|s| s.locate(key)).collect()
     }
 
+    /// Rank 0's slot of a stored block with its bytes ([`L1PinnedTier::locate_len`]), when the
+    /// tier has one shard.
+    pub fn locate_len(&self, key: &KvKey) -> Option<(u64, usize, usize)> {
+        match self.shards.as_slice() {
+            [one] => one.locate_len(key),
+            _ => None,
+        }
+    }
+
     /// Reserves `key` in every shard, or in none: a shard that cannot reserve aborts the
     /// reservations already taken.
     pub fn reserve(&self, key: KvKey) -> Result<ShardSlots, TierError> {
@@ -262,5 +271,27 @@ impl KvTier for ShardedL1Tier {
 
     fn degraded(&self) -> bool {
         self.shards.iter().any(|s| s.degraded())
+    }
+
+    /// Changes when any shard's does.
+    fn room_epoch(&self) -> u64 {
+        self.shards
+            .iter()
+            .fold(0u64, |a, s| a.wrapping_add(s.room_epoch()))
+    }
+
+    /// A block is stored only when every shard takes its part: the fewest any shard has room
+    /// for, each shard asked for its share of `bytes`.
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        if let [one] = self.shards.as_slice() {
+            return one.free_slots(format, bytes);
+        }
+        let total: u64 = self.shard_bytes.iter().map(|&b| b as u64).sum();
+        self.shards
+            .iter()
+            .zip(&self.shard_bytes)
+            .map(|(s, &b)| s.free_slots(format, (bytes * b as u64).div_ceil(total.max(1))))
+            .min()
+            .unwrap_or(0)
     }
 }

@@ -1,0 +1,34 @@
+# turbine-server configuration for the Phase 6a MXFP4 proof's BF16 baseline on novanas:
+#   scripts/lab-bench.sh --model llama8b [--golden16]
+# Weights: unsloth/Llama-3.1-8B-Instruct @ 4699cc75b550f9c6f3173fb80f4703b62d946aa5 in
+# /home/piwi/turbine-models/llama-3.1-8b-instruct (lab-bench passes model.path). The Phase 2c
+# Llama values (scripts/lab/phase2c-novanas-llama.yaml) unchanged, so the 8B BF16 and MXFP4
+# runs differ only in the checkpoint; 16 GB of weights leave the 8 GiB KV pool room on a 32 GB
+# R9700.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.1-8b-instruct
+  served_name: meta-llama/Llama-3.1-8B-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    queue_timeout: 60s

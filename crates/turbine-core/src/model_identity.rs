@@ -5,20 +5,37 @@
 use serde::{Deserialize, Serialize};
 
 /// What the KV cache of a model depends on: BLAKE3 of the model's `config.json` bytes and of its
-/// safetensors index (or single-file header). Two checkpoints share KV only if both match.
+/// safetensors index (or single-file header), and of the resolved RoPE parameters (P6a S-16).
+/// Two checkpoints share KV only if all three match.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct ModelIdentity {
     pub config_hash: [u8; 32],
     pub weights_index_hash: [u8; 32],
+    /// BLAKE3 of the canonical JSON of the resolved RoPE parameters
+    /// (`turbine_model::ModelArchConfig::rope_identity`, set by [`ModelIdentity::with_rope`]):
+    /// a `model.rope_scaling` override changes the rotary table without changing
+    /// `config.json`, so `config_hash` alone would let blocks cached under one RoPE
+    /// configuration be reused under another. [`ModelIdentity::from_bytes`] leaves it the hash
+    /// of the empty string (no RoPE resolved).
+    pub rope_hash: [u8; 32],
 }
 
 impl ModelIdentity {
     /// The identity of a checkpoint from the bytes of its `config.json` and of its safetensors
-    /// index (`model.safetensors.index.json`, or a single file's header).
+    /// index (`model.safetensors.index.json`, or a single file's header); no RoPE resolved yet.
     pub fn from_bytes(config_json: &[u8], weights_index: &[u8]) -> ModelIdentity {
         ModelIdentity {
             config_hash: *blake3::hash(config_json).as_bytes(),
             weights_index_hash: *blake3::hash(weights_index).as_bytes(),
+            rope_hash: *blake3::hash(b"").as_bytes(),
+        }
+    }
+
+    /// This identity under the resolved RoPE parameters `rope_identity` (canonical JSON).
+    pub fn with_rope(self, rope_identity: &str) -> ModelIdentity {
+        ModelIdentity {
+            rope_hash: *blake3::hash(rope_identity.as_bytes()).as_bytes(),
+            ..self
         }
     }
 
@@ -45,6 +62,10 @@ pub enum KvDtype {
     Fp16,
     Fp8E4m3PerTensorScale,
     Fp8E4m3PerBlockScale,
+    /// TurboQuant `tq4` L0 pages (P6b S-5).
+    Tq4,
+    /// TurboQuant `tq2` L0 pages (P6b S-5).
+    Tq2,
 }
 
 impl KvDtype {
@@ -55,6 +76,8 @@ impl KvDtype {
             KvDtype::Fp16 => "fp16",
             KvDtype::Fp8E4m3PerTensorScale => "fp8_e4m3_per_tensor_scale",
             KvDtype::Fp8E4m3PerBlockScale => "fp8_e4m3_per_block_scale",
+            KvDtype::Tq4 => "tq4",
+            KvDtype::Tq2 => "tq2",
         }
     }
     /// TKV1 `kv_format` code.
@@ -64,6 +87,8 @@ impl KvDtype {
             KvDtype::Fp16 => 1,
             KvDtype::Fp8E4m3PerTensorScale => 2,
             KvDtype::Fp8E4m3PerBlockScale => 3,
+            KvDtype::Tq4 => 4,
+            KvDtype::Tq2 => 5,
         }
     }
 }
@@ -77,6 +102,7 @@ mod tests {
         let a = ModelIdentity {
             config_hash: [1; 32],
             weights_index_hash: [7; 32],
+            rope_hash: [0; 32],
         };
         let b = ModelIdentity {
             weights_index_hash: [8; 32],
@@ -96,9 +122,30 @@ mod tests {
         assert_eq!(from.config_hash, *blake3::hash(b"{}").as_bytes());
         assert_eq!(from.weights_index_hash, *blake3::hash(b"index").as_bytes());
         assert_ne!(from, ModelIdentity::from_bytes(b"{} ", b"index"));
+        assert_eq!(from.rope_hash, *blake3::hash(b"").as_bytes());
+        let roped = from.with_rope(r#"{"theta":10000.0}"#);
         assert_eq!(
-            [KvDtype::Bf16, KvDtype::Fp8E4m3PerBlockScale].map(|d| (d.as_str(), d.wire_code())),
-            [("bf16", 0), ("fp8_e4m3_per_block_scale", 3)]
+            roped.rope_hash,
+            *blake3::hash(br#"{"theta":10000.0}"#).as_bytes()
+        );
+        assert_eq!(
+            (roped.config_hash, roped.weights_index_hash),
+            (from.config_hash, from.weights_index_hash)
+        );
+        assert_eq!(
+            [
+                KvDtype::Bf16,
+                KvDtype::Fp8E4m3PerBlockScale,
+                KvDtype::Tq4,
+                KvDtype::Tq2
+            ]
+            .map(|d| (d.as_str(), d.wire_code())),
+            [
+                ("bf16", 0),
+                ("fp8_e4m3_per_block_scale", 3),
+                ("tq4", 4),
+                ("tq2", 5)
+            ]
         );
     }
 }

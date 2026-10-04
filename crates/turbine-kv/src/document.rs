@@ -4,6 +4,8 @@
 //! `KvDocument::from_pool` still renders exactly the Phase 2 JSON while `KvHierarchy::document`
 //! renders the full Phase 4 document (every P2 tier field kept inside each tier object).
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use turbine_core::types::PressureState;
 
@@ -29,6 +31,32 @@ pub struct KvTierDocument {
     pub blocks_free: u32,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub state: Option<TierState>,
+    /// P6b S-2: the copies the tier holds per codec (`blocks` copies, `bytes` at that codec's
+    /// encoded block size); empty in the Phase 2 document. `blocks_total` and `blocks_used`
+    /// count L0-format blocks, so a lossy tier's capacity in its own blocks is
+    /// `capacity_bytes` over the codec's `bytes / blocks`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub formats: BTreeMap<&'static str, FormatUsage>,
+}
+
+/// One codec's share of a tier (`formats` of [`KvTierDocument`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct FormatUsage {
+    pub blocks: u64,
+    pub bytes: u64,
+}
+
+/// The compression ladder's state (P6b S-10): the resolved config and each local tier's
+/// current rung (`None` = the tier is at its base format; the tier order of
+/// [`KvHierarchy::document`]). `/turbine/v1/status` reports it under `quantization.ladder`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LadderDoc {
+    pub enabled: bool,
+    /// Whether the L0 rung is on (`kv.ladder.l0`).
+    pub l0: bool,
+    pub max_format: Option<String>,
+    /// `l0`, `l1`, `l2` → the rung new demotions take (`None` = the tier's base format).
+    pub rungs: BTreeMap<String, Option<String>>,
 }
 
 /// Phase 4 per-tier keys (P4 §Data).
@@ -101,6 +129,7 @@ impl KvDocument {
                 blocks_used: pool.used_blocks(),
                 blocks_free: pool.free_blocks(),
                 state: None,
+                formats: BTreeMap::new(),
             }],
             summary: None,
         }

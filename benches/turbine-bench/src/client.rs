@@ -286,9 +286,52 @@ fn request_lengths(args: &BenchArgs, index: u64) -> (u32, u32) {
     (words, max_tokens)
 }
 
+/// Seed of the `--shared-prefix-share` prefixes (`prompt::prompt(SHARED_PREFIX_SEED, k, words)`)
+/// and salt of the per-request stream that picks them, apart from the length draws.
+pub const SHARED_PREFIX_SEED: u64 = 6_000_101;
+
+/// Words a shared-prefix request keeps after its prefix, at least.
+pub const SHARED_SUFFIX_MIN_WORDS: u32 = 16;
+
+/// The shared prefix request `index` starts with (`--shared-prefix-share`), if any: drawn from
+/// its own seeded stream, so the length draws and the other requests do not change.
+pub fn shared_prefix_of(args: &BenchArgs, index: u64) -> Option<u64> {
+    if args.shared_prefix_share <= 0.0 {
+        return None;
+    }
+    let mut rng = OpenLoopRng::for_request(args.seed ^ SHARED_PREFIX_SEED, index);
+    let millionths = rng.draw(open_loop::RangeArg {
+        min: 0,
+        max: 999_999,
+    });
+    (f64::from(millionths) < args.shared_prefix_share * 1e6).then(|| {
+        u64::from(rng.draw(open_loop::RangeArg {
+            min: 0,
+            max: args.shared_prefixes.max(1) - 1,
+        }))
+    })
+}
+
+/// The prompt text of request `index` with `words` prompt words.
+fn request_prompt(args: &BenchArgs, index: u64, words: u32) -> String {
+    match shared_prefix_of(args, index) {
+        Some(k) => {
+            let own = words
+                .saturating_sub(args.shared_prefix_words)
+                .max(SHARED_SUFFIX_MIN_WORDS);
+            format!(
+                "{}\n\n{}",
+                prompt::prompt(SHARED_PREFIX_SEED, k, args.shared_prefix_words),
+                prompt::prompt(args.seed, index, own)
+            )
+        }
+        None => prompt::prompt(args.seed, index, words),
+    }
+}
+
 fn request_body(args: &BenchArgs, model: &str, index: u64) -> Value {
     let (words, max_tokens) = request_lengths(args, index);
-    let text = prompt::prompt(args.seed, index, words);
+    let text = request_prompt(args, index, words);
     let mut body = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -474,5 +517,74 @@ pub(crate) async fn one_request(
                     .and_then(Value::as_u64);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    fn args(extra: &[&str]) -> BenchArgs {
+        let base = [
+            "turbine-bench",
+            "--url",
+            "http://127.0.0.1:1",
+            "--seed",
+            "7",
+        ];
+        BenchArgs::try_parse_from(base.iter().chain(extra)).unwrap()
+    }
+
+    /// `--shared-prefix-share` (user decision "6b Task 16: ladder proof results — four open
+    /// points", 4 A): about that share of the requests starts with one of the
+    /// `--shared-prefixes` prefixes, each prefix is used several times, the rest of a prompt is
+    /// its own, and every request without a prefix (and every length draw) is the same as
+    /// without the flag. Breaks if no request or every request shares, if the prefixes are not
+    /// reused, or if the flag changes the unshared requests.
+    #[test]
+    fn a_share_of_requests_starts_with_a_shared_prefix() {
+        let plain = args(&["--prompt-words-range", "20..60"]);
+        let shared = args(&[
+            "--prompt-words-range",
+            "20..60",
+            "--shared-prefix-share",
+            "0.5",
+            "--shared-prefixes",
+            "4",
+            "--shared-prefix-words",
+            "30",
+        ]);
+        let prefixes: Vec<String> = (0..4)
+            .map(|k| prompt::prompt(SHARED_PREFIX_SEED, k, 30))
+            .collect();
+        let mut uses = [0u32; 4];
+        for i in 0..400u64 {
+            assert_eq!(request_lengths(&plain, i), request_lengths(&shared, i));
+            let (words, _) = request_lengths(&shared, i);
+            let text = request_prompt(&shared, i, words);
+            match shared_prefix_of(&shared, i) {
+                Some(k) => {
+                    let (head, own) = text.split_once("\n\n").unwrap();
+                    assert_eq!(head, prefixes[k as usize]);
+                    let own_words = words.saturating_sub(30).max(SHARED_SUFFIX_MIN_WORDS);
+                    assert_eq!(own, prompt::prompt(7, i, own_words));
+                    uses[k as usize] += 1;
+                }
+                None => assert_eq!(text, request_prompt(&plain, i, words)),
+            }
+            assert_eq!(shared_prefix_of(&plain, i), None);
+        }
+        let total: u32 = uses.iter().sum();
+        assert!((160..=240).contains(&total), "{total} of 400 shared");
+        assert!(uses.iter().all(|&u| u >= 20), "{uses:?}");
+        assert!(parse_share_rejects());
+    }
+
+    fn parse_share_rejects() -> bool {
+        ["-0.1", "1.5", "x"]
+            .iter()
+            .all(|s| crate::args::parse_share(s).is_err())
     }
 }

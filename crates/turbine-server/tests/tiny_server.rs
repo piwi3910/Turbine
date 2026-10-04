@@ -136,6 +136,13 @@ struct Setup<'a> {
     olmoe: bool,
     /// More environment variables for the server.
     env: &'a [(&'a str, String)],
+    /// Rewrite the tiny Llama into the weight format this `quantization_config` declares
+    /// (Phase 6a).
+    quantization: Option<Value>,
+    /// Extra `kv` keys, e.g. `"  dtype: fp8_e4m3\n"`.
+    kv_extra: &'a str,
+    /// `head_dim` of the tiny Llama (default 16; TurboQuant KV pages need 128).
+    head_dim: Option<u32>,
 }
 
 impl Default for Setup<'_> {
@@ -151,6 +158,9 @@ impl Default for Setup<'_> {
             capture_logs: false,
             olmoe: false,
             env: &[],
+            quantization: None,
+            kv_extra: "",
+            head_dim: None,
         }
     }
 }
@@ -220,9 +230,15 @@ impl TinyServer {
                 7,
                 &TinyOptions {
                     template_with_tools: setup.template_with_tools,
+                    head_dim: setup.head_dim.unwrap_or(TinyOptions::default().head_dim),
                     ..TinyOptions::default()
                 },
             );
+        }
+        if let Some(q) = &setup.quantization {
+            let format =
+                turbine_model::weights::detect(&json!({ "quantization_config": q })).unwrap();
+            assert!(format.write_tiny(&model_dir, None).unwrap());
         }
         if let Some(positions) = setup.max_positions {
             let path = model_dir.join("config.json");
@@ -244,7 +260,7 @@ impl TinyServer {
                 setup.model_extra,
                 setup.server_extra,
                 setup.execution_extra,
-                setup.kv_bytes,
+                &format!("{}\n{}", setup.kv_bytes, setup.kv_extra.trim_end()),
                 setup.extra,
             );
             std::fs::write(&config, yaml).unwrap();
@@ -322,6 +338,56 @@ impl TinyServer {
     }
 }
 
+/// A GET used for polling (`wait_for`) or a retried one-shot read: a transient connect/read
+/// hiccup from a loaded host (WouldBlock/TimedOut, a non-200 status, or a response that doesn't
+/// parse) is `None` rather than a panic, since it reflects host contention rather than the
+/// condition under test. `disconnect_releases_kv` (P2 S-8) hit exactly this: `request()`'s
+/// single-shot read timeout panicked mid-poll on a loaded host instead of letting `wait_for`'s
+/// own deadline decide pass/fail.
+fn poll_json(addr: SocketAddr, path: &str) -> Option<Value> {
+    let mut conn = TcpStream::connect(addr).ok()?;
+    conn.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(
+        conn,
+        "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp).ok()?;
+    let status: u16 = resp.split_whitespace().nth(1)?.parse().ok()?;
+    if status != 200 {
+        return None;
+    }
+    serde_json::from_str(resp.split("\r\n\r\n").nth(1)?).ok()
+}
+
+/// `/turbine/v1/kv`'s `l0` `referenced_blocks`, tolerating a transient host hiccup (see
+/// [`poll_json`]).
+fn poll_blocks_used(addr: SocketAddr) -> Option<u64> {
+    poll_json(addr, "/turbine/v1/kv")?["tiers"][0]["referenced_blocks"].as_u64()
+}
+
+/// Replica 0's scheduler document, tolerating a transient host hiccup (see [`poll_json`]).
+fn poll_scheduler(addr: SocketAddr) -> Option<Value> {
+    poll_json(addr, "/turbine/v1/scheduler")?.get("0").cloned()
+}
+
+/// A one-shot (non-`wait_for`) read of `poll_blocks_used`, retried for up to 10 s instead of
+/// panicking on the first transient hiccup.
+fn blocks_used_retrying(addr: SocketAddr) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(n) = poll_blocks_used(addr) {
+            return n;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "GET /turbine/v1/kv: no usable response within 10s"
+        );
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Running requests in a scheduler document.
 fn running(doc: &Value) -> u64 {
     ["prefilling", "decoding", "paused"]
@@ -367,7 +433,9 @@ impl OpenStream {
     /// the first SSE chunk (a queued request produces none until it runs).
     fn open(addr: SocketAddr, body: &Value, first_chunk: bool) -> OpenStream {
         let mut conn = held_connection(addr);
-        conn.set_read_timeout(Some(Duration::from_secs(60)))
+        // Generous: on a loaded host a chunk gap can run well past a healthy host's, and a read
+        // timeout here surfaces as a raw io::Error panic instead of a clear "not ready" signal.
+        conn.set_read_timeout(Some(Duration::from_secs(120)))
             .unwrap();
         write_request(
             &mut conn,
@@ -575,9 +643,26 @@ fn read_body(reader: &mut BufReader<TcpStream>, head: &str) -> String {
 }
 
 fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> Response {
+    request_within(addr, method, path, body, Duration::from_secs(30))
+}
+
+/// How long a client waits for a non-streaming response that queues behind long generations
+/// (the queued requests of `queue_full_429` and `phase2_metrics_and_reasons`): its head comes
+/// only once it has run to the end, and debug builds on a loaded host (the gate's tests share
+/// four cores at nice 19 with fixture jobs) take minutes for what a quiet host does in seconds.
+/// Only a bound against a hung server; no test measures the wait.
+const QUEUED_RESPONSE_LIMIT: Duration = Duration::from_secs(600);
+
+/// [`request`] with a read timeout of `limit` for each read.
+fn request_within(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    limit: Duration,
+) -> Response {
     let mut conn = TcpStream::connect(addr).expect("connect");
-    conn.set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    conn.set_read_timeout(Some(limit)).unwrap();
     write_request(&mut conn, method, path, body);
     let mut reader = BufReader::new(conn);
     let (status, head) = read_head(&mut reader);
@@ -721,6 +806,14 @@ fn completions_stream_and_non_stream() {
     assert_eq!(status["model"]["architecture"], "LlamaForCausalLM");
     assert!(status["model"]["weight_bytes"].as_u64().unwrap() > 0);
     assert!(status["model"]["load_seconds"].as_f64().is_some());
+    // P6a followups: the resolved RoPE configuration (also logged at load,
+    // event="rope_config"); the tiny Llama fixture carries llama3 scaling like the real
+    // checkpoint (`llama_config_json`), so it is not "default".
+    let rope = &status["model"]["rope"];
+    assert_eq!(rope["theta"], 10_000.0, "{rope}");
+    assert_eq!(rope["rope_type"], "llama3", "{rope}");
+    assert_eq!(rope["factor"], 8.0, "{rope}");
+    assert!(rope["attention_factor"].is_null(), "{rope}");
     // P5 S-4: the cpu backend's plan — one replica on execution.device, no communicator.
     let parallel = &status["parallel"];
     assert_eq!(parallel["tp"], 1, "{parallel}");
@@ -811,6 +904,322 @@ fn status_reports_modules_and_kernels() {
         .collect();
     assert!(!expected.is_empty());
     assert_eq!(status["kernels"], Value::Array(expected), "{status}");
+}
+
+/// Phase 6a S-19: `/turbine/v1/status` of a tiny compressed-tensors FP8 server with FP8 KV
+/// reports `quantization` (weight format, packaging, activation, KV dtype) and lists the
+/// `qgemm` and `quantize_act` choices under `kernels`; `turbine_weight_format_info` names the
+/// format and the `weight_format` event is logged. Breaks if a key is missing.
+#[test]
+fn status_reports_quantization() {
+    let server = TinyServer::launch(&Setup {
+        quantization: Some(json!({
+            "quant_method": "compressed-tensors", "format": "float-quantized",
+            "ignore": ["lm_head"],
+            "config_groups": {"group_0": {"targets": ["Linear"],
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "token",
+                                      "dynamic": true},
+                "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}}}})),
+        kv_extra: "  dtype: fp8_e4m3\n",
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let status = server.get("/turbine/v1/status").json();
+    let q = &status["quantization"];
+    assert_eq!(q["weight_format"], "fp8", "{status}");
+    assert_eq!(q["packaging"], "ct_fp8", "{status}");
+    assert_eq!(q["activation"], "fp8_token", "{status}");
+    assert_eq!(q["kv_dtype"], "fp8_e4m3", "{status}");
+    assert!(q["layers"]["fp8_channel"].as_u64().unwrap() > 0, "{status}");
+    let ops: Vec<&str> = status["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|k| k["op"].as_str())
+        .collect();
+    assert!(ops.contains(&"qgemm"), "{ops:?}");
+    assert!(ops.contains(&"quantize_act"), "{ops:?}");
+    assert_eq!(status["support"]["weight_format"], "fp8", "{status}");
+    let metrics = server.metrics();
+    let line = r#"turbine_weight_format_info{format="fp8",packaging="ct_fp8"} 1"#;
+    assert!(metrics.lines().any(|l| l == line), "{line}:\n{metrics}");
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(
+        Duration::from_secs(10),
+        "the weight_format log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.lines()
+                .any(|l| l.contains(r#""event":"weight_format""#) && l.contains("ct_fp8"))
+        },
+    );
+}
+
+/// P6b S-10 (the exit's one open criterion): a tiny server with a lossy L1 format
+/// (`kv.cpu.format: tq4`) and the ladder on reports `quantization.tier_formats` — blocks and
+/// bytes per tier × format, of the kv document — and `quantization.ladder`, the ladder's
+/// resolved config and current rungs, and `kernels` names the ABI v2.11 `kv_transcode` the
+/// tier format selects. Breaks if a key is missing or the transcode choice is not named.
+#[test]
+fn status_reports_tier_formats_and_ladder() {
+    // The L0 base is FP8 so every ladder class page is exact (an FP8-from-BF16 class page
+    // carries the scales header the cpu provider's class check does not model — recorded for
+    // the lead); `kv.dtype: fp8_e4m3` also ranks fp8 at the base, so the classes are the
+    // window's BF16 and TurboQuant `tq4`.
+    let server = TinyServer::launch(&Setup {
+        head_dim: Some(128),
+        kv_extra: "  dtype: fp8_e4m3\n  cpu:\n    enabled: true\n    format: tq4\n  ladder:\n    enabled: true\n    max_format: tq4\n",
+        ..Setup::default()
+    });
+    // The engine publishes its documents with the first step; one completion makes the rungs
+    // and the kv document live.
+    // `ignore_eos` past one full block, so the sequence caches full blocks the kv document's
+    // per-format copies can name (a prompt of less than one block caches nothing).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 200,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let status = server.get("/turbine/v1/status").json();
+    let q = &status["quantization"];
+    let tf = &q["tier_formats"];
+    assert!(tf.is_object() && tf["l0"].is_object(), "{status}");
+    // A tier that holds nothing (L1 is host-pinned memory, absent on the cpu backend) has an
+    // empty map; every listed format carries its copy count and encoded bytes.
+    assert!(!tf["l0"].as_object().unwrap().is_empty(), "{status}");
+    for (tier, formats) in tf.as_object().unwrap() {
+        for (f, u) in formats.as_object().unwrap() {
+            assert!(
+                u["blocks"].is_u64() && u["bytes"].is_u64(),
+                "{tier}/{f}: {u}"
+            );
+        }
+    }
+    let ladder = &q["ladder"];
+    assert_eq!(ladder["enabled"], true, "{status}");
+    assert_eq!(ladder["max_format"], "tq4", "{status}");
+    assert!(ladder["rungs"].is_object(), "{status}");
+    assert!(
+        ladder["rungs"]["l1"].is_null() || ladder["rungs"]["l1"].is_string(),
+        "{status}"
+    );
+    let kernels = status["kernels"].as_array().unwrap();
+    let transcode = kernels
+        .iter()
+        .find(|k| k["op"] == "kv_transcode")
+        .unwrap_or_else(|| panic!("kernels lists kv_transcode: {kernels:?}"));
+    assert_eq!(transcode["reason_code"], "tier_format", "{transcode}");
+    assert!(transcode["implementation"].is_string(), "{transcode}");
+    assert!(transcode["config"].is_string(), "{transcode}");
+}
+
+/// P6b S-5: `kv.dtype: tq4` serves on the cpu backend (the tiny Llama with head_dim 128):
+/// completions run over TurboQuant L0 pages, and the resolved support row names the `tq4` KV
+/// column, `experimental`. Breaks if startup still refuses TurboQuant pages on the CPU
+/// provider or a forward over them fails.
+#[test]
+fn tq_kv_serves_on_cpu() {
+    let server = TinyServer::launch(&Setup {
+        kv_extra: "  dtype: tq4\n",
+        head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    // P6b Task 8: the executor got the device copy of the tables before its first forward.
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the tq_tables log line", || {
+        logs.lock().unwrap().contains(r#""event":"tq_tables""#)
+    });
+    for _ in 0..2 {
+        let resp = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 8,
+                    "ignore_eos": true, "temperature": 0}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            resp.json()["usage"]["completion_tokens"],
+            8,
+            "{}",
+            resp.body
+        );
+    }
+    let status = server.get("/turbine/v1/status").json();
+    assert_eq!(status["support"]["kv_format"], "tq4", "{status}");
+    assert_eq!(status["support"]["status"], "experimental", "{status}");
+}
+
+/// P6b S-5/S-7 (the GPU counterpart of kv_sim's `recent_window_holds_newest_blocks_at_bf16`,
+/// served): with `kv.dtype: tq4` and the default window, the pool grows the BF16 page class
+/// (`kv_page_classes`), a completion over the window serves, and a block that left the window
+/// is recompressed into the base format (`turbine_kv_ladder_actions_total{tier="l0",
+/// reason="recent_window"}` counts it). Breaks if the window's BF16 pages cannot be addressed
+/// by the executor (the Task 17 open item) or the window conversion never runs.
+#[test]
+fn recent_window_serves_on_cpu() {
+    let server = TinyServer::launch(&Setup {
+        kv_extra: "  dtype: tq4\n",
+        head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the tq_tables log line", || {
+        logs.lock().unwrap().contains(r#""event":"tq_tables""#)
+    });
+    wait_for(
+        Duration::from_secs(10),
+        "the kv_page_classes log line",
+        || {
+            let text = logs.lock().unwrap();
+            text.contains(r#""event":"kv_page_classes""#) && text.contains("bf16")
+        },
+    );
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 300,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    assert_eq!(
+        resp.json()["usage"]["completion_tokens"],
+        300,
+        "{}",
+        resp.body
+    );
+    // The window's exit conversions run on the engine's ticks: like kv_sim's
+    // `recent_window_holds_newest_blocks_at_bf16`, a following request's iterations drive
+    // them (the first request's blocks are unreferenced and outside the live windows).
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Again", "max_tokens": 8,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    wait_for(
+        Duration::from_secs(20),
+        "the recent_window conversion",
+        || {
+            server.metrics().lines().any(|l| {
+                l.starts_with("turbine_kv_ladder_actions_total{")
+                    && l.contains("tier=\"l0\"")
+                    && l.contains("reason=\"recent_window\"")
+                    && l.rsplit(' ')
+                        .next()
+                        .is_some_and(|v| v.parse::<f64>().is_ok_and(|v| v >= 1.0))
+            })
+        },
+    );
+}
+
+/// P6b S-5 (user decision 2026-10-04, "6b exit: llama fp8-KV golden fails deterministically",
+/// A): the recent window softens a LOSSY base format only. `fp8_e4m3` with the served scales
+/// is the format's lossless-with-matched-scales representation (P6b S-1, P6a S-13) — with it
+/// as the L0 base and the default `kv.recent_window_blocks: 1` the pool stays flat (no BF16
+/// window class, no window conversion), and the served tokens match a `recent_window_blocks: 0`
+/// server: the 6a bytes the FP8-KV golden was calibrated on. Breaks if the window applies to
+/// the fp8 base (the newest blocks would hold BF16 pages and shift the served numerics).
+#[test]
+fn recent_window_skips_lossless_fp8kv_base() {
+    // Serves two completions (the second drives the engine's ticks, where window exits would
+    // run) and returns their first choice's token ids plus the window observables.
+    let serve = |kv_extra: &str| {
+        let server = TinyServer::launch(&Setup {
+            kv_extra,
+            capture_logs: true,
+            ..Setup::default()
+        });
+        let resp = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 300,
+                    "ignore_eos": true, "temperature": 0, "logprobs": 20,
+                    "return_tokens_as_token_ids": true}),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let resp2 = server.post(
+            "/v1/completions",
+            &json!({"model": server.model, "prompt": "Again", "max_tokens": 8,
+                    "ignore_eos": true, "temperature": 0}),
+        );
+        assert_eq!(resp2.status, 200, "{}", resp2.body);
+        let ids = choice_token_ids(&resp.json()["choices"][0]);
+        assert_eq!(ids.len(), 300);
+        let window_actions = server.metrics().lines().any(|l| {
+            l.starts_with("turbine_kv_ladder_actions_total{")
+                && l.contains("reason=\"recent_window\"")
+                && l.rsplit(' ')
+                    .next()
+                    .is_some_and(|v| v.parse::<f64>().is_ok_and(|v| v > 0.0))
+        });
+        let classed = server
+            .logs
+            .as_ref()
+            .expect("logs captured")
+            .lock()
+            .unwrap()
+            .contains("kv_page_classes");
+        (ids, classed, window_actions)
+    };
+
+    // The default: `kv.dtype: fp8_e4m3`, `kv.recent_window_blocks: 1`.
+    let (ids, classed, window_actions) = serve("  dtype: fp8_e4m3\n");
+    assert!(
+        !classed,
+        "the fp8 base pool must stay flat: no BF16 window class"
+    );
+    assert!(
+        !window_actions,
+        "no recent-window conversion runs on a lossless base"
+    );
+    // The same server with the window off serves the same bytes.
+    let (ids_off, _, _) = serve("  dtype: fp8_e4m3\n  recent_window_blocks: 0\n");
+    assert_eq!(ids, ids_off, "the window must not change fp8-KV numerics");
+}
+
+/// P6b S-3 / S-5 (user decision 2026-10-02, "6b Task 13", 4 A): over TurboQuant L0 pages a
+/// reused prefix is served from lossy blocks, so the second run of a 201-token prompt reports
+/// its full 128-token block as both `cached_tokens` and `lossy_cached_tokens`, and
+/// `turbine_kv_lossy_cached_tokens_total` counts it; over BF16 pages the same reuse reports 0
+/// lossy tokens. Breaks if cached L0 TurboQuant blocks are reported lossless, or BF16 blocks
+/// lossy.
+#[test]
+fn tq_l0_reuse_counts_lossy_cached_tokens() {
+    let prompt = "x".repeat(200);
+    for (dtype, lossy) in [("bf16", false), ("tq4", true)] {
+        let kv_extra = format!("  dtype: {dtype}\n");
+        let server = TinyServer::launch(&Setup {
+            kv_extra: &kv_extra,
+            head_dim: Some(128),
+            ..Setup::default()
+        });
+        let details = || {
+            let resp = server.post(
+                "/v1/completions",
+                &json!({"model": server.model, "prompt": prompt, "max_tokens": 2,
+                        "ignore_eos": true, "temperature": 0}),
+            );
+            assert_eq!(resp.status, 200, "{dtype}: {}", resp.body);
+            resp.json()["usage"]["prompt_tokens_details"].clone()
+        };
+        let cold = details();
+        assert_eq!(cold["cached_tokens"], 0, "{dtype}: {cold}");
+        assert_eq!(cold["lossy_cached_tokens"], 0, "{dtype}: {cold}");
+        let warm = details();
+        assert_eq!(warm["cached_tokens"], 128, "{dtype}: {warm}");
+        let want = if lossy { 128 } else { 0 };
+        assert_eq!(warm["lossy_cached_tokens"], want, "{dtype}: {warm}");
+        let metrics = server.metrics();
+        let counted = metrics
+            .lines()
+            .find_map(|l| l.strip_prefix("turbine_kv_lossy_cached_tokens_total "))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{dtype}: no lossy counter:\n{metrics}"));
+        assert_eq!(counted, f64::from(want), "{dtype}");
+    }
 }
 
 /// Phase 2m S-11: the support-matrix row resolved at startup is the `support` key of
@@ -962,9 +1371,12 @@ fn single_slot_and_cancel() {
 #[test]
 fn queue_full_429() {
     // `extra` lines indented by two spaces continue the base config's `reliability` section.
+    // The queued two wait for the whole held stream (1,500 tokens with 20 logprobs each): on a
+    // loaded host far longer than the default `reliability.admission.queue_timeout`.
     let server = TinyServer::start_long_with(
         HOLD_PAUSED,
-        "  admission:\n    max_queue: 2\nscheduler:\n  max_running_requests: 1\n",
+        "  admission:\n    max_queue: 2\n    queue_timeout: 10m\nscheduler:\n  \
+         max_running_requests: 1\n",
     );
     let held = server.hold_stream();
     wait_for(Duration::from_secs(10), "first request running", || {
@@ -978,7 +1390,7 @@ fn queue_full_429() {
             let addr = server.addr;
             let model = server.model.clone();
             std::thread::spawn(move || {
-                request(
+                request_within(
                     addr,
                     "POST",
                     "/v1/completions",
@@ -987,6 +1399,7 @@ fn queue_full_429() {
                                 "ignore_eos": true})
                         .to_string(),
                     ),
+                    QUEUED_RESPONSE_LIMIT,
                 )
             })
         })
@@ -1045,33 +1458,36 @@ fn disconnect_releases_kv() {
     let server = TinyServer::start_long_with(HOLD_PAUSED, "");
     let mut streams: Vec<OpenStream> = (0..8).map(|_| server.hold_stream()).collect();
     wait_for(Duration::from_secs(60), "all 8 streams paused", || {
-        let doc = server.scheduler();
+        let doc = poll_scheduler(server.addr).unwrap_or_default();
         doc["paused"] == 8 && doc["waiting"] == 0
     });
     // Paused requests hold their blocks and grow no more.
-    let all8 = server.blocks_used();
+    let all8 = blocks_used_retrying(server.addr);
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.blocks_used(), all8);
+    assert_eq!(blocks_used_retrying(server.addr), all8);
 
     let kept = streams.split_off(4);
     drop(streams);
     let dropped = Instant::now();
+    // The 1 s bound is the P2 S-8 spec claim under test (cancellation frees blocks within one
+    // engine iteration); `poll_scheduler` only turns a transient read/connect hiccup from a
+    // loaded host into "not reached yet" instead of a panic that pre-empts this deadline.
     wait_for(
         Duration::from_secs(1),
         "dropped clients' blocks freed",
         || {
-            let doc = server.scheduler();
+            let doc = poll_scheduler(server.addr).unwrap_or_default();
             doc["paused"] == 4 && running(&doc) == 4
         },
     );
-    let remaining = server.blocks_used();
+    let remaining = blocks_used_retrying(server.addr);
     assert!(dropped.elapsed() < Duration::from_secs(1));
     // Every dropped request held at least its prompt block; the remaining four still hold
     // exactly theirs (they stay paused, so their usage is stable).
     assert!(remaining + 4 <= all8, "{remaining} of {all8}");
     assert!(remaining >= 4, "{remaining}");
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.blocks_used(), remaining);
+    assert_eq!(blocks_used_retrying(server.addr), remaining);
     let metrics = server.metrics();
     assert_eq!(
         sample(
@@ -1085,8 +1501,8 @@ fn disconnect_releases_kv() {
     for s in kept {
         assert_eq!(stream_finish_reason(&s.read_rest()), "length");
     }
-    wait_for(Duration::from_secs(1), "every block free", || {
-        server.blocks_used() == 0
+    wait_for(Duration::from_secs(5), "every block free", || {
+        poll_blocks_used(server.addr) == Some(0)
     });
     let tier = server.kv_tier();
     assert_eq!(tier["referenced_blocks"], 0, "{tier}");
@@ -1360,6 +1776,174 @@ fn run_failing(dir: &TempDir, yaml: &str) -> (Option<i32>, String) {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Phase 4 (found by the P6b Task 6 lab test): `POST /turbine/v1/kv/prefetch` on an idle engine
+/// answers. The engine parks on its command channel when nothing runs, and the prefetch travels
+/// on the KV command channel, so without a wake it waited for the next request (the lab tests'
+/// 300 s read timeouts). Breaks if the prefetch is queued without waking the engine.
+#[test]
+fn prefetch_on_an_idle_engine_answers() {
+    let server = TinyServer::start("");
+    // Let the engine finish its warm-up turns and park.
+    std::thread::sleep(Duration::from_secs(1));
+    let resp = request_within(
+        server.addr,
+        "POST",
+        "/turbine/v1/kv/prefetch",
+        Some(&json!({"prompt": "hello there, this is a prompt"}).to_string()),
+        Duration::from_secs(10),
+    );
+    assert_eq!(resp.status, 202, "{}", resp.body);
+}
+
+/// P6b S-1 (Task 6 fix): the device staging of the KV transcode is a fixed cost in the workspace
+/// pool, counted before the KV pool is sized. With a lossy lower tier (`kv.nvme.format:
+/// fp8_e4m3` under the BF16 pages) the budget error's `workspace=` is larger than with `l0`
+/// tiers by the staging slots; the budget is too small to start either way, so the refusal (exit
+/// 1, the pools named) is what is compared. Breaks if the staging is allocated outside the
+/// budget again.
+#[test]
+fn transcode_staging_is_in_the_workspace_pool() {
+    let dir = TempDir::new("turbine-staging-budget");
+    let tiny = dir.path().join("tiny");
+    write_tiny_llama(&tiny, 7);
+    let workspace = |format: &str| -> u64 {
+        let addr = free_addr();
+        let yaml = format!(
+            "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+             kv:\n  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    \
+             format: {format}\nreliability:\n  memory:\n    workspace_bytes: 1KiB\n    \
+             device_budget_bytes: 1KiB\n",
+            tiny.display(),
+            dir.path().join("kv").display()
+        );
+        let (code, stderr) = run_failing(&dir, &yaml);
+        assert_eq!(code, Some(1), "{format}: stderr:\n{stderr}");
+        let at = stderr
+            .find("workspace=")
+            .unwrap_or_else(|| panic!("{format}: no pool named:\n{stderr}"));
+        stderr[at + "workspace=".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{format}: unreadable workspace:\n{stderr}"))
+    };
+    let plain = workspace("l0");
+    let staged = workspace("fp8_e4m3");
+    assert!(
+        staged > plain,
+        "workspace {plain} bytes with l0 tiers, {staged} with an fp8 tier"
+    );
+}
+
+/// A tiny Llama with head_dim 128 (the TurboQuant codecs' only head dimension) in `dir`:
+/// `(path, layers, KV heads)`.
+fn write_tiny_llama_128(dir: &TempDir) -> (PathBuf, u64, u64) {
+    let path = dir.path().join("tiny128");
+    let spec = write_tiny_llama_with(
+        &path,
+        7,
+        &TinyOptions {
+            head_dim: 128,
+            ..TinyOptions::default()
+        },
+    );
+    (
+        path,
+        u64::from(spec.config.num_layers),
+        u64::from(spec.config.num_kv_heads),
+    )
+}
+
+/// P6b Task 8: the TurboQuant tables are a fixed cost in the workspace pool, counted before the
+/// KV pool is sized, whichever TurboQuant format needs them. The budget is too small to start,
+/// so the refusal (exit 1, the pools named) shows the workspace each configuration reserves:
+/// `kv.dtype: tq4` pages reserve exactly the tables over BF16 pages (no tier, same executor
+/// workspace), a `tq4` NVMe tier those plus its staging slots over `l0` tiers, and no TurboQuant
+/// format nothing. Breaks if the tables are uploaded outside the budget (a model that fits
+/// without them starts and then runs out of memory) or counted for a configuration that does not
+/// upload them.
+#[test]
+fn tq_tables_are_in_the_workspace_pool() {
+    let dir = TempDir::new("turbine-tq-budget");
+    let (tiny, layers, heads) = write_tiny_llama_128(&dir);
+    // layers x KV heads x (K signs + V signs) F32, and the four codebooks.
+    let tables = 4 * (layers * heads * 2 * 128 + 2 + 4 + 8 + 16);
+    let workspace = |kv: &str| -> u64 {
+        let addr = free_addr();
+        let yaml = format!(
+            "model:\n  path: {}\nserver:\n  listen: {addr}\nexecution:\n  backend: cpu\n\
+             kv:\n{kv}reliability:\n  memory:\n    workspace_bytes: 1KiB\n    \
+             device_budget_bytes: 1KiB\n",
+            tiny.display(),
+        );
+        let (code, stderr) = run_failing(&dir, &yaml);
+        assert_eq!(code, Some(1), "{kv}: stderr:\n{stderr}");
+        let at = stderr
+            .find("workspace=")
+            .unwrap_or_else(|| panic!("{kv}: no pool named:\n{stderr}"));
+        stderr[at + "workspace=".len()..]
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{kv}: unreadable workspace:\n{stderr}"))
+    };
+    let plain = workspace("  dtype: bf16\n");
+    assert_eq!(workspace("  dtype: tq4\n"), plain + tables, "tq4 pages");
+    let nvme = |format: &str| {
+        format!(
+            "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 1GiB\n    format: {format}\n",
+            dir.path().join("kv").display()
+        )
+    };
+    let l0_tier = workspace(&nvme("l0"));
+    assert_eq!(l0_tier, plain, "l0 tiers reserve nothing");
+    let tq_tier = workspace(&nvme("tq4"));
+    assert!(
+        tq_tier >= l0_tier + tables,
+        "a tq4 tier reserves {tq_tier} bytes, l0 tiers {l0_tier}, the tables are {tables}"
+    );
+    // The staging slots differ by format, the tables do not: the formats' difference is only
+    // the staging.
+    let fp8_tier = workspace(&nvme("fp8_e4m3"));
+    let tq2_tier = workspace(&nvme("tq2"));
+    assert!(fp8_tier > l0_tier && tq2_tier >= l0_tier + tables);
+}
+
+/// P6b Task 8: a `tq4` NVMe tier below BF16 pages starts on the cpu backend (the tier format is
+/// `experimental`, no longer refused), uploads the TurboQuant tables for the transcode and runs
+/// its copies on it (`kv_transcode_device` names `tq4`), and the server answers. Breaks if the
+/// startup still refuses lower-tier `tq4`, the tables are not built for the transcode, or the
+/// device path does not take the format.
+#[test]
+fn tq_tier_transcodes_on_the_device_path() {
+    let kv_dir = TempDir::new("turbine-tq-tier");
+    let nvme = format!(
+        "  nvme:\n    enabled: true\n    path: {}\n    max_bytes: 64MiB\n    slab_bytes: 8MiB\n    \
+         format: tq4\n",
+        kv_dir.path().join("kv").display()
+    );
+    let server = TinyServer::launch(&Setup {
+        kv_extra: &nvme,
+        head_dim: Some(128),
+        capture_logs: true,
+        extra: "logging:\n  format: json\n",
+        ..Setup::default()
+    });
+    let logs = server.logs.as_ref().expect("logs captured");
+    wait_for(Duration::from_secs(10), "the transcode log line", || {
+        logs.lock()
+            .unwrap()
+            .lines()
+            .any(|l| l.contains(r#""event":"kv_transcode_device""#) && l.contains("tq4"))
+    });
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello there", "max_tokens": 4,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
 }
 
 #[test]
@@ -1698,6 +2282,7 @@ fn reference_tokens(prompt: &[u32], sampling: SamplingParams, max_tokens: u32) -
         deadline_ms: u64::MAX,
         session: None,
         cache_salt: None,
+        kv_policy: None,
     };
     let cancel = turbine_core::request::CancelFlag::default();
     generate(
@@ -2338,8 +2923,16 @@ fn phase2_metrics_and_reasons() {
             let addr = server.addr;
             let body = json!({"model": model, "prompt": "Hello", "max_tokens": 450,
                               "ignore_eos": true, "temperature": 1.0, "seed": i});
+            // Non-streaming: the head comes when the request ends, and the sixth first waits for
+            // one of the five to finish its 450 tokens.
             std::thread::spawn(move || {
-                request(addr, "POST", "/v1/completions", Some(&body.to_string()))
+                request_within(
+                    addr,
+                    "POST",
+                    "/v1/completions",
+                    Some(&body.to_string()),
+                    QUEUED_RESPONSE_LIMIT,
+                )
             })
         })
         .collect();

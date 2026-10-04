@@ -13,13 +13,13 @@ pub use buffer::{
     StagingId, StreamRef,
 };
 pub use dtype::DType;
-pub use kv_view::KvPoolView;
+pub use kv_view::{KvPageClass, KvPageClasses, KvPoolView};
 pub use mapped::{
     MAPPED_ABORT_HOST, MAPPED_ABORT_TIMEOUT, MappedCollectives, MappedDma, MappedHost, MappedKind,
     MappedReduce, MappedRegion, MappedStep,
 };
 pub use pinned::{
-    CopyEngine, CopySource, CopyTarget, CopyTicket, PinnedBuffer, PinnedMemory, PinnedOwner,
+    CopyEngine, CopyOp, CopySource, CopyTarget, CopyTicket, PinnedBuffer, PinnedMemory, PinnedOwner,
 };
 pub use tensor::{Tensor, TensorView};
 pub use turbine_core::types::DeviceId;

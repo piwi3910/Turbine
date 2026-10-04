@@ -92,6 +92,9 @@ pub(crate) struct RopeDesc {
     pub k_stride_token: i64,
     pub style: i32,
     pub dtype: i32,
+    /// v2.10: YaRN's attention factor on cos/sin (1.0 = none); a library below minor 10 does
+    /// not read it and is only ever handed 1.0 ([`V21Symbols::rope_attn_factor`]).
+    pub attn_factor: f32,
 }
 
 /// `turbine_silu_mul_desc`.
@@ -186,6 +189,33 @@ pub(crate) struct AttentionPagedDesc {
     pub scale: f32,
     pub causal: i32,
     pub dtype: i32,
+    /// v2.9: per-layer K / V scales of FP8 pages (read only by a library of minor ≥ 9; 1.0
+    /// otherwise).
+    pub k_scale: f32,
+    pub v_scale: f32,
+    /// v2.11: device U8 `[num_seqs, max_blocks_per_seq]` block formats, NULL = every block in
+    /// `dtype` (read only by a library of minor ≥ 11).
+    pub block_formats: *const u8,
+    /// v2.11: host pointer to this layer's TurboQuant tables (read during the call only).
+    pub tq_params: *const TqParamsDesc,
+    /// v2.11 per-class page addressing: the pool's page classes (read during the call only);
+    /// NULL = flat base pages (then `base_blocks == num_blocks`).
+    pub page_classes: *const KvPageClassDesc,
+    /// v2.11 per-class page addressing: the whole id space, base pages, base pages per slab
+    /// and class page ids per slab (`num_blocks`, `base_blocks` and `slab_stride` /
+    /// `slab_base_blocks` of the pool).
+    pub num_page_classes: i32,
+    pub base_blocks: i32,
+    pub slab_stride: i32,
+    pub slab_base_blocks: i32,
+}
+
+/// `turbine_kv_page_class` (v2.11): one page class besides the base.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KvPageClassDesc {
+    pub fmt: i32,
+    pub per_layer_bytes: i32,
 }
 
 /// `turbine_copy_blocks_desc` (v2). `src_blocks`/`dst_blocks` are host arrays.
@@ -199,6 +229,14 @@ pub(crate) struct CopyBlocksDesc {
     pub src_blocks: *const i32,
     pub dst_blocks: *const i32,
     pub count: i32,
+    /// v2.11 per-class page addressing: the pool's page classes and the pairs' shared
+    /// `TURBINE_KVFMT_*` codes (both NULL/0 with flat pools).
+    pub page_classes: *const KvPageClassDesc,
+    pub pair_formats: *const u8,
+    pub num_page_classes: i32,
+    pub base_blocks: i32,
+    pub slab_stride: i32,
+    pub slab_base_blocks: i32,
 }
 
 /// `TURBINE_MOE_ROUTE_RENORMALIZE`: `MoeRouteDesc::flags` bit dividing the selected weights by
@@ -315,6 +353,79 @@ pub(crate) struct RowSumsqDesc {
     pub dim: i64,
     pub x_stride_row: i64,
     pub dtype: i32,
+}
+
+/// `turbine_qgemm_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QGemmDesc {
+    pub a: *const c_void,
+    pub a_scales: *const f32,
+    pub b: *const c_void,
+    pub b_scales: *const c_void,
+    pub b_zeros: *const u8,
+    pub c: *mut c_void,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub lda: i64,
+    pub ldc: i64,
+    pub scheme: i32,
+    pub act_quant: i32,
+    pub a_dtype: i32,
+    pub c_dtype: i32,
+    pub group_size: i32,
+    pub block_n: i32,
+    pub block_k: i32,
+    pub alpha: f32,
+    pub prefill: i32,
+}
+
+/// `turbine_quantize_act_desc` (v2.9).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuantizeActDesc {
+    pub x: *const c_void,
+    pub out: *mut c_void,
+    pub scales: *mut f32,
+    pub rows: i64,
+    pub cols: i64,
+    pub x_stride_row: i64,
+    pub out_stride_row: i64,
+    pub mode: i32,
+    pub static_scale: f32,
+    pub x_dtype: i32,
+    pub out_dtype: i32,
+}
+
+/// `turbine_kv_transcode_desc` (v2.11).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KvTranscodeDesc {
+    pub pages: *const *mut c_void,
+    pub k_scales: *const f32,
+    pub v_scales: *const f32,
+    pub coded: *mut c_void,
+    pub coded_block_bytes: i64,
+    pub seed: u64,
+    pub num_blocks: i32,
+    pub layers: i32,
+    pub block_tokens: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub page_dtype: i32,
+    pub format: i32,
+    pub direction: i32,
+    pub tq_params: *const TqParamsDesc,
+}
+
+/// `turbine_tq_params` (v2.11): the TurboQuant tables, device pointers.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TqParamsDesc {
+    pub seed: u64,
+    pub codebooks: [*const f32; 4],
+    pub tables: *const f32,
 }
 
 /// `turbine_rmsnorm_sharded_desc` (v2.6).
@@ -434,6 +545,20 @@ pub(crate) struct CopyFns {
         unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut TurbineEvent) -> i32,
 }
 
+/// `turbine_copy_seg` (v2.11): one segment of `turbine_memcpy_h2d_kernel`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopySeg {
+    pub dst: *mut c_void,
+    pub src: *const c_void,
+    pub bytes: usize,
+}
+
+/// `turbine_memcpy_h2d_kernel` (v2.11): the host-to-device copy kernel (P6b, decision "6b: KV
+/// promotions slow decode — which fix" A).
+pub(crate) type CopyKernelFn =
+    unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *const CopySeg, i32, i32) -> i32;
+
 /// The v2.6 tensor-parallel group: `turbine_stream_native_handle` and the `row_sumsq` and
 /// `rmsnorm_sharded` trios.
 #[derive(Clone, Copy)]
@@ -442,6 +567,13 @@ pub(crate) struct TensorParallelFns {
         unsafe extern "C" fn(*mut TurbineCtx, *mut TurbineStream, *mut *mut c_void) -> i32,
     pub row_sumsq: OpTrio<RowSumsqDesc>,
     pub rmsnorm_sharded: OpTrio<RmsnormShardedDesc>,
+}
+
+/// The v2.9 quantization group: the `qgemm` and `quantize_act` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct QuantFns {
+    pub qgemm: OpTrio<QGemmDesc>,
+    pub quantize_act: OpTrio<QuantizeActDesc>,
 }
 
 /// The v2.7 host-mapped group: `turbine_host_{alloc,free}_mapped`,
@@ -529,11 +661,13 @@ pub(crate) struct ImplFns {
     pub set_profile: unsafe extern "C" fn(*mut TurbineCtx, *const CardProfileDesc) -> i32,
 }
 
-/// The optional ABI v2.1–v2.7 functions. `minor` is `turbine_abi_minor()` (0 when the library
+/// The optional ABI v2.1–v2.11 functions. `minor` is `turbine_abi_minor()` (0 when the library
 /// lacks it); every v2.1 group is `None` unless `minor` ≥ 1, `staging` unless `minor` ≥ 3,
 /// `impls` unless `minor` ≥ 4, `copies` unless `minor` ≥ 5 and `staging` is resolved,
 /// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
-/// library exports the whole group.
+/// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
+/// from minor 10, `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
+/// (v2.5) groups resolved, and `copy_kernel` minor ≥ 11 with `copies`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -555,6 +689,14 @@ pub(crate) struct V21Symbols {
     pub mapped_dseq: Option<MappedDseqFn>,
     /// v2.8 copy-engine all-reduce (needs the v2.7 group and the v2.3 / v2.5 copy functions).
     pub mapped_dma: Option<MappedDmaFns>,
+    /// v2.9 quantized GEMM and activation quantization (Phase 6a).
+    pub quant: Option<QuantFns>,
+    /// v2.10: the library reads `turbine_rope_desc.attn_factor` (minor ≥ 10; no new symbol).
+    pub rope_attn_factor: bool,
+    /// v2.11 KV transcode (Phase 6b); needs the v2.9 and v2.5 groups.
+    pub kv_transcode: Option<OpTrio<KvTranscodeDesc>>,
+    /// v2.11 host-to-device copy kernel (Phase 6b); needs the v2.5 group.
+    pub copy_kernel: Option<CopyKernelFn>,
 }
 
 impl V21Symbols {
@@ -658,10 +800,33 @@ impl V21Symbols {
                 alloc: optional(lib, "turbine_host_alloc_dma")?,
             })
         })();
+        let quant = (|| {
+            if minor < 9 {
+                return None;
+            }
+            Some(QuantFns {
+                qgemm: optional_trio(lib, "qgemm")?,
+                quantize_act: optional_trio(lib, "quantize_act")?,
+            })
+        })();
+        let kv_transcode = if minor >= 11 && quant.is_some() && copies.is_some() {
+            optional_trio(lib, "kv_transcode")
+        } else {
+            None
+        };
+        let copy_kernel = if minor >= 11 && copies.is_some() {
+            optional(lib, "turbine_memcpy_h2d_kernel")
+        } else {
+            None
+        };
         V21Symbols {
             minor,
+            rope_attn_factor: minor >= 10,
+            kv_transcode,
+            copy_kernel,
             mapped_dseq,
             mapped_dma,
+            quant,
             options,
             add_rmsnorm: optional_trio(lib, "add_rmsnorm"),
             logits_reduce: optional_trio(lib, "logits_reduce"),
@@ -833,4 +998,280 @@ pub(crate) fn check(
             message: format!("unknown status {other}: {message}"),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use turbine_core::types::DType;
+    use turbine_tensor::{DeviceBuffer, DeviceMemory, Tensor};
+
+    use crate::KernelError;
+    use crate::ops::{
+        KernelProvider, KvCodecFns, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
+        KvTranscodeTables, OpKind, RopeConfig, RopeContext,
+    };
+    use crate::registry::OpConfig;
+    use crate::shim::tests::{STUB_CONTEXTS, mocked_device, stub_hook};
+    use crate::shim::{ShimLibrary, shim_provider};
+
+    /// Calls of `turbine_rope` the stub has seen and the `attn_factor` of the last one.
+    fn rope_calls(lib: &ShimLibrary) -> (i32, f32) {
+        let calls = stub_hook(
+            lib,
+            "stub_rope_calls",
+            |f: unsafe extern "C" fn() -> i32| {
+                // SAFETY: the stub defines `int32_t stub_rope_calls(void)`; the library is loaded.
+                unsafe { f() }
+            },
+        );
+        let last = stub_hook(
+            lib,
+            "stub_rope_last_attn_factor",
+            |f: unsafe extern "C" fn() -> f32| {
+                // SAFETY: the stub defines `float stub_rope_last_attn_factor(void)`.
+                unsafe { f() }
+            },
+        );
+        (calls, last)
+    }
+
+    /// Runs the provider's rope on 1-token device tensors with `attn_factor`.
+    fn run_rope(
+        provider: &Arc<dyn KernelProvider>,
+        mem: &Arc<dyn DeviceMemory>,
+        attn_factor: f32,
+    ) -> Result<(), KernelError> {
+        let cfg = RopeConfig {
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 4,
+            rotary_dim: 4,
+            dtype: DType::BF16,
+        };
+        let q = Tensor::empty(mem, &[1, 1, 4], DType::BF16).expect("q");
+        let k = Tensor::empty(mem, &[1, 1, 4], DType::BF16).expect("k");
+        let positions = Tensor::empty(mem, &[1], DType::I32).expect("positions");
+        let inv_freq = Tensor::empty(mem, &[2], DType::F32).expect("inv_freq");
+        provider
+            .rope()
+            .expect("rope family")
+            .execute(&mut RopeContext {
+                cfg,
+                q: q.view(),
+                k: k.view(),
+                positions: positions.view(),
+                inv_freq: inv_freq.view(),
+                attn_factor,
+            })
+    }
+
+    /// ABI v2.10 (Phase 6a Task 28a): `turbine_rope_desc.attn_factor` is handed only to a
+    /// library at minor ≥ 10. A minor-9 library reports no support, is refused a factor ≠ 1
+    /// with `rope_attn_factor_unavailable` before the library is called, and gets 1.0
+    /// otherwise; a minor-10 library reports support and receives the factor as passed.
+    /// Breaks if an older library is handed a factor it would ignore (a silent YaRN error) or
+    /// the factor does not reach a v2.10 library.
+    #[test]
+    fn optional_groups_v210_rope() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let m = 1.277_258_9_f32;
+
+        let v29 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V29")), "hip")
+            .expect("a v2.9 library loads");
+        assert_eq!(v29.abi_minor(), 9);
+        assert!(!v29.rope_attn_factor());
+        let ctx = v29
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(!provider.rope().expect("rope").attn_factor_supported());
+        let before = rope_calls(&v29).0;
+        let err = run_rope(&provider, &mem, m).expect_err("a factor on a minor-9 library");
+        assert!(
+            err.to_string().contains("rope_attn_factor_unavailable"),
+            "{err}"
+        );
+        assert_eq!(rope_calls(&v29).0, before, "the library must not be called");
+        // Factor 1: the call reaches the library (the stub's rope is unsupported) with 1.0.
+        let err = run_rope(&provider, &mem, 1.0).expect_err("the stub rope fails");
+        assert!(err.to_string().contains("stub: rope"), "{err}");
+        assert_eq!(rope_calls(&v29), (before + 1, 1.0));
+        drop((provider, mem, ctx));
+
+        let v210 = ShimLibrary::load(Path::new(env!("TURBINE_STUB_GFX942_V210")), "hip")
+            .expect("a v2.10 library loads");
+        assert_eq!((v210.abi_version(), v210.abi_minor()), (2, 10));
+        assert!(v210.rope_attn_factor());
+        let ctx = v210
+            .create_context(&mocked_device("gfx942"))
+            .expect("context");
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(provider.rope().expect("rope").attn_factor_supported());
+        let before = rope_calls(&v210).0;
+        let err = run_rope(&provider, &mem, m).expect_err("the stub rope fails");
+        assert!(err.to_string().contains("stub: rope"), "{err}");
+        assert_eq!(rope_calls(&v210), (before + 1, m));
+        drop((provider, mem, ctx));
+    }
+    /// A codec table the stub never calls.
+    struct NoCodecs;
+
+    impl KvCodecFns for NoCodecs {
+        fn encode(
+            &self,
+            _: &KvTranscodeConfig,
+            _: u64,
+            _: (&[f32], &[f32]),
+            _: &[u8],
+            _: &mut [u8],
+        ) -> Result<(), String> {
+            Err("no codecs".into())
+        }
+
+        fn decode(
+            &self,
+            _: &KvTranscodeConfig,
+            _: u64,
+            _: (&[f32], &[f32]),
+            _: &[u8],
+            _: &mut [u8],
+        ) -> Result<(), String> {
+            Err("no codecs".into())
+        }
+    }
+
+    /// ABI v2.11 (Phase 6b Task 5): the KV transcode group resolves only on a library of minor
+    /// 11 or later that exports the whole trio and the v2.9 and v2.5 groups it depends on. A
+    /// minor-10 library has no `kv_transcode` (and is not asked for its op code); minor 11
+    /// resolves it, and the stub names its implementation; a library missing one symbol of the
+    /// trio, or the v2.9 group, gets none of it. A well-formed call reaches the library, a
+    /// malformed one is refused before. Breaks if the group resolves partially or on an older
+    /// library (a demotion would call a symbol that is not there), or is missing on a v2.11 one.
+    #[test]
+    fn optional_groups_v211() {
+        let _serial = STUB_CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = KvTranscodeConfig {
+            src_format: KvTranscodeFormat::L0,
+            dst_format: KvTranscodeFormat::Fp8E4m3,
+            page_dtype: DType::BF16,
+            head_dim: 128,
+            num_kv_heads: 8,
+            block_tokens: 128,
+            layers: 28,
+        };
+        let provider_of = |path: &str| {
+            let lib = ShimLibrary::load(Path::new(path), "hip").expect("stub library loads");
+            let ctx = lib
+                .create_context(&mocked_device("gfx942"))
+                .expect("context");
+            (lib, ctx)
+        };
+
+        let (v210, ctx) = provider_of(env!("TURBINE_STUB_GFX942_V210"));
+        assert_eq!(v210.abi_minor(), 10);
+        let provider = shim_provider(Arc::clone(&ctx));
+        assert!(provider.kv_transcode().is_none());
+        assert!(!OpConfig::KvTranscode(cfg).supported_by(provider.as_ref()));
+        assert!(v210.implementations(OpKind::KvTranscode).is_empty());
+        drop((provider, ctx));
+
+        for (path, what) in [
+            (env!("TURBINE_STUB_GFX942_V211_PARTIAL"), "missing _impl"),
+            (env!("TURBINE_STUB_GFX942_V211_NOQUANT"), "no v2.9 group"),
+        ] {
+            let (lib, ctx) = provider_of(path);
+            assert_eq!(lib.abi_minor(), 11, "{what}");
+            let provider = shim_provider(Arc::clone(&ctx));
+            assert!(provider.kv_transcode().is_none(), "{what}");
+            assert!(!OpConfig::KvTranscode(cfg).supported_by(provider.as_ref()));
+            drop((provider, ctx));
+        }
+
+        let (v211, ctx) = provider_of(env!("TURBINE_STUB_GFX942_V211"));
+        assert_eq!((v211.abi_version(), v211.abi_minor()), (2, 11));
+        let provider = shim_provider(Arc::clone(&ctx));
+        let kernel = provider.kv_transcode().expect("the v2.11 family");
+        assert!(!kernel.supports(&cfg), "the stub supports nothing");
+        assert_eq!(kernel.implementation(&cfg), "stub_kv_transcode");
+        let impls = v211.implementations(OpKind::KvTranscode);
+        assert_eq!(impls.len(), 1);
+        assert_eq!(impls[0].name, "stub_kv_transcode");
+
+        // A call shaped like a demotion of one block: the stub refuses it, having been called.
+        let mem: Arc<dyn DeviceMemory> = ctx.clone();
+        let page = cfg.page_bytes();
+        let pages: Vec<DeviceBuffer> = (0..cfg.layers)
+            .map(|_| DeviceBuffer::alloc(&mem, page).expect("page"))
+            .collect();
+        let slots: Vec<_> = pages.iter().map(DeviceBuffer::ptr).collect();
+        let slot = cfg.layers as usize * (8 + page / 2);
+        let coded = DeviceBuffer::alloc(&mem, slot).expect("coded");
+        let call = |pages: &[turbine_tensor::DevicePtr], bytes: usize| {
+            kernel.execute(&mut KvTranscodeContext {
+                cfg,
+                pages,
+                coded: coded.slice(0, bytes),
+                coded_block_bytes: slot,
+                seed: 0,
+                k_scales: None,
+                v_scales: None,
+                codecs: &NoCodecs,
+            })
+        };
+        let err = call(&slots, slot).expect_err("the stub kv_transcode fails");
+        assert!(err.to_string().contains("stub: kv_transcode"), "{err}");
+        // Malformed: a page missing, a coded buffer that is not whole slots.
+        let err = call(&slots[1..], slot).expect_err("27 pages for 28 layers");
+        assert!(err.to_string().contains("pages for 1 blocks"), "{err}");
+        let err = call(&slots, slot - 1).expect_err("a partial slot");
+        assert!(err.to_string().contains("whole slots"), "{err}");
+
+        // TurboQuant (Task 8): the tables are required, checked for shape, then passed on.
+        let tq = KvTranscodeConfig {
+            dst_format: KvTranscodeFormat::Tq4,
+            ..cfg
+        };
+        let codebooks: Vec<Tensor> = [2, 4, 8, 16]
+            .iter()
+            .map(|n| Tensor::empty(&mem, &[*n], DType::F32).expect("codebook"))
+            .collect();
+        let per_layer = cfg.num_kv_heads as usize * KvTranscodeTables::head_elems(cfg.head_dim);
+        let run_tq = |table_layers: usize, with: bool| {
+            let tables =
+                Tensor::empty(&mem, &[table_layers * per_layer], DType::F32).expect("tq tables");
+            let t = KvTranscodeTables {
+                codebooks: std::array::from_fn(|i| codebooks[i].view()),
+                tables: tables.view(),
+            };
+            kernel.execute_with_tables(
+                &mut KvTranscodeContext {
+                    cfg: tq,
+                    pages: &slots,
+                    coded: coded.slice(0, slot),
+                    coded_block_bytes: slot,
+                    seed: 7,
+                    k_scales: None,
+                    v_scales: None,
+                    codecs: &NoCodecs,
+                },
+                with.then_some(&t),
+            )
+        };
+        let layers = cfg.layers as usize;
+        let err = run_tq(layers, false).expect_err("tq4 without tables");
+        assert!(
+            err.to_string().contains("needs the TurboQuant tables"),
+            "{err}"
+        );
+        let err = run_tq(layers - 1, true).expect_err("tables one layer short");
+        assert!(err.to_string().contains("tq tables"), "{err}");
+        let err = run_tq(layers, true).expect_err("the stub kv_transcode fails");
+        assert!(err.to_string().contains("stub: kv_transcode"), "{err}");
+        drop((codebooks, pages, coded, provider, mem, ctx));
+    }
 }

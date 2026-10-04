@@ -30,6 +30,19 @@ const FMHA_ORDER: &[&str] = &["ck_tile_fmha_fwd"];
 /// The tensor-parallel sharded RMSNorm (ABI v2.6): the Turbine kernels only (no CK instance takes
 /// an external sum of squares; decision "P5 T6: sharded RMSNorm — provider evaluation").
 const SHARDED_NORM_ORDER: &[&str] = &["turbine_hip"];
+/// Rows up to which INT4 weights run the fused WMMA kernel (codes streamed into the matrix
+/// registers); above, dequantizing to BF16 once and running hipBLASLt is faster
+/// (`tools/qgemm_int4_eval` on the R9700 GPU 0, Llama-3.2-3B layer sums: 128 rows 652 µs fused
+/// vs 711 dequant, 512 rows 2,387 vs 1,402; decision "P6: INT4 group GEMM — provider
+/// evaluation (kernel reuse rule)").
+const INT4_WMMA_MAX_ROWS: u32 = 128;
+const QGEMM_SMALL_ORDER: &[&str] = &[
+    "hipblaslt_fp8",
+    "turbine_hip_int4_wmma",
+    "turbine_hip_int4_dequant",
+    "turbine_hip_mxfp4",
+    "turbine_hip_fp8_block",
+];
 
 pub static GFX1201: CardProfile = CardProfile {
     name: "gfx1201",
@@ -79,6 +92,37 @@ pub static GFX1201: CardProfile = CardProfile {
         OpPreference {
             op: OpKind::RmsnormSharded,
             order: SHARDED_NORM_ORDER,
+            row_tiers: &[],
+        },
+        // ABI v2.9 (Phase 6a): FP8 W8A8 on hipBLASLt and Turbine's own e4m3 activation
+        // quantization (decision "P6: FP8 GEMM — provider evaluation (kernel reuse rule)");
+        // MXFP4 weights and activation emulation on Turbine's own kernels at every row count
+        // (decision "P6: MXFP4 GEMM — provider evaluation (kernel reuse rule)").
+        OpPreference {
+            op: OpKind::QGemm,
+            order: QGEMM_SMALL_ORDER,
+            // INT4 (decision "P6: INT4 group GEMM — provider evaluation (kernel reuse rule)"):
+            // the fused kernel up to INT4_WMMA_MAX_ROWS rows, dequantize + hipBLASLt above.
+            row_tiers: &[
+                RowTierSpec {
+                    max_rows: Some(INT4_WMMA_MAX_ROWS),
+                    order: QGEMM_SMALL_ORDER,
+                },
+                RowTierSpec {
+                    max_rows: None,
+                    order: &[
+                        "hipblaslt_fp8",
+                        "turbine_hip_int4_dequant",
+                        "turbine_hip_int4_wmma",
+                        "turbine_hip_mxfp4",
+                        "turbine_hip_fp8_block",
+                    ],
+                },
+            ],
+        },
+        OpPreference {
+            op: OpKind::QuantizeAct,
+            order: &["turbine_hip", "turbine_hip_mxfp4"],
             row_tiers: &[],
         },
         OpPreference {

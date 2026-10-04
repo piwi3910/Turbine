@@ -1,0 +1,60 @@
+# turbine-server configuration for the Phase 6b compression ladder proof on novanas (plan Task 16):
+#   scripts/lab-serve.sh novanas scripts/lab/phase6-novanas-ladder.yaml [--set <k>=<v>]...
+# scripts/lab/phase6-novanas-llama.yaml (BF16 weights and BF16 KV pages in L0) with small lower
+# tiers, both stored as they are (`l0`), and the L1/L2 ladder on (P6b S-6): from YELLOW pressure
+# on the lowest tier's oldest, least-reusable copies move one rung down (l0 -> fp8_e4m3 -> tq4),
+# rewritten on the device by the ABI v2.11 transcode, and new demotions into a tier take its
+# current rung; a rung steps back up only at GREEN after reliability.pressure.deescalate_dwell
+# below kv.ladder.low_water. The ladder's floor is tq4: tq2 failed its own lower-tier GSM8K gate
+# (Task 9, perf log 6b), so this config does not let a reused block reach it.
+# A/B on the same bytes:
+#   --set kv.ladder.enabled=false   (the tiers keep every copy at l0)
+# Task 18 (the ladder's L0 step, P6b S-7): the candidate adds
+#   --set kv.ladder.l0=true
+# (the config keeps l0: false so the Task 16 recipe is unchanged; the L0 rung classes are
+# read by the v2.11 mixed-format paged attention). The baseline arm keeps
+# kv.ladder.enabled=false.
+# The overload soak (spec S-6 AC: L1 4 GiB, L2 16 GiB):
+# L2 lives under /home/piwi/turbine-kv-ladder (wiped at startup).
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/llama-3.2-3b-instruct
+  served_name: meta-llama/Llama-3.2-3B-Instruct
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: false
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+  cpu:
+    enabled: true
+    max_bytes: 2GiB
+    format: l0
+  nvme:
+    enabled: true
+    path: /home/piwi/turbine-kv-ladder
+    max_bytes: 4GiB
+    format: l0
+  lossy_reuse: allow
+  ladder:
+    enabled: true
+    l0: false
+    max_format: tq4
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

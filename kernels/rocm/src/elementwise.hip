@@ -266,12 +266,25 @@ constexpr int32_t kRopeMaxHalf = 512;
 
 // cos/sin of the f32 angle evaluated in f64 and rounded to f32: the correctly
 // rounded f32 value a host libm returns, which the device's f32 cosf/sinf (a
-// few ulp) can miss by one BF16 rounding step. Then rounded to T.
-template <typename T> __device__ inline float rope_cos(float f) {
-  return round_to<T>(static_cast<float>(cos(static_cast<double>(f))));
+// few ulp) can miss by one BF16 rounding step. Then multiplied by the
+// attention factor m in f32 (v2.10, YaRN; 1.0 = none, exact) and rounded to T,
+// as transformers' cos() * attention_scaling then .to(dtype).
+template <typename T> __device__ inline float rope_cos(float f, float m) {
+  return round_to<T>(static_cast<float>(cos(static_cast<double>(f))) * m);
 }
-template <typename T> __device__ inline float rope_sin(float f) {
-  return round_to<T>(static_cast<float>(sin(static_cast<double>(f))));
+template <typename T> __device__ inline float rope_sin(float f, float m) {
+  return round_to<T>(static_cast<float>(sin(static_cast<double>(f))) * m);
+}
+
+// The attention factor a descriptor carries: turbine_rope_desc.attn_factor
+// (v2.10). The v2.3 build reports minor 3 and does not read it.
+float rope_attn_factor(const turbine_rope_desc *d) {
+#ifdef TURBINE_V23_BUILD
+  (void)d;
+  return 1.0f;
+#else
+  return d->attn_factor;
+#endif
 }
 
 // Heads (q heads, then k heads) one block rotates: enough pairs to fill it.
@@ -287,7 +300,8 @@ __global__ void rope_kernel(T *q, T *k, const int32_t *positions,
                             const float *inv_freq, int32_t num_q_heads,
                             int32_t num_kv_heads, int32_t head_dim,
                             int32_t rotary_dim, int64_t q_stride,
-                            int64_t k_stride, int32_t heads_per_block) {
+                            int64_t k_stride, int32_t heads_per_block,
+                            float attn_factor) {
   __shared__ float cos_s[kRopeMaxHalf];
   __shared__ float sin_s[kRopeMaxHalf];
   const int64_t t = blockIdx.x;
@@ -300,8 +314,8 @@ __global__ void rope_kernel(T *q, T *k, const int32_t *positions,
   if (staged) {
     for (int32_t i = threadIdx.x; i < half; i += blockDim.x) {
       const float f = pos * inv_freq[i];
-      cos_s[i] = rope_cos<T>(f);
-      sin_s[i] = rope_sin<T>(f);
+      cos_s[i] = rope_cos<T>(f, attn_factor);
+      sin_s[i] = rope_sin<T>(f, attn_factor);
     }
     __syncthreads();
   }
@@ -319,8 +333,8 @@ __global__ void rope_kernel(T *q, T *k, const int32_t *positions,
       s = sin_s[i];
     } else {
       const float f = pos * inv_freq[i];
-      c = rope_cos<T>(f);
-      s = rope_sin<T>(f);
+      c = rope_cos<T>(f, attn_factor);
+      s = rope_sin<T>(f, attn_factor);
     }
     const float x1 = to_f32<T>(x[i]);
     const float x2 = to_f32<T>(x[i + half]);
@@ -349,7 +363,7 @@ constexpr int64_t kRopeTokenKernelMin = 128;
 __global__ __launch_bounds__(kBlock) void rope_token_kernel(
     Bf16 *q, Bf16 *k, const int32_t *positions, const float *inv_freq,
     int32_t num_q_heads, int32_t num_kv_heads, int32_t head_dim,
-    int32_t rotary_dim, int64_t q_stride, int64_t k_stride) {
+    int32_t rotary_dim, int64_t q_stride, int64_t k_stride, float attn_factor) {
   __shared__ float cos_s[kRopeMaxHalf];
   __shared__ float sin_s[kRopeMaxHalf];
   const int64_t t = blockIdx.x;
@@ -359,9 +373,9 @@ __global__ __launch_bounds__(kBlock) void rope_token_kernel(
     const int32_t i = w < half ? w : w - half;
     const float f = pos * inv_freq[i];
     if (w < half) {
-      cos_s[i] = rope_cos<Bf16>(f);
+      cos_s[i] = rope_cos<Bf16>(f, attn_factor);
     } else {
-      sin_s[i] = rope_sin<Bf16>(f);
+      sin_s[i] = rope_sin<Bf16>(f, attn_factor);
     }
   }
   __syncthreads();
@@ -431,7 +445,8 @@ template <typename T> struct RopeLaunch {
                          dim3(kBlock), 0, s, static_cast<Bf16 *>(d->q),
                          static_cast<Bf16 *>(d->k), d->positions, d->inv_freq,
                          d->num_q_heads, d->num_kv_heads, d->head_dim,
-                         d->rotary_dim, d->q_stride_token, d->k_stride_token);
+                         d->rotary_dim, d->q_stride_token, d->k_stride_token,
+                         rope_attn_factor(d));
       return;
     }
     const int32_t per_block = rope_heads_per_block(d->rotary_dim / 2);
@@ -443,7 +458,8 @@ template <typename T> struct RopeLaunch {
              static_cast<unsigned>(groups)),
         dim3(kBlock), 0, s, static_cast<T *>(d->q), static_cast<T *>(d->k),
         d->positions, d->inv_freq, d->num_q_heads, d->num_kv_heads, d->head_dim,
-        d->rotary_dim, d->q_stride_token, d->k_stride_token, per_block);
+        d->rotary_dim, d->q_stride_token, d->k_stride_token, per_block,
+        rope_attn_factor(d));
   }
 };
 

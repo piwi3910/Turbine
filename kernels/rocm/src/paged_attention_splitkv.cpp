@@ -30,6 +30,7 @@
 #include <string>
 
 #include "fmha_fwd.hpp"
+#include "paged_fp8.hpp"
 #include "turbine_hip.hpp"
 
 using turbine_hip::check_hip;
@@ -41,9 +42,14 @@ constexpr int32_t kHeadDim = 128;
 // The split count (see the header comment).
 constexpr int32_t kSplits = 1;
 
-// Grows ctx's split scratch to at least bytes, rounded up to a power of two
-// (never while capturing).
-int32_t split_scratch(turbine_ctx *ctx, size_t bytes, void **out) {
+} // namespace
+
+namespace turbine_hip {
+
+// Grows ctx's attention scratch (the split-KV accumulators, and the staged FP8
+// pages of paged_attention.cpp, which never run under a capture) to at least
+// bytes, rounded up to a power of two (never while capturing).
+int32_t attention_scratch(turbine_ctx *ctx, size_t bytes, void **out) {
   if (ctx->attn_split_scratch_bytes < bytes) {
     if (ctx->capturing) {
       return turbine_hip::refuse_while_capturing(
@@ -67,6 +73,14 @@ int32_t split_scratch(turbine_ctx *ctx, size_t bytes, void **out) {
   }
   *out = ctx->attn_split_scratch;
   return TURBINE_OK;
+}
+
+} // namespace turbine_hip
+
+namespace {
+
+int32_t split_scratch(turbine_ctx *ctx, size_t bytes, void **out) {
+  return turbine_hip::attention_scratch(ctx, bytes, out);
 }
 
 } // namespace

@@ -1401,11 +1401,13 @@ mod kv_sim {
                 ModelIdentity {
                     config_hash: [5; 32],
                     weights_index_hash: [6; 32],
+                    rope_hash: [0; 32],
                 },
                 KvFormat {
                     dtype: KvDtype::Bf16,
                     layout,
                     shards: 1,
+                    scales: None,
                 },
                 64,
                 Some(l1.clone()),
@@ -1462,7 +1464,13 @@ mod kv_sim {
             }
         }
 
-        fn run(&self, prompt: &[u32], salt: &str, session: Option<&SessionHints>) -> PrefixAttach {
+        fn run(
+            &self,
+            prompt: &[u32],
+            salt: &str,
+            session: Option<&SessionHints>,
+            allow_lossy: Option<bool>,
+        ) -> PrefixAttach {
             let g = &mut *self.lock();
             let id = turbine_core::types::RequestId::new_v4();
             let req = AttachRequest {
@@ -1471,6 +1479,7 @@ mod kv_sim {
                 cache_salt: salt,
                 session,
                 priority: Priority::default(),
+                allow_lossy,
             };
             let attach = 'attach: loop {
                 match g.h.attach_prefix(&mut g.pool, &req) {
@@ -1527,13 +1536,15 @@ mod kv_sim {
                 end: req.hints.session_end,
             });
             let salt = req.hints.cache_salt.clone().unwrap_or_default();
-            let attach = self.run(&prompt, &salt, session.as_ref());
+            let allow_lossy = req.hints.kv_policy.map(|p| p.allow_lossy);
+            let attach = self.run(&prompt, &salt, session.as_ref(), allow_lossy);
             Box::pin(async move {
                 let (tx, rx) = tokio::sync::mpsc::channel(8);
                 let usage = Usage {
                     prompt_tokens: prompt.len() as u32,
                     completion_tokens: 1,
                     cached_tokens: attach.cached_tokens,
+                    lossy_cached_tokens: attach.lossy_tokens,
                 };
                 for e in [
                     GenerationEvent::Started { choice: 0 },
@@ -1890,7 +1901,25 @@ fn check_labels(line: &str) {
         "recompute_cheaper",
         "l0_pressure",
         "no_match",
+        "compressed",
+        "ladder_floor",
     ];
+    // P6b S-6: the compression ladder's actions name codecs, not tiers, as from/to.
+    const LADDER_REASONS: &[&str] = &[
+        "fill_high_water",
+        "would_drop",
+        "new_demotion",
+        "rung_step_up",
+        "floor_evict",
+        // A rewrite whose tier had no slot of the new format (counted by the server).
+        "no_room",
+        // The tier's rewrites backed off after a `no_room` until a slab frees.
+        "no_room_backoff",
+        // A demotion stored at the tier's format: no slot of the rung's size was free.
+        "rung_no_slot",
+    ];
+    const CODECS: &[&str] = &["l0", "fp8_e4m3", "tq4", "tq2"];
+    let ladder = line.starts_with("turbine_kv_ladder_actions");
     let Some(labels) = line.split_once('{').map(|(_, rest)| rest) else {
         return;
     };
@@ -1899,6 +1928,9 @@ fn check_labels(line: &str) {
         let (k, v) = pair.split_once('=').unwrap_or_else(|| panic!("{line}"));
         let v = v.trim_matches('"');
         let ok = match k {
+            "from" if ladder => CODECS.contains(&v),
+            "to" if ladder => CODECS.contains(&v) || v == "evict",
+            "reason" if ladder => LADDER_REASONS.contains(&v),
             "tier" | "from" | "to" => TIERS.contains(&v),
             "state" => ["used", "free"].contains(&v),
             "kind" => ["capacity", "used"].contains(&v),
@@ -1963,6 +1995,44 @@ async fn kv_metrics_bounded() {
     sim.settle();
     sim.demote_all();
 
+    // P6b S-3: `usage.prompt_tokens_details.lossy_cached_tokens` in completion and chat
+    // responses (0: these tiers store the L0 bytes), and `x-turbine-kv-lossy` is allow or deny.
+    for deny in [&[][..], &[("x-turbine-kv-lossy", "deny")][..]] {
+        let (s, v) = post_json(
+            &app,
+            "/v1/completions",
+            json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+            deny,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["lossy_cached_tokens"], 0,
+            "{v}"
+        );
+    }
+    let (s, v) = post_json(
+        &app,
+        "/v1/chat/completions",
+        json!({"model": kv_sim::MODEL, "max_tokens": 1,
+               "messages": [{"role": "user", "content": prompt}]}),
+        &[("x-turbine-kv-lossy", "allow")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["usage"]["prompt_tokens_details"]["lossy_cached_tokens"], 0,
+        "{v}"
+    );
+    let (s, v) = post_json(
+        &app,
+        "/v1/completions",
+        json!({"model": kv_sim::MODEL, "prompt": prompt, "max_tokens": 1}),
+        &[("x-turbine-kv-lossy", "maybe")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+
     let (s, _, body) = send(&app, "GET", "/metrics", Vec::new(), None).await;
     assert_eq!(s, StatusCode::OK);
     let text = String::from_utf8(body).unwrap();
@@ -1971,6 +2041,8 @@ async fn kv_metrics_bounded() {
         "turbine_kv_bytes{",
         "turbine_kv_lookups_total{",
         "turbine_kv_prefix_cached_tokens_total",
+        "turbine_kv_lossy_cached_tokens_total ",
+        "turbine_kv_lossy_denied_total ",
         "turbine_kv_prompt_tokens_total",
         "turbine_kv_promotions_total{",
         "turbine_kv_demotions_total{",
@@ -1986,6 +2058,9 @@ async fn kv_metrics_bounded() {
         "turbine_kv_tier_degraded{",
         "turbine_storage_queue_depth ",
         "turbine_storage_latency_seconds_bucket{",
+        // P6b S-6: the compression ladder (its actions render once the ladder acts).
+        "turbine_kv_ladder_rung{",
+        "turbine_kv_ladder_actions_total{",
     ] {
         assert!(text.contains(family), "{family} missing");
     }

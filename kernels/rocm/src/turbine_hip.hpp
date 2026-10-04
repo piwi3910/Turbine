@@ -15,9 +15,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -50,6 +52,18 @@ struct GemmChoice {
 };
 
 struct TunedGemm;
+
+// The per-context state of the quantized GEMM (qgemm.cpp).
+struct QGemmCache;
+// The INT4 dequant path's BF16 staging buffer (qgemm_int4.hip).
+struct Int4Scratch;
+
+// The block-scaled FP8 dequant path's BF16 staging buffer
+// (qgemm_fp8_block.hip).
+struct Fp8BlockScratch;
+
+// The KV transcode's page-table upload ring (kv_transcode.hip).
+struct KvTranscodeScratch;
 
 // The card profile a context holds (ABI v2.4 turbine_card_profile, copied by
 // turbine_ctx_set_profile). The turbine_<op> entry points read their
@@ -117,12 +131,27 @@ struct turbine_ctx {
   std::map<int32_t, std::map<std::string, int>> gemm_solutions;
   // Table rows whose fallback was logged (once per row and context).
   std::set<const turbine_hip::TunedGemm *> gemm_table_logged;
+  // v2.9 quantized GEMM algorithm cache (qgemm.cpp), created at the first
+  // turbine_qgemm call.
+  std::shared_ptr<turbine_hip::QGemmCache> qgemm;
+  // INT4 dequant-path staging buffer (qgemm_int4.hip), created at its first
+  // call.
+  std::shared_ptr<turbine_hip::Int4Scratch> qgemm_int4;
+  // Block-scaled FP8 dequant-path staging buffer (qgemm_fp8_block.hip),
+  // created at its first use.
+  std::shared_ptr<turbine_hip::Fp8BlockScratch> qgemm_fp8_block;
+  // v2.11 KV transcode page-table upload ring (kv_transcode.hip), created at
+  // the first turbine_kv_transcode call.
+  std::shared_ptr<turbine_hip::KvTranscodeScratch> kv_transcode;
   // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
   // host-mapped collective step (hostmem.hip); 0 until then.
   int64_t wall_clock_khz = 0;
   // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
   // stream is being captured, so copies, syncs and allocations are refused.
   bool capturing = false;
+  // The thread that began the capture in progress (valid while capturing): its
+  // entry in the process-wide capture gate (graph.cpp).
+  std::thread::id capture_thread;
   std::mutex error_mutex;
   std::string last_error;
 };
@@ -151,6 +180,31 @@ int32_t refuse_while_capturing(turbine_ctx *ctx, const char *what);
 // Ends and discards a capture in progress on ctx (no-op otherwise), e.g. before
 // the context is destroyed (graph.cpp).
 void abandon_capture(turbine_ctx *ctx);
+
+// Process-wide capture gate (graph.cpp). HIP (ROCm 7.14 clr) refuses a
+// synchronous runtime call such as hipMemset or hipMemcpy anywhere in the
+// process while any stream is capturing, whatever the capture mode
+// (thread-local included), and invalidates every capture in progress
+// (hipErrorStreamCaptureImplicit, "operation would make the legacy stream
+// depend on a capturing blocking stream"). hipblasLtCreate makes one such call
+// (a hipMemset of its synchronizer) and exit(1)s when it fails.
+// turbine_ctx_create therefore holds a CreationGuard around the context's
+// construction: it waits until no context of the process is capturing, and
+// turbine_graph_begin waits while any guard is held, so a capture and a context
+// creation never overlap. A thread that has a capture open cannot create a
+// context (it would wait for itself): ok() is then false and the guard holds
+// nothing.
+class CreationGuard {
+public:
+  CreationGuard();
+  ~CreationGuard();
+  CreationGuard(const CreationGuard &) = delete;
+  CreationGuard &operator=(const CreationGuard &) = delete;
+  bool ok() const { return ok_; }
+
+private:
+  bool ok_ = false;
+};
 
 // hipGetErrorName-style name of a hipBLAS status.
 const char *blaslt_status_name(hipblasStatus_t status);
@@ -296,7 +350,21 @@ int32_t add_rmsnorm_run(turbine_ctx *ctx, const turbine_add_rmsnorm_desc *d,
 // paged_attention.cpp: the paged attention implementations -- CK
 // fmha_fwd_pagedkv, CK fmha_fwd_splitkv (decode of grouped query heads only)
 // or the Turbine kernel; entry names the op in error messages.
-enum class PagedPath { CkPagedkv, CkSplitkv, Turbine };
+// FP8 pages (Phase 6a S-13): CkPagedkvFp8Staged (prefill, the pages staged as
+// BF16 for CK pagedkv), TurbineFp8Decode, TurbineFp8; the others are BF16 only.
+enum class PagedPath {
+  CkPagedkv,
+  CkSplitkv,
+  Turbine,
+  CkPagedkvFp8Staged,
+  TurbineFp8Decode,
+  TurbineFp8,
+  // Mixed-format pages (ABI v2.11, Phase 6b S-5): TurboQuant dtypes or a
+  // block_formats table; the others refuse them.
+  CkPagedkvMixedStaged,
+  TurbineMixedStaged,
+  TurbineMixed
+};
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);

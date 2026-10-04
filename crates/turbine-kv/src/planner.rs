@@ -2,7 +2,11 @@
 //!
 //! For a request's matched prefix the planner picks the cutoff k minimising
 //! cost(k) = Σ retrieval of blocks 0..k from their fastest tier + recompute of tokens k·B..n,
-//! from measured copy estimates and the prefill-throughput EWMA. It is a pure function of its
+//! from measured copy estimates and the prefill-throughput EWMA; a block served lossy costs its
+//! retrieval × (1 + `kv.lossy_penalty` of its codec) (P6b S-3). A path's latency is paid once
+//! per plan and shared by the plan's blocks on that path (their copies are pipelined; on a GPU
+//! the latency estimate is mostly the wait behind other copies on the same copy stream), the
+//! bytes once per block (decision "6b planner follow-ups", 1 A). It is a pure function of its
 //! inputs; the caller logs every plan (`kv_plan`) and counts it (`turbine_kv_plans_total`).
 
 use turbine_core::types::PressureState;
@@ -88,17 +92,55 @@ pub struct PlanInputs<'a> {
     pub l0_state: PressureState,
     pub l1_degraded: bool,
     pub l2_degraded: bool,
+    /// P6b S-1: bytes each matched block's copy moves into L0 (its tier format's size, the
+    /// transfer engine's measured rates are per moved byte); blocks past the slice's end move
+    /// `block_bytes`.
+    pub copy_bytes: &'a [u64],
+    /// P6b S-3: per matched block, `Some(kv.lossy_penalty of its codec)` when it is served
+    /// lossy, `None` when exact; blocks past the slice's end are exact.
+    pub lossy_penalty: &'a [Option<f64>],
+    /// P6b S-3: false (`x-turbine-kv-lossy: deny`) — no block from the first lossy one on is
+    /// reused.
+    pub allow_lossy: bool,
 }
 
 impl PlanInputs<'_> {
-    fn block_retrieval(&self, t: TierId) -> f64 {
-        let path = match t {
-            TierId::L0 => return 0.0,
-            TierId::L1 => self.l1_to_l0,
-            TierId::L2 => self.l2_to_l0,
-            TierId::L3 => None,
-        };
-        path.map_or(f64::INFINITY, |p| p.block_seconds(self.block_bytes))
+    fn penalty(&self, i: usize) -> Option<f64> {
+        self.lossy_penalty.get(i).copied().flatten()
+    }
+
+    /// Seconds to bring the first `k` matched blocks into L0, lossy penalties included: each
+    /// path's latency once, shared by the blocks it carries (each block's share weighted by its
+    /// own penalty), plus every block's bytes over its path's rate.
+    fn retrieval(&self, k: usize) -> f64 {
+        // Per path into L0 (L1, L2): blocks, Σ (1 + penalty), Σ bytes × (1 + penalty).
+        let mut sums = [(0u32, 0.0f64, 0.0f64); 2];
+        for i in 0..k {
+            let slot = match self.matched[i] {
+                TierId::L0 => continue,
+                TierId::L1 => 0,
+                TierId::L2 => 1,
+                TierId::L3 => return f64::INFINITY,
+            };
+            let weight = 1.0 + self.penalty(i).unwrap_or(0.0);
+            let bytes = self.copy_bytes.get(i).copied().unwrap_or(self.block_bytes);
+            let s = &mut sums[slot];
+            s.0 += 1;
+            s.1 += weight;
+            s.2 += bytes as f64 * weight;
+        }
+        let mut total = 0.0;
+        for (path, (blocks, weights, bytes)) in [self.l1_to_l0, self.l2_to_l0].into_iter().zip(sums)
+        {
+            if blocks == 0 {
+                continue;
+            }
+            let Some(p) = path else {
+                return f64::INFINITY;
+            };
+            total += p.latency_s * weights / f64::from(blocks) + bytes / p.bandwidth_bps.max(1.0);
+        }
+        total
     }
 
     fn degraded(&self, t: TierId) -> bool {
@@ -140,13 +182,10 @@ impl PlanInputs<'_> {
     }
 }
 
-/// Seconds to reuse the first `k` matched blocks (retrieving each from its fastest tier) and
-/// recompute the rest of the prompt. `k` must not exceed the matched blocks nor the prompt.
+/// Seconds to reuse the first `k` matched blocks (retrieving each from its fastest tier, each
+/// path's latency once) and recompute the rest of the prompt. `k` must not exceed the matched blocks nor the prompt.
 pub fn plan_cost(inp: &PlanInputs<'_>, k: usize) -> f64 {
-    let retrieve: f64 = inp.matched[..k]
-        .iter()
-        .map(|t| inp.block_retrieval(*t))
-        .sum();
+    let retrieve = inp.retrieval(k);
     let recompute_tokens = inp.prompt_tokens - k as u32 * inp.block_tokens;
     retrieve + f64::from(recompute_tokens) / inp.prefill_tps.max(1.0)
 }
@@ -166,9 +205,19 @@ pub fn reuse_cap(prompt_tokens: u32, block_tokens: u32) -> usize {
 
 /// Chooses the cutoff minimising [`plan_cost`]. At least [`MIN_RECOMPUTE_TOKENS`] prompt tokens
 /// are always recomputed; blocks at or behind a degraded tier are never
-/// retrieved; at L0 RED or above only the leading L0 blocks are reused (no promotion into L0).
+/// retrieved; at L0 RED or above only the leading L0 blocks are reused (no promotion into L0);
+/// without `allow_lossy` nothing from the first lossy block on is reused.
 pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
-    let cap = reuse_cap(inp.prompt_tokens, inp.block_tokens).min(inp.matched.len());
+    let exact = if inp.allow_lossy {
+        inp.matched.len()
+    } else {
+        (0..inp.matched.len())
+            .position(|i| inp.penalty(i).is_some())
+            .unwrap_or(inp.matched.len())
+    };
+    let cap = reuse_cap(inp.prompt_tokens, inp.block_tokens)
+        .min(inp.matched.len())
+        .min(exact);
     let matched = &inp.matched[..cap];
     if matched.is_empty() {
         return inp.plan(0, PlanReason::NoMatch);
@@ -218,6 +267,9 @@ mod tests {
             l0_state: PressureState::Green,
             l1_degraded: false,
             l2_degraded: false,
+            copy_bytes: &[],
+            lossy_penalty: &[],
+            allow_lossy: true,
         }
     }
 
@@ -316,5 +368,120 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    /// Decision "6b planner follow-ups", 1 A: a path's latency (on the server mostly the shared
+    /// wait behind demotions on the same copy stream) is paid once by the blocks of a plan that
+    /// come over that path, since their copies are pipelined; only the bytes are paid per
+    /// block. Breaks if the latency is charged once per block again (a 30 ms wait then prices
+    /// every 128-token block above recomputing it and the 20-block prefix is recomputed).
+    #[test]
+    fn path_latency_is_charged_once_per_plan() {
+        use TierId::L1;
+        let bytes = 14_680_064u64;
+        let l1 = vec![L1; 20];
+        let mut inp = inputs(&l1, 20 * 128 + 2);
+        inp.block_tokens = 128;
+        inp.block_bytes = bytes;
+        inp.prefill_tps = 9_000.0;
+        inp.l1_to_l0 = Some(PathCost {
+            latency_s: 0.03,
+            bandwidth_bps: 10.45e9,
+        });
+        let per_block = bytes as f64 / 10.45e9;
+        let want = 0.03 + 20.0 * per_block + 2.0 / 9_000.0;
+        let got = plan_cost(&inp, 20);
+        assert!(
+            (got - want).abs() < 1e-9,
+            "latency once plus 20 blocks of bytes: {got} s vs {want} s"
+        );
+        let p = plan_prefix(&inp);
+        assert_eq!(
+            (p.cutoff_blocks(), p.reason),
+            (20, PlanReason::RetrieveCheaper),
+            "58 ms of copies against 284 ms of prefill"
+        );
+        // One block still pays the whole latency: 31 ms against 14 ms of prefill.
+        let one = [L1];
+        let mut inp = inputs(&one, 128 + 2);
+        inp.block_tokens = 128;
+        inp.block_bytes = bytes;
+        inp.prefill_tps = 9_000.0;
+        inp.l1_to_l0 = Some(PathCost {
+            latency_s: 0.03,
+            bandwidth_bps: 10.45e9,
+        });
+        assert_eq!(plan_prefix(&inp).reason, PlanReason::RecomputeCheaper);
+        // Two paths each pay their own latency once.
+        let mixed = [L1, TierId::L2, L1, TierId::L2];
+        let inp = inputs(&mixed, 4 * 16 + 2);
+        let (l1c, l2c) = (inp.l1_to_l0.unwrap(), inp.l2_to_l0.unwrap());
+        let want = l1c.latency_s
+            + l2c.latency_s
+            + 2.0 * 1_835_008.0 / l1c.bandwidth_bps
+            + 2.0 * 1_835_008.0 / l2c.bandwidth_bps
+            + 2.0 / 8_000.0;
+        assert!((plan_cost(&inp, 4) - want).abs() < 1e-9);
+    }
+
+    /// P6b S-3: a lossy block is retrieved only while retrieval × (1 + penalty) is cheaper than
+    /// recomputing it, and never without `allow_lossy`. Breaks if the penalty is ignored or an
+    /// opted-out plan reuses a lossy block.
+    #[test]
+    fn lossy_penalty_weighs_retrieval() {
+        use TierId::{L0, L1};
+        let tiers = [L0, L1, L1, L1];
+        let prompt = 4 * 16 + 2;
+        // L1 at 1 ms per block (all of it bytes: a path's latency is paid once per plan)
+        // against 2 ms of prefill per block (16 tokens at 8,000 tok/s).
+        let slow = |p: &mut PlanInputs<'_>| {
+            p.l1_to_l0 = Some(PathCost {
+                latency_s: 0.0,
+                bandwidth_bps: 1_835_008.0 / 1e-3,
+            });
+        };
+        let lossy = [None, Some(0.5), Some(0.5), Some(0.5)];
+        let mut inp = inputs(&tiers, prompt);
+        slow(&mut inp);
+        inp.lossy_penalty = &lossy;
+        let p = plan_prefix(&inp);
+        assert_eq!(p.cutoff_blocks(), 4, "1.5 ms < 2 ms: retrieved");
+        let heavy = [None, Some(1.5), Some(1.5), Some(1.5)];
+        inp.lossy_penalty = &heavy;
+        let p = plan_prefix(&inp);
+        assert_eq!(
+            (p.cutoff_blocks(), p.reason),
+            (1, PlanReason::RecomputeCheaper),
+            "2.5 ms > 2 ms: recomputed"
+        );
+        let exact = [None; 4];
+        inp.lossy_penalty = &exact;
+        assert_eq!(plan_prefix(&inp).cutoff_blocks(), 4, "exact at 1 ms");
+        // An opted-out plan stops at the first lossy block, however cheap.
+        inp.lossy_penalty = &lossy;
+        inp.allow_lossy = false;
+        assert_eq!(plan_prefix(&inp).cutoff_blocks(), 1);
+        // A smaller (encoded) copy moves fewer bytes: at a quarter of the block, a slow path
+        // becomes worth it again.
+        let mut inp = inputs(&tiers, prompt);
+        inp.l1_to_l0 = Some(PathCost {
+            latency_s: 0.0,
+            bandwidth_bps: 1_835_008.0 / 3e-3,
+        });
+        assert_eq!(plan_prefix(&inp).cutoff_blocks(), 1, "3 ms per full block");
+        let quarter = [1_835_008 / 4; 4];
+        inp.copy_bytes = &quarter;
+        inp.lossy_penalty = &lossy;
+        assert_eq!(
+            plan_prefix(&inp).cutoff_blocks(),
+            4,
+            "0.75 ms × 1.5 per block"
+        );
+        // A lossy L0 block costs nothing to retrieve.
+        let l0 = [L0, L0];
+        let costly = [Some(100.0); 2];
+        let mut inp = inputs(&l0, 34);
+        inp.lossy_penalty = &costly;
+        assert_eq!(plan_prefix(&inp).cutoff_blocks(), 2);
     }
 }

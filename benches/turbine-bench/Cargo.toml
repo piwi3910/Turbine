@@ -25,7 +25,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 # HumanDuration: --duration uses the configuration duration grammar (CONFLICT C-14);
-# kv-sim (P4): the real KV hierarchy on virtual time; deterministic request ids
+# kv-sim (P4): the real KV hierarchy on virtual time; deterministic request ids;
+# `turbine-golden eval-compare --max-drop` defaults to `quality.max_accuracy_drop` (umbrella S-4)
 turbine-core.workspace = true
 turbine-kv.workspace = true
 turbine-tensor.workspace = true
@@ -33,7 +34,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-# lab_scripts: the lab configs and k3s manifests are checked against the real config model.
+# lab_scripts: the lab configs and k3s manifests are checked against the real config model
+# (`turbine-core`, a normal dependency).
 serde_norway.workspace = true
 
 [lints.rust]

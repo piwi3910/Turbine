@@ -2478,6 +2478,7 @@ dependencies = [
  "tracing-subscriber",
  "turbine-core",
  "turbine-device",
+ "turbine-kv",
  "turbine-observability",
  "turbine-tensor",
 ]
@@ -2527,6 +2528,7 @@ dependencies = [
  "turbine-device",
  "turbine-distributed",
  "turbine-kernels",
+ "turbine-kv",
  "turbine-observability",
  "turbine-tensor",
 ]
@@ -2597,6 +2599,7 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "turbine-api",
  "turbine-core",
  "turbine-device",

@@ -1,6 +1,7 @@
 //! `kv` configuration section: the Phase 0 tier switches, the Phase 2 L0 pool size and the
 //! Phase 4 tier, policy, transfer, session and prefetch keys (P4 §Configuration, S-15).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -23,13 +24,19 @@ pub struct HostFacts {
 #[serde(deny_unknown_fields, default)]
 pub struct KvConfig {
     pub block_tokens: u32,
+    /// Element format of the L0 pages (Phase 6a S-13); `bf16`, the exact default, or the
+    /// lossy `fp8_e4m3`, which is only ever an explicit setting.
+    pub dtype: KvDtypeChoice,
     pub gpu: KvGpuConfig,
     pub cpu: KvCpuConfig,
     pub nvme: KvNvmeConfig,
     /// Eviction policy (Phase 4; an `eviction_policy` registry name, validated with the other
     /// module keys by `Config::validate_modules`).
     pub policy: ModuleName,
-    /// Blocks scoring below this are dropped instead of demoted.
+    /// Blocks scoring below this are dropped instead of demoted. Absolute, on the eviction
+    /// policy's scale: the policy prices a block's return trip at the lower tier's encoded size
+    /// (P6b), so with a compressing lower tier an L0 block scores lower and a set threshold drops
+    /// more blocks the cheaper that tier is (`docs/extending/eviction-policy.md`, Pitfalls).
     pub demote_min_value: f64,
     /// `false`: no prefix lookup and no reuse (A/B switch).
     pub prefix_sharing: bool,
@@ -37,12 +44,35 @@ pub struct KvConfig {
     pub session: KvSessionConfig,
     pub prefetch: KvPrefetchConfig,
     pub policy_weights: KvPolicyWeights,
+    /// The last N full blocks of a sequence at demotion time leave L0 at the L0 format,
+    /// whatever the tier's format (P6b S-2, user decision 2026-09-28, Q13); 0..=64.
+    pub lossless_tail_blocks: u32,
+    /// The newest N full blocks of each live sequence hold BF16 pages while the L0 base
+    /// format is window-eligible — TurboQuant (`bf16` and `fp8_e4m3` are lossless-with-
+    /// matched-scales bases and get no window; P6b S-5, the recent window; user decision
+    /// 2026-10-02, "6b Task 13", 1 C); 0..=64. A block that leaves the window is recompressed
+    /// in place into the L0 base format. Only with a window-eligible `kv.dtype`. Default 1
+    /// (one block, `kv.block_tokens` tokens: it matches `kv.lossless_tail_blocks` and the
+    /// newest tokens carry most of an attention row's mass; larger values trade L0 capacity
+    /// for exactness); 0 turns the window off.
+    pub recent_window_blocks: u32,
+    /// Whether requests without `x-turbine-kv-lossy` may reuse lossy cached blocks (P6b S-3,
+    /// Q15).
+    pub lossy_reuse: LossyReuse,
+    /// Planner retrieval-cost penalty per codec name (P6b S-3, Q16): a lossy block's retrieval
+    /// cost is multiplied by `1 + penalty` (0..=100). Null: every codec's own default
+    /// (`KvCodec::default_lossy_penalty`); an entry overrides one codec and the others keep
+    /// theirs. The names are checked against the `kv_format` registry at startup.
+    pub lossy_penalty: Option<BTreeMap<ModuleName, f64>>,
+    /// The pressure-driven compression ladder (P6b S-6, S-7).
+    pub ladder: KvLadderConfig,
 }
 
 impl Default for KvConfig {
     fn default() -> Self {
         KvConfig {
             block_tokens: 128,
+            dtype: KvDtypeChoice::Bf16,
             gpu: KvGpuConfig::default(),
             cpu: KvCpuConfig::default(),
             nvme: KvNvmeConfig::default(),
@@ -53,6 +83,108 @@ impl Default for KvConfig {
             session: KvSessionConfig::default(),
             prefetch: KvPrefetchConfig::default(),
             policy_weights: KvPolicyWeights::default(),
+            lossless_tail_blocks: 1,
+            recent_window_blocks: 1,
+            lossy_reuse: LossyReuse::Allow,
+            lossy_penalty: None,
+            ladder: KvLadderConfig::default(),
+        }
+    }
+}
+
+/// `kv.dtype`: how the L0 pool stores K and V (Phase 6a S-13; `tq4` / `tq2` arrive with
+/// `phase-6b-kv-compression`).
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum KvDtypeChoice {
+    /// BF16 pages: exact.
+    #[default]
+    Bf16,
+    /// OCP e4m3fn pages with one K and one V scale per layer (the checkpoint's `k_scale` /
+    /// `v_scale` when present, else 1.0): half the bytes, lossy.
+    Fp8E4m3,
+    /// TurboQuant 4-bit pages (P6b S-5): `experimental` on the CPU reference provider and on
+    /// gfx1201 Llama / OLMoE (the ABI v2.11 mixed-format attention reads the tables the server
+    /// uploads at startup); a library without it is refused with `kv_tq_unavailable`.
+    Tq4,
+    /// TurboQuant 2-bit pages (P6b S-5): parsed, but refused at startup on every backend
+    /// (`kv_tq2_l0_refused`, user decision 2026-10-02); `tq2` stays a lower-tier format.
+    Tq2,
+}
+
+impl KvDtypeChoice {
+    /// The configuration spelling, also the support-matrix KV column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KvDtypeChoice::Bf16 => "bf16",
+            KvDtypeChoice::Fp8E4m3 => "fp8_e4m3",
+            KvDtypeChoice::Tq4 => "tq4",
+            KvDtypeChoice::Tq2 => "tq2",
+        }
+    }
+
+    /// True for a lossy (quantized) format.
+    pub fn is_lossy(self) -> bool {
+        self != KvDtypeChoice::Bf16
+    }
+
+    /// True for a TurboQuant format (`tq4`, `tq2`).
+    pub fn is_turboquant(self) -> bool {
+        matches!(self, KvDtypeChoice::Tq4 | KvDtypeChoice::Tq2)
+    }
+
+    /// True when the recent window (P6b S-5) applies to this L0 base format. The window
+    /// softens a lossy base — TurboQuant pages, whose approximation error is Turbine's own.
+    /// `bf16` and `fp8_e4m3` hold the format's reference representation (`fp8_e4m3` with the
+    /// served per-layer scales is lossless with matched scales, P6b S-1: the quantize at
+    /// append is what the FP8-KV golden reference emulates), so holding a base-format
+    /// sequence's newest blocks at BF16 would deviate from the format's defined numerics —
+    /// the window does not apply (user decision 2026-10-04, "6b exit: llama fp8-KV golden
+    /// fails deterministically", A).
+    pub fn recent_window_base(self) -> bool {
+        self.is_turboquant()
+    }
+}
+
+/// `kv.lossy_reuse`: the default for requests without `x-turbine-kv-lossy`.
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LossyReuse {
+    /// Lookups continue on lossy blocks (the planner still weighs their penalty).
+    #[default]
+    Allow,
+    /// Lookups stop at the first lossy block; the request recomputes from there.
+    Deny,
+}
+
+/// `kv.ladder`: the pressure-driven compression ladder (P6b S-6, S-7; user decision
+/// 2026-09-28, Q17, Q18). Off by default.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct KvLadderConfig {
+    /// Needs L1 or L2 enabled.
+    pub enabled: bool,
+    /// Whether L0 joins the ladder (S-7); false keeps it in L1/L2.
+    pub l0: bool,
+    /// The lossiest rung: a lossy codec of the `kv_format` registry (checked at startup).
+    /// Default `tq4`: `tq2` failed its lower-tier GSM8K gate (user decision 2026-10-02).
+    pub max_format: ModuleName,
+    /// Tier fill above which an upper tier compresses (and the floor may drop); 0.5 < v ≤ 1.0.
+    pub high_water: f64,
+    /// At YELLOW the lowest tier compresses only while `fill + demand` exceeds this (GREEN
+    /// headroom; user decision 2026-09-29); 0.5 ≤ v < `high_water`.
+    pub low_water: f64,
+}
+
+impl Default for KvLadderConfig {
+    fn default() -> Self {
+        KvLadderConfig {
+            enabled: false,
+            l0: true,
+            max_format: ModuleName::fixed("tq4"),
+            high_water: 0.95,
+            low_water: 0.85,
         }
     }
 }
@@ -82,6 +214,14 @@ impl Default for KvGpuConfig {
 pub struct KvCpuConfig {
     pub enabled: bool,
     pub max_bytes: ByteSize,
+    /// Bytes per pinned slab (decision "6b: after the demotion fallback — C"): 128 MiB, small
+    /// enough that a slab of one block format empties in a handful of evictions and is
+    /// reformatted for a copy of another format, so formats mix inside one `max_bytes`. Every
+    /// slab holds whole slots of one size (the largest is the L0-format block).
+    pub slab_bytes: ByteSize,
+    /// Codec of the blocks L1 holds (P6b S-2): a `kv_format` registry name, checked at startup
+    /// with the tier ordering (not more precise than L0).
+    pub format: ModuleName,
 }
 
 impl Default for KvCpuConfig {
@@ -89,6 +229,8 @@ impl Default for KvCpuConfig {
         KvCpuConfig {
             enabled: true,
             max_bytes: ByteSize::gib(64),
+            slab_bytes: ByteSize::mib(128),
+            format: ModuleName::fixed("l0"),
         }
     }
 }
@@ -103,6 +245,9 @@ pub struct KvNvmeConfig {
     pub slab_bytes: ByteSize,
     pub max_queue_depth: u32,
     pub io_threads: u32,
+    /// Codec of the blocks L2 holds (P6b S-2): a `kv_format` registry name, not more precise
+    /// than L1 when L1 is enabled, else than L0 (checked at startup).
+    pub format: ModuleName,
 }
 
 impl Default for KvNvmeConfig {
@@ -114,6 +259,7 @@ impl Default for KvNvmeConfig {
             slab_bytes: ByteSize::gib(1),
             max_queue_depth: 64,
             io_threads: 4,
+            format: ModuleName::fixed("l0"),
         }
     }
 }
@@ -123,12 +269,44 @@ impl Default for KvNvmeConfig {
 pub struct KvTransferConfig {
     /// Bound on bytes of block copies in flight across all local paths.
     pub max_inflight_bytes: ByteSize,
+    /// How pinned → L0 copies (L1 promotions, staged L2 / transcoded promotions) cross the
+    /// host link. Unset (the default): the copy kernel when every copy-stream device's library
+    /// has it, else the copy engine with a WARN (`promotion_copy_kernel_unavailable`); set
+    /// explicitly, `kernel` is refused at startup on such a library and `sdma` keeps the copy
+    /// engine (decision "6b: promotion copy kernel — default" A).
+    pub promotion_copy: Option<PromotionCopy>,
 }
 
 impl Default for KvTransferConfig {
     fn default() -> Self {
         KvTransferConfig {
             max_inflight_bytes: ByteSize::gib(1),
+            promotion_copy: None,
+        }
+    }
+}
+
+/// `kv.transfer.promotion_copy` (P6b, decisions "6b: KV promotions slow decode — which fix" A
+/// and "6b: promotion copy kernel — default" A).
+#[derive(Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionCopy {
+    /// The device's copy engine (`turbine_memcpy_async`).
+    Sdma,
+    /// The kernel library's host-to-device copy kernel (kernel ABI v2.11
+    /// `turbine_memcpy_h2d_kernel`): a few workgroups read the pinned memory directly. On the
+    /// R9700 it moves a promotion ~1.8× faster and stalls decode ~17× less per MiB than the
+    /// copy engine (`.procoder/perf-log.md` 6b "Promotion copy kernel"). The default; set
+    /// explicitly, it is refused at startup (`promotion_copy_kernel_unavailable`) when a
+    /// device's library lacks it.
+    Kernel,
+}
+
+impl PromotionCopy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromotionCopy::Sdma => "sdma",
+            PromotionCopy::Kernel => "kernel",
         }
     }
 }
@@ -209,6 +387,12 @@ impl KvConfig {
                 "must be greater than 0 when kv.cpu.enabled is true",
             ));
         }
+        if self.cpu.enabled && self.cpu.slab_bytes.0 == 0 {
+            return Err(invalid(
+                "kv.cpu.slab_bytes",
+                "must be greater than 0 when kv.cpu.enabled is true",
+            ));
+        }
         self.validate_nvme()?;
         if !(self.demote_min_value >= 0.0 && self.demote_min_value.is_finite()) {
             return Err(invalid(
@@ -251,6 +435,73 @@ impl KvConfig {
                 format!("must be between 0 and 1, got {active}"),
             ));
         }
+        self.validate_formats()
+    }
+
+    /// P6b S-2, S-3, S-6: the lossless tail, the penalties and the ladder. Codec names and the
+    /// tier ordering need the `kv_format` registry: `Config::validate_modules` and the server's
+    /// startup check them.
+    fn validate_formats(&self) -> Result<(), ConfigError> {
+        if self.lossless_tail_blocks > 64 {
+            return Err(invalid(
+                "kv.lossless_tail_blocks",
+                format!(
+                    "must be between 0 and 64, got {}",
+                    self.lossless_tail_blocks
+                ),
+            ));
+        }
+        if self.recent_window_blocks > 64 {
+            return Err(invalid(
+                "kv.recent_window_blocks",
+                format!(
+                    "must be between 0 and 64, got {}",
+                    self.recent_window_blocks
+                ),
+            ));
+        }
+        for (name, &value) in self.lossy_penalty.iter().flatten() {
+            if !(0.0..=100.0).contains(&value) {
+                return Err(invalid(
+                    &format!("kv.lossy_penalty.{name}"),
+                    format!("must be between 0 and 100, got {value}"),
+                ));
+            }
+        }
+        let ladder = &self.ladder;
+        if !(0.5..1.0).contains(&ladder.low_water) {
+            return Err(invalid(
+                "kv.ladder.low_water",
+                format!(
+                    "must be at least 0.5 and below 1.0, got {}",
+                    ladder.low_water
+                ),
+            ));
+        }
+        if !(ladder.high_water > 0.5 && ladder.high_water <= 1.0) {
+            return Err(invalid(
+                "kv.ladder.high_water",
+                format!(
+                    "must be above 0.5 and at most 1.0, got {}",
+                    ladder.high_water
+                ),
+            ));
+        }
+        if ladder.high_water <= ladder.low_water {
+            return Err(invalid(
+                "kv.ladder.high_water",
+                format!(
+                    "must be greater than kv.ladder.low_water ({}), got {}",
+                    ladder.low_water, ladder.high_water
+                ),
+            ));
+        }
+        if ladder.enabled && !self.cpu.enabled && !self.nvme.enabled {
+            return Err(invalid(
+                "kv.ladder.enabled",
+                "needs a lower tier: kv.cpu.enabled or kv.nvme.enabled",
+            ));
+        }
         Ok(())
     }
 
@@ -289,9 +540,19 @@ impl KvConfig {
         Ok(())
     }
 
+    /// The configured `kv.lossy_penalty` of codec `name`, if any (else the codec's default).
+    pub fn lossy_penalty_override(&self, name: &str) -> Option<f64> {
+        self.lossy_penalty
+            .as_ref()?
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, &v)| v)
+    }
+
     /// Rules that need the model's KV block size, checked at startup once the model config is
-    /// parsed (exit 2): the in-flight bound holds one block and an enabled L2 slab holds one
-    /// 4 KiB-rounded slot. Slots per slab are `slab_bytes / slot_bytes`, rounded down.
+    /// parsed (exit 2): the in-flight bound holds one block, an enabled L1 slab holds one
+    /// L0-format block, and an enabled L2 slab holds one 4 KiB-rounded slot. Slots per slab are
+    /// `slab_bytes / slot_bytes`, rounded down.
     pub fn validate_block_bytes(&self, block_bytes: u64) -> Result<(), ConfigError> {
         if self.transfer.max_inflight_bytes.0 < block_bytes {
             return Err(invalid(
@@ -299,6 +560,15 @@ impl KvConfig {
                 format!(
                     "must be at least one KV block ({block_bytes} bytes), got {}",
                     self.transfer.max_inflight_bytes
+                ),
+            ));
+        }
+        if self.cpu.enabled && self.cpu.slab_bytes.0 < block_bytes {
+            return Err(invalid(
+                "kv.cpu.slab_bytes",
+                format!(
+                    "must hold at least one {block_bytes}-byte L0-format block, got {}",
+                    self.cpu.slab_bytes
                 ),
             ));
         }
@@ -353,5 +623,58 @@ impl KvConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn parse(yaml: &str) -> Result<super::super::Config, ConfigError> {
+        super::super::load_from_str(yaml, Path::new("test.yaml"), &[])
+    }
+
+    /// `kv.dtype` defaults to the exact `bf16`, accepts `fp8_e4m3`, and refuses anything else
+    /// naming the key. Breaks if the default turns lossy or the key is not wired.
+    #[test]
+    fn kv_dtype_key() {
+        let base = "model: {path: /models/m}\n";
+        let default = parse(base).expect("defaults");
+        assert_eq!(default.kv.dtype, KvDtypeChoice::Bf16);
+        assert!(!default.kv.dtype.is_lossy());
+        let fp8 = parse(&format!("{base}kv: {{dtype: fp8_e4m3}}\n")).expect("fp8_e4m3");
+        assert_eq!(fp8.kv.dtype, KvDtypeChoice::Fp8E4m3);
+        assert_eq!(fp8.kv.dtype.as_str(), "fp8_e4m3");
+        assert!(fp8.kv.dtype.is_lossy());
+        for bad in ["int8", "fp8", "tq3"] {
+            let err = parse(&format!("{base}kv: {{dtype: {bad}}}\n")).expect_err(bad);
+            assert_eq!(err.key(), Some("kv.dtype"), "{bad}: {err}");
+        }
+    }
+
+    /// The L1 slab size is configurable (`kv.cpu.slab_bytes`) and defaults to 128 MiB
+    /// (decision "6b: after the demotion fallback — C"): small enough that a slab of one
+    /// block format empties in a handful of evictions and is reformatted for a copy of
+    /// another format, so formats mix inside one `kv.cpu.max_bytes`.
+    #[test]
+    fn kv_cpu_slab_bytes_key() {
+        let base = "model: {path: /models/m}\n";
+        let default = parse(base).expect("defaults");
+        assert_eq!(default.kv.cpu.slab_bytes, ByteSize::mib(128));
+        let bigger = parse(&format!("{base}kv: {{cpu: {{slab_bytes: 256MiB}}}}\n"))
+            .expect("slab_bytes parses");
+        assert_eq!(bigger.kv.cpu.slab_bytes, ByteSize::mib(256));
+        // A zero slab holds no slots; refused when L1 is enabled.
+        let err = parse(&format!("{base}kv: {{cpu: {{slab_bytes: 0}}}}\n")).expect_err("zero");
+        assert_eq!(err.key(), Some("kv.cpu.slab_bytes"), "{err}");
+        // A slab smaller than one L0-format block holds no slots either.
+        let cfg = parse(base).expect("defaults");
+        let err = cfg
+            .kv
+            .validate_block_bytes(ByteSize::mib(128).0 + 1)
+            .expect_err("slab below one block");
+        assert_eq!(err.key(), Some("kv.cpu.slab_bytes"), "{err}");
     }
 }

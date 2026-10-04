@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod compare;
+pub mod eval;
 pub mod fixture;
 pub mod positions;
 

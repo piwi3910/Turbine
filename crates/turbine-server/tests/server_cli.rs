@@ -548,6 +548,41 @@ fn sigterm_graceful_shutdown() {
     );
 }
 
+/// A clean shutdown waits for the engine thread to drop the executor, the KV pool and the
+/// kernel library's resources before `main` returns. Catches the process exiting (running the
+/// static destructors of the device runtime) while the engine thread still frees device
+/// buffers: the W4A4 8B server died with SIGSEGV after `shutdown complete` (2026-09-29).
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_engine_before_exit() {
+    let addr = SocketAddr::from(([127, 0, 0, 1], free_port()));
+    let (_model, yaml) = tiny_model_yaml(addr);
+    let cfg = TempConfig::new("sigterm-engine-stop", &yaml);
+    let mut child = spawn_server(&[], &cfg.path);
+    let _reaper = KillOnDrop(child.id());
+    wait_until_serving(&mut child, addr);
+    wait_until_ready(&mut child, addr);
+
+    sigterm(&child);
+    let out = wait_with_timeout(child, Duration::from_secs(10));
+    assert_eq!(out.status.code(), Some(0));
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stopped = log
+        .find("engine_stopped")
+        .unwrap_or_else(|| panic!("no engine_stopped event in the log:\n{log}"));
+    let complete = log
+        .find("shutdown complete")
+        .unwrap_or_else(|| panic!("no shutdown complete line in the log:\n{log}"));
+    assert!(
+        stopped < complete,
+        "the engine must stop before shutdown completes:\n{log}"
+    );
+}
+
 /// `max_position_embeddings` of the checkpoint `long_model_yaml` serves, so streams can be held.
 const LONG_POSITIONS: u32 = 8192;
 /// Tokens of a stream that must outlive the shutdown grace: far more events than the output
@@ -561,10 +596,13 @@ const LONG_TOKENS: u32 = 1500;
 /// it autotunes), so it pauses after 880 tokens or more.
 const SHORT_TOKENS: u32 = if cfg!(target_os = "macos") { 1200 } else { 600 };
 /// `server.shutdown_grace` of the drain test: time for the short stream's remaining tokens
-/// (at most about 300 on Linux, 320 on macOS) in a debug build. 5 s on Linux too: 2 s missed by
-/// 10 ms under a loaded lab run (`cargo test`, server_cli's tests side by side, 2026-09-28); the
-/// long stream stays paused (unread) however long the grace is, so only the test's length grows.
-const GRACE: Duration = Duration::from_secs(5);
+/// (at most about 300 on Linux, 320 on macOS) in a debug build. 2 s was missed by 10 ms under a
+/// loaded lab run (2026-09-28); the follow-up 5 s was itself missed by 25 ms under a full-gate
+/// load run (2026-09-29, `target/gate/20260929-140442-57912.log`: "short stream took
+/// 5.025602012s"). The long stream stays paused (unread) however long the grace is, so only the
+/// test's length grows with it: 15 s for real headroom against host contention instead of
+/// chasing single-digit-millisecond misses again.
+const GRACE: Duration = Duration::from_secs(15);
 
 /// The tiny checkpoint patched to `LONG_POSITIONS` positions, served as `m` on the cpu backend
 /// with a 16 MiB KV pool; `server_extra` is appended to the `server` section verbatim.
@@ -633,7 +671,10 @@ impl HeldStream {
         socket.set_recv_buffer_size(HELD_SOCKET_BUFFER).unwrap();
         socket.connect(&addr.into()).unwrap();
         let mut conn: TcpStream = socket.into();
-        conn.set_read_timeout(Some(Duration::from_secs(10)))
+        // Generous: a loaded host can delay a chunk well past what a healthy one would (see
+        // GRACE's history above), and a read timeout here surfaces as a bogus chunk-framing
+        // panic (`chunk()` below) rather than a clear timeout message.
+        conn.set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
         write_request(&mut conn, "POST", "/v1/completions", &body.to_string());
         let mut reader = BufReader::new(conn);
@@ -821,12 +862,20 @@ fn support_matrix_output() {
                 && r["status"] == status
         })
     };
-    // Every registered family has its supported rows, and the phase 8 families are refused on
-    // the GPU vendors.
+    // Every registered family has its supported AMD rows; the former NVIDIA baseline rows are
+    // refused while phase-2b-nvidia is deferred, and every nvidia key is (deferred_vendors).
     for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
         assert!(has("amd", "gfx1201", architecture, "supported"), "{v}");
-        assert!(has("nvidia", "sm_121", architecture, "supported"), "{v}");
+        assert!(has("nvidia", "sm_121", architecture, "unsupported"), "{v}");
     }
+    let deferred = v["deferred_vendors"].as_array().expect("deferred_vendors");
+    assert!(
+        deferred.iter().any(|d| d["vendor"] == "nvidia"
+            && d["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("phase-2b-nvidia"))),
+        "{v}"
+    );
     for architecture in [
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -834,7 +883,6 @@ fn support_matrix_output() {
         "MixtralForCausalLM",
     ] {
         assert!(has("amd", "*", architecture, "unsupported"), "{v}");
-        assert!(has("nvidia", "*", architecture, "unsupported"), "{v}");
     }
     assert!(has("cpu", "*", "*", "experimental"), "{v}");
     // P5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is refused.
@@ -858,7 +906,7 @@ fn support_matrix_output() {
     assert!(text.starts_with("vendor "), "{text}");
     assert_eq!(
         text.lines().count(),
-        rows.len() + 1 + refusals.len(),
+        rows.len() + 1 + deferred.len() + refusals.len(),
         "{text}"
     );
 
@@ -963,7 +1011,7 @@ fn unsupported_row_exits_2_before_bind() {
     assert!(stderr.contains("support matrix"), "stderr: {stderr}");
     assert!(stderr.contains("Qwen3ForCausalLM"), "stderr: {stderr}");
     assert!(
-        stderr.contains("phase-8c-model-families"),
+        stderr.contains("phase-7-model-families"),
         "stderr: {stderr}"
     );
     let logs = format!("{stdout}\n{stderr}");
@@ -976,6 +1024,90 @@ fn unsupported_row_exits_2_before_bind() {
         "no event=support_matrix line:\n{logs}"
     );
     TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
+}
+
+/// P6b (user decision 2026-10-02, "6b Task 13", 2 B): `kv.dtype: tq2` is refused on every
+/// backend before the port is bound: exit 2 naming `kv.dtype` and the reason code
+/// `kv_tq2_l0_refused`, under `--check-config` too; `kv.dtype: tq4` still passes the check, and
+/// `tq2` as a lower-tier format is not refused. Breaks if L0 `tq2` binds or loses its reason
+/// code, or if the refusal spreads to the lower-tier format.
+#[test]
+fn kv_dtype_tq2_exits_2_before_bind() {
+    let dir = TempDir::new("turbine-server-tq2-l0");
+    write_tiny_llama(dir.path(), 5);
+    let port = free_port();
+    let yaml = |kv: &str| {
+        format!(
+            "model:\n  path: {}\nserver:\n  listen: 127.0.0.1:{port}\nexecution:\n  backend: cpu\n\
+             kv:\n{kv}",
+            dir.path().display()
+        )
+    };
+    let tq2 = TempConfig::new("tq2-l0", &yaml("  dtype: tq2\n"));
+    for args in [&[][..], &["--check-config"][..]] {
+        let out = wait_with_timeout(spawn_server(args, &tq2.path), Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(stderr.contains("kv.dtype"), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("kv_tq2_l0_refused"),
+            "{args:?}: stderr: {stderr}"
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
+    }
+    for kv in ["  dtype: tq4\n", "  cpu:\n    format: tq2\n"] {
+        let cfg = TempConfig::new("tq-ok", &yaml(kv));
+        let out = wait_with_timeout(
+            spawn_server(&["--check-config"], &cfg.path),
+            Duration::from_secs(20),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{kv}: stderr: {stderr}");
+    }
+}
+
+/// P6b S-7 / S-9: the L0 compression ladder starts once per-class block addressing landed
+/// (the Task 17 refusal is lifted): `--check-config --set kv.dtype=tq4 --set
+/// kv.cpu.format=tq4 --set kv.ladder.enabled=true` exits 0 printing the resolved row and
+/// `config ok` (`kv.ladder.l0` defaults true); `kv.ladder.enabled` without any lower tier is
+/// still exit 2 naming `kv.ladder.enabled`. Breaks if the L0 ladder is refused at startup
+/// again or the AC's keys are not wired.
+#[test]
+fn check_config_accepts_the_l0_ladder() {
+    let cfg = TempConfig::new("l0-ladder", "model:\n  path: /m\n");
+    for set in [
+        "kv.ladder.enabled=true",
+        "kv.dtype=tq4 --set kv.cpu.format=tq4 --set kv.ladder.enabled=true",
+    ] {
+        let args = format!("--check-config --set {set}");
+        let out = wait_with_timeout(
+            spawn_server(&args.split(' ').collect::<Vec<_>>(), &cfg.path),
+            Duration::from_secs(20),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{set}: stderr: {stderr}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("config ok"),
+            "{set}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    let out = wait_with_timeout(
+        spawn_server(
+            &[
+                "--check-config",
+                "--set",
+                "kv.ladder.enabled=true",
+                "--set",
+                "kv.cpu.enabled=false",
+            ],
+            &cfg.path,
+        ),
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("kv.ladder.enabled"), "{stderr}");
 }
 
 /// Phase 2m S-4 / S-11: `model.tool_call_parser: hermes` (and `mistral`) names a registered

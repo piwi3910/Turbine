@@ -19,8 +19,8 @@ use turbine_tensor::TensorView;
 use crate::KernelError;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
-    GemmKernel, KernelProvider, KvCopyKernel, LogitsReduceKernel, MoeKernel, NormKernel,
-    ProviderId, RopeKernel, ShardedNormKernel,
+    GemmKernel, KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel,
+    NormKernel, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -30,13 +30,17 @@ mod elementwise;
 mod embedding;
 mod gemm;
 mod kv_copy;
+mod kv_transcode;
 mod logits_reduce;
 mod math;
 mod moe;
 mod norm;
 mod paged;
+mod qgemm;
+pub mod quant;
 mod rope;
 mod topk;
+pub mod tq_attention;
 
 pub use topk::torch_topk;
 
@@ -114,7 +118,7 @@ fn invalid(message: String) -> KernelError {
 
 /// Byte offsets of every logical element of `v` in row-major order, after checking that the
 /// view's strides stay inside its slice.
-fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
+pub(super) fn element_offsets(v: &TensorView<'_>) -> Result<Vec<usize>, KernelError> {
     if v.strides.len() != v.shape.len() {
         return Err(invalid(format!(
             "view has shape {:?} but strides {:?}",
@@ -174,6 +178,44 @@ pub(crate) fn load(v: &TensorView<'_>) -> Result<Vec<f32>, KernelError> {
     let offsets = element_offsets(v)?;
     let bytes = v.slice.read_bytes()?;
     Ok(offsets.iter().map(|&o| codec.decode(&bytes[o..])).collect())
+}
+
+/// Reads a one-byte view (U8 or F8E4M3) as its raw bytes, in logical row-major order.
+pub(crate) fn load_bytes(v: &TensorView<'_>) -> Result<Vec<u8>, KernelError> {
+    if v.dtype.size_bytes() != 1 {
+        return Err(invalid(format!(
+            "expected a one-byte view, got {}",
+            v.dtype.as_str()
+        )));
+    }
+    let offsets = element_offsets(v)?;
+    let bytes = v.slice.read_bytes()?;
+    Ok(offsets.iter().map(|&o| bytes[o]).collect())
+}
+
+/// Writes raw bytes into a one-byte view (U8 or F8E4M3) in logical row-major order; bytes of
+/// the slice the view does not address are preserved.
+pub(crate) fn store_bytes(v: &TensorView<'_>, values: &[u8]) -> Result<(), KernelError> {
+    if v.dtype.size_bytes() != 1 {
+        return Err(invalid(format!(
+            "expected a one-byte view, got {}",
+            v.dtype.as_str()
+        )));
+    }
+    let offsets = element_offsets(v)?;
+    if values.len() != offsets.len() {
+        return Err(invalid(format!(
+            "{} values for a view of {} elements",
+            values.len(),
+            offsets.len()
+        )));
+    }
+    let mut bytes = v.slice.read_bytes()?;
+    for (&o, &b) in offsets.iter().zip(values) {
+        bytes[o] = b;
+    }
+    v.slice.write_bytes(&bytes)?;
+    Ok(())
 }
 
 /// Reads an I32 view exactly.
@@ -297,6 +339,15 @@ impl KernelProvider for CpuReference {
         Some(self)
     }
     fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        Some(self)
+    }
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        Some(self)
+    }
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        Some(self)
+    }
+    fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         Some(self)
     }
 }

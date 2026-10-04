@@ -53,6 +53,34 @@ pub struct SessionId {
     pub salt: String,
 }
 
+/// Whether a block's KV was computed over an exact prefix (P6b S-3). A block computed over a
+/// prefix with any lossy block — or a lossy copy promoted into L0 — is `Lossy`: its key chains
+/// from a [`crate::identity::lossy_key`], so it never aliases the exact block of the same tokens,
+/// and a request that opted out of lossy reuse is never attached to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Lineage {
+    #[default]
+    Exact,
+    /// `format`: the codec of the first lossy block of the prefix it was computed over (or of
+    /// the promoted copy).
+    Lossy { format: &'static str },
+}
+
+impl Lineage {
+    pub fn is_lossy(self) -> bool {
+        matches!(self, Lineage::Lossy { .. })
+    }
+}
+
+/// True when a copy stored in codec `format` may differ from the L0 bytes of `l0` (an
+/// unregistered name counts as lossy).
+pub fn format_is_lossy(format: &str, l0: &turbine_core::types::KvLayout) -> bool {
+    format != crate::tier::L0_FORMAT
+        && crate::codec::registry()
+            .get(format)
+            .is_none_or(|c| c.lossy(l0))
+}
+
 /// TS §8 `KvBlock` plus the Phase 4 fields (P4 S-2).
 #[derive(Clone, Debug)]
 pub struct KvBlock {
@@ -79,6 +107,8 @@ pub struct KvBlock {
     pub child_count: u32,
     /// The block's token ids, compared on every lookup.
     pub tokens: Box<[u32]>,
+    /// P6b S-3: exact, or computed over (or promoted from) a lossy block.
+    pub lineage: Lineage,
 }
 
 impl KvBlock {
@@ -95,9 +125,13 @@ impl KvBlock {
 /// One matched block of a prefix lookup, at its fastest tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchedBlock {
+    /// The directory entry used (the block's key, a lossy key, or a lossy-lineage key).
     pub key: KvKey,
     pub tier: TierId,
     pub location: KvLocation,
+    /// `Some(codec)` when the block is served lossy: a copy in a lossy codec, or an entry of
+    /// lossy lineage (P6b S-3). Never `Some` in a lookup that denied lossy reuse.
+    pub lossy: Option<&'static str>,
 }
 
 /// Result of a longest-prefix lookup.
@@ -111,6 +145,25 @@ pub struct PrefixMatch {
     pub keys: Vec<KvKey>,
     /// The first unmatched block, when another request registered it as being computed.
     pub pending: Option<KvKey>,
+    /// A lookup that denied lossy reuse stopped at a block only a lossy copy held (P6b S-3).
+    pub denied: bool,
+    /// P6b S-3: the first matched block served lossy and its codec. From it on, blocks
+    /// computed over the matched prefix are keyed by `lossy_chain`.
+    pub lossy_from: Option<(usize, &'static str)>,
+    /// With `lossy_from = Some((s, f))`: the keys of every full block, equal to `keys` before
+    /// `s`, then `lossy_key(keys[s], f, seed)` chained on; empty otherwise.
+    pub lossy_chain: Vec<KvKey>,
+}
+
+impl PrefixMatch {
+    /// The keys a request that reuses the first `cut` matched blocks commits its blocks under,
+    /// with their lineage: the exact keys unless a block before `cut` is served lossy.
+    pub fn keys_for(&self, cut: usize) -> (&[KvKey], Lineage) {
+        match self.lossy_from {
+            Some((s, format)) if s < cut => (&self.lossy_chain, Lineage::Lossy { format }),
+            _ => (&self.keys, Lineage::Exact),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -223,49 +276,152 @@ impl KvDirectory {
 
     /// Longest cached prefix of `tokens` across all tiers, each block at its fastest tier.
     /// Matched blocks get `last_access = now`; a stored-token mismatch is logged and is a miss.
+    ///
+    /// Lossy reuse (P6b S-3): the walk follows the exact chain, taking each block's fastest
+    /// exact copy. Where none exists and `allow_lossy`, it continues on the block's fastest
+    /// lossy copy — a lossy-format copy of the block, or its promoted copy under
+    /// `lossy_key(key, codec, seed)` — and from then on also on the blocks computed over that
+    /// lossy prefix (keyed by [`PrefixMatch::lossy_chain`], or by another request's chain that
+    /// started at a later block: reached as lossy-lineage children of the previous block's
+    /// matching entries). Without `allow_lossy` it stops at
+    /// the first block only a lossy copy holds (`denied`).
     pub fn lookup(
         &mut self,
         hasher: &dyn KeyHasher,
         tokens: &[u32],
         block_tokens: u32,
         now: Timestamp,
+        allow_lossy: bool,
+        seed: u64,
     ) -> PrefixMatch {
         let mut m = PrefixMatch::default();
         let mut matching = true;
-        for chunk in tokens.chunks_exact(block_tokens as usize) {
+        // The previous block's entries whose tokens matched: their lossy-lineage children are
+        // candidates too (see below).
+        let mut prev: SmallVec<[KvKey; 8]> = SmallVec::new();
+        for (i, chunk) in tokens.chunks_exact(block_tokens as usize).enumerate() {
             let key = hasher.key(m.keys.last(), chunk);
             m.keys.push(key);
+            let chain = m
+                .lossy_from
+                .map(|_| hasher.key(m.lossy_chain.last(), chunk));
+            if let Some(c) = chain {
+                m.lossy_chain.push(c);
+            }
             if !matching {
                 continue;
             }
-            match self.blocks.get_mut(&key) {
-                Some(b) if *b.tokens != *chunk => {
-                    m.mismatches += 1;
-                    tracing::warn!(
-                        event = "kv_key_mismatch",
-                        key = %key,
-                        "cached block tokens differ from the prompt; treated as a miss"
-                    );
-                    matching = false;
+            // Candidates: the block's own entry, its promoted lossy copies, and (on a lossy
+            // prefix) the block computed over that prefix.
+            let mut cands: SmallVec<[KvKey; 8]> = SmallVec::new();
+            cands.push(key);
+            for c in crate::codec::registry().iter() {
+                let lk = crate::identity::lossy_key(key, c.name(), seed);
+                if self.blocks.contains_key(&lk) {
+                    cands.push(lk);
                 }
-                Some(b) => match b.fastest().and_then(|t| b.location(t)) {
-                    Some(location) => {
-                        b.last_access = now;
-                        m.blocks.push(MatchedBlock {
-                            key,
-                            tier: location.tier,
-                            location,
-                        });
+            }
+            cands.extend(chain);
+            // A block computed over a lossy prefix is keyed by the chain of the request that
+            // computed it, which starts at *that* request's first lossy block; once an earlier
+            // block has turned lossy too (history leaves L0 leaf-first), this lookup's own
+            // chain starts earlier and never names it. Its directory parent is the entry its
+            // predecessor was served from, so it is reached through the children of the
+            // previous block's matching entries.
+            for p in &prev {
+                for c in self.children.get(p).into_iter().flatten() {
+                    if !cands.contains(c)
+                        && self.blocks.get(c).is_some_and(|b| b.lineage.is_lossy())
+                    {
+                        cands.push(*c);
                     }
-                    None => matching = false,
-                },
+                }
+            }
+            let mut here: SmallVec<[KvKey; 8]> = SmallVec::new();
+            // (entry, location, lossy codec) of the best exact and the best lossy copy.
+            let mut exact: Option<(KvKey, KvLocation)> = None;
+            let mut lossy: Option<(KvKey, KvLocation, &'static str)> = None;
+            let mut lossy_seen = false;
+            let mut mismatch = false;
+            for k in &cands {
+                let Some(b) = self.blocks.get(k) else {
+                    continue;
+                };
+                if *b.tokens != *chunk {
+                    mismatch = true;
+                    continue;
+                }
+                here.push(*k);
+                for loc in &b.locations {
+                    let codec = match b.lineage {
+                        Lineage::Lossy { format } => Some(format),
+                        Lineage::Exact if format_is_lossy(loc.format, &b.format.layout) => {
+                            Some(loc.format)
+                        }
+                        Lineage::Exact => None,
+                    };
+                    match codec {
+                        None => {
+                            if exact.is_none_or(|(_, e)| loc.tier < e.tier) {
+                                exact = Some((*k, *loc));
+                            }
+                        }
+                        Some(f) => {
+                            lossy_seen = true;
+                            if allow_lossy && lossy.is_none_or(|(_, l, _)| loc.tier < l.tier) {
+                                lossy = Some((*k, *loc, f));
+                            }
+                        }
+                    }
+                }
+            }
+            let chosen = match (exact, lossy) {
+                (Some((k, loc)), _) => Some((k, loc, None)),
+                (None, Some((k, loc, f))) => Some((k, loc, Some(f))),
+                (None, None) => None,
+            };
+            prev = here;
+            match chosen {
+                Some((k, location, codec)) => {
+                    if let Some(b) = self.blocks.get_mut(&k) {
+                        b.last_access = now;
+                    }
+                    // After the switch an exact copy is still its block's exact KV: only
+                    // lossy copies and lossy-lineage blocks count as served lossy.
+                    let served_lossy = codec;
+                    if m.lossy_from.is_none()
+                        && let Some(f) = served_lossy
+                    {
+                        m.lossy_from = Some((i, f));
+                        m.lossy_chain = m.keys[..i].to_vec();
+                        m.lossy_chain.push(crate::identity::lossy_key(key, f, seed));
+                    }
+                    m.blocks.push(MatchedBlock {
+                        key: k,
+                        tier: location.tier,
+                        location,
+                        lossy: served_lossy,
+                    });
+                }
                 None => {
-                    let computing = self
-                        .pending
-                        .get(&key)
-                        .is_some_and(|since| now.saturating_sub(*since) < PENDING_WAIT);
-                    if computing {
-                        m.pending = Some(key);
+                    if mismatch {
+                        m.mismatches += 1;
+                        tracing::warn!(
+                            event = "kv_key_mismatch",
+                            key = %key,
+                            "cached block tokens differ from the prompt; treated as a miss"
+                        );
+                    } else if lossy_seen && !allow_lossy {
+                        m.denied = true;
+                    } else if !self.blocks.contains_key(&chain.unwrap_or(key)) {
+                        let pending = chain.unwrap_or(key);
+                        let computing = self
+                            .pending
+                            .get(&pending)
+                            .is_some_and(|since| now.saturating_sub(*since) < PENDING_WAIT);
+                        if computing {
+                            m.pending = Some(pending);
+                        }
                     }
                     matching = false;
                 }
@@ -317,6 +473,18 @@ impl KvDirectory {
             })
     }
 
+    /// True when a child of `key` has a copy in `tier` (a parent the leaf-first rule holds
+    /// there while that child stays).
+    pub fn has_child_in(&self, key: &KvKey, tier: TierId) -> bool {
+        self.children.get(key).is_some_and(|kids| {
+            kids.iter().any(|k| {
+                self.blocks
+                    .get(k)
+                    .is_some_and(|c| c.location(tier).is_some())
+            })
+        })
+    }
+
     /// A location found pointing at a freed slot: logged, removed; debug builds assert.
     pub fn stale_location(&mut self, key: &KvKey, tier: TierId) {
         tracing::error!(
@@ -363,6 +531,7 @@ pub(crate) mod tests {
                 block_tokens: 16,
             },
             shards: 1,
+            scales: None,
         }
     }
 
@@ -370,6 +539,7 @@ pub(crate) mod tests {
         KvLocation {
             tier: TierId::L0,
             slot,
+            format: crate::tier::L0_FORMAT,
         }
     }
 
@@ -402,6 +572,7 @@ pub(crate) mod tests {
             parent,
             child_count: 0,
             tokens: tokens.into(),
+            lineage: Lineage::Exact,
         }
     }
 
@@ -421,12 +592,13 @@ pub(crate) mod tests {
         let mut dir = KvDirectory::new(16);
         dir.insert(block(Colliding.key(None, &a), None, 0, &a, &[l0(3)]))
             .unwrap();
-        let hit = dir.lookup(&Colliding, &a, 16, Duration::ZERO);
+        let hit = dir.lookup(&Colliding, &a, 16, Duration::ZERO, true, 0);
         assert_eq!(hit.blocks.len(), 1, "the same tokens hit");
         assert_eq!(hit.blocks[0].location, l0(3));
 
         let metrics = KvMetrics::unregistered();
-        let (m, logs) = test_log::capture(|| dir.lookup(&Colliding, &b, 16, Duration::ZERO));
+        let (m, logs) =
+            test_log::capture(|| dir.lookup(&Colliding, &b, 16, Duration::ZERO, true, 0));
         assert!(
             m.blocks.is_empty(),
             "a colliding key must never return another sequence's KV"
@@ -461,6 +633,7 @@ pub(crate) mod tests {
             let loc = KvLocation {
                 tier,
                 slot: i as u64,
+                format: crate::tier::L0_FORMAT,
             };
             dir.insert(block(
                 keys[i],
@@ -474,7 +647,7 @@ pub(crate) mod tests {
         // Block 8 is cached while block 7 is missing: the lookup must stop at the gap.
         dir.insert(block(keys[8], None, 8, &tokens[128..144], &[l0(8)]))
             .unwrap();
-        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(1));
+        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(1), true, 0);
         let tiers: Vec<TierId> = m.blocks.iter().map(|b| b.tier).collect();
         use TierId::{L0, L1, L2};
         assert_eq!(tiers, [L0, L0, L0, L0, L1, L1, L2]);
@@ -486,7 +659,7 @@ pub(crate) mod tests {
 
         // A block with copies in L0 and L2 is reported in L0, the fastest tier.
         dir.add_location(&keys[6], l0(60));
-        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(2));
+        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(2), true, 0);
         assert_eq!((m.blocks[6].tier, m.blocks[6].location), (L0, l0(60)));
 
         // The metrics count one lookup per full block: its fastest tier, or a miss.
@@ -512,9 +685,9 @@ pub(crate) mod tests {
         );
         // A block another request is computing is reported for up to PENDING_WAIT.
         dir.register_pending(keys[1], Duration::from_secs(10));
-        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(11));
+        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(11), true, 0);
         assert_eq!((m.blocks.len(), m.pending), (1, Some(keys[1])));
-        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(12));
+        let m = dir.lookup(&h, &tokens, 16, Duration::from_secs(12), true, 0);
         assert_eq!(m.pending, None, "after 2 s the request computes its own");
 
         dir.insert(block(keys[1], Some(keys[0]), 1, &tokens[16..32], &[l0(1)]))

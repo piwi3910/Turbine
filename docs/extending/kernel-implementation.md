@@ -43,7 +43,7 @@ No Rust registry lists implementations: the library's table is the source, and `
 OpPreference { op: OpKind::Gemm, order: &["turbine_hip_gemm_tiled", "hipblaslt"], row_tiers: &[] },
 ```
 
-The selection's `reason_code` says why: `profile_preferred` (the first listed name that the library has supports the config), `profile_fallback` (a later one), `library_order` (the profile lists no order for the op), `provider_internal` (no enumeration: the CPU reference, or a library of minor ≤ 3). It is logged as `event="kernel_selected"`, exported as `turbine_kernel_provider_selected{op,provider,impl}` and listed under `kernels` in `GET /turbine/v1/status`.
+The selection's `reason_code` says why: `profile_preferred` (the first listed name that the library has supports the config), `profile_fallback` (a later one), `library_order` (the profile lists no order for the op), `provider_internal` (no enumeration: the CPU reference, or a library of minor ≤ 3). The one entry under `kernels` that is not a registry selection is the ABI v2.11 `kv_transcode` a lossy tier format selects (P6b S-10), appended with `reason_code: tier_format` and the provider's own implementation choice. It is logged as `event="kernel_selected"`, exported as `turbine_kernel_provider_selected{op,provider,impl}` and listed under `kernels` in `GET /turbine/v1/status`.
 
 ## Conformance suite
 

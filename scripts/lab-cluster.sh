@@ -1256,6 +1256,12 @@ stop_run() {
 	if [[ $DRY_RUN -eq 1 ]]; then say "dry run: nothing contacted"; else say "stopped"; fi
 }
 
+# Two-GPU scenarios wait for novanas's PSU replacement (coordinator rule 2026-09-29):
+# TURBINE_LAB_ONE_GPU_JOB=0 overrides once it is in.
+if [[ $MODE == run && "${TURBINE_LAB_ONE_GPU_JOB:-1}" == 1 && ${DRY_RUN:-0} -eq 0 ]]; then
+	echo "lab-cluster: refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" >&2
+	exit 2
+fi
 case "$MODE" in
 run) run_scenario ;;
 stop) stop_run ;;

@@ -38,6 +38,10 @@ kv:
     enabled: true
     # At most host MemTotal minus reliability.memory.host_reserve_bytes.
     max_bytes: 64GiB
+    # Codec of L1 blocks, a kv_format registry name: l0 (the L0 bytes, lossless), fp8_e4m3,
+    # tq4 or tq2 (lossy); not more precise than kv.dtype. Anything stored other than at the L0
+    # format exits 1 (kv_transcode_unavailable) until the v2.10 KV transcode lands (6b Task 5).
+    format: l0
   # L2 NVMe slab files; wiped at startup, nothing persists across restarts.
   nvme:
     enabled: false
@@ -49,6 +53,8 @@ kv:
     slab_bytes: 1GiB
     max_queue_depth: 64
     io_threads: 4
+    # Codec of L2 blocks, as kv.cpu.format; not more precise than kv.cpu.format (L1 enabled).
+    format: l0
   # cost_aware or lru (the benchmark baseline).
   policy: cost_aware
   # Blocks scoring below this are dropped instead of demoted.
@@ -72,6 +78,30 @@ kv:
     # Reuse boost of a hot session's blocks, 0..1.
     session_active: 0.5
     hit_half_life: 60s
+  # The last N full blocks of a sequence leave L0 at the L0 format whatever the tier's
+  # format (0..64).
+  lossless_tail_blocks: 1
+  # allow or deny: may requests without x-turbine-kv-lossy reuse lossy cached blocks.
+  lossy_reuse: allow
+  # Per codec: a lossy block's retrieval cost is multiplied by 1 + penalty (0..100) when
+  # planning reuse. null: each codec's default (fp8_e4m3 0.1, tq4 0.5, tq2 1.0); an entry
+  # such as {tq4: 0.7} overrides one codec.
+  lossy_penalty: null
+  # Pressure-driven compression ladder (l0 -> fp8_e4m3 -> tq4 -> tq2 -> evict), off by default;
+  # needs L1 or L2 enabled. Its rewrites run on the device transcode (a library without ABI
+  # v2.11 exits 1, kv_transcode_unavailable); with l0: true the L0 rung classes are read by
+  # the v2.11 mixed-format paged attention (6b S-7).
+  ladder:
+    enabled: false
+    # true: L0 joins the ladder (needs the v2.11 mixed-format paged attention on a GPU).
+    l0: true
+    # The lossiest rung, a lossy codec (tq2 failed its lower-tier quality gate).
+    max_format: tq4
+    # An upper tier compresses above this fill (0.5 < high_water <= 1.0).
+    high_water: 0.95
+    # At YELLOW the lowest tier compresses only until its fill is back to this
+    # (0.5 <= low_water < high_water).
+    low_water: 0.85
 reliability:
   enabled: true
   emergency_vram_reserve: 2GiB

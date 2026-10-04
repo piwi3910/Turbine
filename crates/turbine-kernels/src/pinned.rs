@@ -21,8 +21,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use turbine_tensor::{
-    CopyEngine, CopySource, CopyTarget, CopyTicket, MemoryError, PinnedBuffer, PinnedMemory,
-    PinnedOwner,
+    CopyEngine, CopyOp, CopySource, CopyTarget, CopyTicket, MemoryError, PinnedBuffer,
+    PinnedMemory, PinnedOwner,
 };
 
 use crate::KernelError;
@@ -151,6 +151,19 @@ impl ShimContext {
                 syms.minor
             ))),
         }
+    }
+
+    /// The ABI v2.11 host-to-device copy kernel, `Unsupported` without it.
+    fn copy_kernel_fn(&self) -> Result<ffi::CopyKernelFn, MemoryError> {
+        let syms = &self.library().syms().v21;
+        syms.copy_kernel.ok_or_else(|| {
+            MemoryError::Unsupported(format!(
+                "{} does not export the kernel ABI v2.11 copy kernel \
+                 (turbine_memcpy_h2d_kernel; minor {})",
+                self.library().path().display(),
+                syms.minor
+            ))
+        })
     }
 
     fn resolve_end(
@@ -396,6 +409,132 @@ impl PinnedOwner for ShimContext {
     }
 }
 
+impl ShimContext {
+    /// Enqueues `ops` in order on the copy stream behind one ticket: every end is resolved
+    /// first (a bad one refuses the batch before anything is enqueued), a batch with a device
+    /// source waits once for the work already on the compute stream, and one event recorded
+    /// after the last copy completes the ticket. A fence and an event per copy cost ~30 us each
+    /// on the R9700's SDMA queue, halving pinned device-to-host bandwidth at the 512 KiB layer
+    /// segments of a KV block (perf-log "Pinned D2H").
+    ///
+    /// With `kernel` every op must be pinned → device and the batch runs as one ABI v2.11
+    /// `turbine_memcpy_h2d_kernel` call on the copy stream instead of the copy engine
+    /// (`kv.transfer.promotion_copy: kernel`).
+    fn enqueue(&self, ops: &[CopyOp], kernel: bool) -> Result<CopyTicket, MemoryError> {
+        let (staging, copies) = self.copy_fns()?;
+        let copy_kernel = if kernel {
+            Some(self.copy_kernel_fn()?)
+        } else {
+            None
+        };
+        let mut s = self.pinned_state().lock();
+        let mut resolved = Vec::with_capacity(ops.len());
+        let mut device_source = false;
+        for op in ops {
+            let d = Self::resolve_end(&s, "copy destination", op.dst, op.bytes)?;
+            let from = Self::resolve_end(&s, "copy source", op.src, op.bytes)?;
+            let kind = match (d.device, from.device) {
+                (true, false) => COPY_H2D,
+                (false, true) => COPY_D2H,
+                (true, true) => COPY_D2D,
+                (false, false) => {
+                    return Err(MemoryError::Unsupported(
+                        "pinned-to-pinned copies are host memcpy, not copy-stream work".into(),
+                    ));
+                }
+            };
+            if copy_kernel.is_some() && kind != COPY_H2D {
+                return Err(MemoryError::Unsupported(
+                    "the copy kernel copies pinned host memory to the device only".into(),
+                ));
+            }
+            device_source |= from.device;
+            resolved.push((d.addr, from.addr, op.bytes, kind));
+        }
+        let stream = self.copy_stream(&copies, &mut s)?;
+        if device_source {
+            // A device source may still be written by work already on the compute stream (the
+            // forward pass that filled a KV block): the copies wait for it.
+            self.order_after_compute(&staging, &copies, stream)?;
+        }
+        // The event exists before the copies are enqueued, so a failure to create it leaves no
+        // copy in flight without a ticket.
+        let event = self.new_event(&staging)?;
+        if let Some(run) = copy_kernel {
+            let segs: Vec<ffi::CopySeg> = resolved
+                .iter()
+                .map(|&(dst, src, bytes, _)| ffi::CopySeg {
+                    dst: dst as *mut c_void,
+                    src: src as *const c_void,
+                    bytes,
+                })
+                .collect();
+            // SAFETY: every segment was resolved above (a device pointer of the caller's
+            // allocation, `bytes` inside a live pinned buffer of this context); the library reads
+            // `segs` during the call only and the buffers stay untouched until the ticket's event
+            // signals, as for `memcpy_async` below. 0 workgroups: the library's choice.
+            let code = unsafe { run(self.raw_ctx(), stream, segs.as_ptr(), segs.len() as i32, 0) };
+            if let Err(e) = self.check_code(code) {
+                // A launch may have been enqueued before the failing one: wait for it.
+                // SAFETY: `event` and `stream` are live objects of this context.
+                unsafe {
+                    if (staging.event_record)(self.raw_ctx(), event.raw, stream) == 0 {
+                        let _ = (staging.event_synchronize)(self.raw_ctx(), event.raw);
+                    }
+                }
+                return Err(e.into());
+            }
+        }
+        // Without the kernel: one copy-engine copy per op.
+        let engine_ops: &[_] = if copy_kernel.is_some() {
+            &[]
+        } else {
+            &resolved
+        };
+        for &(dst, src, bytes, kind) in engine_ops {
+            // SAFETY: both ends were resolved above: a device pointer of the caller's allocation
+            // or `bytes` inside a live pinned buffer of this context. The copy only enqueues; the
+            // buffers are not freed or touched by the host until the ticket's event signals (the
+            // `PinnedOwner` contract; `PinnedBuffer`s are dropped only after their tickets
+            // complete).
+            let code = unsafe {
+                (copies.memcpy_async)(
+                    self.raw_ctx(),
+                    stream,
+                    dst as *mut c_void,
+                    src as *const c_void,
+                    bytes,
+                    kind,
+                )
+            };
+            if let Err(e) = self.check_code(code) {
+                // Copies of this batch already enqueued must end before the caller reuses
+                // their buffers: wait for them (best effort; a failure here is the same device
+                // error).
+                // SAFETY: `event` and `stream` are live objects of this context.
+                unsafe {
+                    if (staging.event_record)(self.raw_ctx(), event.raw, stream) == 0 {
+                        let _ = (staging.event_synchronize)(self.raw_ctx(), event.raw);
+                    }
+                }
+                return Err(e.into());
+            }
+        }
+        // SAFETY: `event` and `stream` are live objects of this context. A failure here is a
+        // device error that leaves the context unusable (the copies stay enqueued without a
+        // ticket and the caller's next device call fails too).
+        let code = unsafe { (staging.event_record)(self.raw_ctx(), event.raw, stream) };
+        self.check_code(code)?;
+        s.next_ticket += 1;
+        let id = s.next_ticket;
+        s.tickets.insert(id, event);
+        Ok(CopyTicket {
+            id,
+            bytes: ops.iter().map(|op| op.bytes).sum(),
+        })
+    }
+}
+
 impl CopyEngine for ShimContext {
     fn copy_async(
         &self,
@@ -403,53 +542,26 @@ impl CopyEngine for ShimContext {
         src: CopySource,
         bytes: usize,
     ) -> Result<CopyTicket, MemoryError> {
-        let (staging, copies) = self.copy_fns()?;
-        let mut s = self.pinned_state().lock();
-        let d = Self::resolve_end(&s, "copy destination", dst, bytes)?;
-        let from = Self::resolve_end(&s, "copy source", src, bytes)?;
-        let kind = match (d.device, from.device) {
-            (true, false) => COPY_H2D,
-            (false, true) => COPY_D2H,
-            (true, true) => COPY_D2D,
-            (false, false) => {
-                return Err(MemoryError::Unsupported(
-                    "pinned-to-pinned copies are host memcpy, not copy-stream work".into(),
-                ));
-            }
-        };
-        let stream = self.copy_stream(&copies, &mut s)?;
-        if from.device {
-            // A device source may still be written by work already on the compute stream (the
-            // forward pass that filled a KV block): the copy waits for it.
-            self.order_after_compute(&staging, &copies, stream)?;
+        self.enqueue(&[CopyOp { dst, src, bytes }], false)
+    }
+
+    fn copy_async_batch(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
         }
-        // The event exists before the copy is enqueued, so a failure to create it leaves no
-        // copy in flight without a ticket.
-        let event = self.new_event(&staging)?;
-        // SAFETY: both ends were resolved above: a device pointer of the caller's allocation or
-        // `bytes` inside a live pinned buffer of this context. The copy only enqueues; the
-        // buffers are not freed or touched by the host until the ticket's event signals (the
-        // `PinnedOwner` contract; `PinnedBuffer`s are dropped only after their tickets complete).
-        let code = unsafe {
-            (copies.memcpy_async)(
-                self.raw_ctx(),
-                stream,
-                d.addr as *mut c_void,
-                from.addr as *const c_void,
-                bytes,
-                kind,
-            )
-        };
-        self.check_code(code)?;
-        // SAFETY: `event` and `stream` are live objects of this context. A failure here is a
-        // device error that leaves the context unusable (the copy stays enqueued without a
-        // ticket and the caller's next device call fails too).
-        let code = unsafe { (staging.event_record)(self.raw_ctx(), event.raw, stream) };
-        self.check_code(code)?;
-        s.next_ticket += 1;
-        let id = s.next_ticket;
-        s.tickets.insert(id, event);
-        Ok(CopyTicket { id, bytes })
+        Ok(vec![self.enqueue(ops, false)?])
+    }
+
+    fn has_copy_kernel(&self) -> bool {
+        self.copy_fns().is_ok() && self.copy_kernel_fn().is_ok()
+    }
+
+    fn copy_async_batch_kernel(&self, ops: &[CopyOp]) -> Result<Vec<CopyTicket>, MemoryError> {
+        self.copy_kernel_fn()?;
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.enqueue(ops, true)?])
     }
 
     fn poll(&self, t: &CopyTicket) -> Result<bool, MemoryError> {
@@ -474,6 +586,21 @@ impl CopyEngine for ShimContext {
                 MemoryError::from,
             )),
         }
+    }
+
+    fn fence_compute(&self) -> Result<CopyTicket, MemoryError> {
+        let (staging, _) = self.copy_fns()?;
+        let mut s = self.pinned_state().lock();
+        let event = self.new_event(&staging)?;
+        // SAFETY: `event` is a live event of this context; a null stream is the compute stream
+        // (as in `mark_staged`). The event is destroyed when its ticket is polled or waited.
+        let code =
+            unsafe { (staging.event_record)(self.raw_ctx(), event.raw, std::ptr::null_mut()) };
+        self.check_code(code)?;
+        s.next_ticket += 1;
+        let id = s.next_ticket;
+        s.tickets.insert(id, event);
+        Ok(CopyTicket { id, bytes: 0 })
     }
 
     fn wait(&self, t: &CopyTicket) -> Result<(), MemoryError> {

@@ -74,6 +74,17 @@ extern "C" {
 #define TURBINE_DTYPE_F32 2
 #define TURBINE_DTYPE_I32 3
 #define TURBINE_DTYPE_I64 4
+/* Phase 6a (quantized formats; used by the optional v2.9 group): FP8 e4m3 (OCP
+ * e4m3fn) and raw packed bytes (INT4 / FP4 nibbles, E8M0 exponents; the scheme
+ * gives the meaning). */
+#define TURBINE_DTYPE_F8E4M3 16
+#define TURBINE_DTYPE_U8 17
+/* Phase 6b (v2.11 paged attention): TurboQuant tq4 / tq2 KV pages, one record
+ * per (KV head, token) of the codec (crates/turbine-kv codec/turboquant: 144 /
+ * 80 bytes at head_dim 128); a page is num_kv_heads * block_tokens records,
+ * record h * block_tokens + t. Only a paged attention descriptor's dtype. */
+#define TURBINE_DTYPE_TQ4 18
+#define TURBINE_DTYPE_TQ2 19
 
 typedef struct turbine_ctx turbine_ctx;
 
@@ -157,6 +168,11 @@ typedef struct turbine_rope_desc {
   /* 0 = half-split (HF rotate_half) */
   int32_t style;
   int32_t dtype;
+  /* v2.10 (read only by a library reporting minor >= 10): YaRN's attention
+   * factor. cos and sin are multiplied by it in F32 before they are rounded to
+   * dtype, so the rotated q and k carry it (transformers' placement); 1.0 =
+   * none. A caller never passes another value to a library below minor 10. */
+  float attn_factor;
 } turbine_rope_desc;
 
 /* out = silu(gate) * up */
@@ -271,13 +287,67 @@ typedef struct turbine_attention_paged_desc {
   int64_t q_stride_token, new_stride_token, out_stride_token;
   float scale;
   int32_t causal, dtype;
+  /* v2.9: per-layer K and V scales of TURBINE_DTYPE_F8E4M3 pages (value =
+   * e4m3 * scale); read only by a library reporting minor >= 9 */
+  float k_scale, v_scale;
+  /* v2.11 (Phase 6b S-5), read only by a library reporting minor >= 11:
+   * device uint8_t [num_seqs, max_blocks_per_seq] laid out like block_table,
+   * the TURBINE_KVFMT_* format of each entry's block (TURBINE_KVFMT_L0 = a
+   * BF16 page); NULL = every block in dtype. Block b's bytes are the first page
+   * bytes of its format at kv_layer + b * (the page bytes of dtype): BF16 and
+   * FP8 pages [2, block_tokens, num_kv_heads, head_dim], TurboQuant pages as
+   * TURBINE_DTYPE_TQ4 / _TQ2. A block's page must fit a page of dtype (a
+   * kernel skips one that does not) — with page_classes (below), class pages
+   * sit at their class's offset instead and always carry their class's bytes.
+   * The append writes each new row in its block's format; FP8 blocks read
+   * k_scale / v_scale. Device memory, so a decode graph can capture the
+   * call. */
+  const uint8_t *block_formats;
+  /* v2.11: host pointer, read during the call only (its device pointers are
+   * captured with the call): the TurboQuant tables of THIS layer -- tables
+   * points at the layer's [num_kv_heads][2 * head_dim] slice of the model's
+   * implementations can skip it. */
+  const struct turbine_tq_params *tq_params;
+  /* v2.11 per-class page addressing (P6b S-5 / S-7), read only by a library
+   * reporting minor >= 11 and purely additive. NULL page_classes keeps the
+   * flat addressing (num_blocks = base_blocks, every block's page bytes are
+   * those of dtype at kv_layer + id * base_page_bytes). Otherwise kv_layer
+   * stays this layer's region, base_blocks * base_page_bytes long
+   * (base_page_bytes = the page bytes of dtype); num_blocks is the whole id
+   * space (base pages plus every grown slab's class pages) and ids at and
+   * above base_blocks resolve through the pool's slabs,
+   *   kv_layer + (id - base_blocks) / slab_stride * slab_base_blocks *
+   *   base_page_bytes + (id - base_blocks) % slab_stride *
+   *   page_classes[c].per_layer_bytes
+   * with c the entry whose fmt equals the block's TURBINE_KVFMT_* byte in
+   * block_formats (ids >= base_blocks are always read through
+   * block_formats). The scalar fields are pool constants that never change
+   * (a decode graph may bake them); page_classes is host memory, read during
+   * the call only. */
+  const struct turbine_kv_page_class *page_classes;
+  int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
 
+/* One page class of the pool besides the base (P6b S-5 / S-7): fmt is the
+ * TURBINE_KVFMT_* code of the class's pages, per_layer_bytes the bytes of one
+ * page in one layer's region. Host array, read during the call only (the
+ * values are pool constants; a decode graph bakes them by value). */
+typedef struct turbine_kv_page_class {
+  int32_t fmt;
+  int32_t per_layer_bytes;
+} turbine_kv_page_class;
+
 /* Forks blocks (n > 1) across all layers: for each i, block src_blocks[i] is
- * copied to dst_blocks[i] in every layer. Layer l's block b is the block_bytes
- * bytes at pool + l * layer_stride_bytes + b * block_bytes. */
+ * copied to dst_blocks[i] in every layer. With page_classes NULL, layer l's
+ * block b is the block_bytes bytes at pool + l * layer_stride_bytes +
+ * b * block_bytes. With page_classes set, block ids address page classes (the
+ * attention descriptor spells out the resolution): pair_formats[i], a host
+ * array [count], names the TURBINE_KVFMT_* class of BOTH blocks of pair i (a
+ * conversion is not a byte copy) and the copy moves the class's
+ * per_layer_bytes per layer at the resolved offsets, pool = the whole
+ * allocation with layer l at l * layer_stride_bytes. */
 typedef struct turbine_copy_blocks_desc {
   void *pool;
   /* block_bytes = per-layer block size */
@@ -287,6 +357,11 @@ typedef struct turbine_copy_blocks_desc {
   const int32_t *src_blocks;
   const int32_t *dst_blocks;
   int32_t count;
+  /* v2.11 per-class page addressing, purely additive. */
+  const struct turbine_kv_page_class *page_classes;
+  /* host array [count] of TURBINE_KVFMT_* codes; NULL with page_classes */
+  const uint8_t *pair_formats;
+  int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks;
 } turbine_copy_blocks_desc;
 
 /* turbine_moe_route_desc flags. RENORMALIZE divides the selected weights by
@@ -391,8 +466,12 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * card profile; v2.5 copy streams and asynchronous copies; v2.6 the native
  * stream handle and the sharded RMSNorm ops; v2.7 host-mapped memory and the
  * one-shot collectives over it; v2.8 the device-sequenced (graph-capturable)
- * mapped collective step (all below). */
-#define TURBINE_ABI_MINOR 8u
+ * mapped collective step; v2.9 the quantized GEMM, activation quantization
+ * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
+ * no new symbol); v2.11 the KV transcode and the host-to-device copy kernel
+ * (below) and the mixed-format paged attention fields (block_formats,
+ * tq_params; no new symbol). */
+#define TURBINE_ABI_MINOR 11u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -487,7 +566,11 @@ const char *turbine_logits_reduce_impl(const turbine_logits_reduce_desc *d);
  * which is captured as a copy node). A failed capture
  * leaves the context usable. A graph records the device pointers its ops were
  * captured with: the caller keeps those buffers alive and destroys the graph
- * before freeing them. */
+ * before freeing them. A capture and a context creation never overlap within
+ * one process: turbine_ctx_create waits until no context captures (and returns
+ * TURBINE_E_ARGUMENT on a thread with a capture open), and turbine_graph_begin
+ * waits while a context is being created, because a library may make device
+ * runtime calls during creation that break every capture in progress. */
 typedef struct turbine_graph turbine_graph;
 int32_t turbine_graph_begin(turbine_ctx *ctx);
 int32_t turbine_graph_end(turbine_ctx *ctx, turbine_graph **out);
@@ -867,6 +950,211 @@ int32_t turbine_mapped_all_reduce_dma(turbine_ctx *ctx,
  * engines' rate): the slots of turbine_mapped_all_reduce_dma, addressed by
  * this host pointer. Freed with turbine_host_free_mapped. */
 int32_t turbine_host_alloc_dma(turbine_ctx *ctx, size_t bytes, void **out);
+
+/* ======== v2.9 (additive, optional): quantized GEMM, activation
+ * quantization, FP8 KV scales ========
+ * Phase 6a. Resolved only when turbine_abi_minor() >= 9 and all six trio
+ * functions exist; a library without them serves BF16 weights only, and a
+ * quantized checkpoint is refused at startup (qgemm_unavailable).
+ * turbine_attention_paged_desc's trailing k_scale / v_scale fields are read
+ * only by a library reporting minor >= 9 (dtype TURBINE_DTYPE_F8E4M3 pages).
+ *
+ * Weight layouts (row-major, n output rows x k input columns, what the loader
+ * repacks every checkpoint packaging into; see crates/turbine-kernels/src/
+ * quant.rs):
+ *   FP8 schemes: b = n x k e4m3 bytes; b_scales = F32 [1] (tensor), [n]
+ *     (channel) or [ceil(n/block_n) x ceil(k/block_k)] (block).
+ *   INT4 groups: b = n x k/2 bytes, low nibble = even column; b_scales = F32
+ *     [n x k/group_size]; b_zeros = bytes 0..15 [n x k/group_size] (ZP only;
+ *     SYM uses 8).
+ *   MXFP4: b = n x k/2 bytes of E2M1 codes, low nibble first; b_scales = E8M0
+ *     bytes [n x k/32].
+ * Value of an element: FP8 e4m3(q) * scale; INT4 (q - z) * s; MXFP4
+ * e2m1(q) * 2^(e - 127). */
+#define TURBINE_QSCHEME_FP8_TENSOR 1
+#define TURBINE_QSCHEME_FP8_CHANNEL 2
+#define TURBINE_QSCHEME_FP8_BLOCK 3
+#define TURBINE_QSCHEME_INT4_GROUP_ZP 4
+#define TURBINE_QSCHEME_INT4_GROUP_SYM 5
+#define TURBINE_QSCHEME_MXFP4 6
+/* How a (the activations) arrive: NONE = BF16 (weight-only schemes, and the
+ * MXFP4-emulated activations after turbine_quantize_act); the FP8 modes = a is
+ * e4m3 with a_scales F32 [1] (TENSOR), [m] (TOKEN) or [m x k/128] (GROUP128).
+ */
+#define TURBINE_ACTQ_NONE 0
+#define TURBINE_ACTQ_FP8_TENSOR 1
+#define TURBINE_ACTQ_FP8_TOKEN 2
+#define TURBINE_ACTQ_FP8_GROUP128 3
+#define TURBINE_ACTQ_MXFP4_EMULATED 4
+#define TURBINE_OP_QGEMM 17
+#define TURBINE_OP_QUANTIZE_ACT 18
+
+/* c[m, n] = alpha * a[m, k] . dequant(b)[n, k]^T, F32 accumulation. */
+typedef struct turbine_qgemm_desc {
+  /* [m, k]: BF16 (act_quant NONE) or e4m3 (FP8 modes); row stride lda */
+  const void *a;
+  /* F32 activation scales (FP8 modes), else NULL */
+  const float *a_scales;
+  /* packed weights, layout of scheme */
+  const void *b;
+  /* F32 scales (FP8, INT4) or E8M0 bytes (MXFP4) */
+  const void *b_scales;
+  /* INT4_GROUP_ZP zero points, else NULL */
+  const uint8_t *b_zeros;
+  /* [m, n]: BF16 or F32; row stride ldc */
+  void *c;
+  int64_t m, n, k, lda, ldc;
+  /* TURBINE_QSCHEME_* */
+  int32_t scheme;
+  /* TURBINE_ACTQ_* */
+  int32_t act_quant;
+  /* TURBINE_DTYPE_* of a and c */
+  int32_t a_dtype, c_dtype;
+  /* INT4 group size; FP8 block shape (0 otherwise) */
+  int32_t group_size, block_n, block_k;
+  float alpha;
+  /* 1 when the call belongs to a prefill step (as turbine_gemm's option) */
+  int32_t prefill;
+} turbine_qgemm_desc;
+
+/* Quantizes x[rows, cols] (BF16) per mode into out and scales:
+ *   FP8_TENSOR: out e4m3 = round(x / static_scale), scales[0] = static_scale;
+ *   FP8_TOKEN: per row scale = max(amax / 448, 1 / (448 * 512));
+ *   FP8_GROUP128: per row and 128-column group, the same rule;
+ *   MXFP4_EMULATED: out BF16 = quantize-dequantize of each 32-column group
+ *     to MXFP4 (E8M0 exponent by Quark's 'even' rule, E2M1 round to nearest
+ *     even, saturating at 6); scales = the group scales as F32 powers of 2.
+ * e4m3 rounding: to nearest, ties to even, saturated to +-448. */
+typedef struct turbine_quantize_act_desc {
+  const void *x;
+  void *out;
+  float *scales;
+  int64_t rows, cols, x_stride_row, out_stride_row;
+  /* TURBINE_ACTQ_* (not NONE) */
+  int32_t mode;
+  float static_scale;
+  /* TURBINE_DTYPE_* of x and out */
+  int32_t x_dtype, out_dtype;
+} turbine_quantize_act_desc;
+
+/* v2.9 trios: qgemm, quantize_act. */
+int32_t turbine_qgemm(turbine_ctx *ctx, const turbine_qgemm_desc *d);
+int32_t turbine_qgemm_supported(const turbine_qgemm_desc *d);
+const char *turbine_qgemm_impl(const turbine_qgemm_desc *d);
+int32_t turbine_quantize_act(turbine_ctx *ctx,
+                             const turbine_quantize_act_desc *d);
+int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);
+const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);
+
+/* ======== v2.11 (additive, optional): KV transcode ========
+ * Phase 6b. Resolved only when turbine_abi_minor() >= 11, all three trio
+ * functions exist and the v2.9 (dtype codes) and v2.5 (the pinned copy path
+ * the encoded bytes cross) groups are resolved; a library without it keeps
+ * every lower KV tier at the page format (kv.cpu.format / kv.nvme.format other
+ * than l0 are then refused at startup, kv_transcode_unavailable).
+ *
+ * One call encodes (direction ENCODE) or decodes (DECODE) a batch of KV blocks
+ * between their L0 pages and a device buffer of encoded slots; the encoded
+ * bytes then cross the host link through the existing pinned copies, so this
+ * op reads host memory only for the page table below.
+ *
+ * Codec formats (TURBINE_KVFMT_*): L0 is the page format itself (never a
+ * transcode); FP8_E4M3 is the OCP e4m3fn codec of crates/turbine-kv (slot =
+ * layers x [K scale, V scale] F32 little-endian, then one e4m3 byte per page
+ * element in page order; a scale is max(absmax / 448, 1 / (448 * 512)) of one
+ * layer's K or V of the block, an element is e4m3(x / scale), rounded to
+ * nearest even and saturated to +-448, decoded as bf16(e4m3 * scale));
+ * TQ4 and TQ2 are the TurboQuant codecs (slot layouts of crates/turbine-kv
+ * codec/turboquant: one record per (layer, KV head, token), head_dim 128),
+ * K and V both TurboQuant_mse (tq4 4 bits each, tq2 2 bits each), which
+ * read their rotation signs and codebooks from tq_params (below). Encode equals
+ * the CPU codec byte for byte and decode bit for bit, for every format
+ * (TurboQuant over finite pages: a NaN's payload is not pinned). */
+#define TURBINE_KVFMT_L0 0
+#define TURBINE_KVFMT_FP8_E4M3 1
+#define TURBINE_KVFMT_TQ4 2
+#define TURBINE_KVFMT_TQ2 3
+#define TURBINE_KV_ENCODE 0
+#define TURBINE_KV_DECODE 1
+#define TURBINE_OP_KV_TRANSCODE 19
+
+/* The TurboQuant tables of a namespace (seed): read by the TQ4 / TQ2 KV
+ * transcode, and shared with the paged attention over TurboQuant pages. The
+ * host builds them from the codec (crates/turbine-kv codec/turboquant) and a
+ * library never regenerates them. */
+typedef struct turbine_tq_params {
+  /* the rotation seed the tables were built from */
+  uint64_t seed;
+  /* device F32 unit-variance Lloyd-Max codebooks of 1, 2, 3 and 4 bits
+   * (index bits - 1), 2, 4, 8 and 16 ascending centroids */
+  const float *codebooks[4];
+  /* device F32 [layers][num_kv_heads][2 * head_dim]: per (layer, KV head)
+   * the K rotation signs (+-1, head_dim), then the V rotation signs */
+  const float *tables;
+} turbine_tq_params;
+
+typedef struct turbine_kv_transcode_desc {
+  /* host array [num_blocks * layers] of device addresses: entry b * layers + l
+   * is layer l of block b, one page of 2 * block_tokens * num_kv_heads *
+   * head_dim elements of page_dtype laid out [K, V][block_tokens][num_kv_heads]
+   * [head_dim] (read by ENCODE, written by DECODE). Read during the call only.
+   */
+  void *const *pages;
+  /* device F32 [layers] scales of FP8 pages (value = e4m3 * scale); NULL = 1.0;
+   * read only with page_dtype F8E4M3 */
+  const float *k_scales;
+  const float *v_scales;
+  /* num_blocks consecutive slots of coded_block_bytes (written by ENCODE, read
+   * by DECODE) */
+  void *coded;
+  int64_t coded_block_bytes;
+  /* TurboQuant rotation seed; ignored by FP8_E4M3 */
+  uint64_t seed;
+  int32_t num_blocks, layers, block_tokens, num_kv_heads, head_dim;
+  /* TURBINE_DTYPE_* of the pages (BF16, or F8E4M3 for codecs that start from
+   * FP8 pages) */
+  int32_t page_dtype;
+  /* TURBINE_KVFMT_* of the coded slots (not L0) */
+  int32_t format;
+  /* TURBINE_KV_ENCODE or TURBINE_KV_DECODE */
+  int32_t direction;
+  /* host pointer, read during the call only: the TurboQuant tables of seed,
+   * required by TQ4 / TQ2 (tables for layers x num_kv_heads) and ignored by
+   * FP8_E4M3; NULL in a _supported / _impl probe */
+  const turbine_tq_params *tq_params;
+} turbine_kv_transcode_desc;
+
+int32_t turbine_kv_transcode(turbine_ctx *ctx,
+                             const turbine_kv_transcode_desc *d);
+int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);
+const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);
+
+/* ======== v2.11 (additive, optional): host-to-device copy kernel ========
+ * Phase 6b (decision "6b: KV promotions slow decode — which fix", A). Resolved
+ * only when turbine_abi_minor() >= 11, the symbol exists and the v2.5 group is
+ * resolved, apart from the KV transcode trio; a library without it runs every
+ * copy as turbine_memcpy_async (kv.transfer.promotion_copy: kernel is then
+ * refused at startup, promotion_copy_kernel_unavailable).
+ *
+ * turbine_memcpy_h2d_kernel enqueues on stream s (NULL = the compute stream)
+ * one or more kernels that copy the count segments of segs in order, each
+ * segs[i].bytes from segs[i].src (inside pinned host memory of this context,
+ * turbine_host_alloc_pinned, which the kernel reads over the host link) to
+ * segs[i].dst (device memory), with `workgroups` workgroups (0 = the
+ * library's choice). On the R9700 a copy-engine copy of pinned memory stalls
+ * the compute queue for about its own length, while a kernel with few
+ * workgroups moves the same bytes faster without that stall
+ * (.procoder/perf-log.md, 6b "Promotion copy kernel"). The copied bytes equal
+ * the source bytes, for any length and alignment. segs is a host array read
+ * during the call only; the buffers follow the turbine_memcpy_async rules. */
+typedef struct turbine_copy_seg {
+  void *dst;
+  const void *src;
+  size_t bytes;
+} turbine_copy_seg;
+int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *s,
+                                  const turbine_copy_seg *segs, int32_t count,
+                                  int32_t workgroups);
 
 #ifdef __cplusplus
 }

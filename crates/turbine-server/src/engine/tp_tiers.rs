@@ -23,7 +23,7 @@
 //!   then, exactly as with `local` mode's copy streams. If any rank failed, the copy fails for
 //!   all (the ranks that made a copy drop it again) and the hierarchy recomputes;
 //! - the transfer estimates learn the copy's time as its slowest rank's own: the leader's copy
-//!   as its poll saw it (as in `local` mode) or a worker's as the worker timed it
+//!   as its copy backend timed it (as in `local` mode) or a worker's as the worker timed it
 //!   ([`TierAck::took_ns`]), not the extra engine turn the acknowledgement took to arrive, which
 //!   would read every static copy as slower and tilt admission towards recomputing;
 //! - the wait is bounded by `parallel.collective.op_timeout`: a worker that does not answer
@@ -58,13 +58,13 @@ use turbine_kv::tier::{
     TierBlockRef, TierError, TierId, TierSlot,
 };
 use turbine_kv::transfer::{
-    TransferBackend, TransferPath, TransferPurpose, TransferRequest, TransferTicket,
+    CopyTime, TransferBackend, TransferCodec, TransferPath, TransferPurpose, TransferRequest,
+    TransferTicket,
 };
 use turbine_kv::{BlockPool, KvMetrics};
 
 use crate::kv_orchestrator::{
-    BlockAddresses, CopyDevice, CopyStreamBackend, IoPoolBackend, KvShard, L1_SLAB_BYTES,
-    tp_kv_format,
+    BlockAddresses, CopyDevice, CopyStreamBackend, IoPoolBackend, KvShard, tp_kv_format,
 };
 use crate::model::{PreparedModel, StartupError};
 
@@ -80,15 +80,15 @@ pub(crate) fn static_rank_kv(kv: &mut KvConfig, rank: u32, tp: u32) {
     kv.cpu.max_bytes = ByteSize(kv.cpu.max_bytes.0 / tp);
     kv.nvme.max_bytes = ByteSize(kv.nvme.max_bytes.0 / tp);
     kv.nvme.path = kv.nvme.path.join(format!("rank-{rank}"));
-    if kv.cpu.enabled && kv.cpu.max_bytes.0 < L1_SLAB_BYTES {
+    if kv.cpu.enabled && kv.cpu.max_bytes.0 < kv.cpu.slab_bytes.0 {
         tracing::warn!(
             event = "kv_l1_share_below_slab",
             tier = "l1",
             rank,
             max_bytes = kv.cpu.max_bytes.0,
-            slab_bytes = L1_SLAB_BYTES,
+            slab_bytes = kv.cpu.slab_bytes.0,
             "kv.cpu.max_bytes / tensor_parallel_size is below one L1 slab per rank; L1 holds \
-             nothing (raise kv.cpu.max_bytes to at least tensor_parallel_size GiB)"
+             nothing (raise kv.cpu.max_bytes to at least one slab per rank)"
         );
     }
 }
@@ -140,6 +140,8 @@ fn wire_path(p: TransferPath) -> TierPath {
         TransferPath::L2ToL1 => TierPath::L2ToL1,
         TransferPath::L0ToL2 => TierPath::L0ToL2,
         TransferPath::L2ToL0 => TierPath::L2ToL0,
+        // An L0 rewrite (S-7) never runs in a static-rank group (the ladder is refused there).
+        TransferPath::L0ToL0 => TierPath::L1ToL2,
     }
 }
 
@@ -257,7 +259,7 @@ impl WorkerTiers {
                     L1Config {
                         enabled: true,
                         max_bytes: kv.cpu.max_bytes.0,
-                        slab_bytes: L1_SLAB_BYTES,
+                        slab_bytes: kv.cpu.slab_bytes.0,
                         block_bytes: shard_bytes,
                         memory_kind,
                     },
@@ -287,13 +289,14 @@ impl WorkerTiers {
         }
         let l2 = l2.filter(|t| t.enabled()).map(|t| t as Arc<dyn KvTier>);
         let io_capacity = (kv.transfer.max_inflight_bytes.0 / shard_bytes.max(1)) as usize + 1;
-        let backend = CopyStreamBackend::new(
+        let mut backend = CopyStreamBackend::new(
             vec![KvShard { device, addresses }],
             l1.clone(),
             l2.clone(),
             IoPoolBackend::new(kv.nvme.io_threads.max(1) as usize, io_capacity),
             shard_bytes as usize,
         );
+        backend.set_promotion_copy(kv.transfer.promotion_copy)?;
         Ok(WorkerTiers {
             backend,
             l1,
@@ -333,6 +336,7 @@ impl TierWorker for WorkerTiers {
                             purpose: TransferPurpose::Demote,
                             src_slot: u64::from(block.0),
                             dst_slot: u64::from(block.0),
+                            codec: TransferCodec::l0(self.shard_bytes),
                         },
                     };
                     match self.backend.start(&t) {
@@ -405,8 +409,8 @@ pub(crate) fn leader_driver(
 struct Pending {
     queued: Instant,
     local: Option<Result<TierSlot, TierError>>,
-    /// When the leader saw its own copy complete, from the start.
-    local_took: Option<Duration>,
+    /// How long the leader's own copy took, as its copy backend timed it.
+    local_took: Option<CopyTime>,
     acks: HashMap<u32, Option<String>>,
     /// Each worker's own copy time (`TierAck::took_ns`).
     worker_took: Duration,
@@ -430,7 +434,7 @@ pub(crate) struct TierDriver {
     local_l1: Option<Arc<ShardedL1Tier>>,
     local_l2: Option<Arc<dyn KvTier>>,
     /// Copy times of the copies completed by the last `poll`s, taken by `took`.
-    took: HashMap<u64, Duration>,
+    took: HashMap<u64, CopyTime>,
 }
 
 impl TierDriver {
@@ -600,10 +604,17 @@ impl TierDriver {
         let error = match (&local, worker.or(group)) {
             (Ok(slot), None) => {
                 // The copy took as long as its slowest rank's part: the leader's own as its
-                // poll saw it (as in `local` mode) or a worker's as the worker timed it — not
-                // the extra engine turn its acknowledgement took to arrive.
-                let own = p.local_took.unwrap_or_default();
-                self.took.insert(t.id, own.max(p.worker_took));
+                // copy backend timed it (as in `local` mode) or a worker's as the worker timed
+                // it — not the extra engine turn its acknowledgement took to arrive.
+                let w = p.worker_took;
+                let took = match p.local_took.unwrap_or(CopyTime::Exact(Duration::ZERO)) {
+                    CopyTime::Exact(d) => CopyTime::Exact(d.max(w)),
+                    CopyTime::Within { at_least, at_most } => CopyTime::Within {
+                        at_least: at_least.max(w),
+                        at_most: at_most.max(w),
+                    },
+                };
+                self.took.insert(t.id, took);
                 return Ok(Some(*slot));
             }
             (_, Some(e)) => TierError::Io(e),
@@ -688,6 +699,13 @@ impl KvTier for MirroredTier {
     fn degraded(&self) -> bool {
         self.local.degraded()
     }
+    fn room_epoch(&self) -> u64 {
+        self.local.room_epoch()
+    }
+
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        self.local.free_slots(format, bytes)
+    }
 }
 
 /// The transfer backend of one pump in `static` mode (module comment): starts each copy on the
@@ -768,7 +786,12 @@ impl TransferBackend for StaticBackend<'_> {
                 Ok(None) => {}
                 Ok(Some(slot)) => {
                     p.local = Some(Ok(slot));
-                    p.local_took = Some(p.queued.elapsed());
+                    // Timed by the leader's backend (I/O-pool stages exactly, copy-stream
+                    // stages within their polls); else bounded by this poll.
+                    p.local_took = Some(self.local.took(t).unwrap_or(CopyTime::Within {
+                        at_least: Duration::ZERO,
+                        at_most: p.queued.elapsed(),
+                    }));
                 }
                 Err(e) => p.local = Some(Err(e)),
             }
@@ -781,7 +804,7 @@ impl TransferBackend for StaticBackend<'_> {
         self.driver.finish(t, p)
     }
 
-    fn took(&mut self, t: &TransferTicket) -> Option<Duration> {
+    fn took(&mut self, t: &TransferTicket) -> Option<CopyTime> {
         self.driver.took.remove(&t.id)
     }
 }
@@ -978,6 +1001,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         let started = Instant::now();
@@ -1032,6 +1056,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 2,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         assert!(
@@ -1067,6 +1092,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         let err = g
@@ -1105,6 +1131,7 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
         g.driver.backend(&mut g.local).start(&t).expect("starts");
@@ -1215,9 +1242,15 @@ mod tests {
                 purpose: TransferPurpose::Demote,
                 src_slot: 1,
                 dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
             },
         };
-        let took = g.driver.backend(&mut g.local).took(&t).expect("measured");
+        let took = g
+            .driver
+            .backend(&mut g.local)
+            .took(&t)
+            .expect("measured")
+            .reported();
         assert!(took >= reported, "at least the worker's own copy: {took:?}");
         assert!(
             took < delay / 3,
@@ -1226,6 +1259,72 @@ mod tests {
         assert!(
             g.driver.backend(&mut g.local).took(&t).is_none(),
             "taken once"
+        );
+        g.runtime.shutdown("test done");
+        assert!(g.worker.join().unwrap().is_ok());
+    }
+
+    /// Decision "backends time their own copies" (A), as `local` mode's `CopyStreamBackend`
+    /// does since `p6b-planner`: the leader's own part of a static copy is timed by the
+    /// leader's copy backend (its I/O-pool stage ends exactly; a copy-stream stage is bounded
+    /// by its polls), not to the engine poll that first saw it done. Breaks if the leader's
+    /// part is read as the time from its start to that poll (one late poll then reads a 1 ms
+    /// copy as 300 ms, and static mode plans recomputes `local` mode plans as retrievals).
+    #[test]
+    fn leader_copy_is_timed_by_its_backend_not_the_poll() {
+        let late = Late {
+            delay: Duration::ZERO,
+            took: Duration::from_millis(1),
+            held: Vec::new(),
+        };
+        let mut g = group(
+            Some(Box::new(late)),
+            Box::new(NoSteps),
+            Duration::from_secs(10),
+        );
+        let t = TransferTicket {
+            id: 1,
+            req: TransferRequest {
+                path: TransferPath::L0ToL2,
+                key: KvKey([4; 16]),
+                bytes: layout().block_bytes(),
+                owner: None,
+                purpose: TransferPurpose::Demote,
+                src_slot: 1,
+                dst_slot: 0,
+                codec: TransferCodec::l0(layout().block_bytes()),
+            },
+        };
+        g.driver
+            .backend(&mut g.local)
+            .start(&t)
+            .expect("the leader's own copy starts");
+        g.driver.flush();
+        // The engine's next poll comes late.
+        let late_poll = Duration::from_millis(300);
+        std::thread::sleep(late_poll);
+        let started = Instant::now();
+        loop {
+            match g.driver.backend(&mut g.local).poll(&t) {
+                Ok(None) => {}
+                Ok(Some(_)) => break,
+                Err(e) => panic!("the copy fails: {e}"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "never ended");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let took = g.driver.backend(&mut g.local).took(&t).expect("measured");
+        let at_least = match took {
+            CopyTime::Exact(d) => d,
+            CopyTime::Within { at_least, .. } => at_least,
+        };
+        assert!(
+            at_least >= Duration::from_millis(1),
+            "at least the worker's own copy: {took:?}"
+        );
+        assert!(
+            took.reported() < late_poll / 3,
+            "the leader's copy, not the late poll: {took:?}"
         );
         g.runtime.shutdown("test done");
         assert!(g.worker.join().unwrap().is_ok());

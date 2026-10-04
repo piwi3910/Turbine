@@ -124,12 +124,18 @@ pub(crate) struct ActiveRequest {
     /// Events the full channel did not take, oldest first. While any are held every new event
     /// queues behind them, so the client sees the stream in order.
     held: VecDeque<GenerationEvent>,
+    /// One channel slot reserved at admission for the event that ends a stream the engine
+    /// closes while its channel is full ([`ActiveRequest::close_with`]); every other event
+    /// shares the rest of the capacity. `None` only once used.
+    last_slot: Option<mpsc::OwnedPermit<GenerationEvent>>,
     /// Accounted as finished, failed, rejected or cancelled: only held events remain to deliver.
     /// A done request whose client never reads again keeps its (at most a few) held events
     /// until the client goes away; it holds no KV.
     pub done: bool,
     /// Prompt tokens served from a cached prefix (Phase 4), reported in `usage`.
     pub cached_tokens: u32,
+    /// Of them, tokens served from lossy cached KV (P6b S-3), reported in `usage`.
+    pub lossy_cached_tokens: u32,
 }
 
 impl ActiveRequest {
@@ -173,9 +179,12 @@ impl ActiveRequest {
                 last_token_at: None,
             })
             .collect();
+        // The channel is new and empty, so the reservation cannot fail on capacity.
+        let last_slot = events.clone().try_reserve_owned().ok();
         ActiveRequest {
             request,
             events,
+            last_slot,
             arrived: Instant::now(),
             choices,
             tools,
@@ -183,6 +192,7 @@ impl ActiveRequest {
             held: VecDeque::new(),
             done: false,
             cached_tokens: 0,
+            lossy_cached_tokens: 0,
         }
     }
 
@@ -258,6 +268,18 @@ impl ActiveRequest {
         }
     }
 
+    /// Ends the stream with `event` although its channel may be full, before the engine
+    /// forgets the request (which closes the channel): the held events are dropped — the client
+    /// stopped reading them — and `event` takes the slot reserved at admission. A client that
+    /// reads on sees what the channel buffered, then `event`, then the end of the stream, instead
+    /// of a bare close the API can only report as `internal_error`.
+    pub fn close_with(&mut self, event: GenerationEvent) {
+        self.held.clear();
+        if let Some(slot) = self.last_slot.take() {
+            slot.send(event);
+        }
+    }
+
     /// Retries the held events in order.
     pub fn flush(&mut self) -> Flush {
         while let Some(event) = self.held.pop_front() {
@@ -294,6 +316,7 @@ impl ActiveRequest {
                 prompt_tokens: self.prompt_len(),
                 completion_tokens: c.generated.len() as u32,
                 cached_tokens: self.cached_tokens,
+                lossy_cached_tokens: self.lossy_cached_tokens,
             }),
         }
     }
@@ -617,6 +640,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),
@@ -893,8 +917,9 @@ mod tests {
         let spec = write_tiny_llama(dir.path(), 7);
         let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
         let vocab = tokenizer.vocab_size() as usize;
-        // Byte tokens: "a" = 97, "b" = 98, "c" = 99; stop at "bc".
-        let (tx, mut rx) = mpsc::channel(2);
+        // Byte tokens: "a" = 97, "b" = 98, "c" = 99; stop at "bc". Three slots, one reserved
+        // for `close_with`.
+        let (tx, mut rx) = mpsc::channel(3);
         let mut r = ActiveRequest::new(
             request(&[256, 97], 10, &["bc"]).into(),
             tx,
@@ -923,7 +948,7 @@ mod tests {
         assert_eq!(r.token_at(0, 5), None);
         assert_eq!(r.generated_tokens(), 3);
 
-        // Channel of 2: the third event is held, the fourth queues behind it, in order.
+        // Two free slots: the third event is held, the fourth queues behind it, in order.
         let started = |choice| GenerationEvent::Started { choice };
         assert_eq!(r.emit(started(0)), Delivery::Sent);
         assert_eq!(r.emit(started(1)), Delivery::Sent);
@@ -948,10 +973,24 @@ mod tests {
                 usage: Some(Usage {
                     prompt_tokens: 2,
                     completion_tokens: 3,
-                    cached_tokens: 0
+                    cached_tokens: 0,
+                    lossy_cached_tokens: 0,
                 })
             }
         );
+
+        // Closing a full channel: the held events go, the closing event takes the reserved
+        // slot behind what the channel buffered.
+        assert_eq!(r.emit(started(4)), Delivery::Sent);
+        assert_eq!(r.emit(started(5)), Delivery::Sent);
+        assert_eq!(r.emit(started(6)), Delivery::Held { now_full: true });
+        let error = ActiveRequest::error_event(ErrorCode::SlowClient, "slow");
+        r.close_with(error.clone());
+        assert!(!r.has_held());
+        assert_eq!(rx.try_recv().unwrap(), started(4));
+        assert_eq!(rx.try_recv().unwrap(), started(5));
+        assert_eq!(rx.try_recv().unwrap(), error);
+        assert!(rx.try_recv().is_err());
         drop(rx);
         assert!(r.is_closed());
         assert_eq!(r.emit(finished), Delivery::Closed);

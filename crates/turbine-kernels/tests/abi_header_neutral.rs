@@ -205,9 +205,9 @@ fn header_declares_the_v24_minor_revision() {
         "2u",
         "v2.4 keeps major 2"
     );
-    // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.4 group is
-    // unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
+    // v2.4 group is unchanged.
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -340,9 +340,9 @@ fn header_declares_the_v27_host_mapped_group() {
         assert_eq!(define(&code, name), value, "{name}");
     }
     assert_eq!(
-        OpKind::ALL.len(),
+        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 7).count(),
         17,
-        "v2.7 adds no op code: TURBINE_OP_RMSNORM_SHARDED stays the last"
+        "v2.7 adds no op code: TURBINE_OP_RMSNORM_SHARDED stays the last before v2.9"
     );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     for decl in [
@@ -377,13 +377,249 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "8u");
-    assert_eq!(OpKind::ALL.len(), 17, "v2.8 adds no op code");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
+    assert_eq!(
+        OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
+        17,
+        "v2.8 adds no op code"
+    );
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let decl = "int32_t turbine_mapped_collective_dseq(turbine_ctx *ctx, \
                 const turbine_mapped_collective_desc *d, uint64_t *seq_counter);";
     assert!(
         flat.contains(decl),
         "turbine_kernels.h lacks the v2.8 {decl}"
+    );
+}
+
+/// v2.9 (Phase 6a Task 7): the minor becomes 9; the quantized GEMM and activation quantization
+/// trios are declared with op codes 17 and 18, the scheme and activation codes equal the Rust
+/// `abi_code`s, the FP8 dtype codes are 16 and 17, and the paged-attention descriptor gains the
+/// trailing `k_scale` / `v_scale`. Breaks if a code drifts between the header and
+/// `turbine_kernels::quant` (a library would dequantize with the wrong layout).
+#[test]
+fn header_declares_the_v29_quantization_group() {
+    use turbine_core::types::DType;
+    use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
+    assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
+    assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
+    assert_eq!(OpKind::QGemm.abi_code(), 17);
+    assert_eq!(OpKind::QuantizeAct.abi_code(), 18);
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_F8E4M3"),
+        DType::F8E4M3.abi_code().to_string()
+    );
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_U8"),
+        DType::U8.abi_code().to_string()
+    );
+    for (name, scheme) in [
+        ("TURBINE_QSCHEME_FP8_TENSOR", QuantSchemeDesc::Fp8Tensor),
+        ("TURBINE_QSCHEME_FP8_CHANNEL", QuantSchemeDesc::Fp8Channel),
+        (
+            "TURBINE_QSCHEME_FP8_BLOCK",
+            QuantSchemeDesc::Fp8Block {
+                block_n: 128,
+                block_k: 128,
+            },
+        ),
+        (
+            "TURBINE_QSCHEME_INT4_GROUP_ZP",
+            QuantSchemeDesc::Int4GroupZp { group: 128 },
+        ),
+        (
+            "TURBINE_QSCHEME_INT4_GROUP_SYM",
+            QuantSchemeDesc::Int4GroupSym { group: 128 },
+        ),
+        ("TURBINE_QSCHEME_MXFP4", QuantSchemeDesc::Mxfp4),
+    ] {
+        assert_eq!(define(&code, name), scheme.abi_code().to_string(), "{name}");
+    }
+    for (name, mode) in [
+        ("TURBINE_ACTQ_NONE", ActQuantDesc::None),
+        ("TURBINE_ACTQ_FP8_TENSOR", ActQuantDesc::Fp8Tensor),
+        ("TURBINE_ACTQ_FP8_TOKEN", ActQuantDesc::Fp8Token),
+        (
+            "TURBINE_ACTQ_FP8_GROUP128",
+            ActQuantDesc::Fp8Group { group: 128 },
+        ),
+        ("TURBINE_ACTQ_MXFP4_EMULATED", ActQuantDesc::Mxfp4Emulated),
+    ] {
+        assert_eq!(define(&code, name), mode.abi_code().to_string(), "{name}");
+    }
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t turbine_qgemm(turbine_ctx *ctx, const turbine_qgemm_desc *d);",
+        "int32_t turbine_qgemm_supported(const turbine_qgemm_desc *d);",
+        "const char *turbine_qgemm_impl(const turbine_qgemm_desc *d);",
+        "int32_t turbine_quantize_act(turbine_ctx *ctx, const turbine_quantize_act_desc *d);",
+        "int32_t turbine_quantize_act_supported(const turbine_quantize_act_desc *d);",
+        "const char *turbine_quantize_act_impl(const turbine_quantize_act_desc *d);",
+        // v2.11 appends block_formats and tq_params after the v2.9 scales.
+        "int32_t causal, dtype; float k_scale, v_scale; const uint8_t *block_formats;",
+    ] {
+        assert!(
+            flat.contains(decl),
+            "turbine_kernels.h lacks the v2.9 {decl}"
+        );
+    }
+}
+
+/// v2.10 (Phase 6a Task 28a): the minor becomes 10 and `turbine_rope_desc` gains the trailing
+/// `float attn_factor` (YaRN's attention factor on cos/sin); no op code and no symbol are added.
+/// Breaks if the field moves (a library would read another field as the factor) or a v2.10 op
+/// code appears.
+#[test]
+fn header_declares_the_v210_rope_attn_factor() {
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
+    assert_eq!(
+        OpKind::ALL.iter().filter(|op| op.abi_minor() == 10).count(),
+        0,
+        "v2.10 adds no op code"
+    );
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = "int32_t style; int32_t dtype; float attn_factor; } turbine_rope_desc;";
+    assert!(
+        flat.contains(decl),
+        "turbine_kernels.h lacks the v2.10 {decl}"
+    );
+}
+
+/// v2.11 (Phase 6b Task 5): the minor becomes 11; the KV transcode trio is declared with op code
+/// 19, the format codes equal `KvTranscodeFormat::abi_code` (and the 6b block format codes of
+/// `KV_FMT_*`), the direction codes are 0 and 1, and the descriptor keeps its field order, ending
+/// with the TurboQuant tables `tq_params` (Task 8) whose struct keeps its own.
+/// Breaks if a code drifts between the header and `turbine_kernels::ops` (a library would
+/// encode with the wrong codec) or the descriptor fields move.
+#[test]
+fn header_declares_the_v211_kv_transcode_group() {
+    use turbine_kernels::{
+        KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KvTranscodeFormat,
+    };
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "11u");
+    assert_eq!(define(&code, "TURBINE_OP_KV_TRANSCODE"), "19");
+    assert_eq!(OpKind::KvTranscode.abi_code(), 19);
+    assert_eq!(OpKind::KvTranscode.abi_minor(), 11);
+    assert_eq!(OpKind::ALL.len(), 20);
+    for (name, format, block_format) in [
+        ("TURBINE_KVFMT_L0", KvTranscodeFormat::L0, KV_FMT_BF16),
+        (
+            "TURBINE_KVFMT_FP8_E4M3",
+            KvTranscodeFormat::Fp8E4m3,
+            KV_FMT_FP8_E4M3,
+        ),
+        ("TURBINE_KVFMT_TQ4", KvTranscodeFormat::Tq4, KV_FMT_TQ4),
+        ("TURBINE_KVFMT_TQ2", KvTranscodeFormat::Tq2, KV_FMT_TQ2),
+    ] {
+        assert_eq!(define(&code, name), format.abi_code().to_string(), "{name}");
+        assert_eq!(i32::from(block_format), format.abi_code(), "{name}");
+    }
+    assert_eq!(define(&code, "TURBINE_KV_ENCODE"), "0");
+    assert_eq!(define(&code, "TURBINE_KV_DECODE"), "1");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "void *const *pages; const float *k_scales; const float *v_scales; void *coded; \
+         int64_t coded_block_bytes; uint64_t seed; int32_t num_blocks, layers, block_tokens, \
+         num_kv_heads, head_dim; int32_t page_dtype; int32_t format; int32_t direction; \
+         const turbine_tq_params *tq_params; } turbine_kv_transcode_desc;",
+        "typedef struct turbine_tq_params { uint64_t seed; const float *codebooks[4]; \
+         const float *tables; } turbine_tq_params;",
+        "int32_t turbine_kv_transcode(turbine_ctx *ctx, const turbine_kv_transcode_desc *d);",
+        "int32_t turbine_kv_transcode_supported(const turbine_kv_transcode_desc *d);",
+        "const char *turbine_kv_transcode_impl(const turbine_kv_transcode_desc *d);",
+    ] {
+        let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&decl),
+            "turbine_kernels.h lacks the v2.11 {decl}"
+        );
+    }
+}
+
+/// Kernel ABI v2.11 host-to-device copy kernel (P6b, decision "6b: KV promotions slow decode —
+/// which fix" A): `turbine_copy_seg` keeps its field order (dst, src, bytes: the layout of
+/// `ffi::CopySeg`) and `turbine_memcpy_h2d_kernel` its signature. Breaks if a field moves (a
+/// library would copy from the destination) or the declaration drifts from the Rust binding.
+#[test]
+fn header_declares_the_v211_copy_kernel() {
+    let flat = strip_comments(&header())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for decl in [
+        "typedef struct turbine_copy_seg { void *dst; const void *src; size_t bytes; } \
+         turbine_copy_seg;",
+        "int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *s, const \
+         turbine_copy_seg *segs, int32_t count, int32_t workgroups);",
+    ] {
+        let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&decl),
+            "turbine_kernels.h lacks the v2.11 {decl}"
+        );
+    }
+}
+
+/// Kernel ABI v2.11 mixed-format paged attention (P6b Task 12): the paged attention descriptor
+/// carries the device `block_formats` table and the layer's `tq_params` (after the v2.9 FP8
+/// scales), and the TurboQuant page dtypes keep the codes of `DType::{Tq4, Tq2}`. Breaks if the
+/// fields move (a library would read a block format as a pointer) or a dtype code drifts.
+#[test]
+fn header_declares_the_v211_mixed_paged_attention_fields() {
+    use turbine_core::types::DType;
+    let code = strip_comments(&header());
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_TQ4"),
+        DType::Tq4.abi_code().to_string()
+    );
+    assert_eq!(
+        define(&code, "TURBINE_DTYPE_TQ2"),
+        DType::Tq2.abi_code().to_string()
+    );
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let decl = "float scale; int32_t causal, dtype; float k_scale, v_scale; \
+                const uint8_t *block_formats; const struct turbine_tq_params *tq_params;";
+    let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&decl),
+        "turbine_kernels.h lacks the v2.11 paged attention fields {decl}"
+    );
+}
+
+/// Kernel ABI v2.11 per-class page addressing (P6b S-5/S-7, the recent window on the GPU): the
+/// paged attention descriptor ends with the host `page_classes` table and the pool's slab
+/// constants, `turbine_kv_page_class` holds `{fmt, per_layer_bytes}`, and the copy-blocks
+/// descriptor carries the same table plus the pairs' `pair_formats`. Breaks if a field moves (a
+/// library would read a slab constant as another field).
+#[test]
+fn header_declares_the_v211_per_class_page_fields() {
+    let code = strip_comments(&header());
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let class = "typedef struct turbine_kv_page_class { int32_t fmt; int32_t per_layer_bytes; \
+                 } turbine_kv_page_class;";
+    let class = class.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&class),
+        "turbine_kernels.h lacks turbine_kv_page_class {class}"
+    );
+    let attn = "const struct turbine_kv_page_class *page_classes; int32_t num_page_classes, \
+                base_blocks, slab_stride, slab_base_blocks; \
+                } turbine_attention_paged_desc;";
+    let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&attn),
+        "turbine_kernels.h lacks the per-class attention fields {attn}"
+    );
+    let copy = "const struct turbine_kv_page_class *page_classes; const uint8_t *pair_formats; \
+                int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
+                } turbine_copy_blocks_desc;";
+    let copy = copy.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&copy),
+        "turbine_kernels.h lacks the per-class copy-blocks fields {copy}"
     );
 }

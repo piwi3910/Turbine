@@ -7,6 +7,7 @@ mod engine;
 mod exit;
 mod host;
 mod kv_orchestrator;
+mod kv_tq;
 mod metrics;
 mod model;
 mod modules;
@@ -16,6 +17,7 @@ mod replicas;
 mod startup;
 mod support_matrix;
 mod support_startup;
+mod tq_device;
 
 use clap::Parser;
 

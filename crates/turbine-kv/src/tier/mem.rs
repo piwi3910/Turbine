@@ -17,19 +17,30 @@ use crate::identity::KvKey;
 pub struct MemTier {
     id: TierId,
     capacity_bytes: u64,
-    /// `Some(block_bytes)`: payload-free mode (every block accounts `block_bytes`, none stored).
+    /// `Some(block_bytes)`: payload-free mode (a block accounts `block_bytes`, or the logical
+    /// bytes [`KvTier::put_as`] names; none are stored).
     nominal_block: Option<u64>,
     clock: Arc<dyn Clock>,
     state: Mutex<MemState>,
 }
 
+/// One stored block: its bytes (none when payload-free) and the bytes it accounts.
+struct Stored {
+    bytes: Vec<u8>,
+    size: u64,
+}
+
 struct MemState {
-    blocks: HashMap<KvKey, Vec<u8>>,
+    blocks: HashMap<KvKey, Stored>,
     used: u64,
     latency: Duration,
     bandwidth: f64,
     fail_reads: u32,
     fail_writes: u32,
+    /// Stores still to refuse with `Full` ([`MemTier::inject_full`]).
+    fail_full: u32,
+    /// [`KvTier::room_epoch`]: bumped whenever stored bytes are released.
+    room_epoch: u64,
     health: TierHealth,
     next_slot: u64,
 }
@@ -40,7 +51,8 @@ impl MemTier {
         Self::build(id, capacity_bytes, None, clock)
     }
 
-    /// A tier that accounts `block_bytes` per block and stores nothing; `get` fills zeros.
+    /// A tier that accounts `block_bytes` per block (or the logical bytes a
+    /// [`KvTier::put_as`] names) and stores nothing; `get` fills zeros.
     pub fn payload_free(
         id: TierId,
         capacity_bytes: u64,
@@ -68,6 +80,8 @@ impl MemTier {
                 bandwidth: 8e9,
                 fail_reads: 0,
                 fail_writes: 0,
+                fail_full: 0,
+                room_epoch: 0,
                 health: TierHealth::new(None),
                 next_slot: 0,
             }),
@@ -90,6 +104,12 @@ impl MemTier {
         self.lock().fail_writes = n;
     }
 
+    /// The next `n` `put` / `put_as` calls find no room (`TierError::Full`), as a slab tier
+    /// without a free slot of the block's size does; the stored copy stays.
+    pub fn inject_full(&self, n: u32) {
+        self.lock().fail_full = n;
+    }
+
     pub fn len(&self) -> usize {
         self.lock().blocks.len()
     }
@@ -98,8 +118,56 @@ impl MemTier {
         self.len() == 0
     }
 
-    fn size_of(&self, stored: &[u8]) -> u64 {
-        self.nominal_block.unwrap_or(stored.len() as u64)
+    /// Keys of the stored blocks with the bytes each accounts.
+    pub fn sizes(&self) -> Vec<(KvKey, u64)> {
+        self.lock()
+            .blocks
+            .iter()
+            .map(|(k, b)| (*k, b.size))
+            .collect()
+    }
+
+    fn store(&self, key: KvKey, bytes: &[u8], logical: Option<u64>) -> Result<TierSlot, TierError> {
+        let now = self.clock.now_mono();
+        let mut s = self.lock();
+        if s.health.is_degraded() {
+            return Err(TierError::Degraded);
+        }
+        if s.fail_writes > 0 {
+            s.fail_writes -= 1;
+            s.health.record_error(now);
+            return Err(TierError::Io("injected write error".into()));
+        }
+        if s.fail_full > 0 {
+            s.fail_full -= 1;
+            return Err(TierError::Full);
+        }
+        let size = match self.nominal_block {
+            Some(nominal) => logical.unwrap_or(nominal),
+            None => bytes.len() as u64,
+        };
+        let replaced = s.blocks.get(&key).map_or(0, |b| b.size);
+        if s.used - replaced + size > self.capacity_bytes {
+            return Err(TierError::Full);
+        }
+        let stored = if self.nominal_block.is_some() {
+            Vec::new()
+        } else {
+            bytes.to_vec()
+        };
+        if size < replaced {
+            s.room_epoch += 1;
+        }
+        s.used = s.used - replaced + size;
+        s.blocks.insert(
+            key,
+            Stored {
+                bytes: stored,
+                size,
+            },
+        );
+        s.next_slot += 1;
+        Ok(TierSlot(s.next_slot))
     }
 
     // The state is updated in single assignments that leave it consistent, so a poisoned lock
@@ -144,30 +212,19 @@ impl KvTier for MemTier {
 
     fn put(&self, key: KvKey, src: TierBlockRef<'_>) -> Result<TierSlot, TierError> {
         let TierBlockRef::Host(bytes) = src;
-        let now = self.clock.now_mono();
-        let mut s = self.lock();
-        if s.health.is_degraded() {
-            return Err(TierError::Degraded);
-        }
-        if s.fail_writes > 0 {
-            s.fail_writes -= 1;
-            s.health.record_error(now);
-            return Err(TierError::Io("injected write error".into()));
-        }
-        let size = self.size_of(bytes);
-        let replaced = s.blocks.get(&key).map_or(0, |b| self.size_of(b));
-        if s.used - replaced + size > self.capacity_bytes {
-            return Err(TierError::Full);
-        }
-        let stored = if self.nominal_block.is_some() {
-            Vec::new()
-        } else {
-            bytes.to_vec()
-        };
-        s.used = s.used - replaced + size;
-        s.blocks.insert(key, stored);
-        s.next_slot += 1;
-        Ok(TierSlot(s.next_slot))
+        self.store(key, bytes, None)
+    }
+
+    /// Payload-free: accounts `bytes`; otherwise stores `src` as `put` does.
+    fn put_as(
+        &self,
+        key: KvKey,
+        _format: &'static str,
+        bytes: u64,
+        src: TierBlockRef<'_>,
+    ) -> Result<TierSlot, TierError> {
+        let TierBlockRef::Host(data) = src;
+        self.store(key, data, Some(bytes))
     }
 
     fn get(&self, key: &KvKey, dst: TierBlockMut<'_>) -> Result<(), TierError> {
@@ -187,25 +244,35 @@ impl KvTier for MemTier {
             out.fill(0);
             return Ok(());
         }
-        if b.len() != out.len() {
+        if b.bytes.len() != out.len() {
             return Err(TierError::Io(format!(
                 "block is {} bytes, buffer {}",
-                b.len(),
+                b.bytes.len(),
                 out.len()
             )));
         }
-        out.copy_from_slice(b);
+        out.copy_from_slice(&b.bytes);
         Ok(())
     }
 
     fn evict(&self, key: &KvKey) -> Result<(), TierError> {
         let mut s = self.lock();
         let b = s.blocks.remove(key).ok_or(TierError::Missing)?;
-        s.used -= self.size_of(&b);
+        s.used -= b.size;
+        s.room_epoch += 1;
         Ok(())
     }
 
     fn degraded(&self) -> bool {
         self.lock().health.is_degraded()
+    }
+
+    fn room_epoch(&self) -> u64 {
+        self.lock().room_epoch
+    }
+
+    /// No slot sizes: bytes are the only limit.
+    fn free_slots(&self, _format: &'static str, _bytes: u64) -> u64 {
+        u64::MAX
     }
 }

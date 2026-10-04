@@ -167,6 +167,7 @@ set(TURBINE_SOURCES
   src/context.cpp
   src/memory.cpp
   src/copy_stream.cpp
+  src/copy_kernel.hip
   src/graph.cpp
   src/gemm.cpp
   src/gemm_table.cpp
@@ -176,6 +177,7 @@ set(TURBINE_SOURCES
   src/paged_attention.cpp
   src/paged_attention_splitkv.cpp
   src/paged_attention.hip
+  src/paged_attention_mixed.hip
   src/copy_blocks.cpp
   src/moe.cpp
   src/moe.hip
@@ -184,6 +186,14 @@ set(TURBINE_SOURCES
   src/logits_reduce.hip
   src/sharded_norm.hip
   src/hostmem.hip
+  src/qgemm.cpp
+  src/quantize_act.hip
+  src/qgemm_int4.hip
+  src/qgemm_mxfp4.hip
+  src/qgemm_fp8_block.hip
+  src/quantize_act_mxfp4.hip
+  src/kv_transcode.hip
+  src/kv_transcode_tq.hip
   src/impl_table.cpp)
 set(CK_SOURCES src/attention.cpp src/paged_attention.cpp src/paged_attention_splitkv.cpp
   src/rmsnorm.cpp ${FMHA_BLOBS})
@@ -254,3 +264,81 @@ target_include_directories(turbine_gemm_tune PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../include"
   "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(turbine_gemm_tune PRIVATE hip::host roc::hipblaslt)
+
+# The promotion copy evaluation (Phase 6b, decision "6b: KV promotions slow
+# decode — which fix" A): copy-engine and copy-kernel promotions against a
+# decode-like compute loop. A lab tool, not loaded by the server.
+add_executable(turbine_copy_eval tools/copy_eval.cpp)
+set_source_files_properties(tools/copy_eval.cpp PROPERTIES LANGUAGE HIP)
+set_target_properties(turbine_copy_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+target_link_libraries(turbine_copy_eval PRIVATE hip::host)
+
+# The quantized GEMM provider evaluation harness (Phase 6a, decisions "P6: FP8 GEMM — provider
+# evaluation (kernel reuse rule)" and its block-scaled sequel): times and checks the hipBLASLt FP8
+# candidates, the CK ck_tile gemm_quant instances (tools/qgemm_eval_ck.cpp, with CK example
+# 38_block_scale_gemm's tile configs) and the activation quantization kernels for the Llama
+# shapes on the current device. A lab tool, off by default: -DTURBINE_BUILD_QGEMM_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_EVAL "Build the FP8 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_EVAL)
+  add_executable(turbine_qgemm_eval tools/qgemm_eval.cpp tools/qgemm_eval_ck.cpp)
+  set_source_files_properties(tools/qgemm_eval.cpp tools/qgemm_eval_ck.cpp PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(tools/qgemm_eval_ck.cpp PROPERTIES COMPILE_OPTIONS
+    "-DCK_TILE_USE_OCP_FP8;-DCK_USE_OCP_FP8;-Wno-global-constructors;-Wno-unknown-warning-option")
+  target_compile_definitions(turbine_qgemm_eval PRIVATE TURBINE_QGEMM_EVAL_CK)
+  set_target_properties(turbine_qgemm_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_qgemm_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools"
+    "${CK_ROOT}/include"
+    "${CK_ROOT}/example/ck_tile/38_block_scale_gemm")
+  target_link_libraries(turbine_qgemm_eval PRIVATE hip::host roc::hipblaslt)
+endif()
+
+# The INT4 group GEMM provider evaluation harness (Phase 6a Task 16, decision "P6: INT4 group
+# GEMM — provider evaluation (kernel reuse rule)"): runs every turbine_qgemm implementation of
+# libturbine_hip.so for the INT4 schemes and the BF16 baseline on the Llama-3.2-3B shapes, checks
+# them against a host reference and times them. A lab tool, off by default:
+# -DTURBINE_BUILD_QGEMM_INT4_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_INT4_EVAL "Build the INT4 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_INT4_EVAL)
+  add_executable(turbine_qgemm_int4_eval tools/qgemm_int4_eval.cpp)
+  set_source_files_properties(tools/qgemm_int4_eval.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(turbine_qgemm_int4_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_qgemm_int4_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(turbine_qgemm_int4_eval PRIVATE hip::host turbine_hip)
+endif()
+
+# The MXFP4 GEMM provider evaluation harness (Phase 6a Task 19, decision "P6: MXFP4 GEMM —
+# provider evaluation (kernel reuse rule)"): checks and times turbine_hip_mxfp4's tiles, its
+# MXFP4_EMULATED quantize-dequantize and the hipBLASLt BF16 baseline (and a dequantize + BF16
+# GEMM candidate) on the Llama-3.2-3B and Llama-3.1-8B shapes of the current device. Linked with
+# the library's objects. A lab tool, off by default: -DTURBINE_BUILD_QGEMM_MXFP4_EVAL=ON.
+option(TURBINE_BUILD_QGEMM_MXFP4_EVAL "Build the MXFP4 GEMM provider evaluation harness" OFF)
+if(TURBINE_BUILD_QGEMM_MXFP4_EVAL)
+  add_executable(turbine_qgemm_mxfp4_eval tools/qgemm_mxfp4_eval.cpp
+    $<TARGET_OBJECTS:turbine_hip_objects>)
+  set_source_files_properties(tools/qgemm_mxfp4_eval.cpp PROPERTIES LANGUAGE HIP)
+  turbine_hip_settings(turbine_qgemm_mxfp4_eval)
+  set_target_properties(turbine_qgemm_mxfp4_eval PROPERTIES LINKER_LANGUAGE HIP)
+endif()
+
+# The mixed-format / TurboQuant paged attention provider evaluation harness (Phase 6b Task 10,
+# decision "P6b: mixed-format / TurboQuant paged attention — provider evaluation (kernel reuse
+# rule)"): builds BF16, FP8, tq4 and tq2 pages for the Llama-3.2-3B and OLMoE head layouts and
+# runs the library's paged attention implementations, the TurboQuant pages staged to BF16 by the
+# Task 8 transcode then CK, and a prototype own rotated-domain mixed-format kernel; checks each
+# against a host reference with cpu::tq_attention's semantics and times decode and prefill shapes.
+# A lab tool, off by default: -DTURBINE_BUILD_ATTN_EVAL=ON.
+option(TURBINE_BUILD_ATTN_EVAL "Build the mixed-format paged attention evaluation harness" OFF)
+if(TURBINE_BUILD_ATTN_EVAL)
+  add_executable(turbine_attn_eval tools/attn_eval.cpp)
+  set_source_files_properties(tools/attn_eval.cpp PROPERTIES LANGUAGE HIP)
+  set_target_properties(turbine_attn_eval PROPERTIES HIP_ARCHITECTURES "${GPU_TARGETS}")
+  target_include_directories(turbine_attn_eval PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(turbine_attn_eval PRIVATE hip::host turbine_hip)
+endif()

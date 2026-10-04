@@ -6,8 +6,8 @@
 # Weights: /home/piwi/turbine-models/llama-3.2-3b-instruct on the host, mounted read-only at
 # /models. The NVMe tier lives at /home/piwi/turbine-kv on the host's root NVMe (mounted at the
 # same path by scripts/lab/novanas-test-job.yaml and novanas-serve-job.yaml), capped at 64 GiB
-# (P4 Constraints). L1 is at most 64 GiB of pinned host memory, grown in 1 GiB slabs on demand
-# (novanas has 125 GiB; the host reserve is 8 GiB).
+# (P4 Constraints). L1 is at most 64 GiB of pinned host memory, grown in `kv.cpu.slab_bytes`
+# slabs (128 MiB default) on demand (novanas has 125 GiB; the host reserve is 8 GiB).
 server:
   listen: 0.0.0.0:18000
 model:

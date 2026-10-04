@@ -47,11 +47,23 @@ pub enum DType {
     F32,
     I32,
     I64,
+    /// FP8 e4m3 (OCP `e4m3fn`: no infinities, NaN = 0x7f / 0xff, max ±448) — FP8 weights and
+    /// the FP8 KV cache (Phase 6a).
+    F8E4M3,
+    /// Raw bytes: the storage of packed formats (INT4 / FP4 nibbles, E8M0 exponents), whose
+    /// meaning a quantization scheme describes (Phase 6a).
+    U8,
+    /// TurboQuant `tq4` KV pages (P6b S-5): one 144-byte record per (token, KV head) of
+    /// head_dim 128, K and V 4 bits. Byte storage; [`KvLayout`] sizes the pages.
+    Tq4,
+    /// TurboQuant `tq2` KV pages (P6b S-5): 80-byte records, K and V 2 bits.
+    Tq2,
 }
 
 impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
+            DType::F8E4M3 | DType::U8 | DType::Tq4 | DType::Tq2 => 1,
             DType::BF16 | DType::F16 => 2,
             DType::F32 | DType::I32 => 4,
             DType::I64 => 8,
@@ -64,6 +76,10 @@ impl DType {
             DType::F32 => 2,
             DType::I32 => 3,
             DType::I64 => 4,
+            DType::F8E4M3 => 16,
+            DType::U8 => 17,
+            DType::Tq4 => 18,
+            DType::Tq2 => 19,
         }
     }
     pub fn as_str(self) -> &'static str {
@@ -73,6 +89,24 @@ impl DType {
             DType::F32 => "f32",
             DType::I32 => "i32",
             DType::I64 => "i64",
+            DType::F8E4M3 => "f8e4m3",
+            DType::U8 => "u8",
+            DType::Tq4 => "tq4",
+            DType::Tq2 => "tq2",
+        }
+    }
+    /// True for raw storage whose element meaning comes from a quantization scheme.
+    pub fn is_packed_storage(self) -> bool {
+        matches!(self, DType::U8)
+    }
+    /// The TurboQuant record bytes of one (token, KV head) of head_dim 128 (P6b S-5): K codes,
+    /// K norm, V codes, V norm, padded to 16 bytes; `None` for every
+    /// other dtype.
+    pub fn tq_record_bytes(self) -> Option<u64> {
+        match self {
+            DType::Tq4 => Some(144),
+            DType::Tq2 => Some(80),
+            _ => None,
         }
     }
 }
@@ -100,12 +134,24 @@ pub struct KvLayout {
 impl KvLayout {
     /// K and V of every layer for one token (Llama-3.2-3B BF16: 114 688). Saturates at
     /// `u64::MAX` for dimensions no device could hold, so a budget refuses it.
+    /// TurboQuant pages ([`DType::Tq4`], [`DType::Tq2`]) hold one record per KV head instead.
     pub fn bytes_per_token(&self) -> u64 {
-        u64::from(self.num_layers)
-            .saturating_mul(2)
-            .saturating_mul(u64::from(self.num_kv_heads))
+        u64::from(self.num_layers).saturating_mul(self.layer_bytes_per_token())
+    }
+    /// K and V of one layer for one token: `2 × kv_heads × head_dim` elements, or one
+    /// TurboQuant record per KV head. Saturates like [`KvLayout::bytes_per_token`].
+    pub fn layer_bytes_per_token(&self) -> u64 {
+        if let Some(record) = self.dtype.tq_record_bytes() {
+            return u64::from(self.num_kv_heads).saturating_mul(record);
+        }
+        2u64.saturating_mul(u64::from(self.num_kv_heads))
             .saturating_mul(u64::from(self.head_dim))
             .saturating_mul(self.dtype.size_bytes() as u64)
+    }
+    /// One block of one layer (a page's bytes in one layer's region).
+    pub fn layer_block_bytes(&self) -> u64 {
+        self.layer_bytes_per_token()
+            .saturating_mul(u64::from(self.block_tokens))
     }
     /// One block of `block_tokens` tokens (Llama-3.2-3B: 1 835 008 at 16 tokens, 14 680 064 at
     /// the default 128). Saturates like [`KvLayout::bytes_per_token`].
@@ -225,5 +271,67 @@ mod tests {
         assert_eq!(huge.bytes_per_token(), u64::MAX);
         assert_eq!(huge.block_bytes(), u64::MAX);
         assert_ne!(RequestId::new_v4(), RequestId::new_v4());
+    }
+
+    /// P6b S-5: TurboQuant page dtypes take ABI codes 18 / 19 and size a KV page by records
+    /// (one per token and KV head): Llama-3.2-3B `tq4` pages are 144 / 512 of the BF16 ones,
+    /// `tq2` 80 / 512. Breaks if a TurboQuant page is sized by element.
+    #[test]
+    fn turboquant_kv_layout() {
+        assert_eq!((DType::Tq4.abi_code(), DType::Tq4.as_str()), (18, "tq4"));
+        assert_eq!((DType::Tq2.abi_code(), DType::Tq2.as_str()), (19, "tq2"));
+        assert_eq!(DType::BF16.tq_record_bytes(), None);
+        let bf16 = KvLayout {
+            num_layers: 28,
+            num_kv_heads: 8,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 128,
+        };
+        for (dtype, record) in [(DType::Tq4, 144), (DType::Tq2, 80)] {
+            let tq = KvLayout { dtype, ..bf16 };
+            assert_eq!(tq.bytes_per_token(), 28 * 8 * record);
+            assert_eq!(tq.block_bytes() * 512, bf16.block_bytes() * record);
+        }
+    }
+
+    /// Phase 6a S-2: FP8 e4m3 and raw packed bytes take ABI codes 16 and 17 (the header's
+    /// reserved 16..63 range), one byte each; an FP8 KV page is half a BF16 one. Neither is a
+    /// float the CPU GEMM computes in, and `U8` alone is packed storage (INT4 / FP4 / E8M0).
+    /// Breaks if a code collides with the Phase 1 codes or a size is wrong.
+    #[test]
+    fn quant_dtypes() {
+        assert_eq!(
+            (
+                DType::F8E4M3.abi_code(),
+                DType::F8E4M3.size_bytes(),
+                DType::F8E4M3.as_str()
+            ),
+            (16, 1, "f8e4m3")
+        );
+        assert_eq!(
+            (
+                DType::U8.abi_code(),
+                DType::U8.size_bytes(),
+                DType::U8.as_str()
+            ),
+            (17, 1, "u8")
+        );
+        assert!(DType::U8.is_packed_storage());
+        assert!(!DType::F8E4M3.is_packed_storage());
+        assert!(!DType::BF16.is_packed_storage());
+        let bf16 = KvLayout {
+            num_layers: 28,
+            num_kv_heads: 8,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 128,
+        };
+        let fp8 = KvLayout {
+            dtype: DType::F8E4M3,
+            ..bf16
+        };
+        assert_eq!(fp8.bytes_per_token() * 2, bf16.bytes_per_token());
+        assert_eq!(fp8.block_bytes(), 7_340_032);
     }
 }

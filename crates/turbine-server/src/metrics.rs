@@ -73,6 +73,11 @@ pub struct GraphOutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReasonLabels {
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StageLabels {
     pub stage: &'static str,
 }
@@ -105,6 +110,10 @@ pub struct ServerMetrics {
     /// `turbine_decode_graph_total{outcome}`: decode graphs `captured`, `replayed`, `evicted`
     /// and `capture_failed` (P2c S-10).
     pub decode_graphs: Family<GraphOutcomeLabels, Counter>,
+    /// `turbine_decode_steps_unjudged_total{reason}`: pure decode steps the `step_time_drift`
+    /// window did not judge; `kv_copy`: the step overlapped an in-flight KV tier copy
+    /// (decision "6b: step-time drift during KV promotions", C).
+    pub unjudged_decode_steps: Family<ReasonLabels, Counter>,
 }
 
 impl ServerMetrics {
@@ -156,6 +165,11 @@ impl ServerMetrics {
             decode_graphs: reg.register(
                 "turbine_decode_graph",
                 "Decode graphs captured, replayed, evicted and failed captures",
+                Family::default(),
+            ),
+            unjudged_decode_steps: reg.register(
+                "turbine_decode_steps_unjudged",
+                "Pure decode steps the step-time drift window did not judge, by reason",
                 Family::default(),
             ),
         }

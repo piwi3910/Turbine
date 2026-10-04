@@ -9,10 +9,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use turbine_core::types::{BlockId, DType};
-use turbine_tensor::{DeviceSlice, TensorView};
+use turbine_tensor::{DevicePtr, DeviceSlice, KvPageClasses, TensorView};
 
 use crate::KernelError;
 use crate::cards::CardProfile;
+use crate::quant::{ActQuantDesc, QuantSchemeDesc};
 use crate::registry::OpConfig;
 
 /// One entry point of the kernel C ABI; `as_str` is the `turbine_<op>` suffix and the `op`
@@ -43,6 +44,13 @@ pub enum OpKind {
     /// ABI v2.6 (optional in a shim library): RMSNorm of a slice with the all-reduced sum of
     /// squares of the full row.
     RmsnormSharded,
+    /// ABI v2.9 (optional in a shim library): GEMM against a quantized weight (Phase 6a).
+    QGemm,
+    /// ABI v2.9 (optional in a shim library): activation quantization before a quantized GEMM.
+    QuantizeAct,
+    /// ABI v2.11 (optional in a shim library): encode KV blocks into a lower tier's codec and
+    /// decode them back (Phase 6b).
+    KvTranscode,
 }
 
 impl OpKind {
@@ -66,6 +74,9 @@ impl OpKind {
         OpKind::LogitsReduce,
         OpKind::RowSumsq,
         OpKind::RmsnormSharded,
+        OpKind::QGemm,
+        OpKind::QuantizeAct,
+        OpKind::KvTranscode,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -87,6 +98,9 @@ impl OpKind {
             OpKind::LogitsReduce => "logits_reduce",
             OpKind::RowSumsq => "row_sumsq",
             OpKind::RmsnormSharded => "rmsnorm_sharded",
+            OpKind::QGemm => "qgemm",
+            OpKind::QuantizeAct => "quantize_act",
+            OpKind::KvTranscode => "kv_transcode",
         }
     }
 
@@ -110,6 +124,9 @@ impl OpKind {
             OpKind::LogitsReduce => 14,
             OpKind::RowSumsq => 15,
             OpKind::RmsnormSharded => 16,
+            OpKind::QGemm => 17,
+            OpKind::QuantizeAct => 18,
+            OpKind::KvTranscode => 19,
         }
     }
 
@@ -119,6 +136,8 @@ impl OpKind {
         match self {
             OpKind::AddRmsnorm | OpKind::LogitsReduce => 1,
             OpKind::RowSumsq | OpKind::RmsnormSharded => 6,
+            OpKind::QGemm | OpKind::QuantizeAct => 9,
+            OpKind::KvTranscode => 11,
             _ => 0,
         }
     }
@@ -245,6 +264,11 @@ pub struct AttentionConfig {
     pub num_q_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
+    /// Element type of Q, the new K/V rows, the output and the KV. A paged kind may name
+    /// [`DType::F8E4M3`] (Phase 6a S-13, `kv.dtype: fp8_e4m3`): the pool pages are then OCP
+    /// e4m3fn bytes with one K and one V scale per layer ([`PagedAttentionContext::k_scale`]),
+    /// while Q, the new rows and the output stay BF16 (the C ABI's `dtype` names the pages the
+    /// same way).
     pub dtype: DType,
     /// KV page size in tokens for paged attention; `None` for the contiguous per-sequence KV of
     /// Phase 1.
@@ -518,7 +542,263 @@ impl fmt::Display for RmsnormShardedConfig {
     }
 }
 
+/// GEMM against a quantized weight (ABI v2.9 `qgemm`, Phase 6a):
+/// `c[m, n] = alpha · a[m, k] · dequant(b)[n, k]ᵀ`, F32 accumulation. `a_dtype` is BF16 for
+/// weight-only schemes (and MXFP4-emulated activations) or F8E4M3 for the FP8 activation
+/// modes; `c_dtype` BF16 or F32.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct QGemmConfig {
+    pub n: u32,
+    pub k: u32,
+    pub scheme: QuantSchemeDesc,
+    pub act_quant: ActQuantDesc,
+    pub a_dtype: DType,
+    pub c_dtype: DType,
+}
+
+impl fmt::Display for QGemmConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "n={} k={} scheme={} act={} a={} c={}",
+            self.n,
+            self.k,
+            self.scheme.as_str(),
+            self.act_quant.as_str(),
+            self.a_dtype.as_str(),
+            self.c_dtype.as_str()
+        )
+    }
+}
+
+/// Activation quantization before a quantized GEMM (ABI v2.9 `quantize_act`): `cols`-wide rows
+/// of `x_dtype` into `out_dtype` (F8E4M3 for the FP8 modes, BF16 for MXFP4 emulation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct QuantizeActConfig {
+    pub cols: u32,
+    pub mode: ActQuantDesc,
+    pub x_dtype: DType,
+    pub out_dtype: DType,
+}
+
+impl fmt::Display for QuantizeActConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cols={} mode={} x={} out={}",
+            self.cols,
+            self.mode.as_str(),
+            self.x_dtype.as_str(),
+            self.out_dtype.as_str()
+        )
+    }
+}
+
+/// The format of one side of a KV transcode (ABI v2.11 `TURBINE_KVFMT_*`, registry names of
+/// `turbine_kv::codec`): `L0` is the page format itself, the others a lower tier's codec.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KvTranscodeFormat {
+    L0,
+    Fp8E4m3,
+    Tq4,
+    Tq2,
+}
+
+impl KvTranscodeFormat {
+    /// The `TURBINE_KVFMT_*` code.
+    pub fn abi_code(self) -> i32 {
+        match self {
+            KvTranscodeFormat::L0 => 0,
+            KvTranscodeFormat::Fp8E4m3 => 1,
+            KvTranscodeFormat::Tq4 => 2,
+            KvTranscodeFormat::Tq2 => 3,
+        }
+    }
+
+    /// The codec's registry name (`turbine_kv::codec`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KvTranscodeFormat::L0 => "l0",
+            KvTranscodeFormat::Fp8E4m3 => "fp8_e4m3",
+            KvTranscodeFormat::Tq4 => "tq4",
+            KvTranscodeFormat::Tq2 => "tq2",
+        }
+    }
+}
+
+/// Which way a transcode runs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum KvTranscodeDirection {
+    /// L0 pages into coded slots (a demotion).
+    Encode,
+    /// Coded slots into L0 pages (a promotion).
+    Decode,
+}
+
+/// A KV transcode (ABI v2.11 `kv_transcode`, Phase 6b): `layers` pages of
+/// `[2, block_tokens, num_kv_heads, head_dim]` elements of `page_dtype` per block, between the
+/// page format (`L0`) and a codec. Exactly one of `src_format` and `dst_format` is `L0`: the
+/// source is the pages when encoding, the coded slots when decoding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct KvTranscodeConfig {
+    pub src_format: KvTranscodeFormat,
+    pub dst_format: KvTranscodeFormat,
+    pub page_dtype: DType,
+    pub head_dim: u32,
+    pub num_kv_heads: u32,
+    pub block_tokens: u32,
+    pub layers: u32,
+}
+
+impl KvTranscodeConfig {
+    /// The direction, or `None` unless exactly one side is `L0`.
+    pub fn direction(&self) -> Option<KvTranscodeDirection> {
+        match (self.src_format, self.dst_format) {
+            (KvTranscodeFormat::L0, KvTranscodeFormat::L0) => None,
+            (KvTranscodeFormat::L0, _) => Some(KvTranscodeDirection::Encode),
+            (_, KvTranscodeFormat::L0) => Some(KvTranscodeDirection::Decode),
+            _ => None,
+        }
+    }
+
+    /// The codec side (the one that is not `L0`), `None` unless [`Self::direction`] is.
+    pub fn codec(&self) -> Option<KvTranscodeFormat> {
+        self.direction().map(|d| match d {
+            KvTranscodeDirection::Encode => self.dst_format,
+            KvTranscodeDirection::Decode => self.src_format,
+        })
+    }
+
+    /// Elements of one layer's K (or V) of a block.
+    pub fn half_layer_elems(&self) -> usize {
+        self.block_tokens as usize * self.num_kv_heads as usize * self.head_dim as usize
+    }
+
+    /// Bytes of one layer's page of a block (K and V).
+    pub fn page_bytes(&self) -> usize {
+        2 * self.half_layer_elems() * self.page_dtype.size_bytes()
+    }
+}
+
+impl fmt::Display for KvTranscodeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}->{} page={} layers={} block_tokens={} kv_heads={} head_dim={}",
+            self.src_format.as_str(),
+            self.dst_format.as_str(),
+            self.page_dtype.as_str(),
+            self.layers,
+            self.block_tokens,
+            self.num_kv_heads,
+            self.head_dim
+        )
+    }
+}
+
 // --------------------------------------------------------------------------------- contexts
+
+/// `a`: `[m, k]` (`a_dtype`); `a_scales`: the activation scales of the FP8 modes (F32, dense:
+/// `[1]`, `[m]` or `[m, k / 128]`), else `None`; `b`: the packed weight bytes `[n, row bytes]`
+/// (U8 or F8E4M3) in the scheme's layout; `b_scales`: F32 scales, or E8M0 bytes (U8) for MXFP4;
+/// `b_zeros`: U8 zero points (INT4 with zero points only); `c`: `[m, n]`.
+pub struct QGemmContext<'a> {
+    pub cfg: QGemmConfig,
+    pub a: TensorView<'a>,
+    pub a_scales: Option<TensorView<'a>>,
+    pub b: TensorView<'a>,
+    pub b_scales: TensorView<'a>,
+    pub b_zeros: Option<TensorView<'a>>,
+    pub c: TensorView<'a>,
+    pub alpha: f32,
+    /// As [`GemmContext::prefill`].
+    pub prefill: bool,
+}
+
+/// `x`: `[rows, cols]`; `out`: `[rows, cols]` (F8E4M3 or BF16); `scales`: F32, dense, as many
+/// as the mode has for `rows × cols` (`ActQuantDesc::scale_count`); `static_scale`: the
+/// checkpoint's `input_scale` for [`ActQuantDesc::Fp8Tensor`].
+pub struct QuantizeActContext<'a> {
+    pub cfg: QuantizeActConfig,
+    pub x: TensorView<'a>,
+    pub out: TensorView<'a>,
+    pub scales: TensorView<'a>,
+    pub static_scale: f32,
+}
+
+/// The host codecs a transcode runs on the CPU (the `cpu-reference` provider; a library
+/// ignores it). `turbine-kernels` does not depend on `turbine-kv`: the server hands in a table
+/// over `turbine_kv::codec`, and the kernel tests one over the same codecs, so the reference a
+/// GPU transcode is judged against is the codec itself.
+pub trait KvCodecFns: Send + Sync {
+    /// Encodes one block (`layers` pages, `layers × page_bytes` bytes, layer order) into one
+    /// coded slot; `k_scales` / `v_scales` are the per-layer scales of FP8 pages (empty = 1.0).
+    fn encode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        block: &[u8],
+        slot: &mut [u8],
+    ) -> Result<(), String>;
+
+    /// Decodes one coded slot into one block (`layers × page_bytes` bytes).
+    fn decode(
+        &self,
+        cfg: &KvTranscodeConfig,
+        seed: u64,
+        scales: (&[f32], &[f32]),
+        slot: &[u8],
+        block: &mut [u8],
+    ) -> Result<(), String>;
+}
+
+/// `pages`: `num_blocks × layers` device addresses, block-major (`pages[b * layers + l]` is
+/// layer `l` of block `b`), each the start of `cfg.page_bytes()` bytes of the same device as
+/// `coded` (read when encoding, written when decoding; like the addresses of
+/// `CopyEngine::copy_async`, the caller guarantees they address live pool pages); `coded`:
+/// `num_blocks` consecutive slots of `coded_block_bytes` (written when encoding, read when
+/// decoding); `k_scales` / `v_scales`: F32 `[layers]` scales of FP8 pages (`None` = 1.0; unused
+/// with BF16 pages); `seed`: the TurboQuant rotation seed; `codecs`: read by the CPU provider
+/// only.
+pub struct KvTranscodeContext<'a> {
+    pub cfg: KvTranscodeConfig,
+    pub pages: &'a [DevicePtr],
+    pub coded: DeviceSlice<'a>,
+    pub coded_block_bytes: usize,
+    pub seed: u64,
+    pub k_scales: Option<TensorView<'a>>,
+    pub v_scales: Option<TensorView<'a>>,
+    pub codecs: &'a dyn KvCodecFns,
+}
+
+impl KvTranscodeContext<'_> {
+    /// Blocks of the batch (`coded` slots).
+    pub fn num_blocks(&self) -> usize {
+        self.coded
+            .len()
+            .checked_div(self.coded_block_bytes)
+            .unwrap_or(0)
+    }
+}
+
+/// The TurboQuant tables of a `tq4` / `tq2` transcode in device memory (ABI v2.11
+/// `turbine_tq_params`), built on the host from the codec (`turbine_kv::codec::turboquant`) for
+/// the context's seed; a library never regenerates them. `codebooks[bits − 1]`: F32 `[2^bits]`,
+/// the unit-variance Lloyd–Max centroids; `tables`: F32 `[layers, num_kv_heads, 2·head_dim]`,
+/// per (layer, KV head) the K signs then the V signs, as [`TqHeadTables`] holds them.
+#[derive(Clone, Debug)]
+pub struct KvTranscodeTables<'a> {
+    pub codebooks: [TensorView<'a>; 4],
+    pub tables: TensorView<'a>,
+}
+
+impl KvTranscodeTables<'_> {
+    /// F32 elements of one (layer, KV head)'s entry of `tables`.
+    pub fn head_elems(head_dim: u32) -> usize {
+        2 * head_dim as usize
+    }
+}
 
 /// `a`: `[m, k]`; `b`: `[n, k]` when `trans_b`, else `[k, n]`; `c`: `[m, n]`. Row strides are
 /// the leading dimensions.
@@ -566,6 +846,90 @@ pub struct PagedAttentionContext<'a> {
     pub max_blocks_per_seq: u32,
     /// Usually `1 / sqrt(head_dim)`.
     pub scale: f32,
+    /// FP8 pages (`cfg.dtype` F8E4M3): a K element is stored as `e4m3(k / k_scale)` and read as
+    /// `e4m3 · k_scale` rounded to the activation dtype, likewise V with `v_scale` (this layer's scales, > 0). Ignored (1.0 by
+    /// convention) for BF16 / F16 / F32 pages.
+    pub k_scale: f32,
+    pub v_scale: f32,
+    /// P6b S-5 (ABI v2.11): `[num_seqs, max_blocks_per_seq]` U8 in the provider's memory
+    /// (device memory on a GPU, so a decode graph can capture the call), laid out like
+    /// `block_table`: one format code per entry ([`KV_FMT_BF16`], [`KV_FMT_FP8_E4M3`],
+    /// [`KV_FMT_TQ4`], [`KV_FMT_TQ2`]); `None` = every block in `cfg.dtype`. A block's bytes are
+    /// the first page bytes of its format in slot `b` of `kv_layer` (slots of `cfg.dtype`'s
+    /// page; the ladder's L0 step, S-7, adds class-page addressing). A table is passed only
+    /// when it can hold a block of another format: a GPU provider cannot read it on the host,
+    /// so `Some` always takes the mixed-format implementations.
+    pub block_formats: Option<TensorView<'a>>,
+    /// TurboQuant tables of this layer and the codec that encodes appended rows; required
+    /// when `cfg.dtype` is TurboQuant or `block_formats` is `Some` (on a GPU provider with
+    /// [`TqPaged::device`]).
+    pub tq: Option<TqPaged<'a>>,
+    /// P6b S-5/S-7 (ABI v2.11 per-class addressing): the pool's page classes. `None` = every
+    /// block id is a flat base page (a block's bytes are the first page bytes of its format at
+    /// `kv_layer + b × page_bytes(dtype)`); `Some` resolves every id through
+    /// [`KvPageClasses::page_offset`] instead, and `kv_layer` is then this layer's region
+    /// ([`KvPoolView::layer_stride_bytes`] bytes of U8) rather than a dense page view.
+    pub classes: Option<KvPageClasses<'a>>,
+}
+
+/// Block format code of a BF16 page (the v2.11 `block_formats` byte).
+pub const KV_FMT_BF16: u8 = 0;
+/// Block format code of an FP8 e4m3 page.
+pub const KV_FMT_FP8_E4M3: u8 = 1;
+/// Block format code of a TurboQuant `tq4` page (K and V 4 bits).
+pub const KV_FMT_TQ4: u8 = 2;
+/// Block format code of a TurboQuant `tq2` page (K and V 2 bits).
+pub const KV_FMT_TQ2: u8 = 3;
+
+/// The block format code of KV pages of `dtype` (`None`: not a KV page dtype).
+pub fn kv_format_code(dtype: DType) -> Option<u8> {
+    match dtype {
+        DType::BF16 => Some(KV_FMT_BF16),
+        DType::F8E4M3 => Some(KV_FMT_FP8_E4M3),
+        DType::Tq4 => Some(KV_FMT_TQ4),
+        DType::Tq2 => Some(KV_FMT_TQ2),
+        _ => None,
+    }
+}
+
+/// The TurboQuant tables of one KV head of a layer (P6b S-5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TqHeadTables {
+    /// ±1 signs of the K rotation (head_dim 128).
+    pub k_signs: Vec<f32>,
+    /// ±1 signs of the V rotation.
+    pub v_signs: Vec<f32>,
+}
+
+/// TurboQuant parameters of one layer (P6b S-5; the host side of the v2.11 `tq_params`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TqParams {
+    /// Per KV head of the layer.
+    pub heads: Vec<TqHeadTables>,
+    /// Unit-variance Lloyd–Max codebooks of 1, 2, 3 and 4 bits (index `bits − 1`).
+    pub codebooks: [Vec<f32>; 4],
+}
+
+/// Encodes one token-head K/V pair (head_dim values each) of TurboQuant format `fmt`
+/// ([`KV_FMT_TQ4`] / [`KV_FMT_TQ2`]) into `record` (the format's record bytes) with `head`'s
+/// tables. The caller supplies the codec (`turbine-kv`'s TurboQuant `encode_record`), so this
+/// crate carries no copy of the encoder.
+pub type TqEncodeFn = fn(fmt: u8, k: &[f32], v: &[f32], head: &TqHeadTables, record: &mut [u8]);
+
+/// The TurboQuant side of a paged attention call.
+#[derive(Clone)]
+pub struct TqPaged<'a> {
+    /// Host tables of the layer (the CPU provider reads these).
+    pub params: &'a TqParams,
+    pub encode: TqEncodeFn,
+    /// The rotation seed the tables were built from.
+    pub seed: u64,
+    /// The same tables in device memory, for a GPU provider (ABI v2.11 `tq_params`):
+    /// `codebooks` as for the transcode and `tables` THIS layer's `[num_kv_heads, head_elems]`
+    /// slice of the model's tables (the caller offsets it, user decision 2026-10-01 "6b Task
+    /// 12: how per-layer TurboQuant tables reach the paged-attention call", A). `None` on the
+    /// CPU provider.
+    pub device: Option<KvTranscodeTables<'a>>,
 }
 
 /// Copies block `src` to block `dst` in every layer, for each `(src, dst)` of `pairs` in order.
@@ -577,6 +941,12 @@ pub struct KvCopyContext<'a> {
     pub block_bytes: u64,
     pub num_layers: u32,
     pub pairs: &'a [(BlockId, BlockId)],
+    /// Per-class addressing (P6b S-5/S-7): the pool's page classes; `None` = flat base pages
+    /// (every block's `block_bytes` bytes at `l · layer_stride_bytes + b · block_bytes`).
+    pub classes: Option<KvPageClasses<'a>>,
+    /// With `classes`: one `TURBINE_KVFMT_*` code per pair — the page class of BOTH blocks (a
+    /// conversion is not a byte copy; the caller refuses such pairs). Empty when flat.
+    pub pair_fmts: &'a [u8],
 }
 
 /// MoE routing of `num_tokens` tokens.
@@ -655,6 +1025,11 @@ pub struct RopeContext<'a> {
     pub k: TensorView<'a>,
     pub positions: TensorView<'a>,
     pub inv_freq: TensorView<'a>,
+    /// YaRN's attention factor `m` (Phase 6a Task 28a, kernel ABI v2.10): cos and sin are
+    /// multiplied by it in F32 before they are rounded to the dtype, so the rotated q and k
+    /// carry it as transformers' do. 1.0 = none; a kernel whose
+    /// [`RopeKernel::attn_factor_supported`] is false refuses any other value.
+    pub attn_factor: f32,
 }
 
 /// `out = silu(gate) · up`, all `[rows, cols]`.
@@ -778,6 +1153,13 @@ pub trait RopeKernel: Send + Sync {
     fn supports(&self, cfg: &RopeConfig) -> bool;
     fn implementation(&self, cfg: &RopeConfig) -> String;
     fn execute(&self, ctx: &mut RopeContext<'_>) -> Result<(), KernelError>;
+    /// True when `execute` applies a [`RopeContext::attn_factor`] other than 1.0 (a kernel
+    /// library at ABI minor ≥ 10, the cpu-reference provider). False by default, so a kernel
+    /// that does not read the factor is never handed one: a YaRN model whose factor is not 1 is
+    /// refused at startup (`rope_attn_factor_unavailable`).
+    fn attn_factor_supported(&self) -> bool {
+        false
+    }
 }
 
 /// SiLU-and-multiply.
@@ -852,6 +1234,46 @@ pub trait ShardedNormKernel: Send + Sync {
     fn rmsnorm_sharded(&self, ctx: &mut RmsnormShardedContext<'_>) -> Result<(), KernelError>;
 }
 
+/// GEMM against a quantized weight (ABI v2.9).
+pub trait QGemmKernel: Send + Sync {
+    fn supports(&self, cfg: &QGemmConfig) -> bool;
+    fn implementation(&self, cfg: &QGemmConfig) -> String;
+    fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Activation quantization (ABI v2.9).
+pub trait QuantizeActKernel: Send + Sync {
+    fn supports(&self, cfg: &QuantizeActConfig) -> bool;
+    fn implementation(&self, cfg: &QuantizeActConfig) -> String;
+    fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError>;
+}
+
+/// KV transcode (ABI v2.11).
+pub trait KvTranscodeKernel: Send + Sync {
+    fn supports(&self, cfg: &KvTranscodeConfig) -> bool;
+    fn implementation(&self, cfg: &KvTranscodeConfig) -> String;
+    /// Runs a transcode that needs no tables (`fp8_e4m3`); a library refuses `tq4` / `tq2`
+    /// here, since they need [`Self::execute_with_tables`].
+    fn execute(&self, ctx: &mut KvTranscodeContext<'_>) -> Result<(), KernelError>;
+
+    /// Runs a transcode with the TurboQuant tables of `ctx.seed` (`tables` is required by
+    /// `tq4` / `tq2` on a library and ignored by `fp8_e4m3`; the cpu-reference provider runs
+    /// `ctx.codecs` and ignores it). The default knows no tables: it runs [`Self::execute`]
+    /// when `tables` is `None` and refuses otherwise.
+    fn execute_with_tables(
+        &self,
+        ctx: &mut KvTranscodeContext<'_>,
+        tables: Option<&KvTranscodeTables<'_>>,
+    ) -> Result<(), KernelError> {
+        match tables {
+            None => self.execute(ctx),
+            Some(_) => Err(KernelError::Unsupported {
+                message: format!("kv_transcode: {} takes no TurboQuant tables", ctx.cfg),
+            }),
+        }
+    }
+}
+
 /// One implementation source (`cpu-reference`, a loaded shim library). A family the provider
 /// does not implement at all returns `None`; per-config support is `supports`. The ABI v2.1 and
 /// v2.6 families default to `None`, so a provider (or a shim library) without them is a
@@ -875,6 +1297,18 @@ pub trait KernelProvider: Send + Sync {
     }
     /// ABI v2.6: `None` (the default) for a provider without the sharded RMSNorm ops.
     fn sharded_norm(&self) -> Option<&dyn ShardedNormKernel> {
+        None
+    }
+    /// ABI v2.9: `None` (the default) for a provider without the quantized GEMM.
+    fn qgemm(&self) -> Option<&dyn QGemmKernel> {
+        None
+    }
+    /// ABI v2.9: `None` (the default) for a provider without activation quantization.
+    fn quantize_act(&self) -> Option<&dyn QuantizeActKernel> {
+        None
+    }
+    /// ABI v2.11: `None` (the default) for a provider without the KV transcode.
+    fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         None
     }
 
@@ -935,7 +1369,10 @@ mod tests {
                 "add_rmsnorm",
                 "logits_reduce",
                 "row_sumsq",
-                "rmsnorm_sharded"
+                "rmsnorm_sharded",
+                "qgemm",
+                "quantize_act",
+                "kv_transcode"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -1088,15 +1525,18 @@ mod tests {
     }
 
     /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
-    /// RMSNorm ops 6. Breaks if a new op is appended without saying which minor group adds it (an
-    /// older library would be asked for an op code it does not know).
+    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11. Breaks if a new op
+    /// is appended without saying which minor group adds it (an older library would be asked for
+    /// an op code it does not know).
     #[test]
     fn op_minor_revisions() {
         for &op in OpKind::ALL {
             let want = match op.abi_code() {
                 0..=12 => 0,
                 13 | 14 => 1,
-                _ => 6,
+                15 | 16 => 6,
+                17 | 18 => 9,
+                _ => 11,
             };
             assert_eq!(op.abi_minor(), want, "{op}");
         }

@@ -2,8 +2,12 @@
 //! × retrieval / memory.
 
 use turbine_core::registry::Module;
+use turbine_core::types::PressureState;
 
-use super::{BlockScoreInputs, EvictionPolicy, PolicyWeights, recompute_seconds};
+use super::{
+    BlockScoreInputs, EvictAction, EvictionPolicy, LadderContext, PolicyWeights, recompute_seconds,
+};
+use crate::codec;
 use crate::directory::{Timestamp, decay};
 
 /// Retrieval costs below this count as this (a copy is never free).
@@ -53,5 +57,57 @@ impl EvictionPolicy for CostAwarePolicy {
         let memory = b.block.size_bytes.max(1) as f64 / b.tier_capacity.max(1) as f64
             * (1.0 + f64::from(b.tier_pressure.as_u8()));
         reuse * recompute * f64::from(b.block.priority.0) * retrieval / memory
+    }
+
+    /// The compression ladder (P6b S-6, user decisions 2026-09-29 "Start at YELLOW earlier" and
+    /// "Compress only until GREEN"). With the ladder on and the pressure controller not GREEN
+    /// (YELLOW or above), a copy of a triggered tier — the lowest enabled tier always, before
+    /// any tier is full (at YELLOW, when nothing must leave and the tier is at or below
+    /// `high_water`, only while `fill + demand > low_water`, so a steady YELLOW does not drift
+    /// the tier to `max_format`); an upper tier once it is above `high_water` — moves one rung
+    /// down from its own format (`l0` → `fp8_e4m3` → `tq4` → `tq2`, bounded by `max_format`),
+    /// provided every enabled tier below
+    /// has already reached that rung (so the lowest tier compresses first and upper tiers follow
+    /// rung by rung). At the floor the lowest tier evicts the copy (`ladder_floor`) only when it
+    /// must leave or the tier is above `high_water`, never from a tier with free room; an upper
+    /// tier keeps it (or demotes a leaving one). Everything else is Phase 4's decision. Which
+    /// copies are offered, and how many per tick, is the hierarchy's call (oldest,
+    /// least-reusable first: [`super::order_victims`]).
+    fn action(&self, _b: &BlockScoreInputs, ctx: &LadderContext) -> EvictAction {
+        let Some(ladder) = ctx.ladder else {
+            return ctx.phase4_action();
+        };
+        let above_high_water = ctx.fill > ladder.high_water;
+        let triggered = ctx.lowest() || above_high_water;
+        if ctx.pressure == PressureState::Green || !triggered {
+            return ctx.phase4_action();
+        }
+        // YELLOW depth ("Compress only until GREEN"): a lowest tier with nothing leaving and at
+        // or below high water compresses only while its GREEN headroom is short.
+        if ctx.pressure == PressureState::Yellow
+            && !ctx.must_leave
+            && !above_high_water
+            && ctx.fill + ctx.demand <= ladder.low_water
+        {
+            return ctx.phase4_action();
+        }
+        let max = codec::tier_rung(ladder.max_format, ladder.l0_dtype).unwrap_or(0);
+        let target = codec::next_rung_in(ctx.format, ladder.l0_dtype)
+            .filter(|t| codec::tier_rung(t, ladder.l0_dtype).is_some_and(|i| i <= max));
+        match target {
+            Some(to) => {
+                let reached = ctx.lower_rung.is_none_or(|lower| {
+                    codec::tier_rung(lower, ladder.l0_dtype).unwrap_or(0)
+                        >= codec::tier_rung(to, ladder.l0_dtype).unwrap_or(0)
+                });
+                if reached {
+                    EvictAction::Compress { to }
+                } else {
+                    ctx.phase4_action()
+                }
+            }
+            None if ctx.lowest() && (ctx.must_leave || above_high_water) => EvictAction::Drop,
+            None => ctx.phase4_action(),
+        }
     }
 }

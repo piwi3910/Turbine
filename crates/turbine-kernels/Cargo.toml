@@ -25,6 +25,9 @@ half.workspace = true
 cc.workspace = true
 
 [dev-dependencies]
+# The TurboQuant codec (records, rotation signs, codebooks) the reference
+# `cpu::tq_attention` is tested against; dev only, turbine-kv does not depend on this crate
+turbine-kv.workspace = true
 # Captures the JSON kernel selection log in registry tests
 tracing-subscriber.workspace = true
 # The seeded uniform draws of the logits_reduce reference test (the sampler's ChaCha8 stream)

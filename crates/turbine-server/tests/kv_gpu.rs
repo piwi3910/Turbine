@@ -27,6 +27,12 @@
 //!   answer, promotions from L2, no checksum eviction (every promoted block's CRC32C matched the
 //!   value written), and at most 64 GiB of slab files under the path.
 //!
+//! - `prefix_reuse_matches_cold_fp8_kv`, `nvme_round_trip_matches_cold_fp8_kv` (Phase 6a S-14):
+//!   the same two checks at `kv.dtype: fp8_e4m3` — FP8 pages are copied through L1/L2 as their
+//!   bytes, so a warm or round-tripped prefix answers exactly like the cold FP8 run — plus the
+//!   FP8 L0 pool itself: F8E4M3 pages of half the bytes and at least 1.95× the BF16 run's blocks
+//!   in the same budget.
+//!
 //! Answers are compared by their text and completion token count: greedy decoding of the same
 //! token ids gives the same text, and any KV difference shows up within 64 tokens as a
 //! different continuation (the Phase 1 golden run showed a single BF16 rounding flip changes
@@ -49,6 +55,8 @@ const POLL: Duration = Duration::from_millis(200);
 /// The lab NVMe tier and its cap (P4 Constraints).
 const KV_DIR: &str = "/home/piwi/turbine-kv";
 const KV_CAP_BYTES: u64 = 64 << 30;
+/// How long the NVMe round trip retries a prefetch refused for L0 pressure.
+const PREFETCH_WAIT: Duration = Duration::from_secs(60);
 /// Greedy tokens per answer.
 const ANSWER_TOKENS: u32 = 64;
 
@@ -163,19 +171,46 @@ impl LabServer {
 
     /// One greedy completion of the token-id prompt `ids` with each token's logprob.
     fn complete_ids(&self, ids: &[u32], max_tokens: u32) -> IdAnswer {
-        let body = json!({
+        self.complete_with_logprobs(json!(ids), max_tokens, None)
+    }
+
+    /// One greedy completion of `prompt` (text or token ids, as the request's JSON) with each
+    /// token's logprob, as a turn of session `session` when given.
+    fn complete_with_logprobs(
+        &self,
+        prompt: Value,
+        max_tokens: u32,
+        session: Option<&str>,
+    ) -> IdAnswer {
+        self.complete_with_headers(prompt, max_tokens, session, &[])
+    }
+
+    /// [`LabServer::complete_with_logprobs`] with extra request headers
+    /// (`x-turbine-kv-lossy: deny`).
+    fn complete_with_headers(
+        &self,
+        prompt: Value,
+        max_tokens: u32,
+        session: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> IdAnswer {
+        let mut body = json!({
             "model": SERVED_NAME,
-            "prompt": ids,
+            "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "ignore_eos": true,
             "logprobs": 1,
         });
-        let (status, text) = request(
+        if let Some(key) = session {
+            body["prompt_cache_key"] = json!(key);
+        }
+        let (status, text) = request_with(
             self.addr,
             "POST",
             "/v1/completions",
             Some(&body.to_string()),
+            headers,
         );
         assert_eq!(status, 200, "{text}");
         let v: Value = serde_json::from_str(&text).expect("JSON response");
@@ -194,6 +229,9 @@ impl LabServer {
                 .collect(),
             prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt_tokens"),
             cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            lossy_cached_tokens: usage["prompt_tokens_details"]["lossy_cached_tokens"]
                 .as_u64()
                 .unwrap_or(0),
         }
@@ -218,6 +256,9 @@ struct IdAnswer {
     logprobs: Vec<f64>,
     prompt_tokens: u64,
     cached_tokens: u64,
+    /// Of the prompt tokens reused, those whose blocks went through a lossy tier (P6b S-3);
+    /// `cached_tokens` counts the exact ones.
+    lossy_cached_tokens: u64,
 }
 
 impl IdAnswer {
@@ -236,12 +277,27 @@ impl Drop for LabServer {
 
 /// Sends one request with `Connection: close`; returns the status and the body.
 fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    request_with(addr, method, path, body, &[])
+}
+
+/// [`request`] with extra request headers.
+fn request_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
     let mut conn = TcpStream::connect(addr).expect("connect");
     conn.set_read_timeout(Some(REQUEST_TIMEOUT)).unwrap();
     let body = body.unwrap_or("");
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     write!(
         conn,
-        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n{extra}\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
@@ -463,6 +519,54 @@ fn prefix_reuse_matches_cold_with(sets: &[String]) {
     println!("prefix_reuse_matches_cold ok");
 }
 
+/// The FP8 KV overrides (Phase 6a S-13).
+fn fp8_kv_sets() -> Vec<String> {
+    vec!["kv.dtype=fp8_e4m3".to_string()]
+}
+
+/// The L0 tier of `GET /turbine/v1/kv`: (page dtype, block bytes, total blocks).
+fn l0_tier(server: &LabServer) -> (String, u64, u64) {
+    let (status, text) = request(server.addr, "GET", "/turbine/v1/kv", None);
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("KV document JSON");
+    let l0 = v["tiers"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["tier"] == "l0"))
+        .unwrap_or_else(|| panic!("no l0 tier: {text}"));
+    (
+        l0["dtype"].as_str().unwrap_or_default().to_string(),
+        l0["block_bytes"].as_u64().unwrap_or(0),
+        l0["blocks_total"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Phase 6a S-13 / S-14: at `kv.dtype: fp8_e4m3` the L0 pool is F8E4M3 with half the block
+/// bytes and at least 1.95× the blocks of the BF16 run (same budget), and prefix reuse gives the
+/// cold FP8 answers exactly (see [`prefix_reuse_matches_cold`]). Breaks if the FP8 pool is not
+/// smaller per block, or a reused FP8 prefix differs from recomputing it.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn prefix_reuse_matches_cold_fp8_kv() {
+    if !require_backend("hip") {
+        return;
+    }
+    {
+        let _gpu = one_server_at_a_time();
+        let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+        let bf16 = l0_tier(&LabServer::start(&model_dir, &[]));
+        let fp8 = l0_tier(&LabServer::start(&model_dir, &fp8_kv_sets()));
+        let ratio = fp8.2 as f64 / bf16.2 as f64;
+        println!("L0 bf16 {bf16:?} fp8 {fp8:?}: {ratio:.3}x the blocks");
+        assert_eq!((bf16.0.as_str(), fp8.0.as_str()), ("bf16", "f8e4m3"));
+        assert_eq!(2 * fp8.1, bf16.1, "FP8 halves a block");
+        assert!(
+            ratio >= 1.95,
+            "FP8 KV holds only {ratio:.3}x the BF16 blocks"
+        );
+    }
+    prefix_reuse_matches_cold_with(&fp8_kv_sets());
+}
+
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn prefix_reuse_suffix_lengths_match_cold() {
@@ -564,58 +668,120 @@ fn nvme_round_trip_matches_cold() {
     if !require_backend("hip") {
         return;
     }
-    let _gpu = one_server_at_a_time();
+    nvme_round_trip_matches_cold_with(&[]);
+}
+
+/// [`nvme_round_trip_matches_cold`] at `kv.dtype: fp8_e4m3` (Phase 6a S-14): the FP8 pages go to
+/// L2 and back as their bytes (checksummed), so A answers exactly as its cold FP8 run.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Llama-3.2-3B weights and /home/piwi/turbine-kv"]
+fn nvme_round_trip_matches_cold_fp8_kv() {
+    if !require_backend("hip") {
+        return;
+    }
+    nvme_round_trip_matches_cold_with(&fp8_kv_sets());
+}
+
+/// The L2 tests' server: L2 under [`KV_DIR`] and a 1 GiB L1 (L0 stays the lab config's 8 GiB:
+/// a smaller cap shrinks Phase 3's device budget below what the HIP runtime and libraries
+/// already hold, and the device_memory signal would put the server in SURVIVAL; cached blocks
+/// are demoted by capacity past 70 % of L0, so filler prompts still push A down through L1),
+/// with the extra overrides `sets`. Returns it with the blocks 1 GiB of L1 holds (73 BF16
+/// Llama blocks of 14,680,064 bytes, 146 FP8).
+fn nvme_server(sets: &[String]) -> (LabServer, f64) {
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     let kv_dir = Path::new(KV_DIR);
     assert!(kv_dir.is_dir(), "{KV_DIR} is not mounted");
-    let server = LabServer::start(
-        &model_dir,
-        &[
-            format!("kv.nvme.path={KV_DIR}"),
-            "kv.nvme.max_bytes=64GiB".into(),
-            // L0 stays the lab config's 8 GiB: a smaller cap shrinks Phase 3's device budget
-            // below what the HIP runtime and libraries already hold, and the device_memory
-            // signal would put the server in SURVIVAL. Cached blocks are demoted by capacity
-            // past 70 % of L0, so filler prompts still push A down through a 1 GiB L1.
-            "kv.cpu.max_bytes=1GiB".into(),
-        ],
-    );
-    let a = prompt(100, 350);
-    // A and the fillers are session turns: blocks of one-off requests are never copied down.
-    let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
+    let tiers = [
+        format!("kv.nvme.path={KV_DIR}"),
+        "kv.nvme.max_bytes=64GiB".into(),
+        "kv.cpu.max_bytes=1GiB".into(),
+    ];
+    let server = LabServer::start(&model_dir, &[&tiers[..], sets].concat());
+    let (_, block_bytes, _) = l0_tier(&server);
+    let l1_blocks = ((1u64 << 30) / block_bytes.max(1)) as f64;
+    (server, l1_blocks)
+}
 
-    // 1 GiB of L1 holds 73 blocks of 14,680,064 bytes: once twice that many have gone on to L2,
-    // A's (the oldest, never touched again) are there.
-    let to_l2 = || {
-        server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#)
-            + server.metric(r#"turbine_kv_demotions_total{from="l0",to="l2"}"#)
-    };
+/// Blocks that have gone down to L2 (from L1 or straight from L0).
+fn to_l2(server: &LabServer) -> f64 {
+    server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#)
+        + server.metric(r#"turbine_kv_demotions_total{from="l0",to="l2"}"#)
+}
+
+/// Blocks promoted out of L2.
+fn from_l2(server: &LabServer) -> f64 {
+    server.metric(r#"turbine_kv_promotions_total{from="l2",to="l0"}"#)
+        + server.metric(r#"turbine_kv_promotions_total{from="l2",to="l1"}"#)
+}
+
+/// Filler session turns until `blocks` blocks have gone down to L2: A's (the oldest, never
+/// touched again) are among them once that is twice L1's blocks plus A's own.
+fn fill_until_l2(server: &LabServer, blocks: f64) {
     let mut filler = 0;
-    while to_l2() < 2.0 * 73.0 {
+    while to_l2(server) < blocks {
         filler += 1;
         assert!(
             filler <= 400,
             "demotion to L2 never happened ({} blocks)",
-            to_l2()
+            to_l2(server)
         );
         let key = format!("filler-{filler}");
         server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
     }
-    println!("{filler} filler prompts moved {} blocks to L2", to_l2());
+    println!(
+        "{filler} filler prompts moved {} blocks to L2",
+        to_l2(server)
+    );
+}
 
-    // Bring A back explicitly (`POST /turbine/v1/kv/prefetch`): on the R9700 the planner may
-    // rightly find recomputing a few blocks cheaper than reading them from NVMe, and this test
-    // is about the bytes surviving the round trip, not about that choice.
-    let from_l2 = || {
-        server.metric(r#"turbine_kv_promotions_total{from="l2",to="l0"}"#)
-            + server.metric(r#"turbine_kv_promotions_total{from="l2",to="l1"}"#)
-    };
+/// Waits until the demotions the fillers left in flight have drained L0: its used blocks are
+/// unchanged over 1.5 s. A prefetch issued while L0 is draining (above its demotion threshold,
+/// the lab runs stopped at 87 %) has its promoted blocks demoted again within a second, as the
+/// lowest-value cached blocks, before any request can use them.
+fn wait_l0_settled(server: &LabServer) {
+    const SERIES: &str = r#"turbine_kv_blocks{tier="l0",state="used"}"#;
+    let started = Instant::now();
+    let mut last = server.metric(SERIES);
+    let mut stable = 0;
+    while stable < 5 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "L0 never settled ({last} blocks used)"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let now = server.metric(SERIES);
+        stable = if now == last { stable + 1 } else { 0 };
+        last = now;
+    }
+    println!(
+        "L0 settled at {last} blocks used after {:?}",
+        started.elapsed()
+    );
+}
+
+/// Brings A back explicitly (`POST /turbine/v1/kv/prefetch`): on the R9700 the planner may
+/// rightly find recomputing a few blocks cheaper than reading them from NVMe, and these tests
+/// are about the bytes surviving the round trip, not about that choice. Returns once a block
+/// was promoted out of L2.
+fn prefetch_a_from_l2(server: &LabServer, a: &str) {
+    wait_l0_settled(server);
     let body = json!({ "prompt": a }).to_string();
-    let (status, text) = request(server.addr, "POST", "/turbine/v1/kv/prefetch", Some(&body));
+    // The fillers leave L0 near its demotion threshold: a prefetch is refused (409
+    // `pressure_too_high`) while L0 pressure is ORANGE or above, until the demotions in flight
+    // complete, so it is retried for a bounded time.
+    let asked = Instant::now();
+    let (status, text) = loop {
+        let (status, text) = request(server.addr, "POST", "/turbine/v1/kv/prefetch", Some(&body));
+        if status != 409 || !text.contains("pressure_too_high") || asked.elapsed() > PREFETCH_WAIT {
+            break (status, text);
+        }
+        std::thread::sleep(POLL);
+    };
     assert_eq!(status, 202, "{text}");
     println!("prefetch of A: {text}");
     let started = Instant::now();
-    while from_l2() < 1.0 {
+    while from_l2(server) < 1.0 {
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "the prefetch never promoted from L2: {text}"
@@ -623,24 +789,379 @@ fn nvme_round_trip_matches_cold() {
         std::thread::sleep(POLL);
     }
     std::thread::sleep(Duration::from_secs(2));
+}
+
+/// Prints the KV document and the KV metric series (what a failed reuse assertion needs).
+fn dump_kv(server: &LabServer) {
+    let (_, doc) = request(server.addr, "GET", "/turbine/v1/kv", None);
+    println!("kv document: {doc}");
+    let (_, metrics) = request(server.addr, "GET", "/metrics", None);
+    for line in metrics.lines().filter(|l| l.starts_with("turbine_kv_")) {
+        println!("  {line}");
+    }
+}
+
+/// [`nvme_round_trip_matches_cold`] on a server started with the extra overrides `sets`.
+fn nvme_round_trip_matches_cold_with(sets: &[String]) {
+    let _gpu = one_server_at_a_time();
+    let (server, l1_blocks) = nvme_server(sets);
+    let a = prompt(100, 350);
+    // A and the fillers are session turns: blocks of one-off requests are never copied down.
+    let cold = server.complete_in(&a, ANSWER_TOKENS, Some("a"));
+    fill_until_l2(&server, 2.0 * l1_blocks);
+    prefetch_a_from_l2(&server, &a);
 
     let warm = server.complete(&a, ANSWER_TOKENS);
+    if warm.2 == 0 {
+        dump_kv(&server);
+    }
     assert_eq!(
         (&warm.0, warm.1),
         (&cold.0, cold.1),
         "A after its L2 round trip"
     );
     assert!(warm.2 > 0, "A reused no prefix");
-    let promoted = from_l2();
+    let promoted = from_l2(&server);
     assert!(promoted > 0.0, "nothing was promoted from L2");
     assert_eq!(
         server.metric(r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#),
         0.0,
         "a promoted block's bytes differed from what was written"
     );
-    let slabs = slab_bytes(kv_dir);
+    let slabs = slab_bytes(Path::new(KV_DIR));
     assert!(slabs <= KV_CAP_BYTES, "{slabs} bytes of slab files");
     println!("nvme_round_trip_matches_cold ok: {promoted} promotions from L2, {slabs} slab bytes");
+}
+
+/// P6b S-1 (ABI v2.11 KV transcode, FP8 on the demotion path): with `kv.nvme.format:
+/// fp8_e4m3` below the BF16 pool, blocks go to L2 encoded on the device (a block of L2 holds
+/// well under the BF16 block bytes: the last block of each sequence stays at `l0`,
+/// `kv.lossless_tail_blocks`), are promoted out of L2 and decoded into the pages by the kernel
+/// (`POST /turbine/v1/kv/prefetch`) without a copy error or a checksum failure, and A still
+/// answers within the codec's bound of its cold run: the first tokens' logprobs within 0.3 and
+/// at least 90 % of all positions within 0.5 (the FP8 KV golden's bounds are 0.15 / 0.55).
+/// The prefetched, decoded lossy copies are then the reused prefix (`cached_tokens` and
+/// `lossy_cached_tokens` > 0: the lookup takes the promoted L0 copy over the L2 one). The `l0`
+/// default stays bit-exact
+/// (`nvme_round_trip_matches_cold`).
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Llama-3.2-3B weights and /home/piwi/turbine-kv"]
+fn nvme_round_trip_fp8_tier() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let (server, l1_blocks) = nvme_server(&["kv.nvme.format=fp8_e4m3".to_string()]);
+    let (_, block_bytes, _) = l0_tier(&server);
+    let a = prompt(100, 350);
+    let cold = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    fill_until_l2(&server, 2.0 * l1_blocks);
+    let stored = to_l2(&server);
+    let used = server.metric(r#"turbine_kv_bytes{tier="l2",kind="used"}"#);
+    println!("L2 holds {used} bytes for {stored} demoted blocks of {block_bytes} bytes");
+    assert!(
+        used < 0.75 * stored * block_bytes as f64,
+        "L2 holds {used} bytes for {stored} blocks of {block_bytes}: not encoded"
+    );
+    prefetch_a_from_l2(&server, &a);
+
+    let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    if warm.cached_tokens == 0 || warm.lossy_cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert_within_codec_bound(&cold, &warm, "fp8 tier");
+    // The decoded lossy copies are the reused prefix, not recomputed (the lookup takes the
+    // promoted L0 copy over the L2 one): the lossless tail block comes back exact.
+    assert!(warm.cached_tokens > 0, "A reused no prefix");
+    assert!(
+        warm.lossy_cached_tokens > 0,
+        "no reused block was served from a lossy copy: {warm:?}"
+    );
+    for series in [
+        r#"turbine_kv_evictions_total{tier="l2",reason="checksum"}"#,
+        r#"turbine_kv_evictions_total{tier="l2",reason="tier_degraded"}"#,
+        r#"turbine_kv_evictions_total{tier="l1",reason="tier_degraded"}"#,
+    ] {
+        assert_eq!(server.metric(series), 0.0, "{series}");
+    }
+    assert!(from_l2(&server) > 0.0, "nothing was promoted from L2");
+    println!(
+        "nvme_round_trip_fp8_tier ok: {} promotions from L2",
+        from_l2(&server)
+    );
+}
+
+/// A lossy-tier answer against the cold run (the FP8 tier's bound): the same completion length,
+/// the first 8 tokens' logprobs within 0.3 and at least 90 % of all positions within 0.5 (the
+/// FP8 KV golden's bounds are 0.15 / 0.55).
+fn assert_within_codec_bound(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
+    assert_within_bounds(cold, warm, label, HeadBound::Flat(0.3), 0.5, 0.9);
+}
+
+/// The first 8 answer tokens' head bound. `GoldenSplit` is exactly how `turbine-golden compare`
+/// judges the slug's batched bounds (user decision 2026-10-03, "6b: stale lossless-tail tags and
+/// the tq4 lab bound", 2): a position whose cold (reference) logprob is above `floor` is judged
+/// against `likely`, at or below it against `tail`.
+#[derive(Clone, Copy)]
+enum HeadBound {
+    Flat(f64),
+    GoldenSplit { likely: f64, tail: f64, floor: f64 },
+}
+
+impl HeadBound {
+    /// The bound for one position's cold (reference) logprob.
+    fn bound_at(&self, reference: f64) -> f64 {
+        match self {
+            HeadBound::Flat(b) => *b,
+            HeadBound::GoldenSplit {
+                likely,
+                tail,
+                floor,
+            } => {
+                if reference > *floor {
+                    *likely
+                } else {
+                    *tail
+                }
+            }
+        }
+    }
+}
+
+/// [`assert_within_codec_bound`] with explicit bounds: the first 8 tokens' head [`HeadBound`],
+/// the per-position |Δ| limit, the share of positions within it.
+fn assert_within_bounds(
+    cold: &IdAnswer,
+    warm: &IdAnswer,
+    label: &str,
+    head_bound: HeadBound,
+    pos_bound: f64,
+    share: f64,
+) {
+    assert_eq!(warm.completion_tokens, cold.completion_tokens);
+    let diff: Vec<f64> = cold
+        .logprobs
+        .iter()
+        .zip(&warm.logprobs)
+        .map(|(c, w)| (c - w).abs())
+        .collect();
+    let head: Vec<(usize, f64)> = diff.iter().take(8).copied().enumerate().collect();
+    let head_worst = head.iter().map(|(_, d)| *d).fold(0.0, f64::max);
+    let likely = head
+        .iter()
+        .filter(|(i, _)| cold.logprobs[*i] > -2.0)
+        .count();
+    let within = diff.iter().filter(|d| **d <= pos_bound).count() as f64 / diff.len().max(1) as f64;
+    let worst = diff.iter().cloned().fold(0.0, f64::max);
+    println!(
+        "{label}: worst of the first 8 |Δ logprob| {head_worst:.3} ({likely} of 8 likely), \
+         {within:.2} within {pos_bound}, \
+         worst {worst:.3} (cached {}, lossy cached {})",
+        warm.cached_tokens, warm.lossy_cached_tokens
+    );
+    for (i, d) in &head {
+        let bound = head_bound.bound_at(cold.logprobs[*i]);
+        assert!(
+            d <= &bound,
+            "first tokens differ: position {i} |Δ| {d:.3} over {bound:.3}"
+        );
+    }
+    assert!(
+        within >= share,
+        "only {within} of the positions are within {pos_bound}"
+    );
+}
+
+/// The golden head bound splits by the reference logprob exactly as `turbine-golden compare`
+/// does: above the floor (−2) a position is judged likely (0.25), at the floor exactly or below
+/// it tail (0.75) — the same `>` comparison against `likely_logprob_floor` as the gate.
+/// Breaks if the split keys on the warm logprob, if −2 counts as likely, or if the tiers'
+/// bounds are swapped.
+#[test]
+fn golden_head_bound_splits_likely_from_tail() {
+    let bound = HeadBound::GoldenSplit {
+        likely: 0.25,
+        tail: 0.75,
+        floor: -2.0,
+    };
+    assert_eq!(
+        bound.bound_at(0.0),
+        0.25,
+        "a likely position gets the likely bound"
+    );
+    // Exactly at the floor is tail, matching compare.rs's `lp > floor`.
+    assert_eq!(bound.bound_at(-2.0), 0.75);
+    assert_eq!(bound.bound_at(-2.5), 0.75);
+    assert_eq!(HeadBound::Flat(0.3).bound_at(-9.0), 0.3);
+}
+
+/// P6b S-2 / S-3 / S-8 (plan Task 6): with `kv.cpu.format: fp8_e4m3` below the BF16 pool, blocks
+/// that capacity demotion moved to L1 are encoded; a later request for the same prompt reuses
+/// them as lossy blocks (`usage.prompt_tokens_details.lossy_cached_tokens` > 0) and answers
+/// within the FP8 tier's bound of its cold run; with `x-turbine-kv-lossy: deny` the lossy
+/// blocks are not reused and the answer equals the cold one bit for bit. Breaks if a lossy block
+/// is reused by a request that opted out, or a lossy L1 copy is never reused.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn lossy_tier_reuse() {
+    lossy_tier_reuse_with("fp8_e4m3", (HeadBound::Flat(0.3), 0.5, 0.9));
+}
+
+/// [`lossy_tier_reuse`] with L1 at TurboQuant 4-bit (P6b Task 8: the tables are uploaded and the
+/// transcode runs `turbine_hip_tq`), held to [`TQ4_TIER_BOUNDS`].
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn lossy_tier_reuse_tq4() {
+    lossy_tier_reuse_with("tq4", TQ4_TIER_BOUNDS);
+}
+
+/// The `tq4` tier's bound (P6b Task 9; head bound per user decision 2026-10-03, "6b: stale
+/// lossless-tail tags and the tq4 lab bound", 2), taken from the gates that judged it: S-8
+/// judges lossy KV by golden with the slug's batched bounds (Llama `tolerance.json`), and
+/// `scripts/lab-bench.sh --golden16` with `kv.cpu.format=tq4` passed them; the shared-prefix
+/// GSM8K gate (lossy cached ratio 0.927) then showed that reuse at that level costs no accuracy
+/// (median 0.775 against BF16 0.780, McNemar n.s.). The head is judged exactly as
+/// `turbine-golden compare` judges: a position whose cold logprob is above the
+/// `likely_logprob_floor` (−2) against 0.25, at or below it against 0.75 — the t9 flat 0.25
+/// assumed an exact tail block, and the all-lossy worst case measured 0.2518 on a cold-unlikely
+/// position. 90 % of the 64 positions stay within 0.75 (a greedy flip later in the answer moves
+/// the positions after it; the FP8 tier's 0.3 / 0.5 / 0.9 is tighter because FP8 is). Breaks if
+/// the TurboQuant tier perturbs reuse beyond what golden accepts from batch composition.
+const TQ4_TIER_BOUNDS: (HeadBound, f64, f64) = (
+    HeadBound::GoldenSplit {
+        likely: 0.25,
+        tail: 0.75,
+        floor: -2.0,
+    },
+    0.75,
+    0.9,
+);
+
+/// P6b Task 8 smoke: `kv.dtype: tq4` serves on the GPU (tables uploaded to the executor before
+/// the first forward, the mixed-format attention reads them): a request answers its tokens with
+/// finite logprobs, and the L0 tier reports TurboQuant pages smaller than BF16's. Task 13 owns
+/// the quality proof.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn tq_kv_serves_on_the_device() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let server = LabServer::start(&model_dir, &["kv.dtype=tq4".to_string()]);
+    let (dtype, block_bytes, blocks) = l0_tier(&server);
+    println!("L0 pages {dtype}: {block_bytes} bytes a block, {blocks} blocks");
+    assert!(
+        dtype.contains("tq4") && block_bytes < 14_680_064,
+        "{dtype} {block_bytes}"
+    );
+    let a = prompt(100, 350);
+    let answer = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    assert_eq!(answer.completion_tokens, ANSWER_TOKENS as u64);
+    assert!(!answer.text.is_empty());
+    assert!(answer.logprobs.iter().all(|l| l.is_finite()), "{answer:?}");
+    println!("tq_kv_serves_on_the_device ok: {:?}", answer.text);
+}
+
+fn lossy_tier_reuse_with(format: &str, bounds: (HeadBound, f64, f64)) {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let server = LabServer::start(
+        &model_dir,
+        &[
+            format!("kv.cpu.format={format}"),
+            "kv.cpu.max_bytes=2GiB".to_string(),
+            "kv.nvme.enabled=false".to_string(),
+            // The lossless tail (S-2: the latest finished sequence's last full blocks demote at
+            // the L0 format, tags expiring with a later finish) is orthogonal to what this test
+            // judges. It stays at 0 here on purpose: with the tail at its default, A's own tail
+            // block demotes raw and comes back exact, which would soften the all-lossy worst
+            // case the accuracy bound is held to. The tail's own behaviour is pinned by
+            // `document_lists_copies_per_codec` and `last_block_is_scored_like_its_history`.
+            "kv.lossless_tail_blocks=0".to_string(),
+        ],
+    );
+    let a = prompt(100, 350);
+    let cold = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    assert_eq!(cold.lossy_cached_tokens, 0);
+    // Filler session turns until capacity demotion has sent well over A's blocks to L1 (A is the
+    // oldest session, never touched again).
+    let to_l1 = |s: &LabServer| s.metric(r#"turbine_kv_demotions_total{from="l0",to="l1"}"#);
+    let mut filler = 0;
+    while to_l1(&server) < 40.0 {
+        filler += 1;
+        assert!(filler <= 400, "demotion to L1 never happened");
+        let key = format!("filler-{filler}");
+        server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
+    }
+    println!(
+        "{filler} filler prompts moved {} blocks to L1",
+        to_l1(&server)
+    );
+    let used = server.metric(r#"turbine_kv_bytes{tier="l1",kind="used"}"#);
+    let (_, block_bytes, _) = l0_tier(&server);
+    println!(
+        "L1 holds {used} bytes for {} demoted blocks of {block_bytes} bytes",
+        to_l1(&server)
+    );
+    dump_kv(&server);
+    assert!(
+        used < 0.75 * to_l1(&server) * block_bytes as f64,
+        "L1 holds {used} bytes: not encoded"
+    );
+
+    let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, None);
+    if warm.lossy_cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert!(
+        warm.lossy_cached_tokens > 0,
+        "no reused block was served from a lossy copy: {warm:?}"
+    );
+    assert_within_bounds(
+        &cold,
+        &warm,
+        &format!("{format} lossy L1 reuse"),
+        bounds.0,
+        bounds.1,
+        bounds.2,
+    );
+    assert_eq!(
+        server.metric(r#"turbine_kv_evictions_total{tier="l1",reason="checksum"}"#),
+        0.0
+    );
+
+    let denied = server.complete_with_headers(
+        json!(a),
+        ANSWER_TOKENS,
+        None,
+        &[("x-turbine-kv-lossy", "deny")],
+    );
+    println!(
+        "deny: cached {} lossy cached {}",
+        denied.cached_tokens, denied.lossy_cached_tokens
+    );
+    assert_eq!(
+        denied.lossy_cached_tokens, 0,
+        "a denied request reused lossy"
+    );
+    assert_eq!(
+        denied.output(),
+        cold.output(),
+        "x-turbine-kv-lossy: deny must equal the cold run bit for bit"
+    );
+    assert!(
+        server.metric("turbine_kv_lossy_denied_total") >= 1.0,
+        "the denial is counted"
+    );
+    println!(
+        "lossy_tier_reuse ok: lossy cached {} of {} prompt tokens",
+        warm.lossy_cached_tokens, warm.prompt_tokens
+    );
 }
 
 /// The lab config loads and spells out the tiers the lab tests rely on.
@@ -655,4 +1176,74 @@ fn phase4_lab_config_loads() {
     let p = prompt(1, 350);
     assert!(p.split_whitespace().count() > 350);
     assert_ne!(prompt(1, 20)[..20], prompt(2, 20)[..20]);
+}
+
+/// The FP8 KV proof configs (plan Task 24) load and differ from their Phase 2c BF16 KV
+/// comparison only in `kv.dtype`.
+#[test]
+fn phase6_fp8kv_lab_configs_load() {
+    use turbine_core::config::KvDtypeChoice;
+    for model in ["llama", "olmoe"] {
+        let lab = repo_root().join("scripts/lab");
+        let fp8 = turbine_core::config::load(
+            &lab.join(format!("phase6-novanas-{model}-fp8kv.yaml")),
+            &[],
+        )
+        .expect("the FP8 KV config loads");
+        let bf16 =
+            turbine_core::config::load(&lab.join(format!("phase2c-novanas-{model}.yaml")), &[])
+                .expect("the Phase 2c config loads");
+        assert_eq!(fp8.kv.dtype, KvDtypeChoice::Fp8E4m3, "{model}");
+        assert_eq!(bf16.kv.dtype, KvDtypeChoice::Bf16, "{model}");
+        assert_eq!(fp8.model.path, bf16.model.path, "{model}");
+        assert_eq!(
+            fp8.scheduler.max_batch_tokens, bf16.scheduler.max_batch_tokens,
+            "{model}"
+        );
+        assert_eq!(fp8.kv.gpu.max_bytes, bf16.kv.gpu.max_bytes, "{model}");
+    }
+}
+
+/// The Phase 6b per-tier lab config (plan Task 6) loads, spells out the tiers and differs from
+/// the Phase 2c config only in its `kv` section's lower tiers.
+#[test]
+fn phase6b_tier_lab_config_loads() {
+    let lab = repo_root().join("scripts/lab");
+    let tier = turbine_core::config::load(&lab.join("phase6-novanas-llama.yaml"), &[])
+        .expect("the per-tier config loads");
+    let base = turbine_core::config::load(&lab.join("phase2c-novanas-llama.yaml"), &[])
+        .expect("the Phase 2c config loads");
+    assert!(tier.kv.cpu.enabled && !tier.kv.nvme.enabled);
+    assert_eq!(tier.kv.cpu.format.as_str(), "l0");
+    assert_eq!(tier.kv.gpu.max_bytes, base.kv.gpu.max_bytes);
+    assert_eq!(tier.kv.dtype, base.kv.dtype);
+    assert_eq!(tier.model.path, base.model.path);
+}
+
+/// The L0 compression ladder serves on the GPU (P6b S-7, plan Task 18): a BF16 pool with the
+/// ladder's rung page classes (`kv.ladder.l0`, `max_format: tq4`) and L1 enabled reaches
+/// /ready — the v2.11 mixed-format paged attention descriptor carries the layer's TurboQuant
+/// tables whenever a block table mixes formats, though `kv.dtype` is `bf16`, so the tables
+/// must be uploaded under the pool's namespace seed before the warm-up forward — and a
+/// completion returns text. Breaks if the mixed pool starts without the executor's tables or
+/// the classed decode diverges.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn l0_ladder_serves_on_gpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let sets = [
+        "kv.ladder.enabled=true".to_string(),
+        "kv.ladder.l0=true".to_string(),
+        "kv.ladder.max_format=tq4".to_string(),
+        "kv.cpu.enabled=true".to_string(),
+        "kv.cpu.max_bytes=1GiB".to_string(),
+    ];
+    let server = LabServer::start(&model_dir, &sets);
+    let (text, tokens, _) = server.complete(&prompt(7, 350), ANSWER_TOKENS);
+    assert_eq!(tokens, u64::from(ANSWER_TOKENS));
+    assert!(!text.trim().is_empty(), "empty completion: {text:?}");
 }

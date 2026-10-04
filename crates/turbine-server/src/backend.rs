@@ -37,10 +37,11 @@ use turbine_core::types::{CircuitState, PressureState, Priority};
 use turbine_device::DeviceInventory;
 use turbine_device::topology::TopologyGraph;
 use turbine_distributed::router::RouterPolicy;
-use turbine_kernels::Selection;
+use turbine_kernels::{KvTranscodeConfig, KvTranscodeFormat, OpConfig, Selection};
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
-use turbine_model::{ChatTemplate, Tokenizer, ToolChoice};
+use turbine_model::weights::QuantizationSummary;
+use turbine_model::{ChatTemplate, RopeSummary, Tokenizer, ToolChoice};
 use turbine_observability::MetricsRegistry;
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::controller::ControllerHandle;
@@ -104,6 +105,9 @@ struct ModelStatus<'a> {
     architecture: &'a str,
     weight_bytes: u64,
     load_seconds: Option<f64>,
+    /// The resolved RoPE configuration (P6a followups; `event="rope_config"` at load,
+    /// `crate::model::log_rope_config`).
+    rope: RopeSummary,
 }
 
 /// `GET /turbine/v1/status` document.
@@ -127,6 +131,9 @@ struct StatusDocument<'a> {
     /// The parallel plan (P5 S-4): tp, dp, backend, mode, groups and the plan's reason codes.
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel: Option<&'a Value>,
+    /// Phase 6a S-19: the weight format, packaging, activation scheme and L0 KV dtype; with
+    /// the 6b S-10 keys, the per-tier copy formats and the ladder state, once an engine runs.
+    quantization: &'a Value,
 }
 
 /// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
@@ -141,7 +148,9 @@ pub struct KernelChoiceView {
     /// provider that chooses internally.
     pub impl_provider: String,
     pub reason: String,
-    /// `profile_preferred`, `profile_fallback`, `library_order` or `provider_internal`.
+    /// A registry selection's code: `profile_preferred`, `profile_fallback`,
+    /// `library_order` or `provider_internal`; the appended tier-format transcode entry
+    /// carries `tier_format` (P6b S-10, not a registry selection).
     pub reason_code: String,
     /// Routed-row tiers of a tiered op (`moe_experts`), empty otherwise.
     pub tiers: Vec<KernelTierView>,
@@ -227,6 +236,10 @@ pub struct ModelBackend {
     devices: Value,
     modules: ModuleChoices,
     kernels: Vec<KernelChoiceView>,
+    /// `quantization` of the status document (Phase 6a S-19).
+    quantization: QuantizationSummary,
+    /// `model.rope` of the status document (P6a followups).
+    rope: RopeSummary,
     /// The support-matrix row resolved at startup (`support` of the status document).
     support: Option<SupportRowView>,
     /// The node topology graph captured at startup (`GET /turbine/v1/topology`, P5 S-1).
@@ -238,16 +251,102 @@ pub struct ModelBackend {
     experts: Vec<Option<Arc<ExpertStats>>>,
 }
 
+/// The status document's `kernels` view of the ABI v2.11 transcode the tier formats select
+/// (P6b S-10): the first provider in backend order whose `kv_transcode` serves the encode
+/// direction for the model's layout, with the implementation its own probe names. `None`
+/// when no tier format is lossy or no provider serves the layout (startup refuses a lossy
+/// tier format whose kernel is missing, so a `None` here with lossy formats is the odd one
+/// out, e.g. a tensor-parallel shard layout).
+fn transcode_view(model: &PreparedModel, formats: &[String]) -> Option<KernelChoiceView> {
+    let codec = crate::kv_orchestrator::transcode_format(formats.first()?)?;
+    let layout = model.arch.kv_layout(model.block_tokens);
+    let spec = OpConfig::KvTranscode(KvTranscodeConfig {
+        src_format: KvTranscodeFormat::L0,
+        dst_format: codec,
+        page_dtype: layout.dtype,
+        head_dim: layout.head_dim,
+        num_kv_heads: layout.num_kv_heads,
+        block_tokens: layout.block_tokens,
+        layers: layout.num_layers,
+    });
+    let provider = model
+        .provider
+        .opened
+        .providers
+        .iter()
+        .find(|p| spec.probe(p.as_ref()).is_some())?;
+    Some(KernelChoiceView {
+        op: spec.op().as_str().to_owned(),
+        config: spec.render(),
+        provider: provider.id().0.to_owned(),
+        implementation: spec.probe(provider.as_ref())?,
+        impl_provider: provider.id().0.to_owned(),
+        reason: format!(
+            "the tier formats ({}) transcode on the device through the ABI v2.11 kernel",
+            formats.join(", ")
+        ),
+        reason_code: "tier_format".to_owned(),
+        tiers: vec![],
+    })
+}
+
 impl ModelBackend {
+    /// `quantization` of the status document (Phase 6a S-19): the weight-format summary, plus
+    /// the 6b S-10 keys once an engine runs — `tier_formats`, every local tier's copies per
+    /// codec of the kv document, and `ladder`, the compression ladder's config and current
+    /// rungs (replica 0's engine; with data parallelism the replicas ladder alike).
+    fn quantization_document(&self) -> Value {
+        let mut v = serde_json::to_value(&self.quantization).unwrap_or(Value::Null);
+        let Some(docs) = self.loaded().and_then(|l| l.shared.docs()) else {
+            return v;
+        };
+        let tier_formats: serde_json::Map<String, Value> = docs
+            .kv
+            .tiers
+            .iter()
+            .map(|t| {
+                let formats: serde_json::Map<String, Value> = t
+                    .formats
+                    .iter()
+                    .map(|(f, u)| {
+                        (
+                            f.to_string(),
+                            serde_json::json!({"blocks": u.blocks, "bytes": u.bytes}),
+                        )
+                    })
+                    .collect();
+                (t.tier.to_string(), Value::Object(formats))
+            })
+            .collect();
+        v["tier_formats"] = Value::Object(tier_formats);
+        v["ladder"] = serde_json::to_value(&docs.ladder).unwrap_or(Value::Null);
+        v
+    }
+
     /// A backend in the `loading_model` state for `model`.
     pub fn new(
         model: &PreparedModel,
         inventory: &DeviceInventory,
         metrics: &EngineMetrics,
+        kv_tier_formats: &[String],
     ) -> ModelBackend {
         let eos_token_ids = crate::model::eos_token_ids(&model.arch, &model.generation)
             .into_iter()
             .collect();
+        // P6b S-10: beside the registry's selections, the ABI v2.11 transcode the lossy tier
+        // formats select, with the provider's own implementation choice for its encode
+        // direction over the model's layout (not a shard's).
+        let mut kernels: Vec<KernelChoiceView> = model
+            .registry
+            .selections()
+            .iter()
+            .map(KernelChoiceView::from)
+            .collect();
+        if !kv_tier_formats.is_empty()
+            && let Some(view) = transcode_view(model, kv_tier_formats)
+        {
+            kernels.push(view);
+        }
         let tool_parser = model.tool_format.as_ref().map(|bound| ToolParser {
             format: Arc::clone(bound),
             parser: Arc::from(bound.format.parser()),
@@ -287,12 +386,9 @@ impl ModelBackend {
             device_count: inventory.devices.len() as u64,
             devices: serde_json::to_value(inventory).unwrap_or(Value::Null),
             modules: model.modules.clone(),
-            kernels: model
-                .registry
-                .selections()
-                .iter()
-                .map(KernelChoiceView::from)
-                .collect(),
+            kernels,
+            quantization: QuantizationSummary::of(&model.arch),
+            rope: model.arch.rope_summary(),
             support: None,
             topology: None,
             parallel: None,
@@ -616,6 +712,7 @@ impl ModelBackend {
                     end: req.hints.session_end,
                 }),
             cache_salt: req.hints.cache_salt.clone(),
+            kv_policy: req.hints.kv_policy,
             endpoint: req.endpoint,
             http_request_id: req.http_request_id.clone(),
             prompt_tokens,
@@ -908,6 +1005,7 @@ impl Readiness for ModelBackend {
 
 impl Diagnostics for ModelBackend {
     fn status(&self) -> Value {
+        let quantization = self.quantization_document();
         let loaded = self.loaded();
         // With data parallelism the worst replica's pressure state and circuit.
         let pressure_state = self
@@ -930,6 +1028,7 @@ impl Diagnostics for ModelBackend {
                 architecture: &self.architecture,
                 weight_bytes: loaded.map_or(self.expected_weight_bytes, |l| l.weight_bytes),
                 load_seconds: loaded.map(|l| l.load_seconds),
+                rope: self.rope,
             },
             modules: &self.modules,
             kernels: &self.kernels,
@@ -937,9 +1036,11 @@ impl Diagnostics for ModelBackend {
             pressure_state,
             circuit_state,
             parallel: self.parallel.as_ref(),
+            quantization: &quantization,
         })
         .unwrap_or(Value::Null)
     }
+
     fn devices(&self) -> Value {
         self.devices.clone()
     }

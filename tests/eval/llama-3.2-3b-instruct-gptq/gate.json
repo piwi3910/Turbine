@@ -1,0 +1,11 @@
+{
+  "format": "gptq_int4",
+  "checkpoint": "shuyuej/Llama-3.2-3B-Instruct-GPTQ@dd5a311f040728fbc612eb03c8dadfae0a90552f",
+  "tasks": "tests/eval/gsm8k-200.jsonl",
+  "baseline": "../llama-3.2-3b-instruct/turbine-bf16.json",
+  "baseline_engine": "turbine, BF16 Llama-3.2-3B-Instruct (unsloth @ 006f5dcd1393c3add266de40994ba96225e9689d)",
+  "max_drop": 0.04,
+  "rule": "spec S-17 (user decision 2026-09-28, Q9): no reference engine runs this checkpoint on gfx1201, so the gate is the BF16 model at the 4-bit per-format drop",
+  "vllm_refusal": "vllm-rocm 0.23.0 (rocm/vllm rocm7.14.1_rdna, gfx1201) fails at engine start (2026-09-29): AutoGPTQLinearMethod selects TritonW4A16LinearKernel, whose triton_w4a16_gemm asserts qzeros.shape == (K // group_size, N // 8) = (24, 640) for the fused qkv (N 5120, K 3072) but receives torch.Size([640, 24]): vLLM's own AutoGPTQ weight processing hands the kernel a transposed qzeros. The checkpoint is plain AutoGPTQ (4 bits, group 128, sym, desc_act false), so this is a defect of the vLLM kernel path, not of the checkpoint; other kernels were not tried (coordinator: brief check only). Log: scripts/lab-serve.sh --vllm llama-3.2-3b-instruct-gptq run 0929040216-3d1a9084.",
+  "command": "turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16.json --candidate tests/eval/llama-3.2-3b-instruct-gptq/turbine.json --max-drop 0.04"
+}

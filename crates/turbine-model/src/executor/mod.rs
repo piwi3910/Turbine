@@ -23,7 +23,7 @@ pub mod rope;
 pub use batch::SequenceKv;
 pub use decoder::{
     AttentionHook, DecoderDims, DecoderExecutor, DecoderSpec, FfnHook, HookBuffers, HookWeights,
-    LayerRun, TpDims, TraceTensor,
+    LayerRun, TpDims, TqDeviceTables, TraceTensor,
 };
 pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
 pub use profile::{OpProfile, OpProfileEntry};
@@ -236,6 +236,9 @@ pub struct SeqSlice<'a> {
     /// The pool blocks holding tokens `0..kv_len` in token order: token `p` lives in
     /// `block_table[p / block_tokens]` at slot `p % block_tokens`. May be longer than needed.
     pub block_table: &'a [BlockId],
+    /// The v2.11 `block_formats` byte of each block-table entry (`TURBINE_KVFMT_*`), parallel
+    /// to `block_table`; empty when every block holds the pool's base format.
+    pub block_formats: &'a [u8],
     /// Reduce this sequence's logits row on the device (`logits_reduce`, P2c S-4) instead of
     /// copying it whole; ignored when the executor does not reduce
     /// ([`ModelExecutor::reduces_logits`]).
@@ -490,6 +493,19 @@ pub trait ModelExecutor: Send {
     /// executor that cannot run graphs ignores the call.
     fn set_decode_graphs(&mut self, graphs: Option<DecodeGraphs>) {
         let _ = graphs;
+    }
+    /// TurboQuant L0 pages (P6b S-5): the device copy of the model's TurboQuant tables a GPU
+    /// provider's paged attention reads, set before the first forward (decode graphs capture
+    /// the pointers). Executors without TurboQuant pages ignore the call.
+    fn set_tq_device_tables(&mut self, tables: TqDeviceTables) -> Result<(), ModelError> {
+        let _ = tables;
+        Ok(())
+    }
+    /// The pool's block tables mix formats (P6b S-5/S-7): every paged attention reads the
+    /// batch's `block_formats` table (needs the v2.11 mixed-format attention).
+    fn set_mixed_blocks(&mut self, on: bool) -> Result<(), ModelError> {
+        let _ = on;
+        Ok(())
     }
     /// Tensor-parallel prefill overlap (P5 Task 32, `parallel.tp_prefill_overlap`): prefills of
     /// at least `min_tokens` rows (`None`: off; the server passes

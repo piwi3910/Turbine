@@ -169,8 +169,11 @@ pub(crate) fn rmsnorm_from_sumsq(
 }
 
 /// HF `rotate_half` RoPE in place on `x` `[tokens, heads, d]` over the first `rotary_dim`
-/// elements of each head: `f = pos · inv_freq[i]` in f32, cos/sin rounded to the activation
-/// dtype, `x1' = round(round(x1·c) + round(−x2·s))`, `x2' = round(round(x2·c) + round(x1·s))`.
+/// elements of each head: `f = pos · inv_freq[i]` in f32, cos/sin multiplied by `attn_factor`
+/// (YaRN's `m`, 1.0 = none) in f32 and then rounded to the activation dtype (transformers'
+/// `cos() * attention_scaling` then `.to(dtype)`), `x1' = round(round(x1·c) + round(−x2·s))`,
+/// `x2' = round(round(x2·c) + round(x1·s))`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rope(
     x: &mut [f32],
     positions: &[i32],
@@ -178,13 +181,14 @@ pub(crate) fn rope(
     heads: usize,
     d: usize,
     rotary_dim: usize,
+    attn_factor: f32,
     round: impl Fn(f32) -> f32,
 ) {
     let half = rotary_dim / 2;
     for (t, &pos) in positions.iter().enumerate() {
         for (i, &freq) in inv_freq[..half].iter().enumerate() {
             let f = pos as f32 * freq;
-            let (c, s) = (round(f.cos()), round(f.sin()));
+            let (c, s) = (round(f.cos() * attn_factor), round(f.sin() * attn_factor));
             for h in 0..heads {
                 let base = (t * heads + h) * d;
                 let x1 = x[base + i];

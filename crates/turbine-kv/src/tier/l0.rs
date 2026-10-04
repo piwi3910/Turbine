@@ -110,4 +110,15 @@ impl KvTier for L0Tier {
     fn degraded(&self) -> bool {
         false
     }
+
+    /// L0 copies are never rewritten through the tier view (the ladder's L0 rung uses page
+    /// classes), so nothing waits on this.
+    fn room_epoch(&self) -> u64 {
+        0
+    }
+
+    /// L0 is the block pool: copies into it are promotions into blocks allocated for them.
+    fn free_slots(&self, _format: &'static str, _bytes: u64) -> u64 {
+        u64::MAX
+    }
 }

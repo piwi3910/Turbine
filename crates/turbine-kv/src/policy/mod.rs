@@ -22,6 +22,7 @@ use turbine_core::config::KvPolicyWeights;
 use turbine_core::registry::{Module, Registry, UnknownModule};
 use turbine_core::types::PressureState;
 
+use crate::codec;
 use crate::directory::{CostEstimate, KvBlock, KvPriority, Timestamp};
 use crate::identity::KvKey;
 use crate::tier::TierId;
@@ -96,10 +97,99 @@ impl Default for PolicyWeights {
 }
 
 /// An eviction policy (contract §24 `eviction_policy`). Stateless: the same inputs always give
-/// the same score, with no clock, randomness or interior state.
+/// the same score and action, with no clock, randomness or interior state.
 pub trait EvictionPolicy: Module {
     /// Value of keeping the copy where it is; higher = keep. Finite and ≥ 0.
     fn score(&self, b: &BlockScoreInputs, w: &PolicyWeights, now: Timestamp) -> f64;
+
+    /// What to do with one copy the hierarchy considers (P6b S-6): a victim that must leave its
+    /// tier, or a block of a ladder sweep. The default is Phase 4's: demote a leaving copy to the
+    /// next enabled tier at that tier's rung (never more precise than the copy), drop it from
+    /// the lowest one, keep everything else. Contract: never upgrade a copy's format, never
+    /// compress while the pressure controller is GREEN.
+    fn action(&self, _b: &BlockScoreInputs, ctx: &LadderContext) -> EvictAction {
+        ctx.phase4_action()
+    }
+}
+
+/// An eviction decision (P6b S-6).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictAction {
+    /// The copy stays as it is.
+    Keep,
+    /// Move the copy to tier `to`, stored in codec `format`.
+    Demote { to: TierId, format: &'static str },
+    /// Rewrite the copy in place in the lossier codec `to` (a ladder rung).
+    Compress { to: &'static str },
+    /// Remove the copy from this tier (the lowest enabled one) without demoting it.
+    Drop,
+}
+
+/// The compression ladder's configuration (`kv.ladder.*`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LadderLimits {
+    /// The lossiest rung (`kv.ladder.max_format`, a registered lossy codec).
+    pub max_format: &'static str,
+    /// Tier fill above which the ladder compresses (`kv.ladder.high_water`, default 0.95).
+    pub high_water: f64,
+    /// GREEN headroom (`kv.ladder.low_water`, default 0.85): at YELLOW the lowest tier
+    /// compresses only while its fill plus the YELLOW reclaim's demand is above it (user
+    /// decision 2026-09-29, "Compress only until GREEN").
+    pub low_water: f64,
+    /// The L0 page format's name (`kv.dtype`): `l0` ranks at its rung (`codec::tier_rung`),
+    /// so a TurboQuant L0's rung order skips the more precise codecs (S-2).
+    pub l0_dtype: &'static str,
+}
+
+/// The facts of one tier (and of the copy's place in it) the ladder decides on (P6b S-6). The
+/// hierarchy fills it; the policy stays a pure function of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LadderContext {
+    /// The tier the copy lives in.
+    pub tier: TierId,
+    /// That tier's used / capacity (0 ..= 1).
+    pub fill: f64,
+    /// The bytes the pressure controller's YELLOW reclaim wants to demote into this tier this
+    /// tick, as a fraction of its capacity (0 when none).
+    pub demand: f64,
+    /// That tier's current rung: the codec new demotions into it take.
+    pub rung: &'static str,
+    /// The pressure controller's state.
+    pub pressure: PressureState,
+    /// The copy's current codec.
+    pub format: &'static str,
+    /// True when the hierarchy needs the copy's space (a victim); false in a ladder sweep.
+    pub must_leave: bool,
+    /// The next enabled tier down and its rung; `None` when this is the lowest enabled tier.
+    pub demote_to: Option<(TierId, &'static str)>,
+    /// The most precise rung among the enabled tiers below this one (`None` for the lowest):
+    /// a tier compresses to a rung only once every tier below has reached it.
+    pub lower_rung: Option<&'static str>,
+    /// The ladder, when `kv.ladder.enabled`.
+    pub ladder: Option<LadderLimits>,
+}
+
+impl LadderContext {
+    /// Phase 4's decision with per-tier formats: a leaving copy is demoted at the lossier of its
+    /// own format and the destination's rung, or dropped from the lowest tier; others stay.
+    pub fn phase4_action(&self) -> EvictAction {
+        if !self.must_leave {
+            return EvictAction::Keep;
+        }
+        match self.demote_to {
+            Some((to, rung)) => EvictAction::Demote {
+                to,
+                format: codec::lossier(self.format, rung),
+            },
+            None => EvictAction::Drop,
+        }
+    }
+
+    /// True when this is the lowest enabled tier.
+    pub fn lowest(&self) -> bool {
+        self.demote_to.is_none()
+    }
 }
 
 static REGISTRY: Registry<dyn EvictionPolicy> =
@@ -309,6 +399,7 @@ pub(crate) mod tests {
         let l1 = KvLocation {
             tier: TierId::L1,
             slot: 0,
+            format: crate::tier::L0_FORMAT,
         };
         dir.add_location(&k2, l1);
         dir.remove_location(&k2, TierId::L0);
@@ -387,6 +478,306 @@ pub(crate) mod tests {
         let err = make_policy("lfu", &w).unwrap_err();
         assert_eq!(err.point, "eviction_policy");
         assert_eq!(err.registered, "cost_aware, lru");
+    }
+
+    /// A YELLOW ladder context of the lowest enabled tier (L2) at 50 % fill, the copy in `l0`
+    /// and leaving, the ladder up to `tq2` with high water 0.95.
+    pub(crate) fn ladder_ctx() -> LadderContext {
+        LadderContext {
+            tier: TierId::L2,
+            fill: 0.5,
+            demand: 0.0,
+            rung: "l0",
+            pressure: PressureState::Yellow,
+            format: "l0",
+            must_leave: true,
+            demote_to: None,
+            lower_rung: None,
+            ladder: Some(LadderLimits {
+                max_format: "tq2",
+                high_water: 0.95,
+                low_water: 0.85,
+                l0_dtype: "bf16",
+            }),
+        }
+    }
+
+    /// The ladder rule of `cost_aware` with pinned fills and pressure states (P6b S-6, user
+    /// decisions 2026-09-29 "Start at YELLOW earlier" and "Compress only until GREEN"): from
+    /// ORANGE on the lowest enabled tier compresses even with free room, at YELLOW only while
+    /// `fill + demand > low_water`; at any non-GREEN state an upper tier compresses only
+    /// above high water; one rung at a time (`l0` → `fp8_e4m3` → `tq4` → `tq2` → evict, bounded
+    /// by `max_format`), an upper tier only once every tier below has reached the target rung;
+    /// at the floor the lowest tier evicts only a leaving copy or above high water; it never
+    /// upgrades a copy, and with the ladder off (or under `lru`) decides as Phase 4 did.
+    /// Breaks if a rung is skipped, a copy upgraded or compressed at GREEN, if the lowest tier
+    /// waits for high water at YELLOW (the pre-amendment rule), if it keeps compressing at
+    /// YELLOW once its GREEN headroom is back (drifting to `tq2`), or if the floor evicts a copy
+    /// from a tier with free room.
+    #[test]
+    fn ladder_actions() {
+        let p = CostAwarePolicy;
+        let b = base();
+        let act = |c: LadderContext| p.action(&b, &c);
+        let with = |f: fn(&mut LadderContext)| {
+            let mut c = ladder_ctx();
+            f(&mut c);
+            c
+        };
+
+        // The lowest tier would drop: one rung down per decision, then the floor evicts.
+        assert_eq!(act(ladder_ctx()), EvictAction::Compress { to: "fp8_e4m3" });
+        assert_eq!(
+            act(with(|c| c.format = "fp8_e4m3")),
+            EvictAction::Compress { to: "tq4" }
+        );
+        assert_eq!(
+            act(with(|c| c.format = "tq4")),
+            EvictAction::Compress { to: "tq2" }
+        );
+        assert_eq!(act(with(|c| c.format = "tq2")), EvictAction::Drop);
+        // `max_format` bounds the ladder.
+        let capped = |c: &mut LadderContext| {
+            c.format = "tq4";
+            c.ladder = Some(LadderLimits {
+                max_format: "tq4",
+                high_water: 0.95,
+                low_water: 0.85,
+                l0_dtype: "bf16",
+            });
+        };
+        assert_eq!(act(with(capped)), EvictAction::Drop);
+
+        // Never at GREEN, never with the ladder off: Phase 4 drops the victim.
+        assert_eq!(
+            act(with(|c| c.pressure = PressureState::Green)),
+            EvictAction::Drop
+        );
+        assert_eq!(act(with(|c| c.ladder = None)), EvictAction::Drop);
+        for state in [
+            PressureState::Yellow,
+            PressureState::Orange,
+            PressureState::Red,
+            PressureState::Survival,
+        ] {
+            let mut c = ladder_ctx();
+            c.pressure = state;
+            assert!(matches!(act(c), EvictAction::Compress { .. }), "{state:?}");
+        }
+
+        // A sweep of the lowest tier (nothing must leave). From ORANGE on it compresses one
+        // rung even with free room (before the tiers are full); at YELLOW only while its GREEN
+        // headroom is short, `fill + demand > low_water` (user decision 2026-09-29, "Compress
+        // only until GREEN"); at the floor it evicts only above high water, never a copy of a
+        // tier with free room; GREEN never compresses.
+        let sweep = |fill: f64, format: &'static str| {
+            let mut c = ladder_ctx();
+            c.must_leave = false;
+            c.fill = fill;
+            c.format = format;
+            c
+        };
+        for state in [
+            PressureState::Orange,
+            PressureState::Red,
+            PressureState::Survival,
+        ] {
+            for fill in [0.0, 0.10, 0.50, 0.90, 0.95, 0.96] {
+                let mut c = sweep(fill, "l0");
+                c.pressure = state;
+                assert_eq!(
+                    act(c),
+                    EvictAction::Compress { to: "fp8_e4m3" },
+                    "{state:?} at fill {fill}: the lowest tier compresses one rung"
+                );
+            }
+        }
+        // YELLOW with GREEN headroom keeps, whatever the copy's rung.
+        for (fill, demand) in [
+            (0.0, 0.0),
+            (0.10, 0.0),
+            (0.50, 0.30),
+            (0.85, 0.0),
+            (0.80, 0.04),
+        ] {
+            for format in ["l0", "fp8_e4m3", "tq4"] {
+                let mut c = sweep(fill, format);
+                c.demand = demand;
+                assert_eq!(
+                    act(c),
+                    EvictAction::Keep,
+                    "YELLOW at fill {fill} + demand {demand} ≤ low water keeps a {format} copy"
+                );
+            }
+        }
+        // YELLOW whose fill or demand pushes it over low water compresses one rung.
+        for (fill, demand) in [
+            (0.80, 0.10),
+            (0.50, 0.40),
+            (0.86, 0.0),
+            (0.90, 0.0),
+            (0.95, 0.0),
+        ] {
+            let mut c = sweep(fill, "l0");
+            c.demand = demand;
+            assert_eq!(
+                act(c),
+                EvictAction::Compress { to: "fp8_e4m3" },
+                "YELLOW at fill {fill} + demand {demand} > low water"
+            );
+        }
+        let mut c = sweep(0.80, "tq4");
+        c.demand = 0.10;
+        assert_eq!(act(c), EvictAction::Compress { to: "tq2" });
+        // GREEN after YELLOW keeps, even with the demand still set.
+        let mut c = sweep(0.80, "fp8_e4m3");
+        c.demand = 0.10;
+        c.pressure = PressureState::Green;
+        assert_eq!(act(c), EvictAction::Keep, "GREEN after YELLOW keeps");
+        // ORANGE with room still compresses.
+        let mut c = sweep(0.10, "tq4");
+        c.pressure = PressureState::Orange;
+        assert_eq!(act(c), EvictAction::Compress { to: "tq2" });
+        assert_eq!(
+            act(sweep(0.10, "tq2")),
+            EvictAction::Keep,
+            "the floor with free room keeps the copy"
+        );
+        assert_eq!(
+            act(sweep(0.95, "tq2")),
+            EvictAction::Keep,
+            "at high water, not above"
+        );
+        assert_eq!(act(sweep(0.96, "tq2")), EvictAction::Drop);
+        for fill in [0.10, 0.99] {
+            let mut green = sweep(fill, "l0");
+            green.pressure = PressureState::Green;
+            assert_eq!(act(green), EvictAction::Keep, "GREEN at fill {fill}");
+        }
+
+        // A repeated sweep at steady pressure: 16 copies of the lowest tier, starting in `l0`
+        // at fill 0.92 (above low water, below high water) with a YELLOW reclaim demand of 0.02
+        // each sweep; the returned actions are applied and `fill` re-derived from the copies'
+        // bytes per codec after every decision. At YELLOW the tier stops once its GREEN
+        // headroom is back and never reaches `tq2`; at ORANGE the same sweep does.
+        let sizes = |f: &str| {
+            let l0 = crate::codec::tests::layout(turbine_core::types::DType::BF16);
+            crate::codec::registry()
+                .get(f)
+                .expect("registered codec")
+                .bytes_per_block(&l0)
+        };
+        let steady = |pressure: PressureState| -> Vec<&'static str> {
+            let mut copies: Vec<&'static str> = vec!["l0"; 16];
+            let capacity = (16 * sizes("l0")) as f64 / 0.92;
+            for _ in 0..50 {
+                for i in 0..copies.len() {
+                    let used: u64 = copies.iter().map(|f| sizes(f)).sum();
+                    let mut c = sweep(used as f64 / capacity, copies[i]);
+                    c.pressure = pressure;
+                    c.demand = 0.02;
+                    match act(c) {
+                        EvictAction::Compress { to } => copies[i] = to,
+                        EvictAction::Keep => {}
+                        other => panic!("{pressure:?}: unexpected {other:?} in a sweep"),
+                    }
+                }
+            }
+            copies
+        };
+        let yellow = steady(PressureState::Yellow);
+        assert!(
+            !yellow.contains(&"tq2"),
+            "a steady YELLOW with room never drifts to tq2: {yellow:?}"
+        );
+        assert!(
+            yellow.contains(&"fp8_e4m3"),
+            "YELLOW above low water compresses: {yellow:?}"
+        );
+        let used: u64 = yellow.iter().map(|f| sizes(f)).sum();
+        let fill = used as f64 / ((16 * sizes("l0")) as f64 / 0.92);
+        assert!(
+            fill + 0.02 <= 0.85,
+            "YELLOW restored GREEN headroom: {fill}"
+        );
+        let orange = steady(PressureState::Orange);
+        assert!(
+            orange.iter().all(|f| *f == "tq2"),
+            "ORANGE walks the tier to tq2: {orange:?}"
+        );
+
+        // An upper tier (L1 above L2) compresses only once L2 has reached the target rung;
+        // otherwise a victim is demoted as in Phase 4, at the lossier of the two formats.
+        let upper = |lower: &'static str, format: &'static str, must_leave: bool| {
+            let mut c = ladder_ctx();
+            c.tier = TierId::L1;
+            c.fill = 0.97;
+            c.format = format;
+            c.must_leave = must_leave;
+            c.demote_to = Some((TierId::L2, lower));
+            c.lower_rung = Some(lower);
+            c
+        };
+        assert_eq!(act(upper("l0", "l0", false)), EvictAction::Keep);
+        assert_eq!(
+            act(upper("l0", "l0", true)),
+            EvictAction::Demote {
+                to: TierId::L2,
+                format: "l0"
+            }
+        );
+        assert_eq!(
+            act(upper("fp8_e4m3", "l0", false)),
+            EvictAction::Compress { to: "fp8_e4m3" }
+        );
+        // At YELLOW only the lowest tier acts with free room: an upper tier at or below high
+        // water keeps its copy (or demotes a leaving one) even when L2 has reached the rung.
+        for fill in [0.10, 0.95] {
+            let mut c = upper("fp8_e4m3", "l0", false);
+            c.fill = fill;
+            assert_eq!(act(c), EvictAction::Keep, "L1 at fill {fill}");
+            c.must_leave = true;
+            assert_eq!(
+                act(c),
+                EvictAction::Demote {
+                    to: TierId::L2,
+                    format: "fp8_e4m3"
+                },
+                "leaving L1 copy at fill {fill}"
+            );
+        }
+        assert_eq!(
+            act(upper("fp8_e4m3", "fp8_e4m3", false)),
+            EvictAction::Keep,
+            "L1 never runs ahead of L2"
+        );
+        assert_eq!(
+            act(upper("tq2", "tq2", false)),
+            EvictAction::Keep,
+            "an upper tier at the floor keeps its copy (the lowest tier evicts)"
+        );
+        // Never upgrade: a tq4 copy demoted into an `l0` tier stays tq4.
+        let mut c = upper("l0", "tq4", true);
+        c.pressure = PressureState::Green;
+        assert_eq!(
+            act(c),
+            EvictAction::Demote {
+                to: TierId::L2,
+                format: "tq4"
+            }
+        );
+
+        // `lru` keeps Phase 4 behaviour whatever the ladder says.
+        let lru = LruPolicy;
+        assert_eq!(lru.action(&b, &ladder_ctx()), EvictAction::Drop);
+        assert_eq!(lru.action(&b, &sweep(0.99, "l0")), EvictAction::Keep);
+        assert_eq!(
+            lru.action(&b, &upper("l0", "fp8_e4m3", true)),
+            EvictAction::Demote {
+                to: TierId::L2,
+                format: "fp8_e4m3"
+            }
+        );
     }
 
     fn older_by(secs: u64) -> BlockScoreInputs {

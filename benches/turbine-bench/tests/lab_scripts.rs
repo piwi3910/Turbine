@@ -6,6 +6,7 @@
 //!   replaced by stubs that record any call, so a dry run that reaches for a host fails the test.
 //! - The rendered Jobs carry the cached workspace slots, the kernel build, the environment and
 //!   the read-only model mount that the GPU tests and `turbine-server` rely on.
+//! - `scripts/track-gate.sh` runs (with `bash`) against a stub procoder launcher.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -705,7 +706,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "prefill_op_timings",
         "every_implementation_matches_cpu",
         "implementations_enumerated",
-        "gemm_matches_cpu",
+        "bf16_gemm_matches_cpu",
         "gemm_table_matches_cpu",
         "norm_rope_silu_embedding_add_match_cpu",
         "paged_prefill_ck_128_matches_cpu",
@@ -717,6 +718,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "prefill_shapes_match_cpu",
         "moe_decode_tier_timings",
         "decode_attention_timings",
+        "paged_mixed_timings",
+        "tq_loss_on_real_kv",
     ];
 
     let text = dry_run(
@@ -1066,11 +1069,32 @@ fn lab_serve_dry_run_prints_the_start_sequence() {
             "kubectl apply -f -",
             &format!("kubectl -n turbine-ci logs -f job/turbine-lab-serve-{id}"),
             ready,
+            &format!("pkill -f '[l]ogs -f job/turbine-lab-serve-{id}'"),
         ],
     );
     assert!(
         !text.contains(" delete "),
         "a start deletes nothing: {text}"
+    );
+}
+
+#[test]
+fn lab_serve_stops_the_remote_log_stream_once() {
+    // The remote `logs -f` survives the local ssh client's kill under a ControlMaster (the
+    // overload-soak hang, rotation 11): lab-serve must also pkill it remotely, exactly once
+    // per run, with the bracket trick so the pkill invocation never matches its own command
+    // line.
+    let text = dry_run(
+        "lab-serve.sh",
+        "stream-stop",
+        &["--dry-run", "novanas", "scripts/lab/phase1-novanas.yaml"],
+    );
+    let id = run_id(&text, "lab-serve");
+    let pkill = format!("pkill -f '[l]ogs -f job/turbine-lab-serve-{id}'");
+    assert_eq!(
+        text.matches(&pkill).count(),
+        1,
+        "exactly one remote log-stream kill: {text}"
     );
 }
 
@@ -1540,6 +1564,94 @@ fn lab_bench_new_flags_are_not_usage_errors() {
     }
 }
 
+/// Phase 6a: every `--model` value maps to its weights directory, golden slug and lab config
+/// (the BF16 models keep their phase2c configs; each proof model has a phase6 config), printed by
+/// `--print-model` without contacting a host; an unknown model is a usage error listing the
+/// valid ones. Breaks if a model points at the wrong weights, reference or config.
+#[test]
+fn lab_bench_model_map() {
+    let expected = [
+        (
+            "llama",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct scripts/lab/phase2c-novanas-llama.yaml",
+        ),
+        (
+            "olmoe",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct scripts/lab/phase2c-novanas-olmoe.yaml",
+        ),
+        (
+            "llama-fp8",
+            "llama-3.2-3b-instruct-fp8-dynamic llama-3.2-3b-instruct-fp8-dynamic scripts/lab/phase6-novanas-llama-fp8.yaml",
+        ),
+        (
+            "llama-fp8-tensor",
+            "llama-3.2-3b-instruct-fp8 llama-3.2-3b-instruct-fp8 scripts/lab/phase6-novanas-llama-fp8-tensor.yaml",
+        ),
+        (
+            "llama-fp8-block",
+            "llama-3.2-3b-instruct-fp8-block llama-3.2-3b-instruct-fp8-block scripts/lab/phase6-novanas-llama-fp8-block.yaml",
+        ),
+        (
+            "llama-awq",
+            "llama-3.2-3b-instruct-awq llama-3.2-3b-instruct-awq scripts/lab/phase6-novanas-llama-awq.yaml",
+        ),
+        (
+            "llama-gptq",
+            "llama-3.2-3b-instruct-gptq llama-3.2-3b-instruct-gptq scripts/lab/phase6-novanas-llama-gptq.yaml",
+        ),
+        (
+            "llama8b-mxfp4",
+            "llama-3.1-8b-instruct-mxfp4a16 llama-3.1-8b-instruct-mxfp4a16 scripts/lab/phase6-novanas-llama8b-mxfp4.yaml",
+        ),
+        (
+            "llama8b",
+            "llama-3.1-8b-instruct llama-3.1-8b-instruct scripts/lab/phase6-novanas-llama8b.yaml",
+        ),
+        (
+            "llama-mxfp4-a4",
+            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-mxfp4-a4 scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml",
+        ),
+        (
+            "llama-yarn16",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-novanas-llama-yarn16.yaml",
+        ),
+        (
+            "llama-fp8kv",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-fp8kv scripts/lab/phase6-novanas-llama-fp8kv.yaml",
+        ),
+        (
+            "llama8b-mxfp4-a4",
+            "llama-3.1-8b-instruct-mxfp4-a4 llama-3.1-8b-instruct-mxfp4-a4 scripts/lab/phase6-novanas-llama8b-mxfp4-a4.yaml",
+        ),
+        (
+            "olmoe-fp8kv",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct-fp8kv scripts/lab/phase6-novanas-olmoe-fp8kv.yaml",
+        ),
+    ];
+    for (model, triple) in expected {
+        let (out, called) = lab_script(
+            "lab-bench.sh",
+            &format!("model-{model}"),
+            &["--print-model", model],
+        );
+        assert_eq!(called, None, "{model}: contacted a host");
+        assert_eq!(out.status.code(), Some(0), "{model}: {}", stderr(&out));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            triple,
+            "{model}"
+        );
+    }
+    let (out, called) = lab_script("lab-bench.sh", "model-bogus", &["--print-model", "qwen"]);
+    assert_eq!(called, None);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("llama-yarn16") && stderr(&out).contains("llama8b-mxfp4"),
+        "the usage lists the models: {}",
+        stderr(&out)
+    );
+}
+
 /// Runs `bash <args>` with the host-contacting tools stubbed as in [`lab_script`]; returns the
 /// output and whether any stub was called.
 fn bash_with_stubs(args: &[&str], tag: &str) -> (Output, Option<String>) {
@@ -1623,11 +1735,145 @@ fn soak_precondition_refuses_busy_gpu() {
         &["localhost"][..],
         &["novanas", "--duration", "ten"][..],
         &["novanas", "--model", "/etc"][..],
+        &["novanas", "--set"][..],
+        &["novanas", "--set", "kv.ladder.enabled"][..],
+        &["novanas", "--shared-prefix-share", "2"][..],
+        &["novanas", "--shared-prefix-share", "half"][..],
+        &["novanas", "--shared-prefixes", "0"][..],
+        &["novanas", "--shared-prefix-words"][..],
     ] {
         let (out, called) = lab_script("overload-soak.sh", "soak-usage", args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
         assert_eq!(called, None, "{args:?}: contacted a host");
     }
+}
+
+/// The soak's workload flags (user decision "6b Task 16: ladder proof results — four open
+/// points", 4 A): share 0 adds nothing, so the Phase 3 soak sends the same requests as before;
+/// a share sends the shared-prefix flags turbine-bench reads, and the script passes the same
+/// list to the calibration and the overload. Breaks if share 0 changes the workload, a share
+/// is dropped, or only one of the two runs gets it.
+#[test]
+fn soak_load_flags_add_a_shared_prefix_share() {
+    let script = repo_root().join("scripts/overload-soak.sh");
+    let flags = |args: &str| {
+        let snippet = format!(
+            "SOAK_SOURCE_ONLY=1 source '{}' && soak_load_flags {args}",
+            script.display()
+        );
+        let (out, called) = bash_with_stubs(&["-c", &snippet], "soak-load-flags");
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(called, None);
+        stdout(&out)
+    };
+    assert_eq!(flags("0 128 1024"), "");
+    assert_eq!(flags("0.0 128 1024"), "");
+    assert_eq!(
+        flags("0.5 128 1024"),
+        "--shared-prefix-share\n0.5\n--shared-prefixes\n128\n--shared-prefix-words\n1024\n"
+    );
+    let text = fs::read_to_string(&script).unwrap();
+    let load = r#"${LOAD[@]+"${LOAD[@]}"}"#;
+    for step in ["calibrate.json", "timeline.jsonl"] {
+        let call = text
+            .split("\nbench ")
+            .skip(1)
+            .find(|c| c.contains(step))
+            .unwrap_or_else(|| panic!("no bench call writes {step}"));
+        assert!(
+            call.contains(load),
+            "the {step} run does not get the load flags"
+        );
+    }
+    // turbine-bench accepts what the script sends.
+    use clap::Parser;
+    let sent = flags("0.5 128 1024");
+    let mut argv = vec!["turbine-bench", "--url", "http://127.0.0.1:1"];
+    argv.extend(sent.lines());
+    let a =
+        turbine_bench::args::BenchArgs::try_parse_from(argv).expect("bench parses the soak flags");
+    assert_eq!(
+        (
+            a.shared_prefix_share,
+            a.shared_prefixes,
+            a.shared_prefix_words
+        ),
+        (0.5, 128, 1024)
+    );
+}
+
+/// P6b (p6b-survival): when `lab-serve.sh` refuses to start because another server already
+/// answers on port 18000, the soak fails at `start` and never calibrates or overloads that server
+/// (on 2026-10-01 it overloaded another builder's server for 10 minutes and reported its
+/// shutdown as a soak failure). The stubs answer the VRAM probe with a free card and every curl
+/// with 200, like a foreign server on the port. Breaks if the start step ignores lab-serve's exit.
+#[test]
+fn soak_refuses_a_server_it_did_not_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = std::env::temp_dir().join(format!(
+        "turbine-lab-scripts-{}-soak-foreign",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&stubs);
+    fs::create_dir_all(&stubs).expect("stub dir");
+    let calls = stubs.join("calls.log");
+    let log = calls.display();
+    let write = |name: &str, body: String| {
+        let p = stubs.join(name);
+        fs::write(&p, body).expect("write stub");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    };
+    write(
+        "ssh",
+        format!(
+            "#!/bin/sh\necho \"ssh $*\" >> '{log}'\ncase \"$*\" in *mem_info_vram_used*) echo 536870912; exit 0;; esac\nexit 97\n"
+        ),
+    );
+    write(
+        "curl",
+        format!(
+            "#!/bin/sh\necho \"curl $*\" >> '{log}'\ncase \"$*\" in *http_code*) printf 200;; *v1/models*) echo '{{\"data\":[{{\"id\":\"m\"}}]}}';; *) echo '{{}}';; esac\nexit 0\n"
+        ),
+    );
+    for tool in ["rsync", "scp", "kubectl"] {
+        write(
+            tool,
+            format!("#!/bin/sh\necho \"{tool} $*\" >> '{log}'\nexit 97\n"),
+        );
+    }
+    write(
+        "bench",
+        format!(
+            "#!/bin/sh\necho \"bench $*\" >> '{log}'\necho '{{\"requests_ok\":1,\"wall_seconds\":1}}'\n"
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/overload-soak.sh"))
+        .args(["novanas", "--duration", "1m"])
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env("SOAK_BENCH", stubs.join("bench"))
+        .env("SOAK_CALIBRATE", "1s")
+        .env("SOAK_COOLDOWN_SECONDS", "0")
+        .output()
+        .expect("run bash");
+    let called = fs::read_to_string(&calls).unwrap_or_default();
+    let _ = fs::remove_dir_all(&stubs);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("did not start the soak's server"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        !called.lines().any(|l| l.starts_with("bench ")),
+        "the soak loaded a server it did not start:\n{called}"
+    );
 }
 
 /// The soak's server configuration loads through the real configuration model, on the hip
@@ -2036,4 +2282,323 @@ fn lab_serve_gpus_2_renders_a_two_gpu_serve_job() {
         "{}",
         stderr(&out)
     );
+}
+
+/// PSU rule (coordinator 2026-09-29): a real `lab-serve --gpus 2` is refused while one GPU job at
+/// a time holds, but its dry run still renders the Job and names the refusal. Breaks if the dry
+/// run starts failing (as e06afc9 did) or stops saying a real run would be refused.
+#[test]
+fn lab_serve_gpus_2_dry_run_names_the_one_gpu_refusal() {
+    let text = dry_run(
+        "lab-serve.sh",
+        "serve-gpus-2-psu",
+        &[
+            "--dry-run",
+            "novanas",
+            "scripts/lab/phase5-novanas-olmoe.yaml",
+            "--gpus",
+            "2",
+        ],
+    );
+    assert!(
+        text.contains("a real run refuses --gpus 2 while one GPU job at a time holds"),
+        "{text}"
+    );
+}
+
+/// A real (not dry-run) `lab-serve.sh` start whose ssh always succeeds, curl sees no server and
+/// rsync fails: the upload fails after bench.lock is taken. Returns the output and the stub calls.
+#[cfg(unix)]
+fn serve_with_failing_upload(tag: &str) -> (Output, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs =
+        std::env::temp_dir().join(format!("turbine-lab-scripts-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&stubs);
+    fs::create_dir_all(&stubs).expect("stub dir");
+    let calls = stubs.join("calls.log");
+    for (tool, body) in [
+        ("ssh", "cat >/dev/null || true\nexit 0"),
+        ("curl", "printf 000\nexit 7"),
+        ("rsync", "exit 23"),
+        ("kubectl", "exit 0"),
+    ] {
+        let path = stubs.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> '{}'\n{body}\n",
+                calls.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+    let path = format!(
+        "{}:{}",
+        stubs.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/lab-serve.sh"))
+        .args(["novanas", "scripts/lab/phase1-novanas.yaml"])
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .env_remove("TURBINE_BENCH_LOCK_HELD")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run bash");
+    let log = fs::read_to_string(&calls).unwrap_or_default();
+    let _ = fs::remove_dir_all(&stubs);
+    (out, log)
+}
+
+/// Bug 2026-10-01: an upload that fails after lab-serve took bench.lock left the holder waiting
+/// up to an hour for a Job that never appeared, blocking every GPU job. Every exit before the
+/// Job is applied must kill this run's holder and remove its files.
+#[cfg(unix)]
+#[test]
+fn lab_serve_failed_upload_releases_the_bench_lock_holder() {
+    let (out, log) = serve_with_failing_upload("serve-upload-fails");
+    let err = stderr(&out);
+    assert!(!out.status.success(), "the start must fail: {err}");
+    assert!(err.contains("rsync to"), "{err}");
+    let start = log
+        .find("setsid nohup flock -x")
+        .unwrap_or_else(|| panic!("the holder was never started:\n{log}"));
+    let after = &log[start..];
+    assert!(
+        after.contains("pkill -f '[r]uns/serve-locks/"),
+        "the holder survived the failed upload:\n{log}"
+    );
+    assert!(
+        after.contains("rm -f /home/piwi/turbine-ci/runs/serve-locks/"),
+        "{log}"
+    );
+}
+
+/// A holder never outlives its run: with no Job after the grace it lets go by itself (the script
+/// may have been SIGKILLed or lost its ssh); the grace is bounded and the old hour is gone.
+#[test]
+fn lab_serve_holder_self_terminates_without_a_job() {
+    let src = fs::read_to_string(repo_root().join("scripts/lab-serve.sh")).expect("read");
+    assert!(
+        src.contains(r#"HOLDER_GRACE="${TURBINE_LAB_HOLDER_GRACE:-900}""#),
+        "grace must default to 900 s"
+    );
+    assert!(
+        src.contains(r"[ \$t -ge ${HOLDER_GRACE} ] && break"),
+        "the holder loop must use it"
+    );
+    assert!(!src.contains("-ge 3600"), "the one-hour wait is the bug");
+}
+
+/// Umbrella S-1 (amended by the Phase 6 split, 2026-09-28): `scripts/track-gate.sh` against a
+/// stub procoder launcher, temporary track specs and support-matrix files.
+#[cfg(unix)]
+mod track_gate_script {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const HEADER: &str = "vendor  arch     architecture       weight_format  kv_format speculative status       reason\n";
+    const BASELINE: &str =
+        "amd     gfx1201  LlamaForCausalLM   bf16           bf16      none        supported    -\n";
+    const QUANT: &str =
+        "amd     gfx1201  LlamaForCausalLM   fp8            bf16      none        supported    -\n";
+    const NVIDIA_QUANT: &str =
+        "nvidia  sm_121   LlamaForCausalLM   fp8            bf16      none        supported    -\n";
+    // 6b's accepted end state (user decisions 2026-10-02 and 2026-10-04 A): the amd L0 `tq4`
+    // rows stay `experimental`; `tq2` is an `experimental` lower-tier rung and L0 `tq2` is
+    // refused, so no amd tq2 matrix row exists at all.
+    const TQ: &str =
+        "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        experimental -\n";
+    const FAMILY: &str =
+        "amd     gfx1201  Qwen3ForCausalLM   bf16           bf16      none        supported    -\n";
+
+    const SPEC_6A: &str = "# phase-6a-quantization\n\nStatus: complete\n\n## In scope\n\n- [S-1] fp8 and fp8_block weights.\n- [S-2] mxfp4, awq_int4 and gptq_int4 weights.\n- [S-3] fp8_e4m3 KV cache.\n- [S-4] YaRN RoPE scaling.\n\n## Out of scope\n\n- NVFP4, GGUF.\n";
+    const SPEC_6B: &str = "# phase-6b-kv-compression\n\nStatus: complete\n\n## In scope\n\n- [S-1] kv.cpu.format and kv.nvme.format.\n- [S-2] TurboQuant tq4 and tq2.\n- [S-3] The compression ladder.\n\n## Out of scope\n\n- NVFP4 KV.\n";
+    const SPEC_7: &str = "# phase-7-model-families\n\nStatus: complete\n\n## In scope\n\n- [S-1] Qwen3 dense and Qwen3 MoE.\n- [S-2] gpt-oss-20b.\n- [S-3] Qwen3.5/3.6 hybrids with Gated DeltaNet; linear-attention kernel provider on AMD: to be evaluated.\n- [S-4] Mistral and Mixtral.\n";
+    const SPEC_8: &str = "# phase-8-speculative-decoding\n\nStatus: complete\n\n## In scope\n\n- [S-1] Llama-3.2-1B-Instruct drafts for Llama-3.2-3B-Instruct behind a Proposer trait.\n\n## Out of scope\n\n- MTP heads, EAGLE heads, DFlash drafters.\n";
+
+    /// A temp directory with `specs/` and a stub launcher, removed on drop.
+    struct Gate {
+        dir: PathBuf,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("turbine-track-gate-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("specs")).unwrap();
+            // Stub procoder launcher: COMPLETE iff the spec says `Status: complete`.
+            let launcher = dir.join("launcher.sh");
+            std::fs::write(
+                &launcher,
+                "#!/usr/bin/env bash\nf=\"$TURBINE_SPEC_DIR/$3.md\"\nif grep -qx 'Status: complete' \"$f\"; then echo \"spec $3: COMPLETE\"; else echo \"spec $3: NOT ready\"; exit 1; fi\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Gate { dir }
+        }
+        fn spec(&self, track: &str, body: &str) -> &Self {
+            std::fs::write(self.dir.join("specs").join(format!("{track}.md")), body).unwrap();
+            self
+        }
+        fn matrix(&self, name: &str, rows: &[&str]) -> PathBuf {
+            let p = self.dir.join(format!("matrix-{name}.txt"));
+            std::fs::write(&p, format!("{HEADER}{}", rows.concat())).unwrap();
+            p
+        }
+        fn run(&self, track: &str, matrix: &Path) -> (Option<i32>, String) {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let out = Command::new("bash")
+                .arg(root.join("scripts/track-gate.sh"))
+                .arg(track)
+                .env("TURBINE_PROCODER_LAUNCHER", self.dir.join("launcher.sh"))
+                .env("TURBINE_SPEC_DIR", self.dir.join("specs"))
+                .env("TURBINE_SUPPORT_MATRIX", matrix)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.code(), text)
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Breaks if a track can start before its predecessor closed (NVIDIA rows must not count),
+    /// on an incomplete spec, or with a spec whose In scope leaves the umbrella scope.
+    #[test]
+    fn track_gate() {
+        let g = Gate::new();
+        let baseline = g.matrix("baseline", &[BASELINE]);
+        let nvidia_only = g.matrix("nvidia", &[BASELINE, NVIDIA_QUANT]);
+        let closed_6a = g.matrix("6a", &[BASELINE, QUANT]);
+        let closed_6b = g.matrix("6b", &[BASELINE, QUANT, TQ]);
+        let closed_7 = g.matrix("7", &[BASELINE, QUANT, TQ, FAMILY]);
+
+        // Usage (the old track names are gone) and a missing spec.
+        assert_eq!(g.run("phase-8a-quantization", &baseline).0, Some(2));
+        assert_eq!(g.run("phase-6-quantization", &baseline).0, Some(2));
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("does not exist"), "{out}");
+
+        // 6a: needs no earlier track; its In scope must cover the formats and name no NVFP4.
+        g.spec("phase-6a-quantization", SPEC_6A);
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("GATE PASS phase-6a-quantization"), "{out}");
+        g.spec(
+            "phase-6a-quantization",
+            &SPEC_6A.replace(
+                "## Out of scope",
+                "- [S-5] NVFP4 weights.\n\n## Out of scope",
+            ),
+        );
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("NVFP4"), "{out}");
+        g.spec(
+            "phase-6a-quantization",
+            &SPEC_6A.replace("Status: complete", "Status: draft"),
+        );
+        let (code, out) = g.run("phase-6a-quantization", &baseline);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("not COMPLETE") && out.contains("Status line"),
+            "{out}"
+        );
+
+        // 6b: refused until 6a has a supported amd row; an NVIDIA row does not count.
+        g.spec("phase-6b-kv-compression", SPEC_6B);
+        for m in [&baseline, &nvidia_only] {
+            let (code, out) = g.run("phase-6b-kv-compression", m);
+            assert_eq!(code, Some(1), "{out}");
+            assert!(
+                out.contains("phase-6a-quantization has not closed"),
+                "{out}"
+            );
+        }
+        assert_eq!(g.run("phase-6b-kv-compression", &closed_6a).0, Some(0));
+        g.spec(
+            "phase-6b-kv-compression",
+            &SPEC_6B.replace("- [S-3] The compression ladder.\n", ""),
+        );
+        let (code, out) = g.run("phase-6b-kv-compression", &closed_6a);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("ladder"), "{out}");
+
+        // 7: refused until 6b closed; every S-8 family must be in scope, gpt-oss included.
+        // 6b's closed marker is its accepted end state (user decisions 2026-10-02 and
+        // 2026-10-04 A): the amd L0 tq4 rows `experimental` (the ladder's L0 rung; `tq2` is a
+        // lower-tier rung and L0 tq2 is refused, so no amd tq2 row exists). A refused tq4 row
+        // (pre-6b) does not close it; a later flip to `supported` still does.
+        g.spec("phase-7-model-families", SPEC_7);
+        let tq_refused = g.matrix(
+            "6b-refused",
+            &[
+                BASELINE,
+                QUANT,
+                "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        unsupported  kv_tq2_l0_refused: TurboQuant KV is not validated yet (track phase-6b-kv-compression)\n",
+            ],
+        );
+        let tq_supported = g.matrix(
+            "6b-supported",
+            &[
+                BASELINE,
+                QUANT,
+                "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        supported    -\n",
+            ],
+        );
+        let (code, out) = g.run("phase-7-model-families", &closed_6a);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-6b-kv-compression has not closed"),
+            "{out}"
+        );
+        let (code, out) = g.run("phase-7-model-families", &tq_refused);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-6b-kv-compression has not closed")
+                && out.contains("tq4 rows experimental"),
+            "{out}"
+        );
+        assert_eq!(g.run("phase-7-model-families", &closed_6b).0, Some(0));
+        assert_eq!(g.run("phase-7-model-families", &tq_supported).0, Some(0));
+        g.spec(
+            "phase-7-model-families",
+            &SPEC_7.replace("- [S-2] gpt-oss-20b.\n", ""),
+        );
+        let (code, out) = g.run("phase-7-model-families", &closed_6b);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("gpt-oss"), "{out}");
+
+        // 8: refused until a Phase 7 family row is supported; no EAGLE.
+        g.spec("phase-8-speculative-decoding", SPEC_8);
+        let (code, out) = g.run("phase-8-speculative-decoding", &closed_6b);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-7-model-families has not closed"),
+            "{out}"
+        );
+        assert_eq!(g.run("phase-8-speculative-decoding", &closed_7).0, Some(0));
+        g.spec(
+            "phase-8-speculative-decoding",
+            &SPEC_8.replace("behind a Proposer trait", "and an EAGLE head"),
+        );
+        let (code, out) = g.run("phase-8-speculative-decoding", &closed_7);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(out.contains("EAGLE"), "{out}");
+    }
 }

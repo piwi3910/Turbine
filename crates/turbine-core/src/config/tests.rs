@@ -569,6 +569,7 @@ fn task1_modules() -> ModuleNames<'static> {
         collective_backends: &["host", "nccl", "rccl"],
         rank_transports: &["tcp"],
         router_policies: &["prefix_affinity", "least_loaded"],
+        kv_formats: &["l0", "fp8_e4m3", "tq4", "tq2"],
     }
 }
 
@@ -794,6 +795,8 @@ fn kv_config_validation() {
     assert_eq!(d.demote_min_value, 0.0);
     assert!(d.prefix_sharing);
     assert_eq!(d.transfer.max_inflight_bytes, ByteSize::gib(1));
+    // Unset: the copy kernel where the library has it, else the copy engine with a WARN.
+    assert_eq!(d.transfer.promotion_copy, None);
     assert_eq!(d.session.max_sessions, 10_000);
     assert_eq!(d.session.hot_ttl, HumanDuration::from_secs(60));
     assert_eq!(d.session.warm_ttl, HumanDuration::from_secs(600));
@@ -804,6 +807,32 @@ fn kv_config_validation() {
     assert_eq!(d.policy_weights.hit_half_life, HumanDuration::from_secs(60));
 
     let base = "model:\n  path: /m\n";
+    // kv.transfer.promotion_copy: unset (default), sdma or kernel, nothing else; an explicit
+    // value stays explicit (only an unset key may fall back at startup).
+    let kernel = parse(
+        &format!("{base}kv:\n  transfer:\n    promotion_copy: kernel\n"),
+        &[],
+    )
+    .expect("kernel is valid");
+    assert_eq!(
+        kernel.kv.transfer.promotion_copy,
+        Some(PromotionCopy::Kernel)
+    );
+    assert_eq!(PromotionCopy::Kernel.as_str(), "kernel");
+    let sdma = parse(
+        &format!("{base}kv:\n  transfer:\n    promotion_copy: sdma\n"),
+        &[],
+    )
+    .expect("sdma is valid");
+    assert_eq!(sdma.kv.transfer.promotion_copy, Some(PromotionCopy::Sdma));
+    assert_eq!(PromotionCopy::Sdma.as_str(), "sdma");
+    assert!(
+        parse(
+            &format!("{base}kv:\n  transfer:\n    promotion_copy: blit\n"),
+            &[]
+        )
+        .is_err()
+    );
     let lru = parse(&format!("{base}kv:\n  policy: lru\n"), &[]).expect("lru is valid");
     assert_eq!(lru.kv.policy.as_str(), "lru");
     // kv.policy names an `eviction_policy` registry module: an unregistered name is refused
@@ -1306,5 +1335,204 @@ fn parallel_mode_rules() {
         base,
         &["parallel.pipeline_parallel_size=2", "parallel.devices=[0]"],
         "parallel.devices",
+    );
+}
+
+/// P6a S-15 / S-18 (rope part of `phase6_keys`): `model.rope_scaling` is a mapping with
+/// Hugging Face's field names that replaces `config.json`'s `rope_scaling`; types that scale
+/// dynamically are refused naming the key (exit 2); the fields are checked at model load.
+#[test]
+fn phase6_keys_rope() {
+    let base = "model:\n  path: /m\n";
+    assert_eq!(parse(base, &[]).unwrap().model.rope_scaling, None);
+    let c = parse(
+        base,
+        &[
+            "model.rope_scaling={rope_type: yarn, factor: 16.0, original_max_position_embeddings: 8192}",
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        c.model.rope_scaling,
+        Some(serde_json::json!({
+            "rope_type": "yarn", "factor": 16.0, "original_max_position_embeddings": 8192
+        }))
+    );
+    let c = parse(
+        "model:\n  path: /m\n  rope_scaling:\n    type: yarn\n    factor: 4\n    truncate: false\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(c.model.rope_scaling.as_ref().unwrap()["truncate"], false);
+    for accepted in ["default", "llama3", "yarn"] {
+        let set = format!("model.rope_scaling={{rope_type: {accepted}, factor: 2.0}}");
+        assert!(parse(base, &[&set]).is_ok(), "{accepted}");
+    }
+    assert_eq!(
+        parse(base, &["model.rope_scaling=null"])
+            .unwrap()
+            .model
+            .rope_scaling,
+        None
+    );
+    for refused in [
+        "{rope_type: dynamic, factor: 2.0}",
+        "{rope_type: linear, factor: 2.0}",
+        "{rope_type: longrope, factor: 2.0}",
+        "{type: dynamic, factor: 2.0}",
+        "{rope_type: yarn, factor: 2.0, dynamic: true}",
+        "{factor: 2.0}",
+        "yarn",
+        "[yarn]",
+    ] {
+        assert_rejected(
+            base,
+            &[&format!("model.rope_scaling={refused}")],
+            "model.rope_scaling",
+        );
+    }
+}
+
+/// P6b S-2 / S-9 (`phase6_keys`): the per-tier KV format, lossy-reuse and ladder keys have the
+/// spec's defaults (nothing lossy by default) and their syntax and ranges are validated
+/// statically (exit 2) naming the key: codec names are module names (whether a codec of that
+/// name exists, and the tier ordering, are checked at startup against the `kv_format`
+/// registry), `kv.lossless_tail_blocks` is 0..=64, the ladder's water marks are ordered,
+/// penalties are 0..=100 and `kv.dtype` accepts `tq4` / `tq2` (refused later, at startup).
+/// Breaks if a key is missing, defaults to a lossy behaviour or goes unvalidated.
+#[test]
+fn phase6_keys() {
+    let base = "model:\n  path: /m\n";
+    let d = parse(base, &[]).unwrap().kv;
+    assert_eq!(d.dtype, KvDtypeChoice::Bf16);
+    assert_eq!(d.cpu.format.as_str(), "l0");
+    assert_eq!(d.nvme.format.as_str(), "l0");
+    assert_eq!(d.lossless_tail_blocks, 1);
+    assert_eq!(d.lossy_reuse, LossyReuse::Allow);
+    // No override: every codec keeps its own default penalty (codec metadata).
+    assert_eq!(d.lossy_penalty_override("tq4"), None);
+    assert!(!d.ladder.enabled);
+    assert!(d.ladder.l0);
+    assert_eq!(d.ladder.max_format.as_str(), "tq4");
+    assert_eq!(d.ladder.high_water, 0.95);
+    assert_eq!(d.ladder.low_water, 0.85);
+
+    // Every key is settable, and the settings are read back.
+    let c = parse(
+        base,
+        &[
+            "kv.dtype=tq4",
+            "kv.cpu.format=tq4",
+            "kv.nvme.enabled=true",
+            "kv.nvme.format=tq2",
+            "kv.lossless_tail_blocks=0",
+            "kv.lossy_reuse=deny",
+            "kv.lossy_penalty.tq4=0.7",
+            "kv.lossy_penalty.my_codec=2",
+            "kv.ladder.enabled=true",
+            "kv.ladder.l0=false",
+            "kv.ladder.max_format=tq4",
+            "kv.ladder.high_water=0.9",
+            "kv.ladder.low_water=0.5",
+        ],
+    )
+    .unwrap()
+    .kv;
+    assert_eq!(c.dtype, KvDtypeChoice::Tq4);
+    assert_eq!(c.dtype.as_str(), "tq4");
+    assert!(c.dtype.is_lossy() && c.dtype.is_turboquant());
+    assert_eq!(c.cpu.format.as_str(), "tq4");
+    assert_eq!(c.nvme.format.as_str(), "tq2");
+    assert_eq!(c.lossless_tail_blocks, 0);
+    assert_eq!(c.lossy_reuse, LossyReuse::Deny);
+    assert_eq!(c.lossy_penalty_override("tq4"), Some(0.7));
+    assert_eq!(c.lossy_penalty_override("my_codec"), Some(2.0));
+    assert_eq!(c.lossy_penalty_override("fp8_e4m3"), None);
+    assert!(c.ladder.enabled && !c.ladder.l0);
+    assert_eq!(c.ladder.max_format.as_str(), "tq4");
+    assert_eq!((c.ladder.high_water, c.ladder.low_water), (0.9, 0.5));
+    assert_eq!(
+        parse(base, &["kv.dtype=tq2"]).unwrap().kv.dtype,
+        KvDtypeChoice::Tq2
+    );
+    // Any well-formed name parses (a new codec needs no core edit); the registry check is
+    // `validate_modules`.
+    let c = parse(base, &["kv.cpu.format=zstd", "kv.lossy_penalty={lz4: 1}"]).unwrap();
+    for (known, key) in [
+        (task1_modules(), "kv.cpu.format"),
+        (
+            ModuleNames {
+                kv_formats: &["l0", "fp8_e4m3", "tq4", "tq2", "zstd"],
+                ..task1_modules()
+            },
+            "kv.lossy_penalty.lz4",
+        ),
+    ] {
+        let err = c.validate_modules(&known).unwrap_err();
+        assert_eq!(err.key(), Some(key), "{err}");
+        assert!(err.to_string().contains("is not registered"), "{err}");
+    }
+    assert!(
+        parse(base, &["kv.ladder.max_format=tq4"])
+            .unwrap()
+            .validate_modules(&task1_modules())
+            .is_ok()
+    );
+    let err = parse(base, &["kv.ladder.max_format=tq3"])
+        .unwrap()
+        .validate_modules(&task1_modules())
+        .unwrap_err();
+    assert_eq!(err.key(), Some("kv.ladder.max_format"), "{err}");
+
+    for (sets, key) in [
+        (
+            &["kv.lossless_tail_blocks=65"][..],
+            "kv.lossless_tail_blocks",
+        ),
+        (
+            &["kv.lossless_tail_blocks=-1"][..],
+            "kv.lossless_tail_blocks",
+        ),
+        (
+            &["kv.ladder.high_water=0.8", "kv.ladder.low_water=0.85"][..],
+            "kv.ladder.high_water",
+        ),
+        (
+            &["kv.ladder.high_water=0.5", "kv.ladder.low_water=0.5"][..],
+            "kv.ladder.high_water",
+        ),
+        (&["kv.ladder.high_water=1.01"][..], "kv.ladder.high_water"),
+        (&["kv.ladder.low_water=0.49"][..], "kv.ladder.low_water"),
+        (&["kv.ladder.low_water=.nan"][..], "kv.ladder.low_water"),
+        (&["kv.ladder.max_format=Tq2"][..], "kv.ladder.max_format"),
+        (
+            &["kv.ladder.enabled=true", "kv.cpu.enabled=false"][..],
+            "kv.ladder.enabled",
+        ),
+        (&["kv.lossy_penalty={Zstd: 1}"][..], "kv.lossy_penalty"),
+        (&["kv.lossy_penalty.tq4=100.5"][..], "kv.lossy_penalty.tq4"),
+        (&["kv.lossy_penalty.tq2=-0.1"][..], "kv.lossy_penalty.tq2"),
+        (&["kv.lossy_reuse=maybe"][..], "kv.lossy_reuse"),
+        (&["kv.cpu.format=fp8-e4m3"][..], "kv.cpu.format"),
+        (&["kv.nvme.format=\"\""][..], "kv.nvme.format"),
+        (&["kv.dtype=int8"][..], "kv.dtype"),
+        (
+            &["model.rope_scaling={rope_type: dynamic, factor: 2.0}"][..],
+            "model.rope_scaling",
+        ),
+    ] {
+        assert_rejected(base, sets, key);
+    }
+    // The ladder is accepted with L2 alone.
+    assert!(
+        parse(
+            base,
+            &[
+                "kv.ladder.enabled=true",
+                "kv.cpu.enabled=false",
+                "kv.nvme.enabled=true",
+            ],
+        )
+        .is_ok()
     );
 }

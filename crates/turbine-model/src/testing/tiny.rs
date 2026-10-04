@@ -201,6 +201,54 @@ pub fn write_tiny_llama_with(dir: &Path, seed: u64, opts: &TinyOptions) -> TinyS
     )
 }
 
+/// A quantized tiny Llama and the BF16 model it decodes to ([`write_tiny_quantized`]).
+#[derive(Clone, Debug)]
+pub struct TinyQuantized {
+    /// The checkpoint in the packaging `quantization_config` declares.
+    pub quantized: TinySpec,
+    /// The same model in BF16, every quantized weight replaced by its exact dequantized values.
+    pub twin: TinySpec,
+}
+
+/// Writes the tiny Llama (tied, [`PLAIN_CHAT_TEMPLATE`], `hidden` and `head_dim` as given; 4
+/// query and 2 KV heads, MLP 128) into `dir/quantized`, quantized by the weight format that
+/// detects `quantization_config` ([`crate::weights::WeightFormat::write_tiny`]), and its
+/// dequantized BF16 twin into `dir/twin` (Phase 6a S-3 fixtures). Block-scaled formats need
+/// `hidden` and `head_dim` in multiples of the block (128). Panics when the format refuses the
+/// configuration or has no tiny writer.
+pub fn write_tiny_quantized(
+    dir: &Path,
+    seed: u64,
+    quantization_config: &serde_json::Value,
+    hidden: u32,
+    head_dim: u32,
+) -> TinyQuantized {
+    let opts = TinyOptions {
+        template_with_tools: false,
+        head_dim,
+        ..TinyOptions::default()
+    };
+    let mut config = llama_config_json(opts.tied, head_dim);
+    config["hidden_size"] = json!(hidden);
+    let (qdir, tdir) = (dir.join("quantized"), dir.join("twin"));
+    write_tiny(&qdir, seed, &config, &opts);
+    let format = crate::weights::detect(&json!({ "quantization_config": quantization_config }))
+        .unwrap_or_else(|e| panic!("{quantization_config}: {e}"));
+    let written = format
+        .write_tiny(&qdir, Some(&tdir))
+        .unwrap_or_else(|e| panic!("{}: write_tiny: {e}", format.name()));
+    assert!(written, "{} has no tiny writer", format.name());
+    let spec = |dir: PathBuf| TinySpec {
+        config: load_model_config(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())),
+        dir,
+        vocab: TINY_VOCAB,
+    };
+    TinyQuantized {
+        quantized: spec(qdir),
+        twin: spec(tdir),
+    }
+}
+
 /// Writes the tiny `OlmoeForCausalLM` checkpoint into `dir`: 2 layers, hidden 64, 4 query and
 /// 4 KV heads of dimension 16 with Q/K norm, 8 SwiGLU experts of width 32 per layer with top-2
 /// routing and `norm_topk_prob: false`, rope theta 10000 without scaling, untied `lm_head`,

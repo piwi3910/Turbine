@@ -91,12 +91,13 @@ use turbine_core::request::{
 };
 use turbine_core::types::{BlockId, CircuitState, PressureState, Priority, RequestId, SeqId};
 use turbine_kv::BlockPool;
-use turbine_kv::hierarchy::{AttachOutcome, PrefixAttach};
+use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     TokenFeed,
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
+use turbine_reliability::budget::PoolKind;
 use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
 use turbine_reliability::controller::{EngineStats, Snapshot};
 use turbine_reliability::recovery::RecoveryStep;
@@ -113,8 +114,8 @@ use super::stages::{Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
-use crate::kv_orchestrator::KvOrchestrator;
-use crate::metrics::{Outcome, TokenKind};
+use crate::kv_orchestrator::{CopyMark, KvOrchestrator};
+use crate::metrics::{Outcome, ReasonLabels, TokenKind};
 use crate::reliability::EngineReliability;
 
 /// Sleep between turns while requests exist but the last plan had nothing to run.
@@ -151,6 +152,10 @@ pub(crate) struct EngineParts {
     /// ([`EngineLoop::turn_pipelined`]); `None` otherwise.
     pub pipeline: Option<Arc<PipelineStats>>,
 }
+
+/// The message of the `slow_client` error event.
+const SLOW_CLIENT_MESSAGE: &str =
+    "the client did not read the stream within server.slow_client_timeout";
 
 enum Turn {
     Continue,
@@ -217,6 +222,9 @@ pub(crate) struct EngineLoop {
     /// Requests that ended this turn, reported to the KV hierarchy after `complete`
     /// (`true`: cancelled or failed).
     kv_done: Vec<(RequestId, bool)>,
+    /// Admitted requests that released their prefix while queued and whose new attach waits for
+    /// promotions ([`EngineLoop::reattach_released`]).
+    reattaching: HashSet<RequestId>,
     /// Pipeline parallelism: the stages' timing and placement, and the micro-batch count.
     pipeline: Option<Arc<PipelineStats>>,
     /// Pipeline parallelism: the micro-batches launched into the stages, oldest first.
@@ -233,6 +241,8 @@ struct PipeFlight {
     /// Requests of the plan, failed together if its step fails.
     requests: Vec<RequestId>,
     launched: Instant,
+    /// KV copies at launch: the step's drift exclusion ([`CopyMark::overlapped`]).
+    copies: CopyMark,
 }
 
 /// A submission whose cached prefix is on its way to L0.
@@ -271,6 +281,9 @@ struct Built {
     tokens: Vec<u32>,
     positions: Vec<u32>,
     slices: Vec<(usize, u32, u32, u32)>,
+    /// The `block_formats` bytes of each plan item's table (`TURBINE_KVFMT_*`, P6b S-5/S-7);
+    /// empty vectors while the pool has one page class.
+    formats: Vec<Vec<u8>>,
     rows: Vec<RowInfo>,
     feeds: Vec<TokenFeed>,
 }
@@ -295,6 +308,8 @@ struct InFlight {
     phase: ForwardPhase,
     /// Host time of the launch call.
     launch_time: Duration,
+    /// KV copies at launch: the step's drift exclusion ([`CopyMark::overlapped`]).
+    copies: CopyMark,
     /// The full blocks the iteration writes (Phase 4), held (one pool reference each) from its
     /// ahead completion until it is collected: committed on success, then released.
     commits: Vec<KvCommit>,
@@ -360,6 +375,7 @@ impl EngineLoop {
             kv: p.kv,
             held: HashMap::new(),
             kv_done: Vec::new(),
+            reattaching: HashSet::new(),
             pipeline: p.pipeline,
             pipe: VecDeque::new(),
             last_collect: None,
@@ -452,6 +468,7 @@ impl EngineLoop {
         self.idle_turn = false;
         self.iteration_requests = plan_requests(&plan, &self.seqs);
         let started = Instant::now();
+        let copies = self.kv.copy_mark();
         let outcome = self.execute(&mut plan);
         let failed = outcome.failed.is_some();
         if !failed {
@@ -464,7 +481,7 @@ impl EngineLoop {
         }
         self.sched.complete(&mut self.pool, outcome);
         if !failed {
-            self.observe(&plan, started.elapsed().as_secs_f64());
+            self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
         self.kv_end_turn();
         self.publish(true);
@@ -542,12 +559,14 @@ impl EngineLoop {
         let requests = plan_requests(&plan, &self.seqs);
         self.iteration_requests = requests.clone();
         let launched = Instant::now();
+        let copies = self.kv.copy_mark();
         match self.try_launch(&plan) {
             Ok(Some(built)) => self.pipe.push_back(PipeFlight {
                 plan,
                 built,
                 requests,
                 launched,
+                copies,
             }),
             Ok(None) => self.sched.complete(
                 &mut self.pool,
@@ -642,7 +661,7 @@ impl EngineLoop {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
                 }
                 self.sched.complete(&mut self.pool, outcome);
-                self.observe(&f.plan, cadence.as_secs_f64());
+                self.observe(&f.plan, cadence.as_secs_f64(), f.copies);
             }
             Err(error) => {
                 let outcome = self.pipe_failure(f.plan.iteration, error);
@@ -774,6 +793,7 @@ impl EngineLoop {
             self.pool.layout().block_tokens,
         );
         r.arrival = self.clock.now_mono();
+        self.sync_kv_held();
         if let Err(e) = self.sched.submit_probe(r, self.pool.total_blocks()) {
             tracing::warn!(
                 event = "circuit_probe",
@@ -792,6 +812,7 @@ impl EngineLoop {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "circuit-probe".into(),
             prompt_tokens: self.probe_prompt.clone(),
@@ -814,24 +835,50 @@ impl EngineLoop {
         tracing::info!(event = "circuit_probe", request_id = %id.0, "circuit probe started");
     }
 
-    /// One executed iteration of `secs`: the decode step window and estimates, and the
-    /// admission throughput EWMAs.
-    fn observe(&mut self, plan: &IterationPlan, secs: f64) {
+    /// One executed iteration of `secs`, launched at KV copy state `copies`: the decode step
+    /// window and estimates, and the admission throughput EWMAs. A step that overlapped a KV
+    /// tier copy is not judged for drift (it still counts for throughput).
+    fn observe(&mut self, plan: &IterationPlan, secs: f64, copies: CopyMark) {
         self.iterations += 1;
         let prefill = plan.prefill_tokens();
         let decodes = plan.decode_tokens();
         let calm = self.snap.state == PressureState::Green
             && self.snap.circuit == CircuitState::Healthy
             && self.probe.is_none();
-        self.decode_steps.observe(
+        let context_tokens = plan.decode_context_tokens();
+        let kv_copy = copies.overlapped(self.kv.copy_mark());
+        let excluded = self.decode_steps.kv_copy_excluded();
+        let judged = self.decode_steps.observe(
             StepSample {
                 prefill_tokens: prefill,
                 rows: decodes,
-                context_tokens: plan.decode_context_tokens(),
+                context_tokens,
                 secs,
+                at: self.clock.now_mono(),
+                copy_overlap: kv_copy,
             },
             calm,
         );
+        if self.decode_steps.kv_copy_excluded() > excluded {
+            self.metrics
+                .server
+                .unjudged_decode_steps
+                .get_or_create(&ReasonLabels { reason: "kv_copy" })
+                .inc();
+        }
+        if prefill == 0 && decodes > 0 {
+            tracing::debug!(
+                event = "decode_step",
+                rows = decodes,
+                context_tokens,
+                secs,
+                calm,
+                kv_copy,
+                kv_copy_excluded = self.decode_steps.kv_copy_excluded(),
+                ratio = judged,
+                "decode step against its shape bucket's calm baseline"
+            );
+        }
         if decodes > 0 {
             self.decode_step_s = if self.decode_step_s > 0.0 {
                 STEP_ALPHA * secs + (1.0 - STEP_ALPHA) * self.decode_step_s
@@ -862,9 +909,22 @@ impl EngineLoop {
         self.kv.record_prefill(prefill, prefill_s);
     }
 
+    /// Reports the L0 blocks requests hold to the ledger's `kv` pool (P6b): a request's KV
+    /// reservation leaves out the cached prefix blocks it attached (P4 S-3), so without this the
+    /// ledger missed every block a request took from the cache. Admission and `kv_utilization`
+    /// then count them; called before each submission and plan and with the stats.
+    fn sync_kv_held(&self) {
+        if let Some((ledger, device)) = self.pool.ledger() {
+            let bytes = u64::from(self.pool.referenced_blocks())
+                .saturating_mul(self.pool.layout().block_bytes());
+            ledger.set_held(*device, PoolKind::Kv, bytes);
+        }
+    }
+
     /// The figures the pressure controller reads on its next tick.
     fn publish_stats(&self) {
-        let p95 = self.decode_steps.p95();
+        self.sync_kv_held();
+        let p95 = self.decode_steps.p95(self.clock.now_mono());
         self.rel.publish(EngineStats {
             running_remaining_tokens: self.sched.remaining_tokens(),
             // Phase 4: cached-but-unreferenced L0 blocks (finished prompts kept for prefix reuse)
@@ -995,16 +1055,30 @@ impl EngineLoop {
         }
     }
 
-    /// `KvHierarchy::attach_prefix` for `request` (P4 S-3).
+    /// `KvHierarchy::attach_prefix` for `request` (P4 S-3), planned with the controller's
+    /// current pressure state ([`EngineLoop::sync_l0_state`]).
     fn attach(&mut self, id: RequestId, request: &GenerationRequest) -> AttachOutcome {
+        self.sync_l0_state();
         self.kv.attach(
             &mut self.pool,
-            id,
-            &request.prompt_tokens,
-            request.cache_salt.as_deref().unwrap_or(""),
-            request.session.as_ref(),
-            request.priority,
+            &AttachRequest {
+                request: id,
+                prompt: &request.prompt_tokens,
+                cache_salt: request.cache_salt.as_deref().unwrap_or(""),
+                session: request.session.as_ref(),
+                priority: request.priority,
+                allow_lossy: request.kv_policy.map(|p| p.allow_lossy),
+            },
         )
+    }
+
+    /// The planner sees the controller's state now: a submission reaches
+    /// [`EngineLoop::attach`] before the turn reads its snapshot, and on an engine that was
+    /// quiet the last snapshot is from its last busy turn (6b Task 16: an item arriving after
+    /// the controller went RED → GREEN while idle planned `l0_pressure` and recomputed).
+    fn sync_l0_state(&mut self) {
+        let state = self.rel.handle.snapshot().state;
+        self.kv.set_l0_state(state);
     }
 
     /// Scheduler submission checks (with the attached prefix, whose blocks the admission
@@ -1035,6 +1109,7 @@ impl EngineLoop {
             return;
         }
         let cached_tokens = attach.as_ref().map_or(0, |a| a.cached_tokens);
+        let lossy_cached_tokens = attach.as_ref().map_or(0, |a| a.lossy_tokens);
         if !zero_tokens {
             let bt = self.pool.layout().block_tokens;
             let mut r =
@@ -1046,6 +1121,7 @@ impl EngineLoop {
             if let Some(a) = attach {
                 r.attach_prefix(a, bt);
             }
+            self.sync_kv_held();
             if let Err(e) = self.sched.submit(r, self.pool.total_blocks()) {
                 if let Some(blocks) = blocks {
                     self.pool.release(&blocks);
@@ -1070,6 +1146,7 @@ impl EngineLoop {
         ));
         let mut active = ActiveRequest::new(submission, events, &seqs, &self.tokenizer);
         active.cached_tokens = cached_tokens;
+        active.lossy_cached_tokens = lossy_cached_tokens;
         for (i, &seq) in seqs.iter().enumerate() {
             self.seqs.insert(seq, (id, i));
         }
@@ -1107,6 +1184,10 @@ impl EngineLoop {
     /// (its KV released), then the reclaim order and the controller's pressure state.
     fn kv_before_plan(&mut self) {
         for (id, attach) in self.kv.poll(&mut self.pool) {
+            if self.reattaching.remove(&id) {
+                self.reattached(id, attach);
+                continue;
+            }
             match self.held.remove(&id) {
                 Some(h) => self.admit_submission(h.submission, h.events, h.ack, Some(attach)),
                 None => {
@@ -1146,7 +1227,89 @@ impl EngineLoop {
                 }
             }
         }
+        self.reattach_released();
         self.kv.before_plan(&mut self.pool, self.snap.state);
+        // The plan's refills from the admission queue reserve against what the pool holds now.
+        self.sync_kv_held();
+    }
+
+    /// Admitted requests that released their prefix in the admission queue
+    /// ([`EngineLoop::release_queued_prefixes`]) attach it again through the planner before
+    /// they start: resident blocks now, promotions when they land, or a recompute; one waiting on
+    /// another request's block tries again next turn. Their KV reservation stays whole.
+    fn reattach_released(&mut self) {
+        self.sync_l0_state();
+        for id in self.sched.awaiting_reattach() {
+            if self.reattaching.contains(&id) {
+                continue;
+            }
+            let Some(r) = self.requests.get(&id) else {
+                continue;
+            };
+            let request = &r.request;
+            let outcome = self.kv.attach_again(
+                &mut self.pool,
+                &AttachRequest {
+                    request: id,
+                    prompt: &request.prompt_tokens,
+                    cache_salt: request.cache_salt.as_deref().unwrap_or(""),
+                    session: request.session.as_ref(),
+                    priority: request.priority,
+                    allow_lossy: request.kv_policy.map(|p| p.allow_lossy),
+                },
+            );
+            match outcome {
+                AttachOutcome::Ready(a) => self.reattached(id, a),
+                AttachOutcome::Promoting => {
+                    // The promotion targets are referenced now: commit them against the
+                    // reservation, or the ledger counts them twice until they land.
+                    let blocks = self.kv.pending_blocks(id);
+                    let block_bytes = self.pool.layout().block_bytes();
+                    self.sched.commit_reattached(id, blocks, block_bytes);
+                    self.reattaching.insert(id);
+                }
+                AttachOutcome::WaitForPrefix => {}
+            }
+        }
+    }
+
+    /// A released request's prefix is attached again: the scheduler may start it, and its
+    /// `usage.cached_tokens` are the new attach's. One the scheduler no longer waits for
+    /// (cancelled meanwhile) gives the blocks back.
+    fn reattached(&mut self, id: RequestId, attach: PrefixAttach) {
+        let (cached, lossy) = (attach.cached_tokens, attach.lossy_tokens);
+        let block_bytes = self.pool.layout().block_bytes();
+        match self.sched.reattach(id, attach, block_bytes) {
+            None => {
+                if let Some(r) = self.requests.get_mut(&id) {
+                    r.cached_tokens = cached;
+                    r.lossy_cached_tokens = lossy;
+                }
+            }
+            Some(attach) => self.pool.release(&attach.blocks),
+        }
+    }
+
+    /// At YELLOW and ORANGE the pressure reclaim may want more blocks than L0 holds
+    /// unreferenced (decision "6b: after the held-prefix ledger fix", 1 B): requests waiting in
+    /// the admission queue then release their whole prefixes, the last to be admitted first, up
+    /// to that shortfall and at most [`CAPACITY_BATCH`] blocks per controller tick (decision "6b:
+    /// queued-prefix demotion — granularity and scope", 1 A, 2 A). The released blocks leave the
+    /// ledger's `held` now and the next reclaim demotes them; each request attaches again once
+    /// admitted ([`EngineLoop::reattach_released`]).
+    fn release_queued_prefixes(&mut self) {
+        let want = self.kv.take_queued_prefix_demand().min(CAPACITY_BATCH);
+        if want == 0 {
+            return;
+        }
+        let released = self.sched.detach_queued_prefixes(&self.pool, want);
+        if released.is_empty() {
+            return;
+        }
+        for (id, attach, alone) in released {
+            self.kv.detach_prefix(&mut self.pool, id, &attach, alone);
+        }
+        self.sync_kv_held();
     }
 
     /// The full blocks each item of `plan` completes, with their tokens (choice 0 of a request
@@ -1182,9 +1345,11 @@ impl EngineLoop {
     /// session TTLs.
     fn kv_end_turn(&mut self) {
         for (id, cancelled) in std::mem::take(&mut self.kv_done) {
+            self.reattaching.remove(&id);
             self.kv.request_done(&mut self.pool, id, cancelled);
         }
         self.kv.end_turn(&mut self.pool);
+        self.release_queued_prefixes();
     }
 
     /// Step 2.
@@ -1230,13 +1395,20 @@ impl EngineLoop {
 
     /// Request deadlines and slow-client timers (P2 S-7, S-8): a live request is cancelled
     /// (the next plan frees its blocks and sends the error event); a finished one whose final
-    /// events stay unread past `server.slow_client_timeout` is dropped, which closes its stream.
+    /// events stay unread past `server.slow_client_timeout` is dropped, which closes its stream
+    /// with the `slow_client` error event in the slot reserved for it.
     fn expire_deadlines(&mut self) {
         for (id, reason) in self.deadlines.expired() {
             match self.requests.get(&id) {
                 Some(r) if r.done => {
                     if reason == CancelReason::SlowClient {
                         tracing::info!(event = "cancel", request_id = %id.0, reason = reason.as_str(), "closing a stream whose final events stay unread");
+                        if let Some(r) = self.requests.get_mut(&id) {
+                            r.close_with(ActiveRequest::error_event(
+                                ErrorCode::SlowClient,
+                                SLOW_CLIENT_MESSAGE,
+                            ));
+                        }
                         self.forget(id);
                     }
                 }
@@ -1294,10 +1466,7 @@ impl EngineLoop {
             ),
             CancelReason::SlowClient => (
                 Outcome::Cancelled,
-                Some((
-                    ErrorCode::SlowClient,
-                    "the client did not read the stream within server.slow_client_timeout",
-                )),
+                Some((ErrorCode::SlowClient, SLOW_CLIENT_MESSAGE)),
             ),
             CancelReason::Shutdown => (
                 Outcome::Cancelled,
@@ -1519,6 +1688,7 @@ impl EngineLoop {
             tokens: Vec::with_capacity(total),
             positions: Vec::with_capacity(total),
             slices: Vec::with_capacity(items.len()),
+            formats: Vec::with_capacity(items.len()),
             rows: Vec::with_capacity(items.len()),
             feeds: Vec::new(),
         };
@@ -1548,6 +1718,16 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
+            built.formats.push(if self.pool.has_page_classes() {
+                plan.items[it.index]
+                    .block_table
+                    .blocks
+                    .iter()
+                    .map(|b| self.pool.format_code(*b))
+                    .collect()
+            } else {
+                Vec::new()
+            });
             built.rows.push(RowInfo {
                 seq,
                 prefill: it.prefill,
@@ -1910,6 +2090,7 @@ impl EngineLoop {
             launched: false,
             phase: ForwardPhase::Decode,
             launch_time: Duration::ZERO,
+            copies: self.kv.copy_mark(),
             commits: Vec::new(),
         };
         next.phase = phase_of(&next.plan);
@@ -2019,6 +2200,7 @@ impl EngineLoop {
         }
         let mut plan = next.plan;
         let started = Instant::now();
+        let copies = self.kv.copy_mark();
         let mut outcome = self.recover_after(&mut plan, error);
         outcome
             .finished
@@ -2026,7 +2208,7 @@ impl EngineLoop {
         let failed = outcome.failed.is_some();
         self.sched.complete(&mut self.pool, outcome);
         if !failed {
-            self.observe(&plan, started.elapsed().as_secs_f64());
+            self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
         Ok(None)
     }
@@ -2131,7 +2313,7 @@ impl EngineLoop {
                 let mut outcome = IterationOutcome::default();
                 self.sample(&p.rows, logits, &mut outcome);
                 self.late_finished.extend(outcome.finished);
-                self.observe(&p.plan, (p.launch_time + waited).as_secs_f64());
+                self.observe(&p.plan, (p.launch_time + waited).as_secs_f64(), p.copies);
                 true
             }
             Err(error) => {
@@ -2431,7 +2613,11 @@ impl EngineLoop {
             .into_iter()
             .map(|(stage, ms)| (stage.to_string(), ms))
             .collect();
-        self.shared.publish(EngineDocs { scheduler, kv });
+        self.shared.publish(EngineDocs {
+            scheduler,
+            kv,
+            ladder: self.kv.ladder_document(),
+        });
         let pending = self
             .requests
             .values()
@@ -2450,19 +2636,23 @@ impl EngineLoop {
 }
 
 /// The [`SeqSlice`] of each row of `built`, a batch of `plan`.
-fn seq_slices<'a>(plan: &'a IterationPlan, built: &Built) -> Vec<SeqSlice<'a>> {
+fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>> {
     built
         .slices
         .iter()
         .zip(&built.rows)
-        .map(|(&(index, q_start, q_len, kv_len), row)| SeqSlice {
-            seq: row.seq,
-            q_start,
-            q_len,
-            kv_len,
-            block_table: &plan.items[index].block_table.blocks,
-            reduce: row.reduce,
-        })
+        .zip(&built.formats)
+        .map(
+            |((&(index, q_start, q_len, kv_len), row), formats)| SeqSlice {
+                seq: row.seq,
+                q_start,
+                q_len,
+                kv_len,
+                block_table: &plan.items[index].block_table.blocks,
+                block_formats: formats,
+                reduce: row.reduce,
+            },
+        )
         .collect()
 }
 
@@ -2568,10 +2758,16 @@ fn plan_requests(
 mod tests {
     use std::time::Duration;
 
+    use tokio::sync::mpsc::error::TryRecvError;
     use tokio::sync::oneshot;
-    use turbine_core::clock::SystemClock;
-    use turbine_core::config::{ByteSize, KvConfig, ReliabilityConfig};
+    use turbine_core::clock::{FakeClock, SystemClock};
+    use turbine_core::config::{ByteSize, HumanDuration, KvConfig, ReliabilityConfig};
+    use turbine_core::pressure::PressureSignal;
     use turbine_core::request::CancelFlag;
+    use turbine_core::request::SessionHints;
+    use turbine_core::telemetry::{
+        DeviceSample, HostSample, LedgerSample, SourceStatus, TelemetrySample,
+    };
     use turbine_core::types::{DeviceId, KvLayout, MemoryKind, ModelIdentity, ModelShape};
     use turbine_kernels::test_support::plain_device_error;
     use turbine_kernels::{KernelError, KernelMetrics, KernelRegistry, cpu_reference_provider};
@@ -2580,14 +2776,16 @@ mod tests {
     use turbine_kv::{BlockPoolConfig, KvMetrics};
     use turbine_model::executor::{self, ExecutorOptions, SequenceKv};
     use turbine_model::testing::TempDir;
-    use turbine_model::testing::tiny::{TinySpec, write_tiny_llama};
+    use turbine_model::testing::tiny::{
+        TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
+    };
     use turbine_model::{
         GenerateOptions, MAX_STAGING_BYTES, ModelError, ModelMetrics, SafetensorsIndex,
         WeightLoader, generate, llama_slots,
     };
     use turbine_observability::MetricsRegistry;
     use turbine_reliability::budget::{DeviceBudget, PoolKind};
-    use turbine_reliability::controller::ControllerHandle;
+    use turbine_reliability::controller::{ControllerHandle, PressureController};
     use turbine_reliability::ledger::Ledger;
     use turbine_reliability::metrics::ReliabilityMetrics;
     use turbine_reliability::reserve::EmergencyReserve;
@@ -2615,6 +2813,7 @@ mod tests {
             free_watermark: 0.01,
             max_seq_len: 128,
             queue_timeout: Duration::from_secs(60),
+            recent_window: None,
         }
     }
 
@@ -2669,6 +2868,7 @@ mod tests {
             deadline_ms: u64::MAX,
             session: None,
             cache_salt: None,
+            kv_policy: None,
             endpoint: Endpoint::Completions,
             http_request_id: "t".into(),
             prompt_tokens: prompt.to_vec(),
@@ -2690,6 +2890,9 @@ mod tests {
         shared: Arc<EngineShared>,
         reg: MetricsRegistry,
         controller: ControllerHandle,
+        /// The pressure controller itself: a test ticks it (no controller thread runs).
+        pressure: Arc<std::sync::Mutex<PressureController>>,
+        clock: Arc<dyn Clock>,
     }
 
     /// An engine over `exec` with a 64-block pool, overlap scheduling off.
@@ -2739,9 +2942,28 @@ mod tests {
         tokenizer: Arc<Tokenizer>,
         params: SchedulerParams,
         overlap: bool,
+        kv: KvConfig,
+        l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
+        pipeline: Option<Arc<PipelineStats>>,
+    ) -> TestEngine {
+        let config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        engine_full(exec, tokenizer, params, overlap, kv, l2, pipeline, config)
+    }
+
+    /// [`engine_with_pipeline`] under the reliability section `config`.
+    #[allow(clippy::too_many_arguments)]
+    fn engine_full(
+        exec: Box<dyn ModelExecutor>,
+        tokenizer: Arc<Tokenizer>,
+        params: SchedulerParams,
+        overlap: bool,
         mut kv: KvConfig,
         l2: impl FnOnce(&KvConfig, &KvFormat, KvMetrics) -> Option<Arc<L2NvmeTier>>,
         pipeline: Option<Arc<PipelineStats>>,
+        config: ReliabilityConfig,
     ) -> TestEngine {
         let reg = MetricsRegistry::new();
         let metrics = EngineMetrics {
@@ -2772,10 +2994,6 @@ mod tests {
             reliability_metrics.clone(),
         )
         .unwrap();
-        let config = ReliabilityConfig {
-            emergency_vram_reserve: ByteSize(0),
-            ..ReliabilityConfig::default()
-        };
         let mut pool = BlockPool::new(
             BlockPoolConfig {
                 layout,
@@ -2800,6 +3018,7 @@ mod tests {
                 clock: Arc::clone(&clock),
                 metrics: metrics.kv.clone(),
                 remote: None,
+                kv_scales: None,
             },
             &mut pool,
         )
@@ -2824,6 +3043,8 @@ mod tests {
             .with_gate(parts.gate)
             .with_micro_batches(pipeline.as_ref().map_or(1, |p| p.micro_batches));
         let controller = parts.engine.handle.clone();
+        let pressure = Arc::clone(&parts.controller);
+        let test_clock = Arc::clone(&clock);
         let (tx, commands) = mpsc::channel(8);
         let shared = Arc::new(EngineShared::default());
         let engine = EngineLoop::new(EngineParts {
@@ -2851,6 +3072,8 @@ mod tests {
             shared,
             reg,
             controller,
+            pressure,
+            clock: test_clock,
         }
     }
 
@@ -3017,6 +3240,265 @@ mod tests {
         );
         drop(tx);
         handle.join().unwrap().unwrap();
+    }
+
+    /// Decision "6b: step-time drift during KV promotions" (C) on the cpu backend, serial and
+    /// overlapped: a decode step that runs while a KV tier copy is in flight (here a long
+    /// request decoding while another prompt's blocks come back from L2) is not judged by the
+    /// drift window and is counted in `turbine_decode_steps_unjudged_total{reason="kv_copy"}`;
+    /// with no copy anywhere no step is excluded. Breaks if overlapped steps are judged (the
+    /// count stays 0), or every step is excluded (the copy-free runs count).
+    #[test]
+    fn decode_steps_during_kv_copies_are_not_judged() {
+        let unjudged = r#"turbine_decode_steps_unjudged_total{reason="kv_copy"}"#;
+        for overlap in [false, true] {
+            let (dir, spec, tokenizer) = tiny();
+            let mut kv = KvConfig::default();
+            kv.nvme.enabled = true;
+            kv.nvme.path = dir.path().join("kv");
+            kv.nvme.max_bytes = ByteSize(16 << 20);
+            kv.nvme.slab_bytes = ByteSize(1 << 20);
+            let exec = if overlap {
+                tiny_reducing_executor(&spec, 4)
+            } else {
+                tiny_executor(&spec, 4)
+            };
+            let t = engine_with_kv(
+                exec,
+                Arc::clone(&tokenizer),
+                params(4, 64),
+                overlap,
+                kv,
+                |cfg, format, metrics| {
+                    crate::kv_orchestrator::open_l2(
+                        cfg,
+                        format,
+                        &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                        Arc::new(SystemClock::new()),
+                        metrics,
+                    )
+                    .expect("L2 opens in the temp directory")
+                },
+            );
+            let reclaim = t.engine.kv.reclaimer();
+            let TestEngine {
+                engine, tx, reg, ..
+            } = t;
+            let handle = std::thread::spawn(move || engine.run());
+
+            let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+            let _ = run_one(&tx, request(&prompt, 8));
+            let (_, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 32, "the reuse evidence demotion needs");
+            assert_eq!(
+                metric(&reg, unjudged),
+                0.0,
+                "no copy ran yet (overlap {overlap})"
+            );
+            reclaim.demote(0.0);
+            let _ = run_one(&tx, request(&[256, 1, 2], 2));
+            let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while metric(&reg, demoted) < 2.0 {
+                assert!(Instant::now() < deadline, "the blocks never reached L2");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let before = metric(&reg, unjudged);
+            // A long decode, then the prompt again: its blocks are promoted from L2 while the
+            // long request decodes.
+            let (mut long, admitted) = submit_with(&tx, request(&[256, 5, 6], 100), 256);
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            while !matches!(
+                long.blocking_recv().expect("stream ended early"),
+                GenerationEvent::Token { .. }
+            ) {}
+            let (_, cached) = run_one(&tx, request(&prompt, 8));
+            assert_eq!(cached, 32, "both blocks came back from L2");
+            loop {
+                match long.blocking_recv().expect("stream ended early") {
+                    GenerationEvent::Finished { .. } => break,
+                    GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                    _ => {}
+                }
+            }
+            assert!(metric(&reg, r#"turbine_kv_promotions_total{from="l2",to="l0"}"#) >= 2.0);
+            assert!(
+                metric(&reg, unjudged) > before,
+                "a decode step overlapped the promotion (overlap {overlap}): {before} -> {}",
+                metric(&reg, unjudged)
+            );
+            drop(tx);
+            handle.join().unwrap().unwrap();
+        }
+    }
+
+    /// The sum of every Prometheus series starting with `prefix` (labels included).
+    fn metric_sum(reg: &MetricsRegistry, prefix: &str) -> f64 {
+        reg.render()
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with(prefix))
+            .filter_map(|l| l.rsplit(' ').next()?.parse::<f64>().ok())
+            .sum()
+    }
+
+    /// One run of [`ladder_rewrites_l2_copies_like_a_direct_fp8_tier`]: a prompt's two blocks go
+    /// to L2 at GREEN (stored `l0` with the ladder, `fp8_e4m3` without), the controller is held
+    /// at ORANGE while small requests drive iterations, then the prompt runs again. Returns its
+    /// tokens, its cached tokens, the ladder's l0 → fp8 rewrites in L2 and L2's bytes.
+    fn ladder_run(ladder: bool) -> (Vec<u32>, u32, f64, u64) {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        // Every full block of the prompt is lossy in both runs (no lossless tail at demotion).
+        kv.lossless_tail_blocks = 0;
+        let fp8 = turbine_core::config::ModuleName::new("fp8_e4m3").unwrap();
+        if ladder {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+            kv.ladder.max_format = fp8.clone();
+        } else {
+            kv.nvme.format = fp8;
+        }
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // ORANGE from 2 % KV utilisation: the ladder compresses the lowest tier at ORANGE
+        // whatever its fill; tiny prompts stay cheap enough to be admitted there.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.02), Some(0.95), Some(0.99)],
+        );
+        let l2_tier = Arc::new(std::sync::Mutex::new(None));
+        let opened = Arc::clone(&l2_tier);
+        let mut t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv.clone(),
+            move |cfg, format, metrics| {
+                let l2 = crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory");
+                *opened.lock().unwrap() = l2.clone();
+                l2
+            },
+            None,
+            config,
+        );
+        // As the engine thread does at startup (the cpu backend's transcode is the cpu
+        // reference provider).
+        let mem = pool_mem(&t.engine.pool);
+        kv.block_tokens = BLOCK_TOKENS;
+        assert!(
+            t.engine
+                .kv
+                .enable_device_transcode(&kv, cpu_reference_provider(), &mem),
+            "the fp8 rung runs on the device transcode"
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        let rewrites = r#"turbine_kv_ladder_actions_total{tier="l2",from="l0",to="fp8_e4m3""#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let _ = run_one(&tx, request(&prompt, 8));
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        reclaim.demote(0.0);
+        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, demoted) < 2.0 {
+            assert!(
+                Instant::now() < deadline,
+                "the prompt's blocks never reached L2 (ladder {ladder}): {}",
+                metric(&reg, demoted)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..3 {
+            tick(&ctl, 0.5);
+        }
+        assert_eq!(controller.state(), PressureState::Orange);
+        // Iterations at ORANGE: the ladder rewrites L2's l0 copies (with the ladder on).
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for i in 0.. {
+            tick(&ctl, 0.5);
+            let _ = run_one(&tx, request(&[256, 3, 4 + i % 50], 2));
+            if (ladder && metric_sum(&reg, rewrites) >= 2.0) || (!ladder && i >= 5) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the ladder never rewrote the L2 copies: {} rewrites\n{}",
+                metric_sum(&reg, rewrites),
+                reg.render()
+                    .unwrap()
+                    .lines()
+                    .filter(|l| l.contains("ladder")
+                        || l.contains("pressure_state")
+                        || l.contains("tier_blocks")
+                        || l.contains("demotions_total")
+                        || l.contains("evictions_total"))
+                    .filter(|l| !l.starts_with('#') && !l.ends_with(" 0"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        assert_eq!(controller.state(), PressureState::Orange);
+        let (tokens, cached) = run_one(&tx, request(&prompt, 8));
+        let l2_bytes = l2_tier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |t| turbine_kv::tier::KvTier::used_bytes(t.as_ref()));
+        let actions = metric_sum(&reg, rewrites);
+        drop(tx);
+        handle.join().unwrap().unwrap();
+        (tokens, cached, actions, l2_bytes)
+    }
+
+    /// P6b S-6, the L1/L2 ladder on the server (cpu backend): with `kv.ladder.enabled` and an
+    /// `l0` L2, ORANGE pressure rewrites the L2 copies of a prompt's blocks one rung down to
+    /// `fp8_e4m3` through the device transcode (the cpu reference provider here), and the prompt
+    /// sent again reuses them from L2 with exactly the tokens it gets from an L2 that stored them
+    /// as `fp8_e4m3` in the first place (the same bytes), at the same L2 bytes. Breaks if the
+    /// ladder is refused or never acts on the server, a rewrite stores other bytes than a direct
+    /// fp8 demotion (a missing decode, the source's bytes), or a rewritten copy is not reused.
+    #[test]
+    fn ladder_rewrites_l2_copies_like_a_direct_fp8_tier() {
+        let (ladder, cached, rewrites, l2_ladder) = ladder_run(true);
+        let (direct, cached_direct, none, l2_direct) = ladder_run(false);
+        assert!(rewrites >= 2.0, "both blocks were rewritten: {rewrites}");
+        assert_eq!(none, 0.0, "no ladder, no rewrite");
+        assert_eq!(
+            (cached, cached_direct),
+            (32, 32),
+            "both reuse the L2 blocks"
+        );
+        assert_eq!(
+            ladder, direct,
+            "rewritten copies give the direct fp8 copies' tokens"
+        );
+        assert_eq!(l2_ladder, l2_direct, "L2 holds fp8 copies in both runs");
     }
 
     /// Queues `req` with an output channel of `capacity` events.
@@ -4013,7 +4495,8 @@ mod tests {
             Arc::clone(&tokenizer),
             params(4, 64),
         );
-        // Four events: `Started` and three tokens fill the slow stream's channel.
+        // Four slots, one reserved for a closing event: `Started` and two tokens fill the slow
+        // stream's channel.
         let (mut slow, admitted) = submit_with(&t.tx, request(&[256, 1, 2], 40), 4);
         let (dropped, _dropped_admitted) = submit(&t.tx, request(&[256, 3], 100));
         let (mut fast, _fast_admitted) = submit(&t.tx, request(&[256, 4], 20));
@@ -4050,6 +4533,544 @@ mod tests {
         for line in [
             r#"turbine_requests_cancelled_total{reason="client_disconnect"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="ok"} 2"#,
+            r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"} 1"#,
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
+    /// P6b SURVIVAL at 20+ multi-turn sessions: a request that attaches a cached prefix holds
+    /// its blocks without a reservation for them (the reservation leaves the attached prefix
+    /// out), so the ledger must still count them. A 100-token prompt runs once (6 full
+    /// 16-token blocks cached), then again with a stream that stops reading, so it pauses
+    /// holding the 6 attached blocks plus its tail. The ledger's kv `used` + `reserved` then
+    /// covers every block the pool holds. Breaks if the engine does not report the pool's
+    /// referenced blocks to the ledger: the ledger showed 2 of the 7 held blocks, and on the lab
+    /// L0 filled to 585 of 585 blocks while `kv_utilization` read 0.70, until admitted decodes
+    /// waited for a block (`decode_deferred`) and the horizon jumped GREEN → SURVIVAL.
+    #[test]
+    fn attached_prefix_blocks_count_in_the_ledger() {
+        let (_dir, spec, tokenizer) = tiny();
+        let t = engine(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+        );
+        let block_bytes = t.engine.pool.layout().block_bytes() as f64;
+        let prompt: Vec<u32> = std::iter::once(256).chain(1..100).collect();
+        assert_eq!(prompt.len(), 100);
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 0);
+        // `Started` and two tokens fill the four slots; the request pauses with its KV.
+        let (mut slow, admitted) = submit_with(&tx, request(&prompt, 20), 4);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.paused != 1 {
+            assert!(Instant::now() < deadline, "the request never paused");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = held_blocks(&shared.docs().unwrap()) as f64;
+        assert!(held >= 7.0, "6 attached blocks and a tail: {held}");
+        let gauge = |kind: &str| {
+            metric(
+                &reg,
+                &format!(r#"turbine_memory_pool_bytes{{device="0",pool="kv",kind="{kind}"}}"#),
+            )
+        };
+        let ledger_blocks = (gauge("used") + gauge("reserved")) / block_bytes;
+        assert!(
+            ledger_blocks >= held,
+            "the ledger counts {ledger_blocks} blocks, the pool holds {held}"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| slow.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 20);
+        drop(tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    /// A telemetry sample at `clock`'s now with KV utilisation `kv` (host and device calm).
+    fn calm_sample(clock: &Arc<dyn Clock>, kv: f64) -> TelemetrySample {
+        TelemetrySample {
+            at_mono_ns: clock.now_mono().as_nanos() as u64,
+            host: HostSample {
+                mem_available_bytes: Some(64 << 30),
+                swap_total_bytes: Some(0),
+                swap_free_bytes: Some(0),
+                pswpin_total: Some(0),
+                psi_memory_some_avg10: Some(0.0),
+                status: SourceStatus::Ok,
+            },
+            // No device memory figure: the test budget is only the 64-block pool.
+            devices: vec![DeviceSample {
+                temperature_c: Some(40.0),
+                slowdown_temperature_c: Some(90.0),
+                clock_mhz: Some(2350),
+                ..DeviceSample::empty(DeviceId(0), SourceStatus::Ok)
+            }],
+            ledger: LedgerSample {
+                kv_utilization: kv,
+                queue_fill: 0.0,
+            },
+            storage: None,
+        }
+    }
+
+    /// One controller tick at KV utilisation `kv` (the test is the controller thread).
+    fn tick(t: &(Arc<std::sync::Mutex<PressureController>>, Arc<dyn Clock>), kv: f64) {
+        let stats = EngineStats {
+            block_tokens: BLOCK_TOKENS,
+            free_kv_blocks: 64,
+            ..EngineStats::default()
+        };
+        t.0.lock().unwrap().tick(&calm_sample(&t.1, kv), &stats);
+    }
+
+    /// Queued-prefix demotion on the cpu backend (decisions "6b: after the held-prefix ledger
+    /// fix", 1 B, and "6b: queued-prefix demotion — granularity and scope", 1 A, 2 A): a request
+    /// waiting in the admission queue behind its head holds its 6 attached blocks at GREEN, even when the
+    /// controller asks for more than L0 holds unreferenced. At YELLOW the reclaim's shortfall
+    /// makes it release them: they leave the referenced blocks and the next reclaim demotes them
+    /// to L2. Admitted once the running request ends, it attaches again through the planner (L2
+    /// or recompute) and yields the cold run's greedy tokens. Breaks if a queued prefix is
+    /// released at GREEN, never released at YELLOW, not demoted afterwards, or if the released
+    /// request never re-attaches (it would wait forever) or produces other tokens.
+    #[test]
+    fn yellow_releases_queued_prefixes_and_they_reattach() {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // YELLOW from 1 % KV utilisation: its reclaim target (1 % of 64 blocks) is below what
+        // the requests hold, so the reclaim always falls short.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.9), Some(0.95), Some(0.99)],
+        );
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(1, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let detached = "turbine_kv_queued_prefix_detached_blocks_total";
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(1..100).collect();
+        let (cold, _) = run_one(&tx, request(&prompt, 8));
+        // R holds the only running slot: paused behind a full channel, with its KV.
+        let other: Vec<u32> = std::iter::once(256).chain(150..189).collect();
+        let (mut slow, admitted) = submit_with(&tx, request(&other, 20), 4);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.paused != 1 {
+            assert!(Instant::now() < deadline, "R never paused");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The admission queue's head H (it keeps whatever it holds), then Q with the prompt's 6
+        // cached blocks attached.
+        let (mut head, admitted) = submit(&tx, request(&[256, 5, 6, 7], 4));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let (mut queued, admitted) = submit(&tx, request(&prompt, 8));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shared.docs().unwrap().scheduler.waiting != 2 {
+            assert!(Instant::now() < deadline, "H and Q are not both queued");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = held_blocks(&shared.docs().unwrap());
+        assert!(held >= 9, "R's 3 blocks and Q's 6: {held}");
+
+        // GREEN: a reclaim that falls short releases nothing.
+        reclaim.demote(0.01);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(metric(&reg, detached), 0.0, "nothing released at GREEN");
+        assert_eq!(held_blocks(&shared.docs().unwrap()), held);
+
+        // YELLOW: the controller's reclaim falls short, Q's blocks are released and demoted.
+        for _ in 0..3 {
+            tick(&ctl, 0.5);
+        }
+        assert_eq!(controller.state(), PressureState::Yellow);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, detached) < 6.0 || metric(&reg, demoted) < 6.0 {
+            assert!(
+                Instant::now() < deadline,
+                "Q's prefix was not released and demoted: {} released, {} demoted",
+                metric(&reg, detached),
+                metric(&reg, demoted)
+            );
+            tick(&ctl, 0.5);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(metric(&reg, detached), 6.0, "only Q's own blocks");
+        assert_eq!(
+            held_blocks(&shared.docs().unwrap()),
+            held - 6,
+            "the released blocks left the referenced ones"
+        );
+
+        // R and H end; Q is admitted, attaches again (from L2 or recomputed) and matches the
+        // cold run.
+        let events: Vec<_> = std::iter::from_fn(|| slow.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 20);
+        let events: Vec<_> = std::iter::from_fn(|| head.blocking_recv()).collect();
+        assert_eq!(token_count(&events), 4);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        loop {
+            match queued.try_recv() {
+                Ok(e) => events.push(e),
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "Q never ran: {events:?}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(!internal_error(&events), "{events:?}");
+        assert_eq!(generated(&events), cold, "Q yields the cold run's tokens");
+        drop(tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+    }
+
+    /// Reproduction hunt for the 2026-10-03 lab transient ("engine thread panicked: release of
+    /// unreferenced KV block BlockId(146)", a 1 GiB-slab ladder multi-turn run, fatal exit 3):
+    /// the release paths that run there, driven together on the cpu backend — multi-turn
+    /// sessions over one shared prefix, an admission queue whose attached prefixes release
+    /// under YELLOW and attach again (queued-prefix demotion, `reattach`), promotions and
+    /// copy-ahead into L2, the ladder's L2 rewrites, and streams dropped mid-turn (cancels).
+    /// Breaks if any of them releases a block whose reference is gone (the engine thread's pool
+    /// assertion ends the run and the join fails) or leaks one (L0 holds nothing at the end).
+    #[test]
+    fn multi_turn_release_paths_stress_without_an_unreferenced_release() {
+        // The ladder's TurboQuant rung needs head_dim 128.
+        let dir = TempDir::new("turbine-engine-loop");
+        let spec = write_tiny_llama_with(
+            dir.path(),
+            7,
+            &TinyOptions {
+                head_dim: 128,
+                ..TinyOptions::default()
+            },
+        );
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        kv.ladder.enabled = true;
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        // YELLOW from 1 % KV utilisation: the reclaim always falls short, so queued prefixes
+        // release and attach again around every admission, like the lab run.
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.01), Some(0.9), Some(0.95), Some(0.99)],
+        );
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(2, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine, tx, shared, ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+
+        const SEEDS: u64 = 12;
+        const SESSIONS: u64 = 6;
+        const TURNS: u64 = 6;
+        const PREFIX: u64 = 64;
+        let mut rng = 0x9E3779B97F4A7C15;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        for seed in 0..SEEDS {
+            for turn in 0..TURNS {
+                let mut batch: Vec<(u64, mpsc::Receiver<GenerationEvent>, Admitted)> = Vec::new();
+                for s in 0..SESSIONS {
+                    let mut prompt: Vec<u32> = (10..10 + PREFIX as u32).collect();
+                    let len = 14 + next(20);
+                    prompt.extend((0..len).map(|i| (80 + (i * 7 + s + turn * 5) % 150) as u32));
+                    let mut req = request(&prompt, 4 + next(4) as u32);
+                    req.session = Some(SessionHints {
+                        session_id: format!("stress-{seed}-{s}"),
+                        resume_within_secs: Some(3600),
+                        end: turn == TURNS - 1,
+                    });
+                    let (rx, admitted) = submit(&tx, req);
+                    // A dropped stream mid-run: its request is cancelled from the queue or
+                    // mid-generation, whichever holds it.
+                    if seed % 2 == 1 && turn == 3 && s == 1 {
+                        drop(rx);
+                        drop(admitted);
+                        continue;
+                    }
+                    batch.push((s, rx, admitted));
+                }
+                for _ in 0..3 {
+                    tick(&ctl, 0.5);
+                }
+                for (s, mut rx, admitted) in batch {
+                    assert_eq!(
+                        admitted.blocking_recv().unwrap(),
+                        Ok(()),
+                        "seed {seed} turn {turn} session {s}"
+                    );
+                    let events: Vec<_> = std::iter::from_fn(|| rx.blocking_recv()).collect();
+                    assert!(
+                        !internal_error(&events),
+                        "seed {seed} session {s} turn {turn}: {events:?}"
+                    );
+                }
+            }
+        }
+        drop(tx);
+        assert_eq!(
+            handle.join().unwrap(),
+            Ok(()),
+            "an engine panic is a release-path bug"
+        );
+        assert_eq!(
+            held_blocks(&shared.docs().unwrap()),
+            0,
+            "every block reference came back"
+        );
+    }
+
+    /// 6b Task 16 (stale planner state): an idle engine blocks for its next command, and a new
+    /// request attaches its prefix before the turn reads the controller's snapshot. The planner
+    /// must still see the controller's current state, not the one of the last busy turn. A
+    /// prompt's two blocks go to L2 (only there), a turn runs at RED (a `max_tokens: 0`
+    /// request), the engine goes quiet, the controller descends to GREEN, then the prompt comes
+    /// again: it retrieves both blocks from L2 (`cached_tokens` 32) and no plan is
+    /// `l0_pressure`. Breaks if the attach plans with the last busy turn's RED (the lab ladder
+    /// eval: the first item after GREEN recomputed its prefix with `l0_pressure`).
+    #[test]
+    fn an_idle_engine_plans_with_the_current_pressure_state() {
+        let (dir, spec, tokenizer) = tiny();
+        let mut kv = KvConfig::default();
+        kv.nvme.enabled = true;
+        kv.nvme.path = dir.path().join("kv");
+        kv.nvme.max_bytes = ByteSize(16 << 20);
+        kv.nvme.slab_bytes = ByteSize(1 << 20);
+        let mut config = ReliabilityConfig {
+            emergency_vram_reserve: ByteSize(0),
+            ..ReliabilityConfig::default()
+        };
+        config.pressure.thresholds.insert(
+            PressureSignal::KvUtilization,
+            [Some(0.5), Some(0.6), Some(0.7), Some(0.99)],
+        );
+        // One level down per all-clear tick.
+        config.pressure.deescalate_dwell = HumanDuration(Duration::ZERO);
+        let t = engine_full(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv,
+            |cfg, format, metrics| {
+                crate::kv_orchestrator::open_l2(
+                    cfg,
+                    format,
+                    &ModelIdentity::from_bytes(b"tiny config", b"tiny index"),
+                    Arc::new(SystemClock::new()),
+                    metrics,
+                )
+                .expect("L2 opens in the temp directory")
+            },
+            None,
+            config,
+        );
+        let reclaim = t.engine.kv.reclaimer();
+        let ctl = (Arc::clone(&t.pressure), Arc::clone(&t.clock));
+        let TestEngine {
+            engine,
+            tx,
+            reg,
+            controller,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+        let l0_pressure = r#"turbine_kv_plans_total{reason="l0_pressure"}"#;
+
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        let (cold, _) = run_one(&tx, request(&prompt, 8));
+        let (_, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(cached, 32, "the reuse evidence demotion needs");
+        // Both blocks leave L0 for L2.
+        reclaim.demote(0.0);
+        let _ = run_one(&tx, request(&[256, 1, 2], 2));
+        let demoted = r#"turbine_kv_demotions_total{from="l0",to="l2"}"#;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while metric(&reg, demoted) < 2.0 {
+            assert!(Instant::now() < deadline, "the blocks never reached L2");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // RED, and one engine turn at RED; then the engine is quiet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.state() != PressureState::Red {
+            assert!(
+                Instant::now() < deadline,
+                "never RED: {:?}",
+                controller.state()
+            );
+            tick(&ctl, 0.8);
+        }
+        let (zero, _) = run_one(&tx, request(&[256, 1, 2], 0));
+        assert!(zero.is_empty());
+        std::thread::sleep(Duration::from_millis(200));
+        // The controller descends to GREEN while nothing runs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while controller.state() != PressureState::Green {
+            assert!(
+                Instant::now() < deadline,
+                "never GREEN: {:?}",
+                controller.state()
+            );
+            tick(&ctl, 0.0);
+        }
+
+        let (warm, cached) = run_one(&tx, request(&prompt, 8));
+        assert_eq!(metric(&reg, l0_pressure), 0.0, "planned with a stale RED");
+        assert_eq!(cached, 32, "both blocks are retrieved from L2");
+        assert_eq!(warm, cold);
+        drop(tx);
+        handle.join().unwrap().unwrap();
+    }
+
+    /// P2 S-7 slow client, deterministic on a fake clock: a stream that stops reading pauses,
+    /// is cancelled with `slow_client` one `server.slow_client_timeout` later (its error event
+    /// held behind the full channel), and when the client still reads nothing for another
+    /// timeout the engine closes the stream. The client reading on afterwards sees what the
+    /// channel buffered, then the `slow_client` error, then the end of the stream — never the
+    /// bare close the API turns into `internal_error`. Breaks if closing a finished request
+    /// drops its terminal event (the tiny_server `slow_client_paused_then_cancelled` failure on
+    /// a loaded host) or if the cancellation is not accounted as `slow_client`.
+    #[test]
+    fn slow_client_closed_after_cancel_ends_with_slow_client() {
+        let (_dir, spec, tokenizer) = tiny();
+        let mut t = engine(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+        );
+        let clock = FakeClock::new(Duration::from_secs(100));
+        let timeout = Duration::from_secs(1);
+        t.engine.deadlines = Deadlines::new(
+            Arc::new(clock.clone()),
+            Timeouts {
+                request: Duration::from_secs(600),
+                slow_client: timeout,
+            },
+        );
+        let req = request(&[256, 1, 2], 40);
+        let id = req.id;
+        let (mut slow, admitted) = submit_with(&t.tx, req, 4);
+        let mut engine = t.engine;
+        let mut turns = 0;
+        while !engine
+            .requests
+            .get(&id)
+            .is_some_and(ActiveRequest::has_held)
+        {
+            assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+            turns += 1;
+            assert!(turns < 100, "the slow request never paused");
+        }
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+
+        // One timeout paused: cancelled, its error event held behind the full channel.
+        clock.advance(timeout);
+        assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+        assert!(
+            engine
+                .requests
+                .get(&id)
+                .is_some_and(|r| r.done && r.has_held())
+        );
+        // Another timeout unread: the engine lets the request go and closes the stream.
+        clock.advance(timeout);
+        assert!(matches!(engine.turn(), Ok(Turn::Continue)));
+        assert!(!engine.requests.contains_key(&id), "the stream is closed");
+
+        let events: Vec<_> = std::iter::from_fn(|| slow.try_recv().ok()).collect();
+        assert!(token_count(&events) > 0, "{events:?}");
+        assert!(
+            matches!(
+                events.last(),
+                Some(GenerationEvent::Error {
+                    code: ErrorCode::SlowClient,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        assert_eq!(slow.try_recv().err(), Some(TryRecvError::Disconnected));
+        let text = t.reg.render().unwrap();
+        for line in [
+            r#"turbine_requests_cancelled_total{reason="slow_client"} 1"#,
             r#"turbine_requests_total{endpoint="/v1/completions",outcome="cancelled"} 1"#,
         ] {
             assert!(text.contains(line), "missing {line:?} in\n{text}");

@@ -1,0 +1,12 @@
+{
+  "format": "awq_int4",
+  "checkpoint": "casperhansen/llama-3.2-3b-instruct-awq@272b3bde867b606760447deb9a4d2719fbdfd3ae",
+  "tasks": "tests/eval/gsm8k-200.jsonl",
+  "baseline": "vllm.json",
+  "baseline_engine": "vllm-rocm 0.23.0 (rocm/vllm rocm7.14.1_rdna, gfx1201), same checkpoint",
+  "max_drop": 0.01,
+  "rule": "spec S-17 (user decision 2026-09-28, Q9): vLLM-ROCm loads the checkpoint on gfx1201, so the gate is the reference engine on the same checkpoint at quality.max_accuracy_drop; the BF16 model (../llama-3.2-3b-instruct/turbine-bf16.json) at 0.04 is recorded alongside",
+  "bf16_baseline": "../llama-3.2-3b-instruct/turbine-bf16.json",
+  "bf16_max_drop": 0.04,
+  "command": "turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct-awq/vllm.json --candidate tests/eval/llama-3.2-3b-instruct-awq/turbine.json --max-drop 0.01"
+}

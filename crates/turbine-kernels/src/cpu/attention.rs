@@ -3,6 +3,8 @@
 use super::{
     CpuReference, expect_rank, expect_shape, invalid, is_float, load, math, paged, round_to, store,
 };
+use turbine_core::types::DType;
+
 use crate::KernelError;
 use crate::ops::{AttentionConfig, AttentionContext, AttentionKernel, PagedAttentionContext};
 
@@ -11,7 +13,9 @@ impl AttentionKernel for CpuReference {
         cfg.num_kv_heads > 0
             && cfg.num_q_heads.is_multiple_of(cfg.num_kv_heads)
             && cfg.head_dim > 0
-            && is_float(cfg.dtype)
+            && (is_float(cfg.dtype)
+                || cfg.kind.is_paged()
+                    && (cfg.dtype == DType::F8E4M3 || cfg.dtype.tq_record_bytes().is_some()))
             && if cfg.kind.is_paged() {
                 cfg.block_tokens.is_some_and(|b| b > 0)
             } else {
@@ -20,7 +24,11 @@ impl AttentionKernel for CpuReference {
     }
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
-        if cfg.kind.is_paged() {
+        if cfg.dtype.tq_record_bytes().is_some() {
+            "cpu_attention_paged_tqkv_f64acc".into()
+        } else if cfg.dtype == DType::F8E4M3 {
+            "cpu_attention_paged_fp8kv_f32acc".into()
+        } else if cfg.kind.is_paged() {
             "cpu_attention_paged_f32acc".into()
         } else {
             "cpu_attention_f32acc".into()

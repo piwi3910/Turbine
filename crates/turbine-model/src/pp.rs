@@ -472,7 +472,7 @@ mod tests {
             );
             // Told the whole model's slots, the loader skips stage 0's tensors quietly.
             let part = WeightLoader::load_part(
-                cfg.weight_format.0,
+                cfg.weight_format.get(),
                 &index,
                 &slots[1],
                 &one,

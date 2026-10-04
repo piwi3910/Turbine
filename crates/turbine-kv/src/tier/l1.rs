@@ -6,6 +6,12 @@
 //! [`L1PinnedTier::reserve`]; the slot is invisible to `contains`/`get` until
 //! [`L1PinnedTier::commit`], and [`L1PinnedTier::abort_reservation`] frees it after a failed copy.
 //! A slot's bytes are never read or written through this tier while a copy on it is outstanding.
+//!
+//! Slot sizes (P6b S-1): a block is stored in the format of its tier's codec (`kv.cpu.format`)
+//! or, for the lossless tail, at the L0 format, so each slab holds slots of one size — the
+//! size of the first block that needed it — and a block goes to a slab of its own size.
+//! `L1Config.block_bytes` is the L0-format size, the largest a slot can be; the copy-stream
+//! protocol reserves slots of that size.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -27,8 +33,9 @@ pub struct L1Config {
     pub enabled: bool,
     /// `kv.cpu.max_bytes`.
     pub max_bytes: u64,
-    /// Bytes per pinned slab (1 GiB in production).
+    /// Bytes per pinned slab (`kv.cpu.slab_bytes`, 128 MiB default).
     pub slab_bytes: u64,
+    /// Bytes of one block at the L0 format: the largest slot and the capacity unit.
     pub block_bytes: u64,
     pub memory_kind: MemoryKind,
 }
@@ -43,6 +50,8 @@ enum SlotState {
 
 struct Slab {
     buf: PinnedBuffer,
+    /// Bytes of each slot of this slab.
+    slot_bytes: usize,
     slots: Vec<SlotState>,
     occupied: usize,
 }
@@ -58,6 +67,11 @@ struct L1State {
     health: TierHealth,
     latency: Duration,
     bandwidth: f64,
+    /// Slot bytes of the stored and reserved blocks.
+    used: u64,
+    /// [`KvTier::room_epoch`]: bumped when a slab empties or is released, and when host
+    /// pressure drops below RED (slabs may be allocated again).
+    room_epoch: u64,
 }
 
 pub struct L1PinnedTier {
@@ -103,6 +117,8 @@ impl L1PinnedTier {
                 health: TierHealth::new(None),
                 latency: Duration::from_micros(20),
                 bandwidth: 8e9,
+                used: 0,
+                room_epoch: 0,
             }),
         }
     }
@@ -116,6 +132,9 @@ impl L1PinnedTier {
     /// is released (and further slabs as they empty).
     pub fn set_host_pressure(&self, p: PressureState) {
         let mut s = self.lock();
+        if s.host_pressure >= PressureState::Red && p < PressureState::Red {
+            s.room_epoch += 1;
+        }
         s.host_pressure = p;
         if p >= PressureState::Red {
             let mut released = 0usize;
@@ -126,6 +145,7 @@ impl L1PinnedTier {
                 }
             }
             if released > 0 {
+                s.room_epoch += 1;
                 tracing::info!(
                     event = "kv_l1_slab_released",
                     tier = "l1",
@@ -151,6 +171,15 @@ impl L1PinnedTier {
         self.address(&s, loc)
     }
 
+    /// [`locate`](Self::locate) plus the slot's bytes: the size of the block as stored (its
+    /// codec's, or the L0 format's), for a copy-stream read of an encoded block.
+    pub fn locate_len(&self, key: &KvKey) -> Option<(u64, usize, usize)> {
+        let s = self.lock();
+        let loc = *s.index.get(key)?;
+        let (id, off) = self.address(&s, loc)?;
+        Some((id, off, s.slabs[loc.0].as_ref()?.slot_bytes))
+    }
+
     /// Takes a free slot for `key`, invisible until [`commit`](Self::commit); returns the buffer id
     /// and offset the copy stream writes to.
     pub fn reserve(&self, key: KvKey) -> Result<(u64, usize), TierError> {
@@ -164,7 +193,7 @@ impl L1PinnedTier {
         if let Some(&loc) = s.pending.get(&key) {
             return self.address(&s, loc).ok_or(TierError::Missing);
         }
-        let loc = self.take_slot(&mut s, SlotState::Reserved)?;
+        let loc = self.take_slot(&mut s, SlotState::Reserved, self.cfg.block_bytes as usize)?;
         s.pending.insert(key, loc);
         self.address(&s, loc).ok_or(TierError::Missing)
     }
@@ -211,8 +240,8 @@ impl L1PinnedTier {
     }
 
     fn address(&self, s: &L1State, (slab, slot): Loc) -> Option<(u64, usize)> {
-        let buf = &s.slabs.get(slab)?.as_ref()?.buf;
-        Some((buf.id(), slot * self.cfg.block_bytes as usize))
+        let slab = s.slabs.get(slab)?.as_ref()?;
+        Some((slab.buf.id(), slot * slab.slot_bytes))
     }
 
     fn slot_mut(s: &mut L1State, (slab, slot): Loc, state: SlotState) {
@@ -226,23 +255,52 @@ impl L1PinnedTier {
         let slab = s.slabs[slab_idx].as_mut().expect("an indexed slab is live");
         slab.slots[slot] = SlotState::Free;
         slab.occupied -= 1;
-        if release && slab.occupied == 0 {
+        let freed = slab.slot_bytes as u64;
+        let empty = slab.occupied == 0;
+        s.used -= freed;
+        if empty {
+            s.room_epoch += 1;
+        }
+        if release && empty {
             s.slabs[slab_idx] = None;
         }
     }
 
-    /// A free slot in a live slab, else a slot in a newly allocated slab when the size limit and
-    /// host pressure allow one.
-    fn take_slot(&self, s: &mut L1State, state: SlotState) -> Result<Loc, TierError> {
+    /// A free `slot_bytes` slot in a live slab of that slot size, else a slot in a newly
+    /// allocated slab when the size limit and host pressure allow one.
+    fn take_slot(
+        &self,
+        s: &mut L1State,
+        state: SlotState,
+        slot_bytes: usize,
+    ) -> Result<Loc, TierError> {
         let free = s.slabs.iter().enumerate().find_map(|(i, slab)| {
             let slab = slab.as_ref()?;
+            if slab.slot_bytes != slot_bytes {
+                return None;
+            }
             let j = slab.slots.iter().position(|x| *x == SlotState::Free)?;
             Some((i, j))
         });
-        let loc = match free {
+        // At the size limit, an empty slab of another slot size takes this size (P6b S-6: the
+        // ladder rewrites copies into other formats, so a tier's slot sizes change over time;
+        // L2 reformats an empty slab the same way).
+        let live = s.slabs.iter().filter(|x| x.is_some()).count();
+        let empty = (free.is_none() && live >= self.max_slabs)
+            .then(|| {
+                s.slabs
+                    .iter()
+                    .position(|x| x.as_ref().is_some_and(|x| x.occupied == 0))
+            })
+            .flatten();
+        if let Some(i) = empty {
+            let slab = s.slabs[i].as_mut().expect("an empty live slab");
+            slab.slot_bytes = slot_bytes;
+            slab.slots = vec![SlotState::Free; self.cfg.slab_bytes as usize / slot_bytes];
+        }
+        let loc = match free.or(empty.map(|i| (i, 0))) {
             Some(loc) => loc,
             None => {
-                let live = s.slabs.iter().filter(|x| x.is_some()).count();
                 if live >= self.max_slabs || s.host_pressure >= PressureState::Red {
                     return Err(TierError::Full);
                 }
@@ -262,7 +320,8 @@ impl L1PinnedTier {
                 };
                 let slab = Slab {
                     buf,
-                    slots: vec![SlotState::Free; self.slots_per_slab],
+                    slot_bytes,
+                    slots: vec![SlotState::Free; self.cfg.slab_bytes as usize / slot_bytes],
                     occupied: 0,
                 };
                 let idx = match s.slabs.iter().position(Option::is_none) {
@@ -281,6 +340,7 @@ impl L1PinnedTier {
         let slab = s.slabs[loc.0].as_mut().expect("the chosen slab is live");
         slab.slots[loc.1] = state;
         slab.occupied += 1;
+        s.used += slot_bytes as u64;
         Ok(loc)
     }
 
@@ -290,12 +350,13 @@ impl L1PinnedTier {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A block fits a slot when it is not empty and no larger than an L0-format block.
     fn check_len(&self, len: usize) -> Result<(), TierError> {
-        if len as u64 == self.cfg.block_bytes {
+        if len > 0 && len as u64 <= self.cfg.block_bytes {
             Ok(())
         } else {
             Err(TierError::Io(format!(
-                "block is {len} bytes, L1 slot {}",
+                "block is {len} bytes, L1 slots hold 1 to {} bytes",
                 self.cfg.block_bytes
             )))
         }
@@ -320,10 +381,9 @@ impl KvTier for L1PinnedTier {
         }
     }
 
-    /// Stored and reserved blocks.
+    /// Slot bytes of the stored and reserved blocks.
     fn used_bytes(&self) -> u64 {
-        let s = self.lock();
-        (s.index.len() + s.pending.len()) as u64 * self.cfg.block_bytes
+        self.lock().used
     }
 
     /// The worse of utilisation pressure and Phase 3 host-memory pressure.
@@ -354,9 +414,21 @@ impl KvTier for L1PinnedTier {
         if s.health.is_degraded() {
             return Err(TierError::Degraded);
         }
-        let loc = match s.index.get(&key) {
-            Some(&loc) => loc,
-            None => self.take_slot(&mut s, SlotState::Stored)?,
+        let same_size = |s: &L1State, loc: Loc| {
+            s.slabs[loc.0]
+                .as_ref()
+                .is_some_and(|x| x.slot_bytes == bytes.len())
+        };
+        let loc = match s.index.get(&key).copied() {
+            Some(loc) if same_size(&s, loc) => loc,
+            old => {
+                // A replacement in another format moves to a slot of its own size.
+                let loc = self.take_slot(&mut s, SlotState::Stored, bytes.len())?;
+                if let Some(old) = old {
+                    Self::release_slot(&mut s, old);
+                }
+                loc
+            }
         };
         let off = loc.1 * bytes.len();
         let slab = s.slabs[loc.0].as_ref().expect("the chosen slab is live");
@@ -373,9 +445,15 @@ impl KvTier for L1PinnedTier {
             return Err(TierError::Degraded);
         }
         let &(slab, slot) = s.index.get(key).ok_or(TierError::Missing)?;
-        self.check_len(out.len())?;
-        let off = slot * out.len();
         let slab = s.slabs[slab].as_ref().expect("an indexed slab is live");
+        if out.len() != slab.slot_bytes {
+            return Err(TierError::Io(format!(
+                "block is {} bytes, buffer {}",
+                slab.slot_bytes,
+                out.len()
+            )));
+        }
+        let off = slot * out.len();
         slab.buf
             .with_bytes(|b| out.copy_from_slice(&b[off..off + out.len()]));
         Ok(())
@@ -390,5 +468,38 @@ impl KvTier for L1PinnedTier {
 
     fn degraded(&self) -> bool {
         self.lock().health.is_degraded()
+    }
+
+    fn room_epoch(&self) -> u64 {
+        self.lock().room_epoch
+    }
+
+    /// Slots are sized, not labelled: `format` plays no part. Counts what
+    /// [`take_slot`](Self::take_slot) would find: a free slot of the size, a new slab below the
+    /// size limit (not under host RED), or at the limit an empty slab of another size.
+    fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
+        let _ = format;
+        let len = bytes as usize;
+        if !self.enabled || len == 0 || bytes > self.cfg.block_bytes {
+            return 0;
+        }
+        let s = self.lock();
+        if s.health.is_degraded() {
+            return 0;
+        }
+        let per_slab = (self.cfg.slab_bytes / bytes) as usize;
+        let live = s.slabs.iter().flatten().count();
+        let mut n = 0;
+        for slab in s.slabs.iter().flatten() {
+            if slab.slot_bytes == len {
+                n += slab.slots.iter().filter(|x| **x == SlotState::Free).count();
+            } else if slab.occupied == 0 && live >= self.max_slabs {
+                n += per_slab;
+            }
+        }
+        if live < self.max_slabs && s.host_pressure < PressureState::Red {
+            n += (self.max_slabs - live) * per_slab;
+        }
+        n as u64
     }
 }

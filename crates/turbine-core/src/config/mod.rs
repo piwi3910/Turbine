@@ -6,7 +6,9 @@ mod duration;
 mod kv;
 mod overrides;
 mod parallel;
+mod quality;
 mod reliability;
+mod speculative;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,10 +18,7 @@ use serde_norway::{Mapping, Value};
 
 pub use byte_size::ByteSize;
 pub use duration::HumanDuration;
-pub use kv::{
-    HostFacts, KV_IO_ALIGN, KvConfig, KvCpuConfig, KvGpuConfig, KvNvmeConfig, KvPolicyWeights,
-    KvPrefetchConfig, KvSessionConfig, KvTransferConfig,
-};
+pub use kv::*;
 pub use reliability::*;
 
 use crate::registry::valid_name;
@@ -29,6 +28,8 @@ pub use parallel::{
     ByteSizeOrAuto, CollectiveTimeouts, DeviceSelection, ExpertConfig, ExpertPlacementChoice,
     ParallelConfig, PipelineConfig, RankMode, RanksConfig, SizeOrAuto, TopologyConfig,
 };
+pub use quality::QualityConfig;
+pub use speculative::{SpeculativeConfig, SpeculativeMethod};
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
 #[derive(Debug, thiserror::Error)]
@@ -68,7 +69,7 @@ fn invalid(key: &str, reason: impl Into<String>) -> ConfigError {
 /// The name of a module in a registry (Phase 2m S-1): `^[a-z0-9_]{1,64}$`. The configuration
 /// only checks the form; whether a module of that name exists is checked against the
 /// registries by [`Config::validate_modules`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ModuleName(String);
 
@@ -133,6 +134,9 @@ pub struct ModuleNames<'a> {
     pub rank_transports: &'a [&'a str],
     /// `parallel.router` (Phase 5).
     pub router_policies: &'a [&'a str],
+    /// `kv.cpu.format`, `kv.nvme.format` and `kv.ladder.max_format` (Phase 6b): the
+    /// `kv_format` registry.
+    pub kv_formats: &'a [&'a str],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -150,6 +154,10 @@ pub struct Config {
     pub structured_output: StructuredOutputConfig,
     /// Multi-GPU plan (Phase 5).
     pub parallel: ParallelConfig,
+    /// Quality gates for lossy formats (umbrella phase-6-8-expansion, Phase 6a).
+    pub quality: QualityConfig,
+    /// Speculative decoding (Phase 8; the umbrella owns `method`).
+    pub speculative: SpeculativeConfig,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -195,6 +203,61 @@ pub struct ModelConfig {
     /// `llama3_json` for `LlamaForCausalLM` whose template renders `tools`, else none (resolved
     /// at startup); `none` turns tool calling off.
     pub tool_call_parser: Option<ModuleName>,
+    /// Replaces `config.json`'s `rope_scaling` wholesale (P6a S-15, user decision 2026-09-28,
+    /// Q19): a mapping with Hugging Face's field names (`rope_type` or `type`, `factor`,
+    /// `original_max_position_embeddings`, …). Only `default`, `llama3` and `yarn` pass
+    /// [`Config::validate`] (dynamic scaling would change cached keys mid-sequence); the fields
+    /// are checked when the model loads.
+    pub rope_scaling: Option<serde_json::Value>,
+}
+
+/// The RoPE scaling types `model.rope_scaling` may name.
+const ROPE_SCALING_TYPES: [&str; 3] = ["default", "llama3", "yarn"];
+
+impl ModelConfig {
+    /// `model.rope_scaling`: a mapping naming a static scaling type, without `dynamic: true`.
+    fn validate_rope_scaling(&self) -> Result<(), ConfigError> {
+        const KEY: &str = "model.rope_scaling";
+        let Some(value) = self.rope_scaling.as_ref().filter(|v| !v.is_null()) else {
+            return Ok(());
+        };
+        let Some(map) = value.as_object() else {
+            return Err(invalid(
+                KEY,
+                format!("must be a mapping with Hugging Face rope_scaling fields, got {value}"),
+            ));
+        };
+        let rope_type = map
+            .get("rope_type")
+            .or_else(|| map.get("type"))
+            .and_then(|t| t.as_str());
+        match rope_type {
+            Some(t) if ROPE_SCALING_TYPES.contains(&t) => {}
+            Some(t) => {
+                return Err(invalid(
+                    KEY,
+                    format!(
+                        "rope_type {t} is not supported (supported: {}; dynamic scaling would \
+                         change cached keys mid-sequence)",
+                        ROPE_SCALING_TYPES.join(", ")
+                    ),
+                ));
+            }
+            None => {
+                return Err(invalid(
+                    KEY,
+                    format!("needs rope_type (one of {})", ROPE_SCALING_TYPES.join(", ")),
+                ));
+            }
+        }
+        if map.get("dynamic").and_then(|d| d.as_bool()) == Some(true) {
+            return Err(invalid(
+                KEY,
+                "dynamic: true is not supported (static scaling only)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -447,6 +510,7 @@ impl Config {
         if self.model.max_seq_len == Some(0) {
             return Err(invalid("model.max_seq_len", "must be at least 1"));
         }
+        self.model.validate_rope_scaling()?;
         if self.scheduler.queue_timeout.is_some() {
             return Err(invalid(
                 "scheduler.queue_timeout",
@@ -521,6 +585,27 @@ impl Config {
             None,
         )?;
         check("kv.policy", &self.kv.policy, known.eviction_policies, None)?;
+        check("kv.cpu.format", &self.kv.cpu.format, known.kv_formats, None)?;
+        check(
+            "kv.nvme.format",
+            &self.kv.nvme.format,
+            known.kv_formats,
+            None,
+        )?;
+        check(
+            "kv.ladder.max_format",
+            &self.kv.ladder.max_format,
+            known.kv_formats,
+            None,
+        )?;
+        for name in self.kv.lossy_penalty.iter().flat_map(|m| m.keys()) {
+            check(
+                &format!("kv.lossy_penalty.{name}"),
+                name,
+                known.kv_formats,
+                None,
+            )?;
+        }
         check(
             "parallel.collective_backend",
             &self.parallel.collective_backend,
@@ -623,6 +708,7 @@ impl Config {
                 format!("must be between 1KiB and 1MiB, got {msb}"),
             ));
         }
+        self.quality.validate()?;
         Ok(())
     }
 }

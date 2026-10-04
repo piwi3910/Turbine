@@ -101,6 +101,7 @@ fn prefill(
         num_blocks: POOL_BLOCKS,
         layer_stride_bytes: layout.block_bytes() / u64::from(layout.num_layers)
             * u64::from(POOL_BLOCKS),
+        classes: None,
     };
     let tokens: Vec<u32> = (0..n).map(|i| (i * 37 + 11) % vocab).collect();
     let positions: Vec<u32> = (0..n).collect();
@@ -111,6 +112,7 @@ fn prefill(
         q_len: n,
         kv_len: n,
         block_table: &table,
+        block_formats: &[],
         reduce: None,
     }];
     let logits = exec
@@ -214,6 +216,7 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
                                 q_len: n,
                                 kv_len: n,
                                 block_table: &[],
+                block_formats: &[],
                                 reduce: None,
                             }],
                             n as usize,
