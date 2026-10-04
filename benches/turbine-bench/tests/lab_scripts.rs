@@ -2406,8 +2406,11 @@ mod track_gate_script {
         "amd     gfx1201  LlamaForCausalLM   fp8            bf16      none        supported    -\n";
     const NVIDIA_QUANT: &str =
         "nvidia  sm_121   LlamaForCausalLM   fp8            bf16      none        supported    -\n";
+    // 6b's accepted end state (user decisions 2026-10-02 and 2026-10-04 A): the amd L0 `tq4`
+    // rows stay `experimental`; `tq2` is an `experimental` lower-tier rung and L0 `tq2` is
+    // refused, so no amd tq2 matrix row exists at all.
     const TQ: &str =
-        "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        supported    -\n";
+        "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        experimental -\n";
     const FAMILY: &str =
         "amd     gfx1201  Qwen3ForCausalLM   bf16           bf16      none        supported    -\n";
 
@@ -2537,14 +2540,42 @@ mod track_gate_script {
         assert!(out.contains("ladder"), "{out}");
 
         // 7: refused until 6b closed; every S-8 family must be in scope, gpt-oss included.
+        // 6b's closed marker is its accepted end state (user decisions 2026-10-02 and
+        // 2026-10-04 A): the amd L0 tq4 rows `experimental` (the ladder's L0 rung; `tq2` is a
+        // lower-tier rung and L0 tq2 is refused, so no amd tq2 row exists). A refused tq4 row
+        // (pre-6b) does not close it; a later flip to `supported` still does.
         g.spec("phase-7-model-families", SPEC_7);
+        let tq_refused = g.matrix(
+            "6b-refused",
+            &[
+                BASELINE,
+                QUANT,
+                "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        unsupported  kv_tq2_l0_refused: TurboQuant KV is not validated yet (track phase-6b-kv-compression)\n",
+            ],
+        );
+        let tq_supported = g.matrix(
+            "6b-supported",
+            &[
+                BASELINE,
+                QUANT,
+                "amd     gfx1201  LlamaForCausalLM   bf16           tq4       none        supported    -\n",
+            ],
+        );
         let (code, out) = g.run("phase-7-model-families", &closed_6a);
         assert_eq!(code, Some(1), "{out}");
         assert!(
             out.contains("phase-6b-kv-compression has not closed"),
             "{out}"
         );
+        let (code, out) = g.run("phase-7-model-families", &tq_refused);
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("phase-6b-kv-compression has not closed")
+                && out.contains("tq4 rows experimental"),
+            "{out}"
+        );
         assert_eq!(g.run("phase-7-model-families", &closed_6b).0, Some(0));
+        assert_eq!(g.run("phase-7-model-families", &tq_supported).0, Some(0));
         g.spec(
             "phase-7-model-families",
             &SPEC_7.replace("- [S-2] gpt-oss-20b.\n", ""),

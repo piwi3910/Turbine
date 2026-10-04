@@ -41,10 +41,15 @@ if [ -z "$matrix_file" ]; then
 	cargo run -q -p turbine-server -- --support-matrix --output text >"$matrix_file"
 fi
 
-# supported_rows <kind>: amd rows with status `supported` ($1..$7 = vendor arch architecture
-# weight kv speculative status) that carry the feature of a closed track.
-supported_rows() {
-	awk -v kind="$1" 'NR > 1 && $1 == "amd" && $7 == "supported" {
+# closed_rows <kind>: amd rows ($1..$7 = vendor arch architecture weight kv speculative
+# status) that carry the feature of a closed track. `quantized` and `family` need a
+# `supported` row. `kv_compression` accepts 6b's end state (user decisions 2026-10-02 and
+# 2026-10-04 A): the amd L0 `tq4` rows stay `experimental` (the ladder's L0 rung), `tq2` is
+# an `experimental` lower-tier rung (`TIER_FORMAT_REFUSALS`, not a matrix row) and L0 `tq2`
+# is refused — so any amd tq4/tq2 row that is `supported` or `experimental` marks 6b closed,
+# and phase-7's own spec owns flipping the L0 rows to `supported`.
+closed_rows() {
+	awk -v kind="$1" 'NR > 1 && $1 == "amd" && ($7 == "supported" || (kind == "kv_compression" && $7 == "experimental")) {
     if (kind == "quantized" && ($4 != "bf16" || $5 == "fp8_e4m3")) n++
     if (kind == "kv_compression" && ($5 == "tq4" || $5 == "tq2")) n++
     if (kind == "family" && $3 != "LlamaForCausalLM" && $3 != "OlmoeForCausalLM") n++
@@ -53,15 +58,15 @@ supported_rows() {
 
 case "$track" in
 phase-6b-kv-compression)
-	[ "$(supported_rows quantized)" -gt 0 ] ||
+	[ "$(closed_rows quantized)" -gt 0 ] ||
 		fail "phase-6a-quantization has not closed: no supported amd row with a quantized weight format or fp8_e4m3 KV"
 	;;
 phase-7-model-families)
-	[ "$(supported_rows kv_compression)" -gt 0 ] ||
-		fail "phase-6b-kv-compression has not closed: no supported amd row with tq4 or tq2 KV"
+	[ "$(closed_rows kv_compression)" -gt 0 ] ||
+		fail "phase-6b-kv-compression has not closed: no amd row with tq4 or tq2 KV in supported or experimental state (6b's accepted end state: the L0 tq4 rows experimental, tq2 an experimental lower-tier rung, L0 tq2 refused; phase-7's spec owns any flip to supported)"
 	;;
 phase-8-speculative-decoding)
-	[ "$(supported_rows family)" -gt 0 ] ||
+	[ "$(closed_rows family)" -gt 0 ] ||
 		fail "phase-7-model-families has not closed: no supported amd row for a Phase 7 family"
 	;;
 esac
