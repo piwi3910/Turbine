@@ -3141,3 +3141,18 @@ startup refusal until this is solved.
 - B) A separate side pool for window blocks
 - C) fp8-rung window: window blocks held at fp8 instead of BF16 (same page size as tq4 base? — no; fp8 pages are half
   of BF16, so the same addressing problem, smaller)
+
+## 6b: stale lossless-tail tags and the tq4 lab bound (lead decisions, test policy, 2026-10-03)
+
+From `p6b-tq4enc` (merged 2c69b14; lab-verified). The `lossy_tier_reuse{,_tq4}` failures were stale lossless-tail
+blocks: every finished sequence permanently tags its last full block, which demotes raw at the L0 format (S-2, Q13),
+and decision 028f465 (tail scores like its history) makes those 3.56×-sized stale tails demote first. tq4 encoding is
+byte-exact; the lower-tier `supported` evidence stands.
+
+1. Stale tail tags expire with the sequence's latest finished block (the tag's purpose — keeping the newest demoted
+   block exact — is served once the sequence can no longer grow); the unbounded tail set, one raw L1 slot per finished
+   sequence, and the ladder's permanent L0-sweep skip on those blocks go away. Builder recommendation, accepted.
+2. The tq4 arm's accuracy head bound: golden's likely/tail split (likely 0.25 for logprob > −2, tail unbounded above
+   the −2 floor) replaces the flat 0.25, matching the `turbine-golden compare` rule; t9's flat bound assumed an exact
+   tail block. Builder recommendation, accepted. Test-policy detail, not a user decision (as in "Golden tolerance floor
+   for quantized checkpoints", 2026-09-29).

@@ -7247,11 +7247,7 @@ fn paged_mixed_classed_matches_cpu() {
         class_page > base_page,
         "the window's class page is the bigger one"
     );
-    let (base_blocks, slab_base, slab_stride) = (
-        8u32,
-        class_page.div_ceil(base_page) as u32,
-        1u32,
-    );
+    let (base_blocks, slab_base, slab_stride) = (8u32, class_page.div_ceil(base_page) as u32, 1u32);
     let num_blocks = base_blocks + 2 * slab_stride;
     let region = base_blocks as usize * base_page;
     let mut codes = vec![KV_FMT_TQ4; num_blocks as usize];
