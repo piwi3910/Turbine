@@ -1567,14 +1567,20 @@ impl KvHierarchy {
             }
             TransferPurpose::Compress if from == TierId::L0 => {
                 self.compressing.remove(&req.key);
+                let src = BlockId(req.src_slot as u32);
                 let dst = BlockId(req.dst_slot as u32);
-                if self
-                    .dir
-                    .get(&req.key)
-                    .and_then(|b| b.location(TierId::L0))
-                    .is_none()
-                {
-                    // The block left L0 while it was rewritten: the page is free again.
+                let current = self.dir.get(&req.key).and_then(|b| b.location(TierId::L0));
+                if current.map(|l| l.slot) != Some(req.src_slot) {
+                    // The block left L0 while it was rewritten — or a recompute published a new
+                    // L0 copy in its place: the stale rewrite's page goes back, and the source
+                    // page belongs to whoever holds it now.
+                    pool.release(&[dst]);
+                    return;
+                }
+                if pool.refcount(src) > 0 {
+                    // A request attached the copy while the rewrite ran: it keeps serving the
+                    // old page, so the rewrite cannot take over — the destination goes back and
+                    // the old location and its real format stay filed.
                     pool.release(&[dst]);
                     return;
                 }
@@ -1591,12 +1597,11 @@ impl KvHierarchy {
                         format: req.codec.to,
                     },
                 );
-                let src = BlockId(req.src_slot as u32);
-                if pool.is_keyed(src) {
-                    pool.evict_cached(src);
-                } else {
-                    pool.release(&[src]);
-                }
+                // The source page is unreferenced (checked above) and keyed: the rewrite's
+                // copy replaces it. Its key mapping goes with the page — a stale entry would
+                // drop the new copy's location when the pool hands the page out again.
+                pool.evict_cached(src);
+                self.l0_keys.remove(&src);
                 self.metrics.eviction(TierId::L0, EvictReason::Compressed);
             }
             TransferPurpose::Compress => {
@@ -1665,12 +1670,18 @@ impl KvHierarchy {
                     pool.release(&[block]);
                     return;
                 }
-                if let Some(p) = self.pending.get_mut(&owner) {
-                    p.promotions.retain(|b| *b != block);
-                    if p.promotions.is_empty() {
-                        let p = self.pending.remove(&owner).expect("present above");
-                        self.ready.push((owner, p.attach));
+                match self.pending.get_mut(&owner) {
+                    Some(p) => {
+                        p.promotions.retain(|b| *b != block);
+                        if p.promotions.is_empty() {
+                            let p = self.pending.remove(&owner).expect("present above");
+                            self.ready.push((owner, p.attach));
+                        }
                     }
+                    // The pending entry was resolved by a sibling's failed copy (its attach was
+                    // truncated and its blocks not this one): this completion holds the block's
+                    // last reference, so it goes back to the pool.
+                    None => pool.release(&[block]),
                 }
             }
         }
@@ -4827,5 +4838,189 @@ pub(crate) mod tests {
         );
         r.pool.release(&ready[0].1.blocks);
         r.h.request_done(&mut r.pool, id, false);
+    }
+
+    /// A promotion copy fails while its siblings are still in flight: the attach is truncated
+    /// (TierDegraded) and the pending entry is resolved, so a sibling whose copy lands after
+    /// the failure has no pending entry (and its owner is not cancelled — `cancel_owner` only
+    /// runs for cancelled requests). Breaks if that completion keeps its freshly allocated
+    /// target block referenced by nobody: the page leaks out of the pool's reusable supply.
+    #[test]
+    fn a_promotion_completing_after_a_failed_sibling_releases_its_block() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(16, Some(l1.clone()), None, clock);
+        let base: Vec<u32> = (0..66).collect();
+        run(&mut r, &base);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        settle(&mut r);
+        assert_eq!(l1.len(), 4, "the 4 blocks sit in L1");
+        assert_eq!(r.pool.used_blocks(), 0, "L0 holds nothing");
+
+        let id = RequestId::new_v4();
+        assert_eq!(attach(&mut r, id, &base), AttachOutcome::Promoting);
+        // The first completion fails; the other three land after the failure resolved the
+        // pending entry.
+        r.backend.fail_next(1);
+        r.clock.advance(Duration::from_millis(10));
+        assert!(
+            r.h.poll(&mut r.pool, &mut r.backend).is_empty(),
+            "copies start"
+        );
+        r.clock.advance(Duration::from_millis(10));
+        let ready = r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(ready.len(), 1, "the failure resolves the attach");
+        assert!(
+            ready[0].1.blocks.is_empty(),
+            "the attach is truncated at the failed block"
+        );
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(
+            r.pool.referenced_blocks(),
+            0,
+            "the failed and the siblings' target pages went back: no orphan reference"
+        );
+        r.h.request_done(&mut r.pool, id, true);
+    }
+    /// An L0 rewrite (S-7: the recent window's out-of-window conversions; the L0 ladder step)
+    /// whose block's copy gains a holder while the rewrite runs: the completion must not take
+    /// over — the rewritten page goes back and the old copy keeps serving under its own
+    /// format. The old code filed the new page and silently dropped the referenced source's
+    /// location, stranding its page where the directory can never free it. Fails if a request
+    /// attaching afterwards is served the rewritten page instead of the one it can share.
+    #[test]
+    fn an_l0_rewrite_over_an_attached_copy_keeps_the_old_page_serving() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let fmt = fmt16();
+        let bb = fmt.layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(8, Some(l1.clone()), None, clock);
+        // A tq4 page class, as the window/L0-ladder pools have (the base format stays the
+        // pool's own): the rewrites' destination pages.
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 24);
+        r.pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: fmt.layout,
+                num_blocks: 8,
+            },
+            mem,
+        )
+        .expect("the pool fits the host memory")
+        .with_page_classes(
+            &[crate::pool::PageClass {
+                format: "tq4",
+                page_bytes: bb / 2,
+            }],
+            1,
+        )
+        .expect("the class fits");
+        let prompt: Vec<u32> = (0..34).collect();
+        run(&mut r, &prompt);
+        let keys = {
+            let hasher = Blake3Hasher(r.h.namespaces.get(""));
+            prefix_keys(&hasher, &prompt, fmt.layout.block_tokens)
+        };
+        // The rewrite of the second block's copy is in flight.
+        assert!(r.h.submit_compress(
+            &mut r.pool,
+            keys[1],
+            TierId::L0,
+            "tq4",
+            LadderReason::RecentWindow
+        ));
+        let src = BlockId(1);
+        assert!(r.pool.is_keyed(src), "the copy sits cached on its page");
+        // A request attaches the block while the rewrite runs.
+        r.pool.incref(src);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        // The attach lets go; the pool is settled and the next request attaches.
+        r.pool.release(&[src]);
+        let id = RequestId::new_v4();
+        let AttachOutcome::Ready(a) = attach(&mut r, id, &prompt) else {
+            panic!("both copies are resident in L0");
+        };
+        assert_eq!(
+            a.blocks.to_vec(),
+            vec![BlockId(0), BlockId(1)],
+            "the old page keeps serving: the rewrite's page went back"
+        );
+        r.pool.release(&a.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+    }
+    /// After a rewrite completed, the old page goes back and the pool hands it out again. Its
+    /// key mapping must go with the page: the hierarchy mirrors pool refcounts through
+    /// `l0_keys`, so a stale entry makes the recompressed copy look referenced by whoever
+    /// holds the dead page now. Fails if the rewritten copy's entry is not at refcount 0 once
+    /// the old page is in use again.
+    #[test]
+    fn a_rewrite_completions_old_page_forgets_only_itself() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let fmt = fmt16();
+        let bb = fmt.layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc));
+        let mut r = rig(8, Some(l1.clone()), None, clock);
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 24);
+        r.pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: fmt.layout,
+                num_blocks: 8,
+            },
+            mem,
+        )
+        .expect("the pool fits the host memory")
+        .with_page_classes(
+            &[crate::pool::PageClass {
+                format: "tq4",
+                page_bytes: bb / 2,
+            }],
+            1,
+        )
+        .expect("the class fits");
+        let prompt: Vec<u32> = (0..34).collect();
+        run(&mut r, &prompt);
+        let keys = {
+            let hasher = Blake3Hasher(r.h.namespaces.get(""));
+            prefix_keys(&hasher, &prompt, fmt.layout.block_tokens)
+        };
+        assert!(r.h.submit_compress(
+            &mut r.pool,
+            keys[1],
+            TierId::L0,
+            "tq4",
+            LadderReason::RecentWindow
+        ));
+        r.clock.advance(Duration::from_millis(10));
+        assert!(r.h.poll(&mut r.pool, &mut r.backend).is_empty(), "starts");
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        // The rewritten copy is filed on its class page; the old page went back.
+        let rewritten =
+            r.h.directory()
+                .iter()
+                .find(|e| e.location(TierId::L0).is_some_and(|l| l.format == "tq4"))
+                .map(|e| (e.key, BlockId(e.location(TierId::L0).unwrap().slot as u32)))
+                .expect("the rewrite is filed");
+        assert_eq!(rewritten.0, keys[1], "the second block's copy moved");
+        // The pool hands the old page out again; the mirror must not count its holder for the
+        // rewritten copy.
+        let held = r.pool.allocate(1).expect("the old page is free");
+        r.h.refresh_reclaim_order(&mut r.pool);
+        let entry =
+            r.h.l0_entry(rewritten.1)
+                .expect("the rewritten copy is still filed");
+        assert_eq!(
+            entry.ref_count, 0,
+            "the rewritten copy is cached, not referenced by the old page's new holder"
+        );
+        r.pool.release(&held);
+        r.h.request_done(&mut r.pool, RequestId::new_v4(), false);
     }
 }
