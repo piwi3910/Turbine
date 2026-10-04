@@ -559,7 +559,14 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 		[[ -s "$out/$f" ]] && attach+=(--attach "$out/$f")
 	done
 	branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-	config_param="$(printf '%s ' "$(basename "$cfg" .yaml)" "$@" | sed 's/--set //g; s/ *$//')"
+	# The labbook identity: the config, the -- --set overrides and the workload-affecting
+	# flags, so a c1 run is never the "previous comparable run" of a c16 one.
+	workload=()
+	[[ $conc -ne 16 ]] && workload+=("conc=$conc")
+	[[ $quick -eq 1 ]] && workload+=("quick")
+	[[ $multi_turn -eq 1 ]] && workload+=("multi-turn")
+	[[ $mt_sessions -ne 0 ]] && workload+=("mt-sessions=$mt_sessions")
+	config_param="$(printf '%s ' "$(basename "$cfg" .yaml)" "$@" ${workload[@]+"${workload[@]}"} | sed 's/--set //g; s/ *$//')"
 	if LABBOOK_URL="${LABBOOK_URL:-https://labbook.kw.watteel.lab}" NODE_EXTRA_CA_CERTS="$HOME/.labbook/cluster-ca.crt" \
 		node "$uploader" run --type turbine-lab-bench --external-id "lab-bench:$label-$model:$commit" \
 		--param model="$slug" --param gpu="R9700 GPU$gpu" --param config="$config_param" \

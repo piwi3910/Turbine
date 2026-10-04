@@ -1213,3 +1213,29 @@ Gate after each commit: `scripts/gate.sh --base 5bec8eea` ok. No throughput or n
 ### kv_idle verification after the used_bytes fix (2026-10-04)
 
 `overload-soak.sh novanas --duration 10m --shared-prefix-share 0.5 --set kv.cpu.max_bytes=4GiB --set kv.nvme.max_bytes=16GiB --set kv.ladder.enabled=true --set kv.ladder.l0=true --set kv.ladder.max_format=tq4` on the merged stack (84c22878 + the fix): **rc=0, `kv_idle: true`, `streams_complete: true`** — the exit's only failing check is cleared. Ladder actions > 0 in the run log.
+
+## Phase 5p: serving efficiency (branch `p5p-t1t3` from the 6b close, labbook set `phase-5p-serving-efficiency`)
+
+### S-2 baseline: host share and multi-turn (plan Task 3, commit 694340d9, 2026-10-04)
+
+novanas GPU 0, bench lock and port lock held, `phase2c` configs (the 6b closing defaults: the ladder off, `kv.recent_window_blocks: 1`), release client on novanas (`client=novanas`), one `lab-bench.sh` run per row. `host_share` is `turbine-bench stage-share` over the `/metrics` scrapes taken before and after the throughput bench (all eight `turbine_engine_iteration_seconds{stage}` sums except `device_wait` over all eight; `launch` counts as host time). Golden c1 PASS on every run, `requests_failed` 0 everywhere.
+
+| Run                                   | Model | conc | tok/s | ITL p50 (ms) | TTFT p50 (ms) | host_share | labbook                    |
+| ------------------------------------- | ----- | ---- | ----- | ------------ | ------------- | ---------- | -------------------------- |
+| `p5p-llama-c1` (--quick)              | Llama | 1    | 77.8  | 12.7         | 54            | **0.0037** | 1ea90d48                   |
+| `p5p-llama-c16-mt1/2/3` (median of 3) | Llama | 16   | 852.2 | 15.5         | 207           | **0.0192** | 67036a79/d23e2275/30379527 |
+| `p5p-olmoe-c1` (--quick)              | OLMoE | 1    | 126.0 | 7.8          | 44            | **0.0077** | be822964                   |
+| `p5p-olmoe-c16`                       | OLMoE | 16   | 615.4 | 24.4         | 118           | **0.0119** | bda3a24c                   |
+
+The S-2 rule (decision "Phase 5p", item 4): overlap scheduling work (S-3, plan Task 4) is built only if a c1 `host_share` > 0.05. Measured: Llama 0.0037, OLMoE 0.0077 — both far below. At c1 the Llama decode step is 12.7 ms and the host part ~0.05 ms per step (3 344 iterations of the c16 run carry 1.14 s of host time against 58.9 s of device wait, 1.9 %); c16's larger share is prepare/emit bookkeeping amortized over more rows, not a c1 overlap opportunity. **Task 4 is closed with no code change.** The 2026-09-27 profile's c16 estimate (0.29 ms of 17.5 ms, 1.5 %) is confirmed at 1.9 %.
+
+Multi-turn profile (Llama, after the throughput bench under the same lock hold; standard = 16 sessions at c8, saturated = `--multi-turn-sessions 64` with `scheduler.max_running_requests=16`):
+
+| Variant          | Runs        | cached_tokens_ratio (median) | first-turn TTFT p50 / p99 (ms) | later-turn TTFT p50 (ms) | mt tok/s (median) |
+| ---------------- | ----------- | ---------------------------- | ------------------------------ | ------------------------ | ----------------- |
+| standard         | mt1/mt2/mt3 | 0.9065 (0.9059–0.9075)       | 129 / 501                      | 80 (75–84)               | 342.4             |
+| saturated 64×c64 | mt64-1/2/3  | 0.9097 (0.8038–0.9102)       | 3 731 / 7 931                  | 10 736                   | 488.4             |
+
+The saturated runs are the queue-saturation baseline: 512 requests against 16 running slots put first-turn TTFT at ~3.7 s and later turns at ~10.7 s. mt64-2's cached ratio (0.8038) and mt tok/s (346.3) are the low outliers of the three (its later-turn TTFT and first-turn p99 are the highest), consistent with more L0 eviction under the deepest queue; the other two arms agree closely. These medians are what the S-7 (`cache_aware`) and S-4/S-5 comparisons judge against: `mt_cached` ≥ baseline + 0.01 and `mt_ttft_later_p50` ≤ 0.95 × baseline at the standard profile.
+
+Recording notes: the first c16 upload (67036a79) initially failed labbook's auto-status because its "previous comparable run" was the same-commit c1 run (TTFT 54 ms) — patched to pass with the explanation, and `lab-bench.sh` now appends the workload flags (`conc=`, `quick`, `multi-turn`, `mt-sessions=`) to the labbook `config` param so different workloads are never comparable. The labbook `turbine-lab-bench` type gained `concurrency`, `host_share` and the four `mt_*` data points (version 5).

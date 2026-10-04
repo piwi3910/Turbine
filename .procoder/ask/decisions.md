@@ -3244,3 +3244,12 @@ delta. Recorded as candidates for the phases that own them — none is tasked ye
    not fit one card and TP is not an option.
 6. **Packaging idea (2b/NVFP4-adjacent)**: they ship an NVFP4 target checkpoint and convert to MXFP4 in a runtime
    cache on first serve. If NVFP4 ever lands (phase-2b), a convert-on-first-serve path is the pattern.
+
+## Phase 5p: host share measured — overlap scheduling go/no-go (2026-10-04)
+
+The decision "Phase 5p" (item 4) fixed the rule before the measurement: overlap scheduling work (S-3, plan Task 4) is built only if the host share of a step at c1 exceeds 0.05 for either model; otherwise S-3 is closed with the measurement as evidence and no code change. Task 3 (plan) took the S-2 baselines on novanas GPU 0 on the 6b closing defaults (ladder off), commit 694340d9, `turbine-bench stage-share` over the throughput interval's before/after scrapes (labbook set `phase-5p-serving-efficiency`, perf log "Phase 5p"):
+
+- Llama-3.2-3B c1: **host_share 0.0037** (77.8 tok/s, ITL p50 12.7 ms); c16: 0.0192 (852.2 tok/s median of 3)
+- OLMoE-1B-7B c1: **host_share 0.0077** (126.0 tok/s, ITL p50 7.8 ms); c16: 0.0119 (615.4 tok/s)
+
+The rule's outcome: **no c1 value exceeds 0.05 — S-3 / Task 4 is closed without code.** At c1 the whole host side of a Llama decode step is ~0.05 ms of 12.7 ms; even giving the engine perfect overlap of it moves ITL by well under the run-to-run noise. The measured c16 share (1.9 %) confirms the 2026-09-27 profile's 1.5 % estimate; its largest components are prepare/emit bookkeeping that scales with batch rows, not the serial launch-ahead gap S-3 targets. The multi-turn baselines recorded in the same runs: standard (16 sessions, c8) cached 0.9065, later-turn TTFT p50 80 ms; saturated (64 sessions, c64, `max_running_requests=16`) cached 0.9097, first-turn TTFT p50 3 731 ms, later-turn TTFT p50 10 736 ms — the medians every later 5p task compares with. No new question is opened; S-4 (token-granular prefix reuse) is next per the phase order.
