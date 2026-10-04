@@ -1047,3 +1047,88 @@ addressable. `kv.recent_window_blocks` defaults to 1.
   every-prompt logprob bound does not hold on all 16 — which is Task 18's gate call
   (golden c16 + eval), not this branch's. Quick throughput 853.1 tok/s, ITL p50 15.7 ms,
   TTFT p50 248 ms, decode_fwd 15.4 ms, 64/64 ok.
+
+### The L0 ladder on the server (Task 18; branches `p6b-t18`, stack tip 8be6dccd)
+
+Task 16's startup refusal of `kv.ladder.l0` is lifted (6542ff14): the lossy rung classes are
+read through the same ABI v2.11 per-class addressing as TurboQuant L0 pages, so
+`kv_format_availability` refuses it only on a GPU library without the v2.11 group. Two serve
+bugs were found and fixed on the way to the first run: the v2.11 mixed-format attention
+descriptor always carries the layer's TurboQuant tables, which a classed pool without
+TurboQuant pages had nowhere to take from (0338bbb8, then 6152d4fb: a classed pool — the
+recent window or the ladder's L0 rungs — now carries its tables in the model `kv_cache` under
+the pool's own namespace seed, and `reserved_bytes` counts the upload); and the OPEN decode
+probe of `p6b-window` root-caused as a harness artifact (94bd16aa): the classed test geometry
+referenced base blocks whose bytes a carved slab also holds — the real pool retires those
+base ids before carving (`convertible_slabs`) — and the two kernels only disagree on that
+garbage (CPU NaN against HIP 0). With a valid geometry the classed decode matches the CPU
+provider on the R9700 (`paged_mixed_classed_matches_cpu` decode leg, job
+turbine-lab-test-1004034318) and a host test pins both legs
+(`classed_pool_prefill_and_decode_stay_finite`).
+
+Multi-turn A/B, Llama-3.2-3B, `scripts/lab/phase6-novanas-ladder.yaml` (L0 8 GiB, L1 2 GiB
+`l0`, L2 4 GiB `l0`, `max_format: tq4`) with `--set kv.ladder.l0=true` against
+`--set kv.ladder.l0=false` on the same budget (the ladder on in both arms). Tree 94bd16aa. A
+fresh native server per run on GPU 0 (port 18000, `bench.lock`, fixtures paused), arms
+interleaved. Workload: `turbine-bench --profile multi-turn --sessions 24 --turns 8
+--concurrency 24 --shared-prefix-words 2000 --think-time 1..4 --session-hints`, client on
+novanas; golden c1 ran on each run's server before the bench. Every run served 192/192 and
+golden c1 was 16/16 PASS on both arms — the L0 ladder's rewritten pages cost no golden prompt.
+
+| Arm | Run | recomputed tokens | cached_tokens_ratio | later-turn TTFT p50 / p99 (ms) | tok/s | L0 rewrites (no_room backoffs) | ORANGE samples |
+| --- | --- | ----------------- | ------------------- | ------------------------------ | ----- | ------------------------------ | -------------- |
+| on  | r1  | 121,476           | 0.8812              | 202.8 / 44,333                 | 172.7 | 56 (37)                        | 192            |
+| on  | r2  | 147,444           | 0.8602              | 193.1 / 35,092                 | 233.0 | 61 (34)                        | 131            |
+| on  | r3  | 180,692           | 0.8210              | 154.9 / 11,791                 | 302.2 | 0                              | 47             |
+| off | r1  | 192,115           | 0.8119              | 178.6 / 14,443                 | 315.5 |                                | 47             |
+| off | r2  | 164,978           | 0.8370              | 171.8 / 10,454                 | 300.6 |                                | 50             |
+| off | r3  | 224,002           | 0.7793              | 157.4 / 12,411                 | 304.2 |                                | 51             |
+
+Medians, L0 on against off: recomputed tokens 147,444 against 192,115 (−23 %);
+`cached_tokens_ratio` 0.8602 against 0.8370; later-turn TTFT p50 193.1 against 171.8 ms,
+p99 35.1 against 12.4 s; output tok/s 233.0 against 304.2 (−23 %); ORANGE 131 against 50
+samples of 0.5 s. The L0 rung compressed in two of three on-runs (56 and 61 rewrites at
+`fill_high_water`, each with 34–37 `no_room` back-offs where a class could not grow); in r3
+the L1/L2 rungs absorbed the pressure and the L0 rung stayed at the base format. The
+ladder-on tail and throughput regression of Task 16 (open point in
+`.procoder/handoff/p6b-t16.md`) is unchanged in shape: the on-arm sits at ORANGE far longer
+and loses tail and throughput against the off-arm.
+
+Golden c16 with the L0 ladder on (`lab-bench --golden16 --model llama -- --set
+kv.ladder.enabled=true --set kv.ladder.l0=true`, run `target/lab-bench/p6b-t18-l0ladder-llama/`):
+**golden c1 and c16 both PASS** — 16/16 prompts at the full 32-token identical prefix (c1
+strict bounds, max likely diff 0.0401; c16 batched), 200/200 bench requests, 781.1 tok/s,
+ITL p50 16.9 ms, TTFT p50 226 ms, decode_fwd 16.5 ms.
+
+Shared-prefix GSM8K, spec S-8's ladder variant with the L0 step (the Task 16 recipe: both
+sides `--set kv.gpu.max_bytes=4GiB --set kv.cpu.max_bytes=4GiB --set kv.nvme.enabled=false`,
+the candidate `kv.ladder.l0=true`, the baseline `kv.ladder.enabled=false`; c16, 32 fillers 16
+at a time, `--fillers-settle`; fresh server per run, arms interleaved). Every run served
+exactly its eval: `turbine_requests_total` 232, `filler_retries` 0; every candidate's lossy
+cached ratio 0.927 (`--min-lossy-cached-ratio 0.5`), cached ratio 0.931 on both sides.
+
+| Arm | Run | accuracy | lossy cached ratio |
+| --- | --- | -------- | ------------------ |
+| ladder l0 on  | r1  | 0.795    | 0.927              |
+| ladder l0 on  | r2  | 0.785    | 0.927              |
+| ladder l0 on  | r3  | 0.765    | 0.927              |
+| ladder off    | r1  | 0.755    | 0.000              |
+| ladder off    | r2  | 0.765    | 0.000              |
+| ladder off    | r3  | 0.765    | 0.000              |
+
+Nine candidate × baseline pairs (`scripts/eval/paired_compare.py --max-drop 0.01`): median
+drop **−0.02**, lowest exact McNemar p 0.0768 — the gate passes with the L0 ladder on, the
+candidates never below their baselines
+(`tests/eval/llama-3.2-3b-instruct/turbine-ladder-l0-sp-r{1,2,3}.json` + `-paired.json`, nine
+pairs in `turbine-ladder-l0-sp-paired.json`). Labbook set `phase-6b-kv-compression`, runs
+`p6b-t18:mt:llama:l0-{on,off}:r{1,2,3}` and `p6b-t18:l0ladder:golden:{c1,c16}`.
+
+Soak (S-7 AC), 10-minute overload with the L0 ladder on:
+`scripts/overload-soak.sh novanas --duration 10m --shared-prefix-share 0.5 --set
+kv.cpu.max_bytes=4GiB --set kv.nvme.max_bytes=16GiB --set kv.ladder.enabled=true --set
+kv.ladder.l0=true --set kv.ladder.max_format=tq4` (serve run 1004035400-0fa35b94,
+`target/soak/novanas-20261004T035400Z`). **Verdict PASS, all 8 checks true**: ITL p99 220.4 ms
+against a calibration of 187.7 ms, GREEN 0 s into the cool-down, 4,665 × 200, 2,886
+`queue_timeout`, 0 client-dropped. `turbine_kv_ladder_actions_total{tier="l0"}` 1,148 —
+712 `l0 → fp8_e4m3` rewrites at `fill_high_water`, 435 `no_room_backoff`, 1 `rung_step_up` —
+so the S-7 soak criterion (above 0) is met; every tier's ladder actions sum to 6,790.
