@@ -193,6 +193,7 @@ fn setup_cfg(
         free_watermark: 0.01,
         max_seq_len: 8192,
         queue_timeout: Duration::from_secs(3600),
+        cache_aware_window: Duration::from_secs(1),
         recent_window,
     };
     let sched = Scheduler::new(params, arc.clone());

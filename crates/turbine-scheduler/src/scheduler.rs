@@ -67,6 +67,9 @@ pub struct SchedulerParams {
     /// block that leaves the window is recompressed by the KV hierarchy. `None` with the
     /// window off.
     pub recent_window: Option<RecentWindow>,
+    /// The `cache_aware` policy's ordering window (`scheduler.cache_aware_window`, P5p S-7),
+    /// read by the policy at push; unused by `default`.
+    pub cache_aware_window: Duration,
 }
 
 /// The recent window (P6b S-5, `kv.recent_window_blocks` with a window-eligible `kv.dtype`).
@@ -96,6 +99,7 @@ impl SchedulerParams {
                     blocks: cfg.kv.recent_window_blocks,
                     format: "bf16",
                 }),
+            cache_aware_window: cfg.scheduler.cache_aware_window.0,
         }
     }
 }
@@ -2144,6 +2148,7 @@ mod tests {
             free_watermark: 0.01,
             max_seq_len: 4096,
             queue_timeout: Duration::from_secs(60),
+            cache_aware_window: Duration::from_secs(1),
             recent_window: None,
         }
     }

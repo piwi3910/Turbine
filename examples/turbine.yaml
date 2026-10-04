@@ -61,6 +61,9 @@ kv:
   demote_min_value: 0.0
   # false: no prefix lookup and no reuse (A/B switch).
   prefix_sharing: true
+  # Token-granular reuse of the last prefix block through a private copy-on-write tail
+  # block (A/B switch; ignored with prefix_sharing false).
+  partial_prefix_reuse: true
   transfer:
     # At least one KV block.
     max_inflight_bytes: 1GiB
@@ -120,11 +123,18 @@ scheduler:
   # Scheduling policy (admission order, preemption victim, chunk sizing): a registered policy
   # name (default).
   policy: default
+  # The cache_aware policy's ordering window (a waiting request is never admitted after an
+  # equal-priority, never-preempted request that arrived at least this much later).
+  cache_aware_window: 1s
 structured_output:
   # Largest accepted response_format JSON schema or tool-definition JSON (1KiB..1MiB).
   max_schema_bytes: 64KiB
   # Longest grammar compilation before 400 invalid_json_schema.
   compile_timeout: 5s
+  # Jump forward over llguidance's forced tokens in one verified multi-token step.
+  jump_forward: true
+  # Longest forced-token run fed in one step (1..=256, at most max_batch_tokens - 1).
+  jump_forward_max_tokens: 32
 distributed:
   enabled: false
 logging:

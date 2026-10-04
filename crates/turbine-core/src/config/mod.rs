@@ -12,6 +12,7 @@ mod speculative;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_norway::{Mapping, Value};
@@ -287,6 +288,11 @@ pub struct SchedulerConfig {
     pub queue_timeout: Option<Value>,
     /// Scheduling policy (Phase 2m): a `scheduling_policy` registry name.
     pub policy: ModuleName,
+    /// The `cache_aware` policy's ordering window (P5p S-7): within one window and one
+    /// priority the longest cached prefix is admitted first; across windows arrival order
+    /// holds. Bounds are the `cache_aware` policy's starvation-bound granularity, so they
+    /// apply whatever policy is selected.
+    pub cache_aware_window: HumanDuration,
 }
 
 impl Default for SchedulerConfig {
@@ -300,6 +306,7 @@ impl Default for SchedulerConfig {
             max_queued_requests: 256,
             queue_timeout: None,
             policy: ModuleName::fixed("default"),
+            cache_aware_window: HumanDuration::from_secs(1),
         }
     }
 }
@@ -312,6 +319,13 @@ pub struct StructuredOutputConfig {
     pub max_schema_bytes: ByteSize,
     /// Longest grammar compilation before 400 `invalid_json_schema`.
     pub compile_timeout: HumanDuration,
+    /// Jump forward over llguidance's forced tokens in one verified multi-token step
+    /// (P5p S-10); `false` falls back to the token-by-token loop.
+    pub jump_forward: bool,
+    /// Longest forced-token run fed in one step (`structured_output.jump_forward`), also
+    /// the per-step bound of `Scheduler::extend` (P5p S-9); 1..=256 and at most
+    /// `scheduler.max_batch_tokens − 1` (the sampled token takes the row beside them).
+    pub jump_forward_max_tokens: u32,
 }
 
 impl Default for StructuredOutputConfig {
@@ -319,6 +333,8 @@ impl Default for StructuredOutputConfig {
         StructuredOutputConfig {
             max_schema_bytes: ByteSize::kib(64),
             compile_timeout: HumanDuration::from_secs(5),
+            jump_forward: true,
+            jump_forward_max_tokens: 32,
         }
     }
 }
@@ -690,6 +706,26 @@ impl Config {
             return Err(invalid(
                 "scheduler.max_queued_requests",
                 format!("must be between 1 and 65536, got {}", s.max_queued_requests),
+            ));
+        }
+        let window = self.scheduler.cache_aware_window.0;
+        if !(Duration::from_millis(10)..=Duration::from_secs(60)).contains(&window) {
+            return Err(invalid(
+                "scheduler.cache_aware_window",
+                format!(
+                    "must be between 10ms and 60s, got {}",
+                    self.scheduler.cache_aware_window
+                ),
+            ));
+        }
+        let jf = self.structured_output.jump_forward_max_tokens;
+        if !(1..=256).contains(&jf) || jf + 1 > s.max_batch_tokens {
+            return Err(invalid(
+                "structured_output.jump_forward_max_tokens",
+                format!(
+                    "must be between 1 and 256 and at most scheduler.max_batch_tokens − 1 ({}, got {jf})",
+                    s.max_batch_tokens - 1
+                ),
             ));
         }
         if !(1..=64).contains(&self.execution.sampler_threads) {

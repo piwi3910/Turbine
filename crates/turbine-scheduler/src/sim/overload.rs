@@ -112,6 +112,7 @@ impl Default for OverloadConfig {
                 free_watermark: 0.01,
                 max_seq_len: 8192,
                 queue_timeout: reliability.admission.queue_timeout.0,
+                cache_aware_window: Duration::from_secs(1),
                 recent_window: None,
             },
             cost: CostModel {
