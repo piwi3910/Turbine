@@ -3184,3 +3184,16 @@ BF16 would shift exactly this kind of per-prompt margin.
   accepted semantics change; revisit the row only if it cannot be restored
 - B) Recalibrate the slug bound now (accept the shift as within lossy-KV tolerance)
 - C) Demote llama fp8-KV to `experimental` (as OLMoE's was)
+
+## 6b close: merge into local main (2026-10-04)
+
+All Task 19 exit items are green: gate --full (959/0 at the pre-soak tip; 961/0 with the exitfix merge), full GPU tier
+(1,051 passed; the 2 stale hip_ops tests fixed in the exitfix merge), two-GPU fault-injection 27/0, golden16 × 9
+(incl. llama-fp8kv restored by the recent-window base fix), the ladder soak 8/8 with kv_idle true after the
+used_bytes fix, support-matrix evidence, and the phase-7 track gate matching 6b's end state. Carried follow-ups are
+recorded (ladder perf trade, FP8 c1 ITL, MXFP4 prefill, OLMoE 0.982×, slab mixing, upstream ROCm items).
+
+- A) Merge `p6b-stack` (e49042e + the exit/verify commits) into local `main` now, no push (mirrors the 6a close)
+- B) Hold; main stays at the 6a state until a later go
+
+**Decision (user, 2026-10-04): A.** Merge `p6b-stack` into local `main` now, no push.
