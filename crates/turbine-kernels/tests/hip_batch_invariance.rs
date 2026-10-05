@@ -2,13 +2,9 @@
 //! target row (or sequence) is computed alone and then inside batches of other sizes, at other
 //! positions and next to other rows; its output bits must not change. A row's logits then do not
 //! depend on which requests share its batch, so greedy decoding is the same at any concurrency
-//! (decision 2026-09-27, "Before Phase 5": the OLMoE golden flip at concurrency 16). Since the
-//! K-split small-m MoE GEMV (decision 2026-10-05) the small-m tier is a numerics class of its
-//! own: its rows are bitwise invariant within the tier and within tolerance across it (the
-//! `Outcome::bounded` comparisons), so a request whose batch crosses `moe_small_max_rows`
-//! routed rows can change its rounding at that boundary. Llama's GEMMs are row-invariant in
-//! prefill steps only (`llama_prefill_gemm_rows_are_batch_invariant`): prefix reuse must
-//! reproduce the whole-prompt prefill, decode keeps its speed-tuned rows.
+//! (decision 2026-09-27, "Before Phase 5": the OLMoE golden flip at concurrency 16). Llama's
+//! GEMMs are row-invariant in prefill steps only (`llama_prefill_gemm_rows_are_batch_invariant`):
+//! prefix reuse must reproduce the whole-prompt prefill, decode keeps its speed-tuned rows.
 //!
 //! Every case prints one line per batch shape (`invariance: <op> <shape> max_abs=<Δ>
 //! differing=<n>/<numel> impl=<name>`) before the test asserts, so one run reports every op.
@@ -141,45 +137,16 @@ struct Outcome {
     max_abs: f32,
     differing: usize,
     numel: usize,
-    /// When set, the comparison judges against this |Delta| bound instead of bit equality: a
-    /// recorded numerics-class change (the K-split small-m MoE GEMV's slice-summed order is
-    /// not bitwise the unsplit chains of the tiers above, decision 2026-10-05), while the
-    /// same-row-same-bits property holds within the implementation that serves the batch.
-    max_allowed: Option<f32>,
 }
 
 impl Outcome {
     fn of(what: String, alone: &[f32], batched: &[f32], impl_name: &str) -> Outcome {
-        Self::bounded_inner(what, alone, batched, impl_name, None)
-    }
-
-    /// A comparison against a recorded tolerance instead of bit equality. `max_allowed` is the
-    /// measured cross-tier |Delta| on heavy-tailed activations plus headroom; the run still
-    /// prints the actual max_abs and the differing count, so a growing spread stays visible.
-    fn bounded(
-        what: String,
-        alone: &[f32],
-        batched: &[f32],
-        impl_name: &str,
-        max_allowed: f32,
-    ) -> Outcome {
-        Self::bounded_inner(what, alone, batched, impl_name, Some(max_allowed))
-    }
-
-    fn bounded_inner(
-        what: String,
-        alone: &[f32],
-        batched: &[f32],
-        impl_name: &str,
-        max_allowed: Option<f32>,
-    ) -> Outcome {
         assert_eq!(alone.len(), batched.len(), "{what}: length");
         let mut o = Outcome {
             what: format!("{what} impl={impl_name}"),
             max_abs: 0.0,
             differing: 0,
             numel: alone.len(),
-            max_allowed,
         };
         for (a, b) in alone.iter().zip(batched) {
             if a.to_bits() != b.to_bits() {
@@ -187,13 +154,9 @@ impl Outcome {
                 o.max_abs = o.max_abs.max((a - b).abs());
             }
         }
-        let bound = o
-            .max_allowed
-            .map(|b| format!(" allowed={b:.3e}"))
-            .unwrap_or_default();
         println!(
-            "invariance: {} max_abs={:.3e} differing={}/{}{}",
-            o.what, o.max_abs, o.differing, o.numel, bound
+            "invariance: {} max_abs={:.3e} differing={}/{}",
+            o.what, o.max_abs, o.differing, o.numel
         );
         o
     }
@@ -202,7 +165,7 @@ impl Outcome {
 fn assert_invariant(outcomes: &[Outcome]) {
     let bad: Vec<&str> = outcomes
         .iter()
-        .filter(|o| o.differing > 0 && o.max_allowed.is_none())
+        .filter(|o| o.differing > 0)
         .map(|o| o.what.as_str())
         .collect();
     assert!(
@@ -210,24 +173,6 @@ fn assert_invariant(outcomes: &[Outcome]) {
         "{} batch shapes change the target's bits:\n{}",
         bad.len(),
         bad.join("\n")
-    );
-    let over: Vec<String> = outcomes
-        .iter()
-        .filter(|o| o.max_allowed.is_some_and(|lim| o.max_abs > lim))
-        .map(|o| {
-            format!(
-                "{} max_abs={:.3e} > allowed {:.3e}",
-                o.what,
-                o.max_abs,
-                o.max_allowed.unwrap()
-            )
-        })
-        .collect();
-    assert!(
-        over.is_empty(),
-        "{} batch shapes exceed the recorded tolerance:\n{}",
-        over.len(),
-        over.join("\n")
     );
 }
 
@@ -553,15 +498,6 @@ const PENDING_GEMM_TABLE: &[&str] = &[];
 /// Heavy-tailed activations: every 97th channel 30× larger, as real hidden states have outlier
 /// channels. The partial sums then cancel, so two summation orders part far more often than on
 /// plain normal data (where small-m and grouped WMMA agreed on every output of a row).
-/// The cross-tier |Delta| bound of the K-split small-m MoE GEMV (decision 2026-10-05): the
-/// small-m tier sums an expert row's k in 8 slices combined in ascending order, the tiers
-/// above in one chain, so the same row at 8 and at 520 routed rows no longer agrees bitwise
-/// (a batch crossing moe_small_max_rows changes a row's rounding). The bound is the measured
-/// cross-tier spread on heavy-tailed activations (the test prints the actual max_abs of every
-/// comparison) plus headroom; heavy-tailed inputs part two summation orders far more often
-/// than plain normal ones, so real hidden states sit well below it.
-const MOE_TIER_TOLERANCE: f32 = 0.25;
-
 fn heavy(mut x: Vec<f32>) -> Vec<f32> {
     for (i, v) in x.iter_mut().enumerate() {
         if i % HIDDEN % 97 == 3 {
@@ -574,17 +510,8 @@ fn heavy(mut x: Vec<f32>) -> Vec<f32> {
 /// `moe_route` then `moe_experts` (through the registry the card profile builds, whose routed-row
 /// tiers switch from small-m to prefill WMMA above 512 rows, as the executor calls them) for one
 /// target token alone and at the first and last position of `tokens`-token batches; the target's
-/// routing and its output row must not change. Within the small-m tier that is bit equality;
-/// across the tier boundary (a row alone in the K-split small-m kernel vs a batch above
-/// `moe_small_max_rows` in the unsplit chains) the row's rounding may differ, and the
-/// comparison judges against `MOE_TIER_TOLERANCE` (decision 2026-10-05). Breaks if the tiers
-/// stop computing a row identically (the prefill kernels' two down-projection tiles included)
-/// beyond that recorded tolerance.
-///
-/// Measured on the R9700 (2026-10-05, the run that amended this test): within the small-m tier
-/// the target row is bitwise its alone copy at every batch shape (8 to 512 routed rows); across
-/// the boundary 377 of 133,120 outputs at 520 routed rows and 19,054 of 3,145,728 at 12,288
-/// differ, all by one BF16 ulp (max_abs 0.125) on heavy-tailed activations.
+/// routing and its output row must not change. Breaks if the tiers (or the prefill kernels' two
+/// down-projection tiles) stop computing a row with the same WMMA chain.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn moe_rows_are_batch_invariant() {
@@ -715,12 +642,11 @@ fn moe_rows_are_batch_invariant() {
             let got = run_with(kernel, &x, &logits, t, pos).2;
             match &first {
                 None => first = Some((info.name.clone(), got)),
-                Some((name, want)) => ab.push(Outcome::bounded(
+                Some((name, want)) => ab.push(Outcome::of(
                     format!("moe_experts {} vs {name} tokens={t} all rows", info.name),
                     want,
                     &got,
                     &info.name,
-                    MOE_TIER_TOLERANCE,
                 )),
             }
         }
@@ -757,20 +683,10 @@ fn moe_rows_are_batch_invariant() {
                 &got.1,
                 "route",
             ));
-            // Above the small-m tier the K-split kernel served the alone row and the
-            // unsplit prefill/grouped chain serves this one: a numerics-class difference
-            // (decision 2026-10-05), judged against the recorded tolerance instead of bits.
-            let moe_outcome = |alone: &[f32], batched: &[f32], what: String, impl_name: &str| {
-                if rows <= small_max {
-                    Outcome::of(what, alone, batched, impl_name)
-                } else {
-                    Outcome::bounded(what, alone, batched, impl_name, MOE_TIER_TOLERANCE)
-                }
-            };
-            out.push(moe_outcome(
+            out.push(Outcome::of(
+                format!("moe_experts tokens={t} routed_rows={rows} row={pos}"),
                 &alone.2,
                 &got.2,
-                format!("moe_experts tokens={t} routed_rows={rows} row={pos}"),
                 impl_name,
             ));
             if t == 1 {
