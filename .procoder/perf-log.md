@@ -1336,3 +1336,5 @@ On the real tokenizer the forced runs are short: Llama writes keys as one or two
 
 - `scripts/lab-test.sh novanas --tier quick` (a004fd93): 1054 tests ok; failures: `json_schema_jump_forward_matches` (the old two-servers-at-once start; fixed above) and `batch_invariance olmoe_rows_are_batch_invariant` (prefill-shaped scenarios differ from 0.moe_out on, max 3e-5 → logits 0.51; decodes bit-identical) — not on the jump-forward path; its first differing op is the MoE output, plausibly the K-split small-m MoE GEMV of `e501123a` (decode-bandwidth branch). Reported to the lead.
 - `lab-bench.sh --quick` on GPU 0 (a004fd93, golden c1 PASS, failed=0): Llama **875.3** tok/s (Task 10 landing 879.1), OLMoE **630.2** (636.4) — within the no-regression band; plain benches never jump.
+
+User decision 2026-10-06 A: jump-forward stays on by default and the S-10 targets are re-bound to this workload — forward steps ≤ 0.90 × (measured 0.899 ×), summed wall ≤ 1.00 × (measured 0.989 ×, never slower); correctness criteria unchanged. Tasks 11–12 close.

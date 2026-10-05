@@ -581,8 +581,9 @@ fn metric_value(addr: SocketAddr, series: &str) -> f64 {
 
 /// P5p S-10 (lab): the four JSON cases at temperature 0, the verified jump-forward on and off
 /// — the same token ids (a divergence excused only at a near-tie under the golden token
-/// rule), logprobs within the strict golden bound, schema-valid content, and at most 0.8 ×
-/// the forward steps and 0.9 × the wall time summed over the four.
+/// rule), logprobs within the strict golden bound, schema-valid content, and at most 0.90 ×
+/// the forward steps and 1.00 × the wall time summed over the four (re-bound to the measured
+/// Llama workload, user decision 2026-10-06 A: short forced runs on its merged-key tokenizer).
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn json_schema_jump_forward_matches() {
@@ -729,12 +730,12 @@ fn json_schema_jump_forward_matches() {
          wall on={time_on_sum:.2}s off={time_off_sum:.2}s"
     );
     assert!(
-        steps_on_sum <= 0.8 * steps_off_sum,
-        "forward steps on={steps_on_sum} must be at most 0.8 x off={steps_off_sum}"
+        steps_on_sum <= 0.90 * steps_off_sum,
+        "forward steps on={steps_on_sum} must be at most 0.90 x off={steps_off_sum}"
     );
     assert!(
-        time_on_sum <= 0.9 * time_off_sum,
-        "wall time on={time_on_sum} must be at most 0.9 x off={time_off_sum}"
+        time_on_sum <= 1.00 * time_off_sum,
+        "wall time on={time_on_sum} must be at most 1.00 x off={time_off_sum}"
     );
 }
 
