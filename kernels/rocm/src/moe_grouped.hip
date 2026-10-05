@@ -787,6 +787,174 @@ __global__ __launch_bounds__(kGemvWaves *kLanes) void moe_wmma_gemv_kernel(
   }
 }
 
+// ---- the K-split decode GEMV ----
+//
+// The decode GEMV above streams one 16-column strip of an expert's weights
+// through one wave from k = 0 to depth; at one routed row per expert (the
+// batch-1 case that sets the OLMoE decode step) the wave count per projection
+// is only (n_out / 16) * expert slots -- 512 waves for OLMoE's gate-up -- and
+// the strip is long enough that the wave's 16-byte loads do not keep enough of
+// the weights in flight: ~430-490 GB/s served (phase-5p decode profile,
+// 2026-10-05). This kernel splits the depth across the block's waves instead of
+// the columns: every wave of the block owns 16 columns and a 1/kSplits slice of
+// k, so the same loads cover 1/kSplits the stream and the grid holds kSplits
+// times the waves (4,096 for OLMoE's gate-up), and the block combines the
+// partial sums.
+//
+// Numerics: within its slice a wave runs the same WMMA chain as
+// moe_wmma_gemv_kernel (16-wide k slices ascending), and the block then adds
+// the per-wave partials in ascending slice order through LDS. The grouping is
+// fixed by the shape (the slice count is a compile-time constant, the slice
+// bounds by the depth), so a row's output does not depend on its batch -- but
+// the sum order differs from the unsplit chains of the tiers above, so this is
+// a numerics class of its own, not bitwise the tiers' (recorded as such,
+// decision 2026-10-05): batch invariance now holds within the small-m tier,
+// across the tier boundary within the measured tolerance.
+constexpr int kGemvSplits = 8;
+
+template <int kSplits, bool kGateUp>
+__global__ __launch_bounds__(kSplits *kLanes) void moe_wmma_gemv_ksplit_kernel(
+    const Bf16 *in, const Bf16 *w0, const Bf16 *w1, const int32_t *sorted_rows,
+    const int32_t *offsets, int32_t expert_begin, int32_t num_local,
+    int32_t top_k, int32_t depth, int32_t n_out, Bf16 *out) {
+  // The per-wave partials of one 16x16 output tile, one plane per slice.
+  __shared__ __attribute__((aligned(16))) float part0[kSplits][kMma * kMma];
+  __shared__ __attribute__((aligned(16))) float
+      part1[kGateUp ? kSplits : 1][kGateUp ? kMma * kMma : 1];
+  const int32_t local = gemv_active_expert(offsets, expert_begin, num_local,
+                                           static_cast<int32_t>(blockIdx.y));
+  if (local < 0)
+    return;
+  const int32_t begin = offsets[expert_begin + local];
+  const int32_t end = offsets[expert_begin + local + 1];
+  const int lane = static_cast<int>(threadIdx.x) % kLanes;
+  const int wave = static_cast<int>(threadIdx.x) / kLanes;
+  // The block's 16 columns; whole blocks past n_out return at once.
+  const int32_t n0 = static_cast<int32_t>(blockIdx.x) * kMma;
+  if (n0 >= n_out)
+    return;
+  const int frag = lane % kMma;
+  const int kh = (lane / kMma) * 8;
+  // Columns past n_out re-read the last one; their results are dropped.
+  const int32_t n = min(n0 + frag, n_out - 1);
+  const int32_t slice = wave;
+  const int32_t slice_k = depth / kSplits;
+  const size_t expert_elems = static_cast<size_t>(n_out) * depth;
+  const Bf16 *b0 =
+      w0 + local * expert_elems + static_cast<size_t>(n) * depth +
+      slice * slice_k + kh;
+  const Bf16 *b1 =
+      kGateUp
+          ? w1 + local * expert_elems + static_cast<size_t>(n) * depth +
+                slice * slice_k + kh
+          : b0;
+  // The row walk and streaming loop of moe_wmma_gemv_kernel, over the wave's
+  // k slice only.
+  for (int32_t r0 = begin; r0 < end; r0 += kMma) {
+    int32_t p = r0 + frag;
+    if (p >= end)
+      p = begin;
+    const int64_t src = kGateUp ? sorted_rows[p] / top_k : p;
+    const Bf16 *a = in + src * depth + slice * slice_k + kh;
+    v8f acc0{};
+    v8f acc1{};
+    v8s ra[kGemvUnroll];
+    v8s rb0[kGemvUnroll];
+    v8s rb1[kGemvUnroll];
+#pragma unroll
+    for (int u = 0; u < kGemvUnroll; ++u) {
+      ra[u] = load8(a + u * kMma);
+      rb0[u] = load8(b0 + u * kMma);
+      if (kGateUp)
+        rb1[u] = load8(b1 + u * kMma);
+    }
+    for (int32_t k = 0; k < slice_k; k += kGemvStep) {
+      v8s ca[kGemvUnroll];
+      v8s cb0[kGemvUnroll];
+      v8s cb1[kGemvUnroll];
+#pragma unroll
+      for (int u = 0; u < kGemvUnroll; ++u) {
+        ca[u] = ra[u];
+        cb0[u] = rb0[u];
+        if (kGateUp)
+          cb1[u] = rb1[u];
+      }
+      const int32_t next = k + kGemvStep;
+      if (next < slice_k) {
+#pragma unroll
+        for (int u = 0; u < kGemvUnroll; ++u) {
+          ra[u] = load8(a + next + u * kMma);
+          rb0[u] = load8(b0 + next + u * kMma);
+          if (kGateUp)
+            rb1[u] = load8(b1 + next + u * kMma);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kGemvUnroll; ++u) {
+        acc0 = mma(ca[u], cb0[u], acc0);
+        if (kGateUp)
+          acc1 = mma(ca[u], cb1[u], acc1);
+      }
+    }
+    // This wave's partials into its plane: lane l holds C[8 (l / 16) + v]
+    // [l % 16], i.e. partial[slice][(kh + v) * 16 + frag].
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+      part0[slice][(kh + v) * kMma + frag] = acc0[v];
+      if (kGateUp)
+        part1[slice][(kh + v) * kMma + frag] = acc1[v];
+    }
+    __syncthreads();
+    // Wave 0 sums the slices in ascending order and runs the epilogue.
+    if (wave == 0) {
+      const int32_t col = n0 + frag;
+#pragma unroll
+      for (int v = 0; v < 8; ++v) {
+        const int32_t q = r0 + kh + v;
+        if (q >= end || col >= n_out)
+          continue;
+        const int at2 = (kh + v) * kMma + frag;
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+#pragma unroll
+        for (int s = 0; s < kSplits; ++s) {
+          s0 += part0[s][at2];
+          if (kGateUp)
+            s1 += part1[s][at2];
+        }
+        float value = s0;
+        if (kGateUp) {
+          const float g = round_bf16(s0);
+          const float u = round_bf16(s1);
+          value = round_bf16(g / (1.0f + expf(-g))) * u;
+        }
+        out[static_cast<size_t>(q) * n_out + col] = f32_to_bf16(value);
+      }
+    }
+    __syncthreads();
+  }
+}
+
+template <int kSplits, bool kGateUp>
+int32_t launch_gemv_ksplit(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                           const void *in, const void *w0, const void *w1,
+                           int32_t depth, int32_t n_out, void *out) {
+  const int32_t rows = d->num_tokens * d->top_k;
+  const int32_t num_local = d->expert_end - d->expert_begin;
+  // At most one expert slot per routed row.
+  const unsigned slots = static_cast<unsigned>(std::min(num_local, rows));
+  hipLaunchKernelGGL(
+      (moe_wmma_gemv_ksplit_kernel<kSplits, kGateUp>),
+      dim3(static_cast<unsigned>((n_out + kMma - 1) / kMma), slots),
+      dim3(kSplits * kLanes), 0, ctx->stream, static_cast<const Bf16 *>(in),
+      static_cast<const Bf16 *>(w0), static_cast<const Bf16 *>(w1),
+      d->sorted_rows, d->expert_offsets, d->expert_begin, num_local, d->top_k,
+      depth, n_out, static_cast<Bf16 *>(out));
+  return check_hip(ctx, hipGetLastError(),
+                   kGateUp ? "moe small k-split gate-up kernel launch"
+                           : "moe small k-split down kernel launch");
+}
+
 template <bool kGateUp>
 int32_t launch_gemv(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                     const void *in, const void *w0, const void *w1,
@@ -881,6 +1049,32 @@ int32_t launch_moe_wmma_gemv(turbine_ctx *ctx,
   }
   return launch_gemv<false>(ctx, d, act, d->w_down, nullptr, d->inter,
                             d->hidden, down);
+}
+
+bool moe_gemv_ksplit_shape(const turbine_moe_experts_desc *d) {
+  // Every wave's slice is a whole number of kGemvStep batches
+  // (kGemvSplits = 8 waves per block, one k slice each).
+  return d->hidden % (kGemvSplits * kGemvStep) == 0 &&
+         d->inter % (kGemvSplits * kGemvStep) == 0;
+}
+
+// The K-split decode GEMV: launch_moe_wmma_gemv with the depth split across
+// the block's waves (kGemvSplits slices, combined through LDS in ascending
+// order) -- the same column coverage as launch_gemv but 16 columns per block,
+// so the grid holds kGemvSplits times the waves.
+int32_t launch_moe_wmma_gemv_ksplit(turbine_ctx *ctx,
+                                    const turbine_moe_experts_desc *d,
+                                    int32_t *pos, void *act, void *down) {
+  if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
+    return rc;
+  if (int32_t rc = launch_gemv_ksplit<kGemvSplits, true>(
+          ctx, d, d->x, d->w_gate, d->w_up, d->hidden, d->inter, act);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  return launch_gemv_ksplit<kGemvSplits, false>(ctx, d, act, d->w_down,
+                                                nullptr, d->inter, d->hidden,
+                                                down);
 }
 
 } // namespace turbine_hip

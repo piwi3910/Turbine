@@ -228,7 +228,9 @@ else
 	wait "$bench_pid"
 	bench_rc=$?
 	curl -s "$url/metrics" >"$outdir/metrics.txt"
-	scp -o BatchMode=yes -q "$host:$profdir/*.csv" "$outdir/" 2>/dev/null
+	# rocprofv3 writes its CSVs into a host-named directory below the working one.
+	scp -o BatchMode=yes -q "$host:$profdir/*.csv" "$outdir/" 2>/dev/null || true
+	scp -o BatchMode=yes -q "$host:$profdir/*/*.csv" "$outdir/" 2>/dev/null || true
 	tok=$(python3 -c "import json;d=json.load(open('$outdir/bench-c1.json'));print(d.get('output_token_throughput',0))" 2>/dev/null)
 	echo "PROFILE $label $model commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown) attach_ms=$attach_ms tok/s_c1=$tok bench_rc=$bench_rc out=$outdir"
 fi
