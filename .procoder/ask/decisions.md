@@ -3428,3 +3428,12 @@ The other two relaxations (OLMoE invariance, rmsnorm bitwise) stay unrelaxed.
 ## Phase 5p close → pause for the new PSU install (user, 2026-10-04)
 
 The user received the replacement PSU for novanas. Phase 5p runs to completion (Tasks 11–12, the b1 attention validation when the GPUs free, Tasks 13–17 as scheduled, the Task 19 exit tiers), then everything pauses and the host is handed over for the PSU install — the exit runs BEFORE the install, on the old PSU (one-GPU-job rules stay until the new PSU is in and confirmed). After the install and the user's go: the one-GPU-job limitation lifts and the next phase starts.
+
+## New PSU validation sequence, then the GPU 1 benchmark (user, 2026-10-05)
+
+The user received and installed the replacement PSU. Before the one-GPU-job rule is lifted: (1) a soak proving both
+GPUs stay healthy under two-GPU load — no crash/power-off, no PCIe downtrain; (2) the standard benchmark measured
+natively on GPU 1 and compared with GPU 0's recorded baselines (Llama 852.2, OLMoE 615.4 tok/s; the 2026-10-04 sysfs
+re-check showed both cards on Gen5 x8 root ports, contradicting the older Gen4 note — the benchmark settles it).
+Within ~3 %: GPU 1 joins perf work and the GPU-0-only rule lifts; measurably slower: documented, GPU 1 stays
+functional-only. Only then does Phase 5p resume under the updated rules.
