@@ -36,7 +36,9 @@ use crate::document::{
 use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
 };
-use crate::metrics::{EvictReason, KvMetrics, LADDER_EVICT, LadderReason, PrefetchOutcome};
+use crate::metrics::{
+    EvictReason, KvMetrics, LADDER_EVICT, LadderReason, PartialOutcome, PrefetchOutcome,
+};
 use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_cost, plan_prefix, reuse_cap};
 use crate::policy::{
     BlockScoreInputs, EvictAction, KvBlockSummary, LadderContext, LadderLimits, SelectedPolicy,
@@ -93,6 +95,10 @@ pub struct HierarchyConfig {
     pub lossy_penalty: Vec<(&'static str, f64)>,
     /// The compression ladder in L1/L2 (P6b S-6), when `kv.ladder.enabled`.
     pub ladder: Option<LadderConfig>,
+    /// `kv.partial_prefix_reuse` (P5p S-4/S-5): the token-granular match and its copy-on-write
+    /// tail copy. `false` restores Phase 4 exactly: no partial extension, no tail copies, no
+    /// published partial entries.
+    pub partial_prefix_reuse: bool,
 }
 
 /// The compression ladder's settings (P6b S-6): `kv.ladder.*` and the pressure controller's
@@ -166,6 +172,7 @@ impl HierarchyConfig {
             l0_dtype: kv.dtype.as_str(),
             ladder_l0: kv.ladder.l0,
             allow_lossy: kv.lossy_reuse == LossyReuse::Allow,
+            partial_prefix_reuse: kv.partial_prefix_reuse,
             lossy_penalty: crate::codec::registry()
                 .iter()
                 .map(|c| {
@@ -249,18 +256,32 @@ struct Demoting {
     keep_source: bool,
 }
 
+/// The copy-on-write tail of one attach (P5p S-5): the first `tokens` tokens of the L0 block
+/// `src` are copied into the private L0 block `dst` (allocated in the source's page class)
+/// before the request's first prefill chunk; the request holds one reference to `src` until
+/// [`KvHierarchy::tail_copied`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TailCopy {
+    pub src: BlockId,
+    pub dst: BlockId,
+    pub tokens: u32,
+}
+
 /// What one admission sees of its cached prefix (the scheduler's `SchedRequest.cached_prefix`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrefixAttach {
-    /// L0 blocks of the reused prefix; the request owns one reference to each.
+    /// L0 blocks of the reused prefix, then the private tail block (when the plan reuses a
+    /// partial tail); the request owns one reference to each. `cached_tokens` covers the full
+    /// blocks plus the tail's tokens.
     pub blocks: SmallVec<[BlockId; 16]>,
-    /// Tokens the blocks cover (`blocks × block_tokens`); feeds
-    /// `ResourceEstimate.cached_prefix_tokens`.
+    /// Tokens the blocks cover: `full blocks × block_tokens + tail tokens` (P5p S-5).
     pub cached_tokens: u32,
     /// Of `cached_tokens`, those served from lossy blocks (P6b S-3): `usage.prompt_tokens_details
     /// .lossy_cached_tokens`.
     pub lossy_tokens: u32,
     pub plan: KvPlan,
+    /// The copy-on-write tail (P5p S-5), when the plan reuses a token-granular tail.
+    pub tail_copy: Option<TailCopy>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -530,6 +551,10 @@ struct RequestKv {
     /// ([`KvHierarchy::detach_prefix`]) until it attaches again: that attach is not a new
     /// prompt (its tokens are not counted twice).
     detached_tokens: Option<u32>,
+    /// The pending tail copy's source block (P5p S-5): the request holds one reference to it
+    /// from attach until the copy's iteration completes ([`KvHierarchy::tail_copied`]), or
+    /// until the request re-attaches or leaves (`request_done`).
+    tail_src: Option<BlockId>,
 }
 
 impl RequestKv {
@@ -962,6 +987,7 @@ impl KvHierarchy {
                     used: Vec::new(),
                     lossy_from: None,
                     detached_tokens: None,
+                    tail_src: None,
                 },
             );
         }
@@ -969,6 +995,13 @@ impl KvHierarchy {
             .requests
             .get(&req.request)
             .and_then(|r| r.detached_tokens);
+        // A re-attach takes over from a previous attach whose tail copy never ran (the request
+        // lost its table: SURVIVAL requeue or detach): its source reference goes back.
+        if let Some(r) = self.requests.get_mut(&req.request)
+            && let Some(src) = r.tail_src.take()
+        {
+            pool.release(&[src]);
+        }
         let allow_lossy = req.allow_lossy.unwrap_or(self.cfg.allow_lossy);
         let hasher = Blake3Hasher(self.namespaces.get(req.cache_salt));
         let m = if self.cfg.prefix_sharing {
@@ -1044,10 +1077,29 @@ impl KvHierarchy {
             .find(|(_, t)| **t != TierId::L0)
             .map_or(0, |(b, _)| *b);
         let k = plan.cutoff_blocks() as usize;
+        // P5p S-5: the token-granular extension's source — the matched L0 block at the cutoff
+        // (the planner split it; served exact by the planner's eligibility rule), or the
+        // directory's partial match when the cutoff keeps every matched block. Referenced
+        // before the promotions allocate, so a reclamation cannot take the copy's source.
+        let tail_src: Option<BlockId> = if self.cfg.partial_prefix_reuse && plan.partial_tokens > 0
+        {
+            Some(if k < m.blocks.len() {
+                BlockId(m.blocks[k].location.slot as u32)
+            } else {
+                m.partial.as_ref().map(|p| p.block).expect(
+                    "a split cutoff block is eligible only when a partial candidate matched",
+                )
+            })
+        } else {
+            None
+        };
         // Reference every reused L0 block first so allocating promotion targets can never
         // reclaim one of them.
         for mb in m.blocks[..k].iter().filter(|mb| mb.tier == TierId::L0) {
             pool.incref(BlockId(mb.location.slot as u32));
+        }
+        if let Some(s) = tail_src {
+            pool.incref(s);
         }
         let mut blocks: SmallVec<[BlockId; 16]> = SmallVec::new();
         let mut promotions = Vec::new();
@@ -1105,6 +1157,59 @@ impl KvHierarchy {
                 .collect();
             pool.release(&unused);
             plan = truncated_plan(&tiers[..cut], req.prompt.len() as u32, bt, plan.reason);
+            // The cutoff fell short of the plan's premise: no tail copy.
+            if let Some(s) = tail_src {
+                pool.release(&[s]);
+            }
+        }
+        // P5p S-5: allocate the private tail block in the source's page class (a recent
+        // window's BF16 source gets a window-class private block). On failure the plan falls
+        // back to whole blocks — the tail is an optimization, never a requirement.
+        let mut tail_copy: Option<TailCopy> = None;
+        if let Some(src) = tail_src {
+            let class = pool.format_of(src);
+            match pool.allocate_in(class, 1) {
+                Ok(mut ids) => {
+                    let dst = ids.pop().expect("allocate_in(1) returns one block");
+                    // The private block rides at the end of the request's table: the shared
+                    // full blocks are followed by the copy (P5p S-5).
+                    blocks.push(dst);
+                    tail_copy = Some(TailCopy {
+                        src,
+                        dst,
+                        tokens: plan.partial_tokens,
+                    });
+                }
+                Err(_) => {
+                    plan.recompute_tokens += plan.partial_tokens;
+                    plan.partial_tokens = 0;
+                    pool.release(&[src]);
+                }
+            }
+            // The tail's own allocation may have reclaimed cached blocks too.
+            self.after_plan(pool);
+        }
+        // P5p S-4/S-5: how the lookup's token-granular comparison ended. `Disabled` when the
+        // switch is off — the plan is stripped back to whole blocks below. `PlannerCutoff` when
+        // the directory matched a tail the plan (its cutoff or the MIN_RECOMPUTE_TOKENS cap)
+        // left unused. The comparison's own outcome otherwise.
+        let partial_outcome = if !self.cfg.partial_prefix_reuse {
+            m.partial_outcome.map(|_| PartialOutcome::Disabled)
+        } else if plan.partial_tokens > 0 {
+            Some(PartialOutcome::Reused)
+        } else if m.partial.is_some() {
+            Some(PartialOutcome::PlannerCutoff)
+        } else {
+            m.partial_outcome
+        };
+        if let Some(o) = partial_outcome {
+            self.metrics.partial_outcome(o, plan.partial_tokens);
+        }
+        // `kv.partial_prefix_reuse: false` restores Phase 4 exactly (the planner's covered
+        // arm never extends): the tokens go back to the prefill.
+        if !self.cfg.partial_prefix_reuse && plan.partial_tokens > 0 {
+            plan.recompute_tokens += plan.partial_tokens;
+            plan.partial_tokens = 0;
         }
         // The keys and lineage of the blocks this request computes (P6b S-3): a lossy chain
         // once a block before the cut is served lossy.
@@ -1122,7 +1227,8 @@ impl KvHierarchy {
                     .map_or(b.key, |(k, _)| k)
             })
             .collect();
-        let cached_tokens = blocks.len() as u32 * bt;
+        let cached_tokens =
+            blocks.len() as u32 * bt - tail_copy.as_ref().map_or(0, |t| bt - t.tokens);
         let lossy_tokens = lossy.iter().filter(|l| **l).count() as u32 * bt;
         if detached.is_none() {
             self.metrics
@@ -1181,7 +1287,8 @@ impl KvHierarchy {
             cost_reuse_all_s = plan_costs.2,
         );
         if let Some(r) = self.requests.get_mut(&req.request) {
-            r.committed = blocks.len();
+            r.committed = blocks.len() - usize::from(tail_copy.is_some());
+            r.tail_src = tail_copy.map(|t| t.src);
             r.lossy_from = match (lineage, m.lossy_from) {
                 (Lineage::Lossy { .. }, Some((s, _))) => Some((s, m.keys.clone())),
                 _ => None,
@@ -1196,6 +1303,7 @@ impl KvHierarchy {
             cached_tokens,
             lossy_tokens,
             plan,
+            tail_copy,
         };
         if promotions.is_empty() {
             AttachOutcome::Ready(attach)
@@ -1230,6 +1338,14 @@ impl KvHierarchy {
     ) {
         pool.release(&attach.blocks);
         if let Some(r) = self.requests.get_mut(&request) {
+            // The pending tail copy's source pin goes with the prefix: the request never
+            // planned its first iteration, so the copy never ran, and a pinned source entry
+            // would sit as a referenced child over the leaf-first reclaim of the released
+            // blocks. The re-attach plans a new tail (and takes a new reference) if it matches
+            // one again.
+            if let Some(src) = r.tail_src.take() {
+                pool.release(&[src]);
+            }
             for key in r.keys.iter().skip(r.committed) {
                 self.dir.clear_pending(key);
             }
@@ -1404,6 +1520,11 @@ impl KvHierarchy {
                 tokens: tokens[i * bt..(i + 1) * bt].into(),
                 lineage,
             };
+            // A full block outranks an opportunistic partial entry: at capacity, one leaf
+            // partial entry makes room (P5p S-5; its L0 slot the next tick frees).
+            if self.dir.len() >= self.dir.max_entries() {
+                self.dir.evict_one_partial(bt as u32);
+            }
             match self.dir.insert(kv) {
                 Ok(()) => {
                     pool.set_keyed(block);
@@ -1422,6 +1543,13 @@ impl KvHierarchy {
     /// and its in-flight ones land as cached unreferenced blocks, never in the sequence.
     pub fn request_done(&mut self, pool: &mut BlockPool, request: RequestId, cancelled: bool) {
         let now = self.now();
+        // A pending tail copy's source reference goes back with the request (the copy never
+        // ran, or `tail_copied` was not reached).
+        if let Some(r) = self.requests.get_mut(&request)
+            && let Some(src) = r.tail_src.take()
+        {
+            pool.release(&[src]);
+        }
         if cancelled {
             for t in self.transfer.cancel_owner(request) {
                 self.lossy_targets.remove(&t.id);
@@ -1473,6 +1601,117 @@ impl KvHierarchy {
             }
         }
         self.metrics.sessions.set(self.sessions.len() as i64);
+    }
+
+    /// A request finished normally (stop, EOS or length — never a cancellation or failure): its
+    /// last block, when partial, is published as an L0-only partial entry holding the tokens
+    /// whose KV is written (P5p S-5): the prompt plus the generated tokens minus the newest,
+    /// never-fed token. `block` is the block of `tokens`' last position
+    /// (`(len−1)/block_tokens` in the finished sequence's table), `tokens` the written KV's
+    /// token ids. A full-block end, a request the hierarchy does not track, a parent the
+    /// directory does not hold, or a disabled switch publishes nothing. Evictions the bound
+    /// ([`crate::directory::PARTIAL_PER_PARENT`]) or a full directory caused are drained and
+    /// their L0 slots freed (`partial_l0_only`).
+    pub fn publish_tail(
+        &mut self,
+        pool: &mut BlockPool,
+        request: RequestId,
+        block: BlockId,
+        tokens: &[u32],
+    ) {
+        let bt = self.cfg.block_tokens as usize;
+        if !self.cfg.prefix_sharing || !self.cfg.partial_prefix_reuse {
+            return;
+        }
+        if tokens.is_empty() || tokens.len().is_multiple_of(bt) {
+            return;
+        }
+        let full = tokens.len() / bt;
+        let Some(r) = self.requests.get(&request) else {
+            return;
+        };
+        if r.keys.len() < full {
+            return;
+        }
+        let parent = full.checked_sub(1).map(|i| r.entry(i));
+        if parent.is_some_and(|p| self.dir.get(&p).is_none()) {
+            return;
+        }
+        let key =
+            Blake3Hasher(self.namespaces.get(&r.salt)).key(parent.as_ref(), &tokens[full * bt..]);
+        let kv = KvBlock {
+            key,
+            model: self.model,
+            token_range: TokenRange {
+                start: (full * bt) as u32,
+                end: tokens.len() as u32,
+            },
+            format: self.namespaces.format(),
+            size_bytes: self.cfg.block_bytes,
+            locations: SmallVec::from_slice(&[KvLocation {
+                tier: TierId::L0,
+                slot: u64::from(block.0),
+                format: l0_tag(pool, block),
+            }]),
+            access_count: 0,
+            last_access: self.now(),
+            ref_count: pool.refcount(block),
+            priority: r.priority,
+            recompute_cost: CostEstimate {
+                seconds: recompute_seconds(bt as u32, tokens.len() as u32, self.prefill_tps),
+            },
+            decayed_hits: 0.0,
+            decayed_at: self.now(),
+            session: None,
+            parent,
+            child_count: 0,
+            tokens: tokens[full * bt..].into(),
+            lineage: Lineage::Exact,
+        };
+        match self.dir.insert_partial(kv) {
+            Ok(()) => {
+                pool.set_keyed(block);
+                self.l0_keys.insert(block, key);
+            }
+            Err(e) => {
+                tracing::debug!(event = "kv_publish_tail_skipped", key = %key, error = %e);
+                return;
+            }
+        }
+        self.metrics
+            .partial_entries
+            .set(self.dir.partial_count(self.cfg.block_tokens) as i64);
+        self.drain_evicted_partials(pool);
+    }
+
+    /// Frees the L0 slots of the partial entries [`KvDirectory::insert_partial`] evicted: the
+    /// evicted entry's block is released from its cache when nothing references it (a reusing
+    /// request's pending tail copy may still pin it — the page then comes back with the pool's
+    /// next reclamation).
+    fn drain_evicted_partials(&mut self, pool: &mut BlockPool) {
+        for e in self.dir.evicted_partials() {
+            if let Some(l) = e.location(TierId::L0) {
+                let id = BlockId(l.slot as u32);
+                self.l0_keys.remove(&id);
+                if pool.evict_cached(id) {
+                    self.metrics
+                        .eviction(TierId::L0, EvictReason::PartialL0Only);
+                    self.metrics.drop_block(EvictReason::PartialL0Only);
+                    self.stats.evictions += 1;
+                    self.stats.drops += 1;
+                }
+            }
+        }
+    }
+
+    /// The copy of a request's pending tail copy ran (its first iteration executed it): the
+    /// source reference goes back.
+    pub fn tail_copied(&mut self, pool: &mut BlockPool, request: RequestId) {
+        if let Some(r) = self.requests.get_mut(&request)
+            && let Some(src) = r.tail_src.take()
+        {
+            pool.release(&[src]);
+        }
     }
 
     /// Advances transfers and applies their completions; returns the requests whose
@@ -1807,6 +2046,12 @@ impl KvHierarchy {
                 if let Some(r) = self.requests.get_mut(&owner) {
                     r.committed = p.attach.blocks.len();
                     r.truncate_attached(p.attach.blocks.len());
+                    // The tail is the last block: a truncation past the failed promotion's
+                    // position always takes it. The source reference goes back.
+                    if let Some(src) = r.tail_src.take() {
+                        pool.release(&[src]);
+                    }
+                    p.attach.tail_copy = None;
                 }
                 self.ready.push((owner, p.attach));
             }
@@ -2042,10 +2287,19 @@ impl KvHierarchy {
             if self.prefetch.evicted(&key) {
                 self.metrics.prefetch_outcome(PrefetchOutcome::Wasted);
             }
-            self.metrics.eviction(TierId::L0, EvictReason::Capacity);
+            let partial = self
+                .dir
+                .get(&key)
+                .is_some_and(|b| b.is_partial(self.cfg.block_tokens));
+            let why = if partial {
+                EvictReason::PartialL0Only
+            } else {
+                EvictReason::Capacity
+            };
+            self.metrics.eviction(TierId::L0, why);
             self.stats.evictions += 1;
             if self.dir.remove_location(&key, TierId::L0) == Some(0) {
-                self.metrics.drop_block(EvictReason::Capacity);
+                self.metrics.drop_block(why);
                 self.stats.drops += 1;
                 self.forget(&key);
             }
@@ -2145,6 +2399,14 @@ impl KvHierarchy {
             let Some(b) = self.dir.get(&key) else {
                 continue;
             };
+            // A partial entry is L0-only and demotes never: any reclaim drops it in place
+            // (P5p S-5), with its own reason.
+            if b.is_partial(self.cfg.block_tokens) {
+                self.drop_everywhere(pool, &key, EvictReason::PartialL0Only);
+                departing.insert(key);
+                bytes += bb;
+                continue;
+            }
             if !self.dir.evictable(b, TierId::L0, &departing) {
                 continue;
             }
@@ -2233,6 +2495,17 @@ impl KvHierarchy {
         let mut bytes = 0;
         let mut started = 0;
         for (key, value) in victims {
+            // A partial entry is L0-only and demotes never: any reclaim drops it in place
+            // (P5p S-5), with its own reason.
+            if self
+                .dir
+                .get(&key)
+                .is_some_and(|b| b.is_partial(self.cfg.block_tokens))
+            {
+                self.drop_everywhere(pool, &key, EvictReason::PartialL0Only);
+                bytes += bb;
+                continue;
+            }
             let Some(to) = to.filter(|_| value >= self.cfg.demote_min_value) else {
                 let why = if value < self.cfg.demote_min_value {
                     EvictReason::BelowMinValue
@@ -3023,6 +3296,7 @@ impl KvHierarchy {
             .iter()
             .filter(|b| {
                 b.ref_count == 0
+                    && !b.is_partial(self.cfg.block_tokens)
                     && !self.demoting.contains_key(&b.key)
                     && !self.transfer.is_busy_with(&b.key)
             })
@@ -3163,6 +3437,7 @@ impl KvHierarchy {
             .iter()
             .filter(|b| {
                 b.ref_count == 0
+                    && !b.is_partial(self.cfg.block_tokens)
                     && !self.tail.contains(&b.key)
                     && !self.demoting.contains_key(&b.key)
                     && !self.compressing.contains_key(&b.key)
@@ -3188,6 +3463,7 @@ impl KvHierarchy {
     /// Session TTLs, expiry and predicted-resume prefetch    /// Session TTLs, expiry and predicted-resume prefetch; call once per iteration.
     pub fn tick(&mut self, pool: &mut BlockPool) {
         self.sync_l0_refs(pool);
+        self.drain_evicted_partials(pool);
         self.window_maintain(pool);
         let now = self.now();
         for action in self.sessions.sweep(now, self.l0_state) {
@@ -3385,6 +3661,8 @@ impl KvHierarchy {
                 u.bytes += self.format_bytes(l.format);
             }
         }
+        let partials = self.dir.partial_count(self.cfg.block_tokens) as u64;
+        self.metrics.partial_entries.set(partials as i64);
         let mut tiers = vec![KvTierDocument {
             tier: TierId::L0.as_str(),
             dtype,
@@ -3393,6 +3671,7 @@ impl KvHierarchy {
             blocks_total: pool.total_blocks(),
             blocks_used: pool.used_blocks(),
             blocks_free: pool.free_blocks(),
+            partial_entries: partials,
             state: Some(TierState {
                 enabled: true,
                 capacity_bytes: u64::from(pool.total_blocks()) * bb,
@@ -3429,6 +3708,7 @@ impl KvHierarchy {
                     est_bandwidth_bytes_per_second: t.and_then(|t| t.est_bandwidth()),
                 }),
                 formats: formats.remove(&id).unwrap_or_default(),
+                partial_entries: 0,
             });
         }
         KvDocument {
@@ -3436,6 +3716,7 @@ impl KvHierarchy {
             summary: Some(KvSummary {
                 policy: self.policy.name(),
                 prefix_sharing: self.cfg.prefix_sharing,
+                partial_prefix_reuse: self.cfg.partial_prefix_reuse,
                 block_tokens: self.cfg.block_tokens,
                 block_bytes: bb,
                 unified_memory: self.cfg.memory_kind == MemoryKind::Unified,

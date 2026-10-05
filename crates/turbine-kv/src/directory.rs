@@ -335,6 +335,39 @@ impl KvDirectory {
         std::mem::take(&mut self.evicted)
     }
 
+    /// Makes room for a full block: evicts the least recently used leaf partial entry of any
+    /// parent when the directory is at capacity, handing its L0 slot to the caller through
+    /// [`KvDirectory::evicted_partials`] (P5p S-5: a shareable, tierable full block is worth
+    /// more than an opportunistic partial entry). False when there is no leaf partial entry.
+    pub fn evict_one_partial(&mut self, block_tokens: u32) -> bool {
+        if self.blocks.len() < self.max_entries {
+            return false;
+        }
+        let victim = self
+            .blocks
+            .values()
+            .filter(|b| b.is_partial(block_tokens) && b.child_count == 0)
+            .min_by_key(|b| b.last_access)
+            .map(|b| b.key);
+        match victim {
+            Some(k) => {
+                if let Some(b) = self.remove(&k) {
+                    self.evicted.push(b);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many partial entries the directory holds.
+    pub fn partial_count(&self, block_tokens: u32) -> usize {
+        self.blocks
+            .values()
+            .filter(|b| b.is_partial(block_tokens))
+            .count()
+    }
+
     /// The partial-entry children of `parent` (the children index holds keyed parents only;
     /// a root-level entry is found by scan).
     fn partial_children(
@@ -557,7 +590,7 @@ impl KvDirectory {
     fn compare_tail(
         &self,
         m: &mut PrefixMatch,
-        _hasher: &dyn KeyHasher,
+        hasher: &dyn KeyHasher,
         tokens: &[u32],
         block_tokens: u32,
         _allow_lossy: bool,
@@ -577,12 +610,17 @@ impl KvDirectory {
                 .flatten()
                 .copied()
                 .collect(),
-            None => self
-                .blocks
-                .values()
-                .filter(|b| b.parent.is_none())
-                .map(|b| b.key)
-                .collect(),
+            None => {
+                // The root scan compares raw token ids, so it must not cross a cache salt's
+                // namespace: a candidate passes only when its tokens hash to its own key under
+                // THIS lookup's namespace (a full-block walk is key-driven and safe by
+                // construction).
+                self.blocks
+                    .values()
+                    .filter(|b| b.parent.is_none() && hasher.key(None, &b.tokens) == b.key)
+                    .map(|b| b.key)
+                    .collect()
+            }
         };
         if kids.len() > PARTIAL_SCAN_LIMIT {
             kids.sort_by(|a, b| {
@@ -886,6 +924,34 @@ pub(crate) mod tests {
             [Some(L0), Some(L1), Some(L2), None].map(|t| metrics.lookups_value(t)),
             [5, 2, 0, 2]
         );
+    }
+
+    #[test]
+    fn root_partial_never_crosses_a_cache_salt() {
+        // The root-parent scan of the token-granular comparison compares raw token ids, so it
+        // must not hand another cache salt's (namespace's) root entry over as a match — the
+        // full-block walk is key-driven and safe by construction. Breaks if a salted lookup
+        // matches another namespace's root partial entry (the leak `cache_salt_isolates`
+        // caught when Task 7 started consuming the matches).
+        let other = Blake3Hasher(NamespaceKey([7; 32]));
+        let tokens: Vec<u32> = (0..20).collect();
+        let mut dir = KvDirectory::new(16);
+        dir.insert_partial(block(other.key(None, &tokens), None, 0, &tokens, &[l0(0)]))
+            .unwrap();
+        let mine = Blake3Hasher(NamespaceKey([9; 32]));
+        let m = dir.lookup(&mine, &tokens, 16, Duration::from_secs(1), true, 0);
+        assert_eq!(m.partial, None, "another salt's entry is not a match");
+        assert_eq!(
+            m.partial_outcome,
+            Some(PartialOutcome::NoCandidate),
+            "the scan sees nothing of the other namespace"
+        );
+        // A same-prompt root entry under this namespace still matches with 20.
+        dir.insert_partial(block(mine.key(None, &tokens), None, 0, &tokens, &[l0(1)]))
+            .unwrap();
+        let m = dir.lookup(&mine, &tokens, 16, Duration::from_secs(2), true, 0);
+        assert_eq!(m.partial.map(|p| p.tokens), Some(20));
+        assert_eq!(m.partial_outcome, Some(PartialOutcome::Reused));
     }
 
     #[test]

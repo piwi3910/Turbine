@@ -869,6 +869,23 @@ impl KvOrchestrator {
         self.h.request_done(pool, request, cancelled);
     }
 
+    /// A request finished normally: its last block, when partial, is published as an L0-only
+    /// partial entry (P5p S-5; [`KvHierarchy::publish_tail`]).
+    pub fn publish_tail(
+        &mut self,
+        pool: &mut BlockPool,
+        request: RequestId,
+        block: BlockId,
+        tokens: &[u32],
+    ) {
+        self.h.publish_tail(pool, request, block, tokens);
+    }
+
+    /// The tail copies of a completed iteration executed: their source references go back.
+    pub fn tail_copied(&mut self, pool: &mut BlockPool, request: RequestId) {
+        self.h.tail_copied(pool, request);
+    }
+
     /// End of an iteration: pending reclaim requests, session TTLs and predicted-resume
     /// prefetches.
     pub fn end_turn(&mut self, pool: &mut BlockPool) {

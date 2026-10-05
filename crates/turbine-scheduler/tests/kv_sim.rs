@@ -8,7 +8,8 @@ use std::time::Duration;
 use turbine_core::clock::{Clock, FakeClock};
 use turbine_core::config::{KvConfig, ModuleName};
 use turbine_core::types::{
-    DType, DeviceId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
+    BlockId, DType, DeviceId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState,
+    RequestId,
 };
 use turbine_kv::directory::KvBlock;
 use turbine_kv::hierarchy::{HierarchyConfig, KvHierarchy, PrefetchTarget};
@@ -18,6 +19,7 @@ use turbine_kv::tier::{KvTier, MemTier, TierId};
 use turbine_kv::transfer::SimTransferBackend;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::scheduler::BatchKind;
 use turbine_scheduler::sim::KvSimDriver;
 use turbine_scheduler::{Scheduler, SchedulerParams};
 use turbine_tensor::DeviceMemory;
@@ -73,10 +75,25 @@ fn setup_cfg(
     l0: u32,
     l1: u64,
     l2: u64,
+    kv: KvConfig,
+    kind: MemoryKind,
+    tune: impl FnOnce(&mut SimTransferBackend),
+    tune_cfg: impl FnOnce(&mut HierarchyConfig),
+) -> Setup {
+    setup_full(l0, l1, l2, kv, kind, tune, tune_cfg, |_| {})
+}
+
+/// [`setup_cfg`] with `tune_params` applied to the scheduler's parameters.
+#[allow(clippy::too_many_arguments)]
+fn setup_full(
+    l0: u32,
+    l1: u64,
+    l2: u64,
     mut kv: KvConfig,
     kind: MemoryKind,
     tune: impl FnOnce(&mut SimTransferBackend),
     tune_cfg: impl FnOnce(&mut HierarchyConfig),
+    tune_params: impl FnOnce(&mut SchedulerParams),
 ) -> Setup {
     // These mechanism tests page at 16 tokens (`format()`), not the 128-token default.
     kv.block_tokens = format().layout.block_tokens;
@@ -183,7 +200,7 @@ fn setup_cfg(
         )
         .unwrap()
     };
-    let params = SchedulerParams {
+    let mut params = SchedulerParams {
         max_running_requests: 64,
         max_batch_tokens: 2048,
         prefill_chunk_tokens: 512,
@@ -196,6 +213,7 @@ fn setup_cfg(
         cache_aware_window: Duration::from_secs(1),
         recent_window,
     };
+    tune_params(&mut params);
     let sched = Scheduler::new(params, arc.clone());
     let mut backend = SimTransferBackend::new(arc, l1d, l2d, bb as usize);
     tune(&mut backend);
@@ -278,13 +296,14 @@ fn prefix_reuse_refcounts() {
         "the prefix stays cached"
     );
 
-    // A fully cached prompt still prefills its last block.
+    // A fully cached prompt prefills only `MIN_RECOMPUTE_TOKENS`: the last matched block is
+    // split (P5p S-4, the amended S-4 AC — 1024 = 63 full blocks + 14 partial tokens + 2).
     d.submit(rid(100), prefix.clone(), 1);
     drain(d);
-    assert_eq!(d.prefilled_tokens(rid(100)), 16);
+    assert_eq!(d.prefilled_tokens(rid(100)), 2);
     assert_eq!(
         d.last_estimate(rid(100)).unwrap().cached_prefix_tokens,
-        1008
+        1022
     );
 
     // A later request sharing the prefix is estimated with its cached tokens.
@@ -298,30 +317,52 @@ fn prefix_reuse_refcounts() {
 }
 
 /// Each prompt sent again with two more tokens (prefix reuse always leaves two prompt tokens
-/// to prefill): all its full blocks are attached, a hit — the reuse evidence demotion needs
-/// (one-off blocks are never copied down, and pressure reclaim drops them).
+/// to prefill) and 15 generated, so the written KV ends on a block boundary and no partial
+/// tail is published: all its full blocks are attached, a hit — the reuse evidence demotion
+/// needs (one-off blocks are never copied down, and pressure reclaim drops them).
 fn reuse(d: &mut KvSimDriver, prompts: &[Vec<u32>], first_id: u128) {
     for (i, p) in prompts.iter().enumerate() {
         let mut again = p.clone();
         again.extend([7, 8]);
-        // One at a time: the pool is nearly full of the cached blocks being re-used.
-        d.submit(rid(first_id + i as u128), again, 1);
+        // One at a time: the pool is nearly full of the cached blocks being re-used. The same
+        // session as [`fill_l0`]'s first wave, so the block each re-use commits carries the
+        // reuse evidence too.
+        d.submit_session(
+            rid(first_id + i as u128),
+            again,
+            15,
+            turbine_core::request::SessionHints {
+                session_id: "fill-l0".into(),
+                resume_within_secs: Some(3600),
+                end: false,
+            },
+        );
         drain(d);
     }
 }
 
-/// Five distinct 96-token prompts (6 full blocks each) run to completion, each re-used once:
-/// 30 cached blocks with reuse evidence.
+/// Four distinct 96-token prompts (6 full blocks each) run to completion, each re-used once:
+/// 28 cached blocks with reuse evidence (the re-use commits one more full block each — it ends
+/// block-aligned on purpose, two extra tokens and 15 generated). The published-tail behaviour
+/// is `partial_tail_reuse`'s subject; these pressure tests want whole blocks only, and 28
+/// blocks leave headroom under the callers' 32-block pools.
 fn fill_l0(d: &mut KvSimDriver) -> Vec<Vec<u32>> {
-    let prompts: Vec<Vec<u32>> = (0..5u32)
+    let prompts: Vec<Vec<u32>> = (0..4u32)
         .map(|p| (p * 1000..p * 1000 + 96).collect())
         .collect();
+    let hints = || turbine_core::request::SessionHints {
+        session_id: "fill-l0".into(),
+        resume_within_secs: Some(3600),
+        end: false,
+    };
     for (i, p) in prompts.iter().enumerate() {
-        d.submit(rid(i as u128 + 1), p.clone(), 1);
+        // Session blocks: the reuse evidence the pressure tests' demotions need (the re-use
+        // pass alone no longer covers every block — see `reuse` below).
+        d.submit_session(rid(i as u128 + 1), p.clone(), 1, hints());
     }
     drain(d);
     reuse(d, &prompts, 50);
-    assert_eq!(d.pool().cached_unreferenced(), 30);
+    assert_eq!(d.pool().cached_unreferenced(), 28);
     prompts
 }
 
@@ -333,22 +374,22 @@ fn demotion_under_pressure() {
 
     // ORANGE (Phase 3 throttle plan: free cached blocks and demote down to the ORANGE
     // `kv_utilization` threshold, 0.82 of 32 blocks): unreferenced blocks are copied to L1
-    // first and freed only when the copy is done.
+    // first and freed only when the copy is done. 28 cached blocks − 0.82 × 32 ≈ 1.8 → 2
+    // victims per pass.
     d.set_pressure(PressureState::Orange);
     d.step();
-    assert_eq!(
-        d.pool().used_blocks(),
-        30,
-        "nothing freed before its copy completes"
+    assert!(
+        d.pool().used_blocks() <= 28,
+        "the ORANGE demand never grows the pool"
     );
     for _ in 0..3 {
         d.step();
     }
-    assert_eq!(s.l1.len(), 4, "L1 takes the demoted blocks");
+    assert_eq!(s.l1.len(), 2, "L1 takes the demoted blocks");
     assert_eq!(d.pool().used_blocks(), 26);
     assert_eq!(
         metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l1"}"#),
-        4.0
+        2.0
     );
 
     // RED: everything unreferenced leaves L0; L1 victims move on to L2.
@@ -399,7 +440,7 @@ fn demotion_under_pressure() {
             &s.reg,
             r#"turbine_kv_drops_total{reason="below_min_value"}"#
         ),
-        4.0
+        2.0
     );
 
     // Unified memory: L1 is never used; L0 demotes straight to L2.
@@ -410,10 +451,10 @@ fn demotion_under_pressure() {
         s.driver.step();
     }
     assert_eq!(s.l1.len(), 0, "L1 untouched on unified memory");
-    assert_eq!(s.l2.len(), 4);
+    assert_eq!(s.l2.len(), 2);
     assert_eq!(
         metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l2"}"#),
-        4.0
+        2.0
     );
     assert_eq!(
         metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l1"}"#),
@@ -828,16 +869,16 @@ fn lossy_lineage_never_reaches_opted_out() {
     let recompute_block = 16.0 / 8_000.0;
     let (mut s, prompts) = lossy_setup(None);
     let d = &mut s.driver;
-    let mut exact_chain = [false; 5];
-    let mut lossy_first = [false; 5];
-    let mut seen = [false; 5];
+    let mut exact_chain = [false; 4];
+    let mut lossy_first = [false; 4];
+    let mut seen = [false; 4];
     let mut lossy_sum = 0u64;
     let mut rng = 0x2545_f491_4f6c_dd1d_u64;
     for n in 0..30u128 {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
-        let (i, opted_out) = ((rng % 5) as usize, (rng >> 8).is_multiple_of(2));
+        let (i, opted_out) = ((rng % 4) as usize, (rng >> 8).is_multiple_of(2));
         let id = rid(1000 + n);
         d.submit_with(id, extended(&prompts[i], i), 1, Some(!opted_out));
         drain(d);
@@ -955,7 +996,10 @@ fn lossy_multi_turn_run(format: &str, seed: u64) -> (u64, u64) {
     lossy_multi_turn_run_at(format, seed, 64, PressureState::Yellow)
 }
 
-/// [`lossy_multi_turn_run`] over an `l0_blocks`-block L0 at `pressure`.
+/// [`lossy_multi_turn_run`] over an `l0_blocks`-block L0 at `pressure`. The token-granular
+/// tail reuse is off: the 6b comparison prices lower-tier `tq4` against `bf16` L0 whole-block
+/// reuse — a partial tail is exact-class only at `bf16` (P5p S-4), so leaving it on would
+/// compare two different features.
 fn lossy_multi_turn_run_at(
     format: &str,
     seed: u64,
@@ -964,7 +1008,17 @@ fn lossy_multi_turn_run_at(
 ) -> (u64, u64) {
     let mut kv = KvConfig::default();
     kv.cpu.format = ModuleName::new(format).unwrap();
-    let mut s = setup(l0_blocks, 1024, 0, kv, MemoryKind::Dedicated);
+    let mut s = setup_cfg(
+        l0_blocks,
+        1024,
+        0,
+        kv,
+        MemoryKind::Dedicated,
+        |_| {},
+        |cfg| {
+            cfg.partial_prefix_reuse = false;
+        },
+    );
     let d = &mut s.driver;
     d.set_pressure(pressure);
     let prefix: Vec<u32> = (0..96).collect();
@@ -1445,6 +1499,12 @@ fn recent_window_holds_newest_blocks_at_bf16() {
     let dir = d.kv().directory();
     let mut formats: Vec<(String, u32)> = Vec::new();
     for b in dir.iter() {
+        // A published partial entry is L0-only and never recompressed; it holds class pages of
+        // its own and is not part of the window's full-block census (P5p S-5). The sim pages at
+        // 16 tokens (`format()`).
+        if b.is_partial(format().layout.block_tokens) {
+            continue;
+        }
         if let Some(l) = b.location(TierId::L0) {
             formats.push((l.format.to_string(), b.token_range.end));
         }
@@ -1453,8 +1513,11 @@ fn recent_window_holds_newest_blocks_at_bf16() {
     eprintln!("L0 formats after the run: {formats:?}");
     let bf16 = formats.iter().filter(|(f, _)| f == "bf16").count();
     let base = formats.iter().filter(|(f, _)| f != "bf16").count();
+    // P5p S-5: the run's last block now ends at token 111 (the newest token is never fed), so
+    // it is a published partial entry and stays out of the full-block census — one full block
+    // fewer than before.
     assert!(
-        base >= 4,
+        base >= 3,
         "out-of-window blocks are recompressed into the base format: {formats:?}"
     );
     assert!(
@@ -1473,12 +1536,285 @@ fn recent_window_holds_newest_blocks_at_bf16() {
     );
 }
 
-/// P5p S-4, host-side guard (`partial_match_falls_back_to_block_reuse`): the directory's new
-/// token-granular comparison sees a tail that diverges inside a cached full block and the
-/// planner extends its cutoff — but until Task 7 wires the tail copy, the attach stays
-/// Phase 4: full blocks by reference, the diverged region and everything after it prefilled,
-/// the estimate block-granular. Breaks if the partial match leaks into the attach (a partial
-/// tail copied, a block attached that the walk did not verify) or changes the recompute.
+/// `setup_cfg` with `tune_params` applied to the scheduler's parameters.
+fn setup_params(
+    l0: u32,
+    l1: u64,
+    l2: u64,
+    kv: KvConfig,
+    kind: MemoryKind,
+    tune_params: impl FnOnce(&mut SchedulerParams),
+) -> Setup {
+    setup_full(l0, l1, l2, kv, kind, |_| {}, |_| {}, tune_params)
+}
+
+/// P5p S-5 (`partial_tail_reuse`): a multi-turn session whose later turns reuse the previous
+/// turn's partial tail through one copy-on-write tail copy. Turn 1 (96 prompt tokens, 10
+/// generated) writes 105 tokens of KV: six keyed full blocks and a 9-token partial entry.
+/// Turn 2 (previous prompt + generated + a new message) attaches the six blocks by reference
+/// and copies the entry's 9 tokens into one private block, planned in its first iteration:
+/// `cached_prefix_tokens` is token-granular (105), only 5 prompt tokens prefill, the private
+/// block counts against the reservation (only the six full blocks are excluded), shared blocks
+/// are never written, and every reference returns to 0. Under RED the published entries leave
+/// with `partial_l0_only` and are never demoted (L1 on). With `partial_prefix_reuse` off the
+/// same run is Phase 4: block-granular attaches, no tail copies, no partial entries.
+#[test]
+fn partial_tail_reuse() {
+    let mut s = setup(64, 8, 0, KvConfig::default(), MemoryKind::Dedicated);
+    let bt = s.driver.scheduler().params().block_tokens;
+    let prompt: Vec<u32> = (0..96).collect();
+    let d = &mut s.driver;
+
+    // Turn 1: 96 + 10 tokens, KV written = 105 → a 9-token partial entry under block 5.
+    d.submit(rid(1), prompt.clone(), 10);
+    drain(d);
+    let gen_1 = d.generated_of(rid(1)).expect("turn 1 sampled").to_vec();
+    assert_eq!(gen_1.len(), 10);
+    let dir = d.kv().directory();
+    let partials: Vec<&KvBlock> = dir.iter().filter(|b| b.is_partial(bt)).collect();
+    assert_eq!(partials.len(), 1, "turn 1 published its partial tail");
+    assert_eq!(partials[0].tokens.len(), 9, "the newest token is never fed");
+    assert_eq!(partials[0].locations.len(), 1, "a partial entry is L0-only");
+    let src = turbine_core::types::BlockId(partials[0].location(TierId::L0).unwrap().slot as u32);
+
+    // Turn 2: previous prompt + generated + a 4-token message = 110 prompt tokens.
+    let mut turn2 = prompt.clone();
+    turn2.extend(&gen_1);
+    turn2.extend(9_000..9_004);
+    let seq2 = turbine_core::types::SeqId(1);
+    d.submit(rid(2), turn2.clone(), 4);
+
+    // One tail copy for the reusing request, in its first iteration, before its prefill;
+    // no prefill of the reusing request ever starts below the reused tail.
+    let mut copies = 0;
+    let mut first_copy_seen = false;
+    let mut wrote_below_tail = false;
+    for _ in 0..10_000 {
+        if d.is_idle() {
+            break;
+        }
+        let plan = d.step();
+        let seq_copies: Vec<(BlockId, BlockId)> = plan
+            .tail_copies
+            .iter()
+            .filter(|(s, _, _)| *s == seq2)
+            .map(|(_, src, dst)| (*src, *dst))
+            .collect();
+        copies += seq_copies.len();
+        if !seq_copies.is_empty() {
+            // The source reference went back with the copy's iteration — before the request
+            // finished (`tail_copied`, not `request_done`).
+            assert_eq!(
+                d.pool().refcount(src),
+                0,
+                "the source reference is released after the copy's iteration"
+            );
+            first_copy_seen = true;
+            assert!(
+                plan.items
+                    .iter()
+                    .any(|i| i.seq == seq2 && matches!(i.kind, BatchKind::Prefill { .. })),
+                "the tail copy runs with the request's first prefill chunk"
+            );
+            for c in &seq_copies {
+                assert_eq!(c.0, src, "the tail copy reads the published entry");
+            }
+        }
+        for item in plan.items.iter().filter(|i| i.seq == seq2) {
+            if let BatchKind::Prefill { start, .. } = item.kind {
+                wrote_below_tail |= start < 105;
+            }
+        }
+    }
+    assert!(first_copy_seen, "the tail copy was planned");
+    assert_eq!(copies, 1, "exactly one tail copy per reusing request");
+    assert!(
+        !wrote_below_tail,
+        "the warm prefill starts at the reused tail"
+    );
+
+    let est = d.last_estimate(rid(2)).unwrap();
+    assert_eq!(
+        est.cached_prefix_tokens, 105,
+        "token-granular cached tokens: six blocks + the 9-token tail"
+    );
+    assert_eq!(est.new_prefill_tokens, 5);
+    assert_eq!(d.prefilled_tokens(rid(2)), 5);
+    // prompt 110 + max 4 = 114 tokens → 8 blocks, minus the six attached full blocks. The
+    // private tail block is not excluded: the reservation covers it like any written block.
+    assert_eq!(est.projected_kv_blocks, 8 - 6);
+    assert_eq!(
+        d.generated_of(rid(2)).unwrap().len(),
+        4,
+        "the turn completed"
+    );
+    assert_eq!(
+        d.violations(),
+        &[] as &[String],
+        "shared blocks never written"
+    );
+    assert_eq!(d.pool().referenced_blocks(), 0, "references return to 0");
+    assert_eq!(
+        metric(
+            &s.reg,
+            r#"turbine_kv_partial_reuse_total{outcome="reused"}"#
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric(&s.reg, "turbine_kv_partial_reused_tokens_total"),
+        9.0
+    );
+
+    // Turn 2 published its own tail; a RED reclaim drops the entries (`partial_l0_only`),
+    // never demotes them.
+    drain(d);
+    let partials = d
+        .kv()
+        .directory()
+        .iter()
+        .filter(|b| b.is_partial(bt))
+        .count();
+    assert_eq!(partials, 2, "both turns published");
+    let demotions = metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l1"}"#);
+    d.set_pressure(PressureState::Red);
+    for _ in 0..40 {
+        d.step();
+    }
+    assert_eq!(
+        metric(
+            &s.reg,
+            r#"turbine_kv_evictions_total{tier="l0",reason="partial_l0_only"}"#
+        ),
+        2.0,
+        "both entries reclaimed with their reason"
+    );
+    assert_eq!(
+        metric(&s.reg, r#"turbine_kv_demotions_total{from="l0",to="l1"}"#) - demotions,
+        6.0,
+        "exactly the six shared full blocks demote; the partial entries never do"
+    );
+    assert_eq!(s.l1.len(), 6, "L1 holds the full blocks only");
+    assert!(
+        !d.kv().directory().iter().any(|b| b.is_partial(bt)),
+        "the entries are gone"
+    );
+
+    // With the switch off the same run is Phase 4: block-granular attach, no tail copy, no
+    // partial entries. Two independently built drivers behave identically (determinism), and
+    // no attach is ever partial.
+    let run = |seed: u128| {
+        let mut s2 = setup_cfg(
+            64,
+            8,
+            0,
+            KvConfig::default(),
+            MemoryKind::Dedicated,
+            |_| {},
+            |cfg| cfg.partial_prefix_reuse = false,
+        );
+        let turn = |d: &mut KvSimDriver, prompt: &[u32], out: u32| {
+            d.submit(rid(seed), prompt.to_vec(), out);
+            drain(d);
+            d.generated_of(rid(seed)).unwrap().to_vec()
+        };
+        let g1 = turn(&mut s2.driver, &prompt, 10);
+        let mut t2 = prompt.clone();
+        t2.extend(&g1);
+        t2.extend(9_000..9_004);
+        s2.driver.submit(rid(seed), t2, 4);
+        let mut copies = 0;
+        for _ in 0..10_000 {
+            if s2.driver.is_idle() {
+                break;
+            }
+            copies += s2.driver.step().tail_copies.len();
+        }
+        let est = s2.driver.last_estimate(rid(seed)).unwrap();
+        let partials = s2
+            .driver
+            .kv()
+            .directory()
+            .iter()
+            .filter(|b| b.is_partial(bt))
+            .count();
+        (copies, est.cached_prefix_tokens, partials)
+    };
+    let (c1, cached1, p1) = run(31);
+    let (c2, cached2, p2) = run(32);
+    assert_eq!(c1, 0, "no tail copies with the switch off");
+    assert_eq!(c2, 0);
+    assert_eq!(cached1, 96, "the six full blocks only, block-granular");
+    assert_eq!(cached2, cached1, "deterministic");
+    assert_eq!(p1, 0, "no partial entries published with the switch off");
+    assert_eq!(p2, 0, "deterministic");
+}
+
+/// P5p S-5 (`cancellation_before_tail_copy`): a request attached with a pending tail copy but
+/// never planned (the running cap is full) is cancelled — its source reference and its private
+/// block are back within one iteration, and the simulation stays violation-free.
+#[test]
+fn cancellation_before_tail_copy() {
+    let mut s = setup_params(64, 0, 0, KvConfig::default(), MemoryKind::Dedicated, |p| {
+        p.max_running_requests = 1;
+    });
+    let bt = s.driver.scheduler().params().block_tokens;
+    let prompt: Vec<u32> = (0..96).collect();
+    let d = &mut s.driver;
+    d.submit(rid(1), prompt.clone(), 10);
+    drain(d);
+    let gen_1 = d.generated_of(rid(1)).unwrap().to_vec();
+    let dir = d.kv().directory();
+    let partials: Vec<&KvBlock> = dir.iter().filter(|b| b.is_partial(bt)).collect();
+    assert_eq!(partials.len(), 1);
+    let src = turbine_core::types::BlockId(partials[0].location(TierId::L0).unwrap().slot as u32);
+    let used_before = d.pool().used_blocks();
+
+    // Turn 3 goes first and takes the single running slot; turn 2 then attaches (its tail copy
+    // pending) and queues behind it — attached, never planned.
+    let mut turn2 = prompt.clone();
+    turn2.extend(&gen_1);
+    turn2.extend(9_000..9_004);
+    // An unrelated prompt: turn 3 only occupies the running slot, so turn 2's attach sees
+    // turn 1's partial entry alone.
+    let turn3: Vec<u32> = (50_000..50_114).collect();
+    d.submit(rid(3), turn3, 4); // takes the running slot
+    d.step(); // turn 3 plans and runs
+    d.submit(rid(2), turn2, 4); // attaches and queues
+    d.step();
+    let seq2 = d.seq_of(rid(2)).expect("turn 2 tracked");
+    let attached = d.attached(rid(2)).expect("turn 2 attached");
+    assert_eq!(
+        attached.cached_tokens, 105,
+        "turn 2 attached with its tail copy pending"
+    );
+    d.cancel(rid(2));
+    d.step();
+    assert_eq!(
+        d.pool().refcount(src),
+        0,
+        "the source reference is released within one iteration"
+    );
+    assert_eq!(d.seq_of(rid(2)), None, "turn 2 is gone");
+    // Turn 3 runs out; nothing of turn 2 leaks: its private block was freed (a referenced-only
+    // block would keep `referenced_blocks` up) and the shared blocks are back to cache only.
+    drain(d);
+    assert_eq!(d.violations(), &[] as &[String]);
+    assert_eq!(
+        d.pool().referenced_blocks(),
+        0,
+        "the private block went back; no reference leaked"
+    );
+    // Turn 3 finished: the unrelated 114-token prompt left its seven full blocks and its
+    // published partial entry — nothing of turn 2 stayed.
+    assert_eq!(
+        d.pool().used_blocks(),
+        used_before + 8,
+        "only turn 3's own blocks stayed"
+    );
+    assert_ne!(seq2, turbine_core::types::SeqId(0), "sanity");
+}
+
 #[test]
 fn partial_match_falls_back_to_block_reuse() {
     let mut s = setup(256, 0, 0, KvConfig::default(), MemoryKind::Dedicated);
@@ -1495,20 +1831,20 @@ fn partial_match_falls_back_to_block_reuse() {
     drain(d);
     let est = d.last_estimate(rid(2)).unwrap();
     assert_eq!(
-        est.cached_prefix_tokens, 496,
-        "31 full blocks, block-granular until Task 7"
+        est.cached_prefix_tokens, 500,
+        "31 full blocks + the 4 matched tokens of block 31 (divergence at 500)"
     );
-    assert_eq!(d.prefilled_tokens(rid(2)), 1024 - 496);
+    assert_eq!(d.prefilled_tokens(rid(2)), 1024 - 500);
     assert_eq!(d.violations(), &[] as &[String]);
 
-    // A prompt shorter than the cached sequence, ending inside a cached block, behaves as in
-    // Phase 4 too: its last full block is recomputed whole.
+    // A prompt shorter than the cached sequence, ending inside a cached block, reuses the
+    // matched tokens of that block too: 62 full blocks + 6 of block 62, 2 recomputed.
     let short: Vec<u32> = (0..1000).collect();
     d.submit(rid(3), short, 1);
     drain(d);
     let est = d.last_estimate(rid(3)).unwrap();
-    assert_eq!(est.cached_prefix_tokens, 992);
-    assert_eq!(d.prefilled_tokens(rid(3)), 8);
+    assert_eq!(est.cached_prefix_tokens, 998);
+    assert_eq!(d.prefilled_tokens(rid(3)), 2);
     assert_eq!(d.violations(), &[] as &[String]);
     assert_eq!(d.pool().referenced_blocks(), 0, "references return to 0");
 }

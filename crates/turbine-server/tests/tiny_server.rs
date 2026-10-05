@@ -1209,8 +1209,10 @@ fn tq_l0_reuse_counts_lossy_cached_tokens() {
         assert_eq!(cold["cached_tokens"], 0, "{dtype}: {cold}");
         assert_eq!(cold["lossy_cached_tokens"], 0, "{dtype}: {cold}");
         let warm = details();
-        assert_eq!(warm["cached_tokens"], 128, "{dtype}: {warm}");
-        let want = if lossy { 128 } else { 0 };
+        // P5p S-5: 128 full-block tokens + 71 of the published tail (the prompt's last block
+        // ends 7 tokens in; the cap is prompt - 2).
+        assert_eq!(warm["cached_tokens"], 199, "{dtype}: {warm}");
+        let want = if lossy { 199 } else { 0 };
         assert_eq!(warm["lossy_cached_tokens"], want, "{dtype}: {warm}");
         let metrics = server.metrics();
         let counted = metrics
@@ -3335,8 +3337,21 @@ fn overlap_scheduling_matches_serial() {
     };
     let overlapped = run(true);
     let serial = run(false);
+    // P5p S-5: which requests catch a partial-tail match is schedule-dependent (the engines'
+    // request interleavings publish different entries), so the reuse counts are not compared —
+    // the served tokens are.
+    let strip_cached = |v: &serde_json::Value| {
+        let mut v = v.clone();
+        v["usage"]["prompt_tokens_details"]["cached_tokens"] = serde_json::json!(0);
+        v
+    };
     for (i, (o, s)) in overlapped.iter().zip(&serial).enumerate() {
-        assert_eq!(o, s, "request {i}: {}", bodies[i]);
+        assert_eq!(
+            strip_cached(o),
+            strip_cached(s),
+            "request {i}: {}",
+            bodies[i]
+        );
     }
     assert_eq!(serial[5]["choices"].as_array().map(Vec::len), Some(2));
 }
@@ -3580,13 +3595,26 @@ fn dp2_routes_to_both_replicas() {
     let total = |r: &str| kv[r]["tiers"][0]["blocks_total"].as_u64().unwrap();
     let (t0, t1) = (total("0"), total("1"));
     assert!(t0 > 0 && t1 > 0, "{kv}");
-    // Each engine publishes after the step that finished its last request.
-    wait_for(Duration::from_secs(30), "both pools free", || {
-        sample(
-            &server.metrics(),
-            r#"turbine_kv_blocks{tier="l0",state="free"}"#,
-        ) == Some((t0 + t1) as f64)
-    });
+    // Each engine publishes after the step that finished its last request. P5p S-5: the
+    // prompts' published partial tails stay keyed cached (the used gauge keeps counting
+    // them), so what must return to zero is the references, not the used blocks.
+    let kv = || server.get("/turbine/v1/kv").json();
+    wait_for(
+        Duration::from_secs(30),
+        "both pools free of references",
+        || {
+            // The DP document is one object per replica.
+            kv().as_object().is_some_and(|o| {
+                o.values().all(|r| {
+                    r["tiers"].as_array().is_some_and(|ts| {
+                        ts.iter()
+                            .filter(|t| t["state"].is_object())
+                            .all(|t| t["state"]["referenced_blocks"].as_u64() == Some(0))
+                    })
+                })
+            })
+        },
+    );
 
     let pressure = server.get("/turbine/v1/pressure").json();
     let groups: Vec<u64> = pressure["groups"]

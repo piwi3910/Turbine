@@ -3287,3 +3287,12 @@ remaining measured options, each with its size:
    before it can be evaluated
 4. Llama side: rope+append fusion, b1 attention selection, inter-kernel gap work (the Llama GEMVs are at the wall;
    these are the only Llama items left)
+
+## 5p Tasks 7–8: HIP tolerance for partial-tail prefill tests (lead decision, test policy, 2026-10-05)
+
+From `p5p-t7t8` (merged): token-granular reuse changes the effective batch composition of a warm prefill, and HIP
+GEMM rounding follows batch composition (user decision 2026-09-26 — the batched-bounds precedent). Mid-block warm
+prefill therefore drifts logprobs ~0.005–0.05 vs cold on HIP (cpu is bit-exact), failing 6 kv_gpu tests that asserted
+HIP bit-exactness. Lead decision: those tests judge by the batched-bounds tolerance (golden's likely/tail split) on
+HIP instead of bit-exactness; cpu-backend bit-exactness tests stay. Cites the 2026-09-26 precedent; test-policy
+detail, not a user decision.

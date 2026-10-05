@@ -1939,6 +1939,18 @@ fn check_labels(line: &str) {
             "result" => TIERS.contains(&v) || v == "miss",
             "reason" => REASONS.contains(&v),
             "path" => PATHS.contains(&v),
+            "outcome" if line.starts_with("turbine_kv_partial_reuse") => {
+                // P5p S-4/S-5: how each token-granular comparison ended.
+                [
+                    "reused",
+                    "no_candidate",
+                    "not_resident",
+                    "planner_cutoff",
+                    "lossy_source",
+                    "disabled",
+                ]
+                .contains(&v)
+            }
             "outcome" => ["used", "wasted", "cancelled", "rejected"].contains(&v),
             "le" => true,
             _ => false,
@@ -2063,9 +2075,30 @@ async fn kv_metrics_bounded() {
         // P6b S-6: the compression ladder (its actions render once the ladder acts).
         "turbine_kv_ladder_rung{",
         "turbine_kv_ladder_actions_total{",
+        // P5p S-4/S-5: the token-granular comparison (the six outcomes render from startup)
+        // and the copy-on-write tail.
+        "turbine_kv_partial_reuse_total{outcome=\"reused\"}",
+        "turbine_kv_partial_reuse_total{outcome=\"no_candidate\"}",
+        "turbine_kv_partial_reuse_total{outcome=\"not_resident\"}",
+        "turbine_kv_partial_reuse_total{outcome=\"planner_cutoff\"}",
+        "turbine_kv_partial_reuse_total{outcome=\"lossy_source\"}",
+        "turbine_kv_partial_reuse_total{outcome=\"disabled\"}",
+        "turbine_kv_partial_reused_tokens_total",
+        "turbine_kv_partial_entries ",
     ] {
         assert!(text.contains(family), "{family} missing");
     }
+    // P5p S-5: the KV document names the switch; the L0 tier its partial entries.
+    let (s, _, body) = send(&app, "GET", "/turbine/v1/kv", Vec::new(), None).await;
+    assert_eq!(s, StatusCode::OK);
+    let kv: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(kv["partial_prefix_reuse"], true, "{kv}");
+    // The field is omitted at 0 (`skip_serializing_if`); a present one is a count.
+    assert!(
+        kv["tiers"][0]["partial_entries"].as_u64().is_some()
+            || kv["tiers"][0].get("partial_entries").is_none(),
+        "{kv}"
+    );
     let value = |series: &str| -> f64 {
         text.lines()
             .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
