@@ -3313,3 +3313,14 @@ The user sets the sequencing principle: speculative decoding (Phase 8) starts on
 leaves performance on the table. Consequence: the remaining Task 18 decode-bandwidth items (K-split small-m MoE GEMV,
 routing-chain fusion, Llama gap/attention/fusion work) are tasked now in 5p, and Phase 8 waits for the ~90 % target.
 The CK rmsnorm-at-n=2048 item stays blocked by the `rmsnorm_sharded` bitwise TP constraint unless the user relaxes it.
+
+## CK rmsnorm at n=2048: relax the bitwise sharded constraint? (open, 2026-10-04)
+
+The decode-bandwidth profile sized CK rmsnorm at n=2048 as a decode-bandwidth item, but it is blocked: the single-GPU
+rmsnorm path must stay bitwise-identical to the `rmsnorm_sharded` TP path (the TP bit-exactness invariant —
+`tp2_matches_tp1_on_host` asserts it). Evaluating CK rmsnorm means single-GPU and TP outputs may differ within the
+golden tolerance instead of bitwise.
+
+- A) Keep the bitwise constraint; the CK rmsnorm item stays out of the decode-bandwidth task
+- B) Relax to golden-tolerance for single-GPU only (TP keeps the sharded kernel); the TP bit-exactness tests change
+  to tolerance — needs your explicit numerics call
