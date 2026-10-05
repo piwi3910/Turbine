@@ -6,8 +6,11 @@
 //!
 //! - `prefix_reuse_matches_cold`: 5 prompts of more than two 128-token blocks, 64 greedy tokens
 //!   each, first with `kv.prefix_sharing: false` (cold), then on a fresh server with sharing on,
-//!   each sent twice: every answer equals the cold one, and the repeat reports
-//!   `cached_tokens` > 0.
+//!   each sent twice: both runs answer within the golden gate's batched bounds of the cold one
+//!   (`assert_within_batched_bounds`: a token-granular warm prefill — even the first run, over a
+//!   published partial tail of an earlier prompt — starts at an arbitrary token offset, and HIP
+//!   GEMM rounding follows batch composition, user decision 2026-09-26; lead decision
+//!   2026-10-05, "5p Tasks 7–8"), and the repeat reports `cached_tokens` > 0.
 //! - `prefix_reuse_suffix_lengths_match_cold`: token-id prompts of whole 128-token blocks plus an
 //!   uncached suffix of 1 to 700 tokens (2 to 64 tokens make a step the size of a decode batch,
 //!   more a prefill-sized one), 64 greedy tokens with their logprobs: cold (sharing off), then warm
@@ -29,9 +32,10 @@
 //!
 //! - `prefix_reuse_matches_cold_fp8_kv`, `nvme_round_trip_matches_cold_fp8_kv` (Phase 6a S-14):
 //!   the same two checks at `kv.dtype: fp8_e4m3` — FP8 pages are copied through L1/L2 as their
-//!   bytes, so a warm or round-tripped prefix answers exactly like the cold FP8 run — plus the
-//!   FP8 L0 pool itself: F8E4M3 pages of half the bytes and at least 1.95× the BF16 run's blocks
-//!   in the same budget.
+//!   bytes, so a round-tripped prefix answers exactly like the cold FP8 run and a reused one
+//!   within the batched bounds (see [`prefix_reuse_matches_cold`]) — plus the FP8 L0 pool
+//!   itself: F8E4M3 pages of half the bytes and at least 1.95× the BF16 run's blocks in the same
+//!   budget.
 //!
 //! Answers are compared by their text and completion token count: greedy decoding of the same
 //! token ids gives the same text, and any KV difference shows up within 64 tokens as a
@@ -200,7 +204,9 @@ impl LabServer {
             "max_tokens": max_tokens,
             "temperature": 0.0,
             "ignore_eos": true,
-            "logprobs": 1,
+            // The gate's top-k: the batched-bounds margin excuse at a divergence needs the
+            // cold run's runner-up (see `batched_verdict`).
+            "logprobs": GOLDEN_TOP_K,
         });
         if let Some(key) = session {
             body["prompt_cache_key"] = json!(key);
@@ -221,11 +227,32 @@ impl LabServer {
             completion_tokens: usage["completion_tokens"]
                 .as_u64()
                 .expect("completion_tokens"),
+            tokens: choice["logprobs"]["tokens"]
+                .as_array()
+                .expect("tokens")
+                .iter()
+                .map(|t| t.as_str().expect("token string").to_string())
+                .collect(),
             logprobs: choice["logprobs"]["token_logprobs"]
                 .as_array()
                 .expect("token_logprobs")
                 .iter()
                 .map(|l| l.as_f64().expect("logprob"))
+                .collect(),
+            top: choice["logprobs"]["top_logprobs"]
+                .as_array()
+                .expect("top_logprobs")
+                .iter()
+                .map(|row| {
+                    let mut row: Vec<(String, f64)> = row
+                        .as_object()
+                        .expect("top row object")
+                        .iter()
+                        .map(|(t, lp)| (t.clone(), lp.as_f64().expect("top logprob")))
+                        .collect();
+                    row.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    row
+                })
                 .collect(),
             prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt_tokens"),
             cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
@@ -252,8 +279,12 @@ impl LabServer {
 struct IdAnswer {
     text: String,
     completion_tokens: u64,
+    /// Each generated token's display string, in order (`logprobs.tokens`).
+    tokens: Vec<String>,
     /// Each generated token's logprob, as the server printed it (equal bits print alike).
     logprobs: Vec<f64>,
+    /// Each generated token's top-k as (display string, logprob), the chosen token first.
+    top: Vec<Vec<(String, f64)>>,
     prompt_tokens: u64,
     cached_tokens: u64,
     /// Of the prompt tokens reused, those whose blocks went through a lossy tier (P6b S-3);
@@ -478,7 +509,11 @@ fn assert_tp(server: &LabServer, sets: &[String]) {
     assert_eq!(tp, want, "tensor parallelism: {}", v["parallel"]);
 }
 
-/// [`prefix_reuse_matches_cold`] on servers started with the extra overrides `sets`.
+/// [`prefix_reuse_matches_cold`] on servers started with the extra overrides `sets`. The cold
+/// run is the reference; both later runs are judged by [`assert_within_batched_bounds`] — with
+/// token-granular reuse even the first run of a later prompt can attach a published partial tail
+/// and start its prefill mid-block, so on HIP the answers are held to the golden gate's batched
+/// bounds instead of bit-equality (lead decision 2026-10-05, "5p Tasks 7–8").
 fn prefix_reuse_matches_cold_with(sets: &[String]) {
     let _gpu = one_server_at_a_time();
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
@@ -486,35 +521,30 @@ fn prefix_reuse_matches_cold_with(sets: &[String]) {
     let prompts: Vec<String> = (1..=5).map(|s| prompt(s, 350)).collect();
 
     let cold_sets = [sets, &["kv.prefix_sharing=false".to_string()]].concat();
-    let cold: Vec<(String, u64, u64)> = {
+    let cold: Vec<IdAnswer> = {
         let server = LabServer::start(&model_dir, &cold_sets);
         assert_tp(&server, sets);
         prompts
             .iter()
-            .map(|p| server.complete(p, ANSWER_TOKENS))
+            .map(|p| server.complete_with_logprobs(json!(p), ANSWER_TOKENS, None))
             .collect()
     };
     let server = LabServer::start(&model_dir, sets);
     assert_tp(&server, sets);
     for (i, p) in prompts.iter().enumerate() {
-        let first = server.complete(p, ANSWER_TOKENS);
-        let warm = server.complete(p, ANSWER_TOKENS);
+        let first = server.complete_with_logprobs(json!(p), ANSWER_TOKENS, None);
+        let warm = server.complete_with_logprobs(json!(p), ANSWER_TOKENS, None);
         println!(
             "prompt {i}: cold {:?} first cached {} warm cached {}",
-            cold[i].0, first.2, warm.2
+            cold[i].text, first.cached_tokens, warm.cached_tokens
         );
-        assert_eq!(cold[i].1, u64::from(ANSWER_TOKENS));
-        assert_eq!(
-            (&first.0, first.1),
-            (&cold[i].0, cold[i].1),
-            "prompt {i}: first run"
+        assert_eq!(cold[i].completion_tokens, u64::from(ANSWER_TOKENS));
+        assert_within_batched_bounds(&cold[i], &first, &format!("prompt {i}: first run"));
+        assert_within_batched_bounds(&cold[i], &warm, &format!("prompt {i}: warm run"));
+        assert!(
+            warm.cached_tokens > 0,
+            "prompt {i}: the warm run reused no prefix"
         );
-        assert_eq!(
-            (&warm.0, warm.1),
-            (&cold[i].0, cold[i].1),
-            "prompt {i}: warm run"
-        );
-        assert!(warm.2 > 0, "prompt {i}: the warm run reused no prefix");
     }
     println!("prefix_reuse_matches_cold ok");
 }
@@ -541,9 +571,10 @@ fn l0_tier(server: &LabServer) -> (String, u64, u64) {
 }
 
 /// Phase 6a S-13 / S-14: at `kv.dtype: fp8_e4m3` the L0 pool is F8E4M3 with half the block
-/// bytes and at least 1.95× the blocks of the BF16 run (same budget), and prefix reuse gives the
-/// cold FP8 answers exactly (see [`prefix_reuse_matches_cold`]). Breaks if the FP8 pool is not
-/// smaller per block, or a reused FP8 prefix differs from recomputing it.
+/// bytes and at least 1.95× the blocks of the BF16 run (same budget), and prefix reuse answers
+/// within the golden gate's batched bounds of the cold FP8 run (see
+/// [`prefix_reuse_matches_cold_with`]). Breaks if the FP8 pool is not smaller per block, or a
+/// reused FP8 prefix answers outside the batched bounds of recomputing it.
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn prefix_reuse_matches_cold_fp8_kv() {
@@ -1063,6 +1094,201 @@ fn assert_within_bounds(
     );
 }
 
+/// The golden gate's `top_k` for this slug (`tests/golden/llama-3.2-3b-instruct/tolerance.json`),
+/// also what the tests request so the margin excuse at a divergence has a runner-up to read.
+const GOLDEN_TOP_K: u32 = 5;
+
+/// The golden gate's batched bounds for this slug (`tolerance.json`
+/// `max_abs_logprob_diff_{likely,tail}_batched`), as the head [`HeadBound`] the existing split
+/// helper already implements: a position whose reference (cold) logprob is above the −2 floor is
+/// judged against 0.25, at or below it against 0.75.
+const BATCHED_BOUNDS: HeadBound = HeadBound::GoldenSplit {
+    likely: 0.25,
+    tail: 0.75,
+    floor: -2.0,
+};
+
+/// The gate's `margin_nats`: a divergence whose reference top-1 − top-2 margin is under this is a
+/// near-tie, excused.
+const GOLDEN_MARGIN: f64 = 0.5;
+
+/// The gate's `min_identical_prefix` of a 64-token answer.
+const GOLDEN_MIN_IDENTICAL_PREFIX: usize = 32;
+
+/// The reference top row's top-1 minus top-2 logprob, whatever its order (compare.rs `margin`).
+fn margin_of(row: &[(String, f64)]) -> Option<f64> {
+    let mut lps: Vec<f64> = row.iter().map(|e| e.1).collect();
+    lps.sort_by(|a, b| b.total_cmp(a));
+    (lps.len() >= 2).then(|| lps[0] - lps[1])
+}
+
+/// `turbine-golden compare`'s batched verdict for one warm answer against its cold reference
+/// (lead decision 2026-10-05, "5p Tasks 7–8: HIP tolerance for partial-tail prefill tests"):
+/// judge every position of the identical token prefix by [`BATCHED_BOUNDS`] — the |Δ logprob| of
+/// the chosen tokens against the bound of the cold logprob's tier — and require the divergence
+/// (any) to be a near-tie (the cold top-1 − top-2 margin at it under [`GOLDEN_MARGIN`]) or the
+/// shared prefix to cover [`GOLDEN_MIN_IDENTICAL_PREFIX`] tokens. Unlike compare.rs this judges
+/// only the chosen tokens (not every reference top-k candidate), so a re-ordered rank 3–5 is not
+/// a violation on its own. Breaks if the tiers' bounds are swapped, the split keys on the warm
+/// logprob, or a pre-divergence drift over the bound or a real (wide-margin) divergence passes.
+fn batched_verdict(cold: &IdAnswer, warm: &IdAnswer) -> Result<(), String> {
+    if warm.completion_tokens != cold.completion_tokens {
+        return Err(format!(
+            "completion token count {} != cold {}",
+            warm.completion_tokens, cold.completion_tokens
+        ));
+    }
+    let identical = cold
+        .tokens
+        .iter()
+        .zip(&warm.tokens)
+        .take_while(|(c, w)| c == w)
+        .count();
+    let mut worst = (0usize, 0.0f64);
+    for (i, (c, w)) in cold.logprobs.iter().zip(&warm.logprobs).enumerate() {
+        if i >= identical {
+            break;
+        }
+        let d = (c - w).abs();
+        let bound = BATCHED_BOUNDS.bound_at(*c);
+        if d > bound {
+            return Err(format!(
+                "position {i} |Δ logprob| {d:.3} over the batched bound {bound:.3} (cold logprob {c:.3})"
+            ));
+        }
+        if d > worst.1 {
+            worst = (i, d);
+        }
+    }
+    let margin = cold.top.get(identical).and_then(|row| margin_of(row));
+    let need = GOLDEN_MIN_IDENTICAL_PREFIX.min(cold.tokens.len());
+    if identical < need && !margin.is_some_and(|m| m < GOLDEN_MARGIN) {
+        return Err(format!(
+            "diverged at token {identical} of {} (cold margin {margin:?}, need < {GOLDEN_MARGIN}), \
+             worst |Δ logprob| within the shared prefix {:.3} at position {}",
+            cold.tokens.len(),
+            worst.1,
+            worst.0
+        ));
+    }
+    println!(
+        "batched verdict: identical prefix {identical}/{} worst |Δ logprob| {:.3} at position {} \
+         (cold margin at the divergence {margin:?})",
+        cold.tokens.len(),
+        worst.1,
+        worst.0
+    );
+    Ok(())
+}
+
+/// [`batched_verdict`] as an assertion.
+fn assert_within_batched_bounds(cold: &IdAnswer, warm: &IdAnswer, label: &str) {
+    if let Err(reason) = batched_verdict(cold, warm) {
+        panic!("{label}: {reason}");
+    }
+}
+
+/// The batched verdict's rules, on synthetic answers (no server): the chosen-token logprobs
+/// within the identical prefix are judged by the cold logprob's tier of [`BATCHED_BOUNDS`], and a
+/// divergence passes only when the shared prefix reaches [`GOLDEN_MIN_IDENTICAL_PREFIX`] (clamped
+/// to the answer length, as the gate clamps it) or the cold top-2 margin at the divergence is
+/// under [`GOLDEN_MARGIN`]. Breaks if the bounds are swapped, the margin excuse keys on the wrong
+/// run's row, or a wide-margin divergence passes.
+#[test]
+fn batched_verdict_excuses_only_a_near_tie_divergence() {
+    fn answer(tokens: &[&str], logprobs: &[f64], top: &[Vec<f64>]) -> IdAnswer {
+        IdAnswer {
+            text: String::new(),
+            completion_tokens: tokens.len() as u64,
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
+            logprobs: logprobs.to_vec(),
+            top: top
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|lp| (String::new(), *lp))
+                        .collect::<Vec<(String, f64)>>()
+                })
+                .collect(),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            lossy_cached_tokens: 0,
+        }
+    }
+    // The cold answer: an all-"a" answer of 4 tokens whose divergence row (position 2) holds a
+    // 0.3-margin near-tie.
+    let cold = answer(
+        &["a"; 4],
+        &[0.0, -1.0, -0.5, -3.0],
+        &[
+            vec![0.0, -1.5, -3.0, -4.0],
+            vec![-1.0, -2.5, -3.0, -4.0],
+            vec![-0.5, -0.8, -3.0, -4.0],
+            vec![-3.0, -4.5, -5.0, -6.0],
+        ],
+    );
+    // Same tokens and logprobs: full prefix, no divergence, passes without reading a margin.
+    assert_within_batched_bounds(&cold, &cold, "warm equals cold");
+    // Divergence at 2 of 4, cold margin there 0.3: excused as a near-tie despite the short prefix.
+    let near = answer(
+        &["a", "a", "b", "a"],
+        &[0.0, -1.0, -0.8, -3.0],
+        &four_rows([0.0, -1.0, -0.5, -3.0]),
+    );
+    assert_within_batched_bounds(&cold, &near, "near-tie divergence is excused");
+    // The same divergence judged against a cold answer whose top-2 at the divergence is a 1.1
+    // margin: a real flip, not excused (the warm run's own top rows are never read).
+    let cold_wide = answer(
+        &["a"; 4],
+        &[0.0, -1.0, -0.5, -3.0],
+        &[
+            vec![0.0, -1.5, -3.0, -4.0],
+            vec![-1.0, -2.5, -3.0, -4.0],
+            vec![-0.5, -1.6, -3.0, -4.0],
+            vec![-3.0, -4.5, -5.0, -6.0],
+        ],
+    );
+    let err = batched_verdict(&cold_wide, &near).unwrap_err();
+    assert!(err.contains("diverged at token 2"), "{err}");
+    // The completion counts must match before anything is judged.
+    let short = answer(
+        &["a"; 3],
+        &[0.0, -1.0, -0.5],
+        &four_rows([0.0, -1.0, -0.5, -3.0]),
+    );
+    let err = batched_verdict(&cold, &short).unwrap_err();
+    assert!(err.contains("completion token count"), "{err}");
+    // A pre-divergence drift over the bound fails even when the prefix rule would hold.
+    let hot = answer(
+        &["a"; 4],
+        &[0.0, -0.5, -0.5, -3.0], // |Δ| 0.5 at position 1; cold −1.0 is likely: bound 0.25
+        &four_rows([0.0, -1.0, -0.5, -3.0]),
+    );
+    let err = batched_verdict(&cold, &hot).unwrap_err();
+    assert!(err.contains("position 1"), "{err}");
+    // The tail tier: the same |Δ| 0.5 at a position whose cold logprob sits exactly at the floor
+    // (−2.0 is tail, `lp > floor`): 0.5 is within the 0.75 tail bound.
+    let cold_tail = answer(
+        &["a"; 4],
+        &[0.0, -2.0, -0.5, -3.0],
+        &four_rows([0.0, -2.0, -0.5, -3.0]),
+    );
+    let hot_tail = answer(
+        &["a"; 4],
+        &[0.0, -2.5, -0.5, -3.0],
+        &four_rows([0.0, -2.0, -0.5, -3.0]),
+    );
+    assert_within_batched_bounds(&cold_tail, &hot_tail, "tail tier");
+}
+
+/// Four top rows whose entries follow the cold chosen logprobs, margins 1.5 everywhere, so a
+/// case's own divergence row decides the verdict.
+fn four_rows(lps: [f64; 4]) -> Vec<Vec<f64>> {
+    lps.iter()
+        .map(|lp| vec![*lp, lp - 1.5, lp - 3.0, lp - 4.0])
+        .collect()
+}
+
 /// The golden head bound splits by the reference logprob exactly as `turbine-golden compare`
 /// does: above the floor (−2) a position is judged likely (0.25), at the floor exactly or below
 /// it tail (0.75) — the same `>` comparison against `likely_logprob_floor` as the gate.
@@ -1090,8 +1316,11 @@ fn golden_head_bound_splits_likely_from_tail() {
 /// that capacity demotion moved to L1 are encoded; a later request for the same prompt reuses
 /// them as lossy blocks (`usage.prompt_tokens_details.lossy_cached_tokens` > 0) and answers
 /// within the FP8 tier's bound of its cold run; with `x-turbine-kv-lossy: deny` the lossy
-/// blocks are not reused and the answer equals the cold one bit for bit. Breaks if a lossy block
-/// is reused by a request that opted out, or a lossy L1 copy is never reused.
+/// blocks are not reused and the answer stays within the golden gate's batched bounds of the
+/// cold one (lead decision 2026-10-05, "5p Tasks 7–8": the denied run can still attach an exact
+/// published partial tail and start its prefill mid-block, which shifts HIP's GEMM rounding
+/// without being a lossy reuse). Breaks if a lossy block is reused by a request that opted out,
+/// or a lossy L1 copy is never reused.
 #[test]
 #[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
 fn lossy_tier_reuse() {
@@ -1240,10 +1469,10 @@ fn lossy_tier_reuse_with(format: &str, bounds: (HeadBound, f64, f64)) {
         denied.lossy_cached_tokens, 0,
         "a denied request reused lossy"
     );
-    assert_eq!(
-        denied.output(),
-        cold.output(),
-        "x-turbine-kv-lossy: deny must equal the cold run bit for bit"
+    assert_within_batched_bounds(
+        &cold,
+        &denied,
+        "x-turbine-kv-lossy: deny reuses no lossy block",
     );
     assert!(
         server.metric("turbine_kv_lossy_denied_total") >= 1.0,
