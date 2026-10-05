@@ -24,6 +24,20 @@
 //! requests a free slot could start) and, with chunked prefill, `max_batch_tokens / m` tokens,
 //! so the running set spreads over the micro-batches; decodes go least recently stepped first.
 //! With `m = 1` (the default) planning is unchanged.
+//!
+//! Multi-token appends (P5p S-9): `extend(seq, tokens)` asks the next plan to feed
+//! `1 + tokens` positions of the decoding sequence as one `BatchKind::Prefill { start, len }`
+//! item with `logits_rows = len` (the verified jump-forward of S-10 feeds the sampled-but-
+//! unfed token and the grammar's forced tokens; the last row yields the next token). The item
+//! takes `len` from the token budget left after the decodes and is planned before the prefill
+//! chunks; not coverable — the budget, the executor's logits-row capacity (the plan keeps an
+//! iteration's total rows at `max_running_requests`, which sizes the executor's head buffers)
+//! or the pool — falls back to a plain decode and drops the extension. The engine reports the
+//! tokens it kept as `appended` and the rest as `IterationOutcome::rolled_back`, which
+//! shortens the table and frees blocks left empty. A preemption, finish or removal drops the
+//! pending extension with the table it would have extended. Callers bound `tokens` by
+//! `structured_output.jump_forward_max_tokens` (spec S-9); the plan additionally caps the item
+//! by the policy's chunk cap and the request's own `prompt_len + max_new_tokens`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -45,7 +59,7 @@ use crate::gate::{AdmissionGate, GateOutcome};
 use crate::metrics::SchedulerMetrics;
 use crate::policy::{AdmissionInfo, DefaultPolicy, PreemptionRank, RunningInfo, SchedulingPolicy};
 use crate::queue::WaitingQueue;
-use crate::request::{CancelReason, PreemptReason, RequestState, SchedRequest};
+use crate::request::{CancelReason, PreemptReason, RequestState, SchedError, SchedRequest};
 
 /// Scheduler bounds (P2 §Configuration). `max_seq_len` and `queue_timeout` are contract
 /// additions used by the submission checks and rule 1; from Phase 3 `queue_timeout` is
@@ -244,6 +258,10 @@ pub struct IterationOutcome {
     /// Tokens sampled per sequence: 1 for a decode and for a completed prefill (on the shared
     /// prefill of `n > 1`, one for every choice), 0 or absent otherwise.
     pub appended: Vec<(SeqId, u32)>,
+    /// Positions the engine fed but rejected (P5p S-9): the table is shortened by that many
+    /// tokens and blocks left empty are freed. Kept + rolled-back positions = every extension
+    /// item's `len`.
+    pub rolled_back: Vec<(SeqId, u32)>,
     pub failed: Option<IterationFailure>,
 }
 
@@ -387,6 +405,11 @@ struct SeqEntry {
     /// it could be planned (preemption, finish, removal) — the copy must never fire against a
     /// stale table.
     tail_pending: Option<(BlockId, BlockId)>,
+    /// Pending multi-token append (P5p S-9): the next plan feeds `1 + tokens` positions of
+    /// this decoding sequence as one prefill-kind item. Cleared wherever the table drops
+    /// (preemption, finish, removal) and decided by every plan: planned, or dropped for a
+    /// plain decode when the budget, the logits-row capacity or the pool cannot cover it.
+    extend_pending: Option<u32>,
 }
 
 /// A plan awaiting `complete`.
@@ -731,6 +754,7 @@ impl Scheduler {
                     pause_pending: false,
                     last_step: 0,
                     tail_pending: None,
+                    extend_pending: None,
                 },
             );
         }
@@ -894,6 +918,31 @@ impl Scheduler {
         self.publish_gauges();
     }
 
+    /// Asks the next plan to feed `1 + tokens` positions of the decoding sequence `seq` as one
+    /// prefill-kind item (`BatchKind::Prefill { start, len }` with `len = 1 + tokens`,
+    /// `logits_rows = len`; P5p S-9): the engine's verified multi-token step feeds the
+    /// sampled-but-unfed token and the grammar's forced tokens, and its `complete` reports the
+    /// kept tokens as `appended` and the rest as `rolled_back`. The next plan takes the item's
+    /// tokens from the budget left after the decodes and plans it before the prefill chunks;
+    /// an extension the budget, the executor's logits-row capacity (`max_running_requests`
+    /// rows per iteration) or the pool cannot cover falls back to a plain decode and is
+    /// dropped. Callers bound `tokens` by `structured_output.jump_forward_max_tokens`; the
+    /// plan additionally caps the item by the policy's chunk cap and the request's own
+    /// `prompt_len + max_new_tokens`. A sequence that is not decoding (prefilling, waiting,
+    /// paused, finished, untracked) is `SchedError::NotDecoding`; `tokens` 0 is a no-op.
+    pub fn extend(&mut self, seq: SeqId, tokens: u32) -> Result<(), SchedError> {
+        let Some(e) = self.seqs.get_mut(&seq) else {
+            return Err(SchedError::NotDecoding);
+        };
+        if e.state != RequestState::Decoding {
+            return Err(SchedError::NotDecoding);
+        }
+        if tokens > 0 {
+            e.extend_pending = Some(tokens);
+        }
+        Ok(())
+    }
+
     /// New submissions get `ShuttingDown`; admitted and queued requests continue.
     pub fn begin_shutdown(&mut self) {
         self.shutting_down = true;
@@ -942,21 +991,12 @@ impl Scheduler {
         if plan.items.len() <= limit {
             return;
         }
-        let bt = self.params.block_tokens;
         for item in plan.items.drain(limit..) {
-            let Some(e) = self.seqs.get_mut(&item.seq) else {
-                continue;
-            };
             let written = match item.kind {
                 BatchKind::Decode => 1,
                 BatchKind::Prefill { len, .. } => len,
             };
-            e.table.tokens = e.table.tokens.saturating_sub(written);
-            let keep = blocks_for_tokens(e.table.tokens, bt) as usize;
-            if e.table.blocks.len() > keep {
-                let extra: SmallVec<[BlockId; 16]> = e.table.blocks.drain(keep..).collect();
-                pool.release(&extra);
-            }
+            self.shorten_table(pool, item.seq, written);
         }
         let kept: HashSet<RequestId> = plan
             .items
@@ -1068,25 +1108,46 @@ impl Scheduler {
             self.requeue_unstarted(pool, &mut plan);
         }
 
-        // (2) Every decodable sequence decodes; preempt until the pool covers them.
+        // (2) Multi-token appends (P5p S-9) and then every decodable sequence decodes; preempt
+        // until the pool covers the decodes.
+        let cap = seq_cap.min(token_cap as usize);
+        let candidates = self.decode_candidates(cap);
+        let mut rows = 0u32;
+        let (extended, ext_reserved) = self.plan_extensions(
+            pool,
+            limits,
+            &candidates,
+            token_cap,
+            &mut plan,
+            &mut in_plan,
+            &mut rows,
+        );
+
         self.plan_decodes(
             pool,
             limits,
-            seq_cap.min(token_cap as usize),
+            cap,
+            &candidates,
+            &extended,
             &mut plan,
             &mut in_plan,
             &mut preempted_now,
+            &mut rows,
         );
 
         // Forks of finished shared prefills (n > 1) wait for blocks, never re-prefill.
         self.plan_forks(pool, &mut plan, &mut in_plan, &mut preempted_now);
 
-        // (3) Prefill: continuing prefills oldest first, then admissions.
+        // (3) Prefill: continuing prefills oldest first, then admissions. An iteration's total
+        // logits rows stay at `max_running_requests` (the executor's head capacity), so an
+        // extension's extra rows shrink what the prefills may take.
         let decode_tokens = plan.decode_tokens();
         let fraction = limits.prefill_budget_fraction.clamp(0.0, 1.0);
-        let mut budget =
-            (f64::from(token_cap.saturating_sub(decode_tokens)) * fraction).floor() as u32;
+        let mut budget = (f64::from(token_cap.saturating_sub(decode_tokens)) * fraction).floor()
+            as u32
+            - ext_reserved;
         let chunk_cap = self.policy.chunk_cap(&self.params, limits);
+        let rows_cap = self.params.max_running_requests;
         for id in self.running.clone() {
             if self.busy.contains_key(&id) {
                 continue;
@@ -1101,6 +1162,8 @@ impl Scheduler {
                     &mut budget,
                     chunk_cap,
                     true,
+                    rows_cap,
+                    &mut rows,
                     &mut plan,
                     &mut in_plan,
                     &mut preempted_now,
@@ -1143,6 +1206,7 @@ impl Scheduler {
                 && (self.running.len() as u32) < self.params.max_running_requests
                 && (gated || limits.batch_growth_limit.is_none_or(|g| admitted_now < g))
                 && plan.items.len() < seq_cap
+                && rows < rows_cap
             {
                 let Some(head) = self.queue.peek() else {
                     break;
@@ -1163,6 +1227,8 @@ impl Scheduler {
                         &mut budget,
                         chunk_cap,
                         false,
+                        rows_cap,
+                        &mut rows,
                         &mut plan,
                         &mut in_plan,
                         &mut preempted_now,
@@ -1298,6 +1364,9 @@ impl Scheduler {
                 e.generated += n;
             }
         }
+        for (seq, n) in outcome.rolled_back {
+            self.shorten_table(pool, seq, n);
+        }
         for (seq, kind) in in_flight {
             if !matches!(kind, BatchKind::Prefill { .. }) {
                 continue;
@@ -1352,8 +1421,26 @@ impl Scheduler {
                 e.generated += n;
             }
         }
+        for (seq, n) in outcome.rolled_back {
+            self.shorten_table(pool, seq, n);
+        }
         for (seq, _reason) in outcome.finished {
             self.finish_or_defer(pool, seq);
+        }
+    }
+
+    /// Removes `n` tokens from the end of `seq`'s table (`IterationOutcome::rolled_back`, P5p
+    /// S-9; also `shrink_plan`), freeing blocks left empty.
+    fn shorten_table(&mut self, pool: &mut BlockPool, seq: SeqId, n: u32) {
+        let bt = self.params.block_tokens;
+        let Some(e) = self.seqs.get_mut(&seq) else {
+            return;
+        };
+        e.table.tokens = e.table.tokens.saturating_sub(n);
+        let keep = blocks_for_tokens(e.table.tokens, bt) as usize;
+        if e.table.blocks.len() > keep {
+            let extra: SmallVec<[BlockId; 16]> = e.table.blocks.drain(keep..).collect();
+            pool.release(&extra);
         }
     }
 
@@ -1572,21 +1659,27 @@ impl Scheduler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn plan_decodes(
         &mut self,
         pool: &mut BlockPool,
         limits: &IterationLimits,
         cap: usize,
+        candidates: &[SeqId],
+        extended: &HashSet<SeqId>,
         plan: &mut IterationPlan,
         in_plan: &mut HashSet<RequestId>,
         preempted_now: &mut HashSet<RequestId>,
+        rows: &mut u32,
     ) {
         let bt = self.params.block_tokens;
         // Preempt until the pool covers every decode (never, without allow_preempt). With
         // micro-batches the victim is still the worst-ranked running request; when it is in
         // flight nothing is preempted, and the decodes lacking a block wait for its plan.
         let mut victim_in_flight = false;
-        while limits.allow_preempt && self.decode_blocks_needed(cap) > pool.available_blocks() {
+        while limits.allow_preempt
+            && self.decode_blocks_needed(cap, extended) > pool.available_blocks()
+        {
             let Some(victim) = self.worst_running(|_| true) else {
                 break;
             };
@@ -1596,11 +1689,19 @@ impl Scheduler {
             }
             self.preempt(pool, victim, plan, preempted_now);
         }
-        for seq in self.decode_candidates(cap) {
-            let e = self
+        for seq in candidates {
+            if extended.contains(seq) {
+                continue; // this plan's step for the sequence is the extension item
+            }
+            // A preemption of this plan's loop may have returned the sequence to the queue
+            // after `candidates` was taken.
+            let Some(e) = self
                 .seqs
-                .get_mut(&seq)
-                .expect("decode set holds tracked sequences");
+                .get_mut(seq)
+                .filter(|e| e.state == RequestState::Decoding)
+            else {
+                continue;
+            };
             let need = e.table.blocks_needed(1, bt);
             let Ok(blocks) = Self::allocate_for(
                 pool,
@@ -1636,9 +1737,10 @@ impl Scheduler {
             };
             e.table.blocks.extend(blocks);
             e.table.tokens += 1;
+            *rows += 1;
             in_plan.insert(e.request);
             plan.items.push(BatchItem {
-                seq,
+                seq: *seq,
                 kind: BatchKind::Decode,
                 block_table: e.table.clone(),
             });
@@ -1730,6 +1832,91 @@ impl Scheduler {
         }
     }
 
+    /// Plans a decoding sequence's pending extension (P5p S-9): the item feeds `1 + tokens`
+    /// positions from the budget left after the decodes, before the prefill chunks. Not
+    /// coverable — the budget, the plan's logits-row capacity (`rows_cap` =
+    /// `max_running_requests`, the executor's head bound) or the pool — the extension is
+    /// dropped and the sequence decodes; a request whose plan is in flight keeps its pending
+    /// extension for the next plan. Returns the extended sequences and the token budget the
+    /// extension items consumed.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_extensions(
+        &mut self,
+        pool: &mut BlockPool,
+        limits: &IterationLimits,
+        candidates: &[SeqId],
+        token_cap: u32,
+        plan: &mut IterationPlan,
+        in_plan: &mut HashSet<RequestId>,
+        rows: &mut u32,
+    ) -> (HashSet<SeqId>, u32) {
+        let bt = self.params.block_tokens;
+        let fraction = limits.prefill_budget_fraction.clamp(0.0, 1.0);
+        let rows_cap = self.params.max_running_requests;
+        let mut extended = HashSet::new();
+        let mut reserved = 0u32;
+        let mut replaced_decodes = 0u32;
+        for &seq in candidates {
+            let Some(e) = self.seqs.get_mut(&seq) else {
+                continue;
+            };
+            let request = e.request;
+            if self.busy.contains_key(&request) {
+                continue; // no plan may touch an in-flight request; the extension waits
+            }
+            let Some(tokens) = e.extend_pending.take() else {
+                continue;
+            };
+            let (table_tokens, ceiling) = {
+                let r = &self.requests[&request];
+                (
+                    e.table.tokens,
+                    r.req.prompt_len.saturating_add(r.req.max_new_tokens),
+                )
+            };
+            // Nothing left to append (the engine extended past `prompt_len + max_new_tokens`):
+            // a plain decode.
+            let Some(len) = u32::checked_add(1, tokens)
+                .map(|l| l.min(ceiling.saturating_sub(table_tokens)))
+                .filter(|&l| l > 1)
+            else {
+                continue;
+            };
+            let budget =
+                (f64::from(token_cap.saturating_sub(candidates.len() as u32 - replaced_decodes))
+                    * fraction)
+                    .floor() as u32;
+            if len > budget || *rows + len > rows_cap {
+                continue; // dropped: the sequence decodes
+            }
+            let need = e.table.blocks_needed(len, bt);
+            let Ok(blocks) = Self::allocate_for(
+                pool,
+                &mut self.requests,
+                request,
+                need,
+                self.params.recent_window,
+            ) else {
+                continue; // dropped: the pool cannot cover the extension's blocks
+            };
+            let e = self.seqs.get_mut(&seq).expect("sequence tracked");
+            e.table.blocks.extend(blocks);
+            let start = e.table.tokens;
+            e.table.tokens += len;
+            *rows += len;
+            reserved += len;
+            replaced_decodes += 1;
+            in_plan.insert(request);
+            extended.insert(seq);
+            plan.items.push(BatchItem {
+                seq,
+                kind: BatchKind::Prefill { start, len },
+                block_table: e.table.clone(),
+            });
+        }
+        (extended, reserved)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn schedule_chunk(
         &mut self,
@@ -1738,6 +1925,8 @@ impl Scheduler {
         budget: &mut u32,
         chunk_cap: u32,
         may_preempt: bool,
+        rows_cap: u32,
+        rows: &mut u32,
         plan: &mut IterationPlan,
         in_plan: &mut HashSet<RequestId>,
         preempted_now: &mut HashSet<RequestId>,
@@ -1748,6 +1937,11 @@ impl Scheduler {
         let remaining = e.target.saturating_sub(e.table.tokens);
         let len = remaining.min(chunk_cap).min(*budget);
         if len == 0 || (self.whole_prefill_required(remaining) && len < remaining) {
+            return false;
+        }
+        if *rows + 1 > rows_cap {
+            // The iteration's logits rows are at `max_running_requests` (P5p S-9); a prefill
+            // chunk's last position is one of them.
             return false;
         }
         let need = e.table.blocks_needed(len, bt);
@@ -1780,6 +1974,7 @@ impl Scheduler {
         let start = e.table.tokens;
         e.table.tokens += len;
         *budget -= len;
+        *rows += 1;
         in_plan.insert(id);
         // The copy-on-write tail copy (P5p S-5) rides with the sequence's first prefill chunk;
         // the engine executes it with the fork copies before the forward.
@@ -1906,6 +2101,7 @@ impl Scheduler {
             pool.release(&table.blocks);
             // The pending tail copy dies with the table it copied into.
             e.tail_pending = None;
+            e.extend_pending = None;
             if matches!(
                 e.state,
                 RequestState::Prefilling | RequestState::Decoding | RequestState::Paused
@@ -1947,6 +2143,7 @@ impl Scheduler {
             let table = std::mem::take(&mut e.table);
             pool.release(&table.blocks);
             e.tail_pending = None;
+            e.extend_pending = None;
         }
         self.retire_if_done(id);
     }
@@ -1993,6 +2190,7 @@ impl Scheduler {
             if let Some(mut e) = self.seqs.remove(seq) {
                 pool.release(&e.table.blocks);
                 e.tail_pending = None;
+                e.extend_pending = None;
                 if e.state.is_live() {
                     e.set_state(terminal, *seq);
                 }
@@ -2041,11 +2239,13 @@ impl Scheduler {
         self.requests.get(&id).is_some_and(|r| r.admitted.is_some())
     }
 
-    /// Blocks this plan's decodes need for one more token each.
-    fn decode_blocks_needed(&self, cap: usize) -> u32 {
+    /// Blocks this plan's decodes need for one more token each. The sequences of `extended`
+    /// step through their extension item instead and are not counted.
+    fn decode_blocks_needed(&self, cap: usize, extended: &HashSet<SeqId>) -> u32 {
         let bt = self.params.block_tokens;
         self.decode_candidates(cap)
             .iter()
+            .filter(|s| !extended.contains(s))
             .map(|s| self.seqs[s].table.blocks_needed(1, bt))
             .sum()
     }
@@ -2171,6 +2371,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::*;
+    use crate::SchedError;
+
     use smallvec::smallvec;
     use turbine_core::clock::FakeClock;
     use turbine_core::types::{DType, DeviceId, KvLayout, Priority};
@@ -2178,8 +2381,6 @@ mod tests {
     use turbine_observability::MetricsRegistry;
     use turbine_tensor::DeviceMemory;
     use turbine_tensor::host::HostMemory;
-
-    use super::*;
 
     fn params() -> SchedulerParams {
         SchedulerParams {
@@ -2257,6 +2458,7 @@ mod tests {
                 iteration: plan.iteration,
                 finished,
                 appended,
+                rolled_back: Vec::new(),
                 failed: None,
             },
         );
@@ -2340,6 +2542,206 @@ mod tests {
             s.submit(request(10, 10, 10, 10), p.total_blocks()),
             Err(SubmitError::ShuttingDown)
         ));
+    }
+
+    /// S-9: `Scheduler::extend` plans a decoding sequence's next step as one `1 + tokens`
+    /// prefill-kind item, taken from the budget left after the decodes and before the prefill
+    /// chunks; `rolled_back` shortens the table and frees a block left empty; an extension the
+    /// budget cannot cover falls back to a plain decode and is dropped; another state is
+    /// `NotDecoding`; a preemption drops the pending extension.
+    #[test]
+    fn extend_and_roll_back() {
+        let clock = FakeClock::new(Duration::ZERO);
+
+        // A decoding sequence extended by 5 tokens is planned as one 6-token item, before the
+        // iteration's prefill chunk and from the budget left after the decodes (none here: the
+        // extension replaces the sequence's decode).
+        let mut s = Scheduler::new(params(), Arc::new(clock.clone()));
+        let mut p = pool(64);
+        s.submit(request(1, 1, 12, 50), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [(1, BatchKind::Prefill { start: 0, len: 12 })]
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&plan), [(1, BatchKind::Decode)]);
+        complete_all(&mut s, &mut p, &plan, &[]); // table 13 tokens (1 block), generated 2
+
+        // A 100-token prompt waits behind the extension's 6 tokens (budget 64 − 6 = 58, the
+        // chunk cap keeps its first chunk at 32).
+        s.submit(request(2, 2, 100, 10), p.total_blocks()).unwrap();
+        s.extend(SeqId(1), 5).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Prefill { start: 13, len: 6 }),
+                (2, BatchKind::Prefill { start: 0, len: 32 }),
+            ]
+        );
+        assert_eq!(plan.items[0].block_table.tokens, 19);
+        assert_eq!(plan.items[0].block_table.blocks.len(), 2);
+        // The engine accepts all 5 forced tokens and row 5 yields the next one: 6 appended.
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: plan.iteration,
+                finished: vec![],
+                appended: vec![(SeqId(1), 6)],
+                rolled_back: Vec::new(),
+                failed: None,
+            },
+        );
+        assert_eq!(s.token_limit(SeqId(1)), Some(50 - 8));
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Decode),
+                (2, BatchKind::Prefill { start: 32, len: 32 })
+            ]
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+
+        // Extending a prefilling, paused or unknown sequence is refused.
+        s.extend(SeqId(2), 3).unwrap_err(); // still between prefill chunks
+        s.pause(SeqId(1));
+        assert!(matches!(
+            s.extend(SeqId(1), 3),
+            Err(SchedError::NotDecoding)
+        ));
+        s.resume(SeqId(1));
+        assert!(matches!(
+            s.extend(SeqId(99), 3),
+            Err(SchedError::NotDecoding)
+        ));
+
+        // An extension the budget cannot cover falls back to a plain decode and is dropped,
+        // not retried on a later plan.
+        let no_prefill = IterationLimits {
+            prefill_budget_fraction: 0.0,
+            ..IterationLimits::default()
+        };
+        s.extend(SeqId(1), 5).unwrap();
+        let plan = s.plan(&mut p, &no_prefill);
+        assert_eq!(kinds(&plan), [(1, BatchKind::Decode)]);
+        complete_all(&mut s, &mut p, &plan, &[]);
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Decode),
+                (2, BatchKind::Prefill { start: 64, len: 32 })
+            ],
+            "the dropped extension is not retried"
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+
+        // A roll-back of 3 shortens the table by 3 tokens and frees the block it emptied.
+        let mut s = Scheduler::new(params(), Arc::new(clock.clone()));
+        let mut p = pool(8);
+        s.submit(request(1, 1, 12, 50), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        complete_all(&mut s, &mut p, &plan, &[]);
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        complete_all(&mut s, &mut p, &plan, &[]); // table 13 tokens, 1 block
+        s.extend(SeqId(1), 5).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [(1, BatchKind::Prefill { start: 13, len: 6 })]
+        );
+        assert_eq!(plan.items[0].block_table.blocks.len(), 2);
+        assert_eq!(p.used_blocks(), 2);
+        // Rows 0..3 verify (3 forced tokens kept), row 3 disagrees: the model's token is
+        // taken (appended) and the 3 rejected positions are rolled back.
+        s.complete(
+            &mut p,
+            IterationOutcome {
+                iteration: plan.iteration,
+                finished: vec![],
+                appended: vec![(SeqId(1), 4)],
+                rolled_back: vec![(SeqId(1), 3)],
+                failed: None,
+            },
+        );
+        assert_eq!(s.token_limit(SeqId(1)), Some(50 - 6));
+        assert_eq!(
+            p.used_blocks(),
+            1,
+            "the emptied block was freed (16 tokens = 1 block of 16)"
+        );
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&plan), [(1, BatchKind::Decode)]);
+        assert_eq!(
+            plan.items[0].block_table.tokens, 17,
+            "16 kept tokens + the decode"
+        );
+        assert_eq!(
+            plan.items[0].block_table.blocks.len(),
+            2,
+            "the decode refills a second block"
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+
+        // A preemption drops the pending extension: after the request is recomputed and
+        // decodes again, no extension item appears.
+        let mut s = Scheduler::new(params(), Arc::new(clock.clone()));
+        let mut p = pool(3);
+        s.submit(request(1, 1, 8, 40), p.total_blocks()).unwrap();
+        s.submit(request(2, 2, 8, 40), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            kinds(&plan),
+            [
+                (1, BatchKind::Prefill { start: 0, len: 8 }),
+                (2, BatchKind::Prefill { start: 0, len: 8 }),
+            ]
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+        s.extend(SeqId(2), 3).unwrap();
+        // Both decode until they cross their first block boundary together; the pool of 3
+        // blocks cannot cover the two new blocks, so the worse-ranked request 2 is preempted.
+        let mut preempted = None;
+        for _ in 0..12 {
+            let plan = s.plan(&mut p, &IterationLimits::default());
+            if !plan.preempted.is_empty() {
+                assert_eq!(plan.preempted, [(SeqId(2), PreemptReason::KvExhausted)]);
+                assert_eq!(
+                    kinds(&plan),
+                    [(1, BatchKind::Decode)],
+                    "only the survivor decodes; the pending extension went with the preemption"
+                );
+                preempted = Some(plan);
+                break;
+            }
+            complete_all(&mut s, &mut p, &plan, &[]);
+        }
+        let plan = preempted.expect("the pool forced a preemption");
+        complete_all(&mut s, &mut p, &plan, &[]);
+        assert!(matches!(
+            s.extend(SeqId(2), 3),
+            Err(SchedError::NotDecoding)
+        ));
+        // Request 2 is recomputed from scratch and decodes again — without its extension.
+        for _ in 0..6 {
+            let plan = s.plan(&mut p, &IterationLimits::default());
+            for item in &plan.items {
+                let ok = item.seq != SeqId(2)
+                    || match item.kind {
+                        BatchKind::Decode => true,
+                        BatchKind::Prefill { start, .. } => start < 8,
+                    };
+                assert!(
+                    ok,
+                    "the preempted request's extension survived: {:?}",
+                    item.kind
+                );
+            }
+            complete_all(&mut s, &mut p, &plan, &[]);
+        }
     }
 
     /// At the default 128-token page: completion KV is counted in whole pages, decodes fill a
@@ -2723,6 +3125,7 @@ mod tests {
             IterationOutcome {
                 iteration: plan.iteration,
                 appended: vec![(SeqId(20), 1), (SeqId(21), 1)],
+                rolled_back: Vec::new(),
                 finished: vec![(SeqId(20), FinishReason::Stop)],
                 failed: None,
             },
@@ -2807,6 +3210,7 @@ mod tests {
             IterationOutcome {
                 iteration: a.iteration,
                 appended: vec![(SeqId(1), 1), (SeqId(2), 1)],
+                rolled_back: Vec::new(),
                 finished: vec![(SeqId(3), FinishReason::Stop)],
                 failed: None,
             },

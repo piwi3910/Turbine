@@ -244,6 +244,7 @@ fn forward(
             block_table: table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         });
         tokens.extend_from_slice(new);
         positions.extend(start..start + new.len() as u32);

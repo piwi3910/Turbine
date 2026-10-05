@@ -179,6 +179,7 @@ fn step(
             block_table: table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         });
         tokens.extend_from_slice(toks);
         positions.extend(start..start + toks.len() as u32);
@@ -1509,6 +1510,7 @@ fn served_step(
             block_table: table,
             block_formats: &[],
             reduce,
+            logits_rows: 1,
         });
         tokens.extend_from_slice(toks);
         positions.extend(start..start + toks.len() as u32);

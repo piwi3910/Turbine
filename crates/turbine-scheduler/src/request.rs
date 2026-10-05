@@ -199,6 +199,10 @@ pub enum SchedError {
         from: RequestState,
         to: RequestState,
     },
+    /// `Scheduler::extend` (P5p S-9) on a sequence that is not decoding: prefilling, waiting,
+    /// paused, finished or untracked.
+    #[error("sequence is not decoding")]
+    NotDecoding,
 }
 
 #[cfg(test)]
@@ -247,6 +251,7 @@ mod tests {
                         assert_eq!((f, t), (from, to));
                         assert_eq!(state, from, "a rejected transition changed the state");
                     }
+                    Err(e) => panic!("{from:?} → {to:?}: unexpected {e}"),
                 }
             }
         }

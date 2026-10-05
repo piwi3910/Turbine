@@ -2827,6 +2827,7 @@ fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>
                 block_table: &plan.items[index].block_table.blocks,
                 block_formats: formats,
                 reduce: row.reduce,
+                logits_rows: 1,
             },
         )
         .collect()

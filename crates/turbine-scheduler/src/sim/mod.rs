@@ -216,6 +216,9 @@ pub struct Simulation {
     hooks: BTreeMap<u64, Vec<Hook>>,
     report: SimReport,
     ledger: AdmissionLedger,
+    /// Random extensions (P5p S-9): every `every`-th iteration extends the first decoding
+    /// sequence by `1 + next % max_k` tokens; `None` (the default) never extends.
+    extensions: Option<(u64, u32)>,
 }
 
 impl Simulation {
@@ -239,7 +242,18 @@ impl Simulation {
             hooks: BTreeMap::new(),
             report: SimReport::default(),
             ledger: AdmissionLedger::default(),
+            extensions: None,
         }
+    }
+
+    /// Random extensions (P5p S-9): every `every`-th iteration extends the first decoding
+    /// sequence by `1 + iteration % max_k` tokens, always fully accepted (the sim's model is a
+    /// grammar whose every forced token the model agrees with). Deterministic: the pattern is
+    /// fixed per run, no RNG.
+    pub fn with_extensions(mut self, every: u64, max_k: u32) -> Simulation {
+        assert!(every > 0 && max_k > 0);
+        self.extensions = Some((every, max_k));
+        self
     }
 
     /// Run the scheduler under `policy` (default: `DefaultPolicy`); set before [`Self::run`].
@@ -317,6 +331,16 @@ impl Simulation {
                 .filter(|s| self.sched.seq_state(*s) == Some(RequestState::Decoding))
                 .collect();
             decodable.sort();
+            // P5p S-9: a scheduled extension replaces the sequence's decode of this iteration
+            // with one multi-row item.
+            if let Some((every, max_k)) = self.extensions
+                && (self.sched.snapshot().iterations_total + 1).is_multiple_of(every)
+                && let Some(&seq) = decodable.first()
+            {
+                let next = self.sched.snapshot().iterations_total + 1;
+                let k = 1 + next as u32 % max_k;
+                let _ = self.sched.extend(seq, k);
+            }
 
             let plan = self.sched.plan(&mut self.pool, &self.limits);
             self.check(&plan, &decodable);
@@ -346,7 +370,7 @@ impl Simulation {
             }
             let duration = self.exec.duration(&plan);
             let completed = self.report.completed;
-            let outcome = self.execute(&plan, now + duration);
+            let outcome = self.execute(&plan, &decodable, now + duration);
             self.record(&plan, now, duration);
             self.clock.advance(duration);
             self.sched.complete(&mut self.pool, outcome);
@@ -423,12 +447,72 @@ impl Simulation {
     }
 
     /// The "model": completed prefills and decodes sample one token each (the shared prefill
-    /// of `n > 1` one per choice); a sequence stops after `output_len` tokens. `end` is the
-    /// virtual time the iteration finishes.
-    fn execute(&mut self, plan: &IterationPlan, end: Duration) -> IterationOutcome {
+    /// of `n > 1` one per choice); a sequence stops after `output_len` tokens. An extension
+    /// item (`decodable` sequence, prefill-kind; P5p S-9) is fully accepted: it appends its
+    /// `len` tokens — the forced ones and the next sampled one — and rolls nothing back.
+    /// `end` is the virtual time the iteration finishes.
+    fn execute(
+        &mut self,
+        plan: &IterationPlan,
+        decodable: &[SeqId],
+        end: Duration,
+    ) -> IterationOutcome {
         let mut appended = Vec::new();
         let mut finished = Vec::new();
         for item in &plan.items {
+            if matches!(item.kind, BatchKind::Prefill { .. }) && decodable.contains(&item.seq) {
+                // Extension: the KV now ends right before the next token being sampled
+                // (`prompt + generated − 1 + len` positions written).
+                let Some(s) = self.seqs.get(&item.seq) else {
+                    continue;
+                };
+                let expected = s.prompt + s.generated - 1
+                    + match item.kind {
+                        BatchKind::Prefill { len, .. } => len,
+                        BatchKind::Decode => unreachable!("matched Prefill above"),
+                    };
+                if item.block_table.tokens != expected {
+                    self.report.violations.push(format!(
+                        "iteration {}: seq {} extended to context {} but prompt + generated − 1 \
+                         + len = {expected}",
+                        plan.iteration, item.seq.0, item.block_table.tokens
+                    ));
+                }
+                let len = match item.kind {
+                    BatchKind::Prefill { len, .. } => len,
+                    BatchKind::Decode => unreachable!(),
+                };
+                let id = s.request;
+                let r = self.reqs.get_mut(&id).expect("tracked request");
+                let s = self.seqs.get_mut(&item.seq).expect("tracked sequence");
+                if !r.first_token {
+                    r.first_token = true;
+                    self.report
+                        .ttft_s
+                        .push(end.saturating_sub(r.arrival).as_secs_f64());
+                }
+                s.generated += len;
+                self.report.generated_tokens += u64::from(len);
+                appended.push((item.seq, len));
+                if s.generated >= s.output_len {
+                    s.finished = true;
+                    let reason = if s.output_len >= s.max_new {
+                        FinishReason::Length
+                    } else {
+                        FinishReason::Stop
+                    };
+                    finished.push((item.seq, reason));
+                }
+                let done = self.reqs[&id]
+                    .seqs
+                    .iter()
+                    .all(|q| self.seqs.get(q).is_none_or(|s| s.finished));
+                if done {
+                    self.report.completed += 1;
+                    self.forget(id);
+                }
+                continue;
+            }
             let samples = match item.kind {
                 BatchKind::Decode => true,
                 BatchKind::Prefill { start, len } => {
@@ -497,6 +581,7 @@ impl Simulation {
             iteration: plan.iteration,
             finished,
             appended,
+            rolled_back: Vec::new(),
             failed: None,
         }
     }
@@ -514,7 +599,7 @@ impl Simulation {
         let decoded: HashSet<SeqId> = plan
             .items
             .iter()
-            .filter(|i| i.kind == BatchKind::Decode)
+            .filter(|i| i.kind == BatchKind::Decode || decodable.contains(&i.seq))
             .map(|i| i.seq)
             .collect();
         let preempted: HashSet<SeqId> = plan.preempted.iter().map(|(s, _)| *s).collect();
@@ -1113,6 +1198,7 @@ impl KvSimDriver {
             iteration: plan.iteration,
             finished,
             appended,
+            rolled_back: Vec::new(),
             failed: None,
         }
     }

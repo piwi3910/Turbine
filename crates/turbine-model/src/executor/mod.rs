@@ -241,8 +241,13 @@ pub struct SeqSlice<'a> {
     pub block_formats: &'a [u8],
     /// Reduce this sequence's logits row on the device (`logits_reduce`, P2c S-4) instead of
     /// copying it whole; ignored when the executor does not reduce
-    /// ([`ModelExecutor::reduces_logits`]).
+    /// ([`ModelExecutor::reduces_logits`]). A sequence with [`SeqSlice::logits_rows`] > 1 is
+    /// never reduced.
     pub reduce: Option<RowReduce>,
+    /// Full logits rows for the last `logits_rows` positions of the sequence (P5p S-9), in
+    /// position order and never device-reduced; 1 keeps today's one row per sequence (the
+    /// last position). 1 ≤ `logits_rows` ≤ `q_len`.
+    pub logits_rows: u32,
 }
 
 /// What the device reduction of one logits row computes (P2c S-4): the `top_n` largest raw
@@ -334,9 +339,10 @@ pub struct BatchInput<'a> {
     pub kv: &'a KvPoolView<'a>,
 }
 
-/// The logits of one forward, one slot per sequence (its last position) in `seqs` order: a full
-/// FP32 row of `data` (`rows × vocab`, row-major, in sequence order) or, for a sequence whose
-/// row was reduced on the device, an entry of `reduced` (in sequence order).
+/// The logits of one forward, one slot per sequence in `seqs` order: its full rows of `data`
+/// (row-major, in position order; `rows` full rows in all, one per sequence plus
+/// `logits_rows − 1` more for a sequence with more) or, for a sequence whose row was reduced on
+/// the device, an entry of `reduced` (in sequence order).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Logits {
     /// Full rows in `data`.
@@ -344,13 +350,14 @@ pub struct Logits {
     pub vocab: usize,
     pub data: Vec<f32>,
     pub reduced: Vec<ReducedRow>,
-    /// Per sequence: its full row (`Full(i)`: row `i` of `data`) or reduced row.
+    /// Per sequence: its full row block (`Full { row, rows }`: rows `row..row + rows` of
+    /// `data`) or reduced row.
     slots: Vec<SlotIndex>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlotIndex {
-    Full(usize),
+    Full { row: usize, rows: u32 },
     Reduced(usize),
 }
 
@@ -370,29 +377,32 @@ impl Logits {
             vocab,
             data,
             reduced: Vec::new(),
-            slots: (0..rows).map(SlotIndex::Full).collect(),
+            slots: (0..rows)
+                .map(|r| SlotIndex::Full { row: r, rows: 1 })
+                .collect(),
         }
     }
 
-    /// Full rows `data` and `reduced` rows interleaved as `is_reduced` says, one flag per
-    /// sequence: the full rows belong to the sequences with `false` in order, the reduced rows
-    /// to those with `true`.
-    pub fn mixed(
+    /// Full rows `data` and `reduced` rows interleaved as `spec` says, one
+    /// `(is_reduced, full_rows)` pair per sequence: the full rows belong to the `false`
+    /// sequences in order, `full_rows` rows to each (P5p S-9). `mixed` is the one-row case.
+    pub fn mixed_rows(
         vocab: usize,
         data: Vec<f32>,
         reduced: Vec<ReducedRow>,
-        is_reduced: impl IntoIterator<Item = bool>,
+        spec: impl IntoIterator<Item = (bool, u32)>,
     ) -> Logits {
-        let (mut full, mut red) = (0, 0);
-        let slots: Vec<SlotIndex> = is_reduced
+        let (mut full, mut red) = (0usize, 0usize);
+        let slots: Vec<SlotIndex> = spec
             .into_iter()
-            .map(|r| {
+            .map(|(r, rows)| {
                 if r {
                     red += 1;
                     SlotIndex::Reduced(red - 1)
                 } else {
-                    full += 1;
-                    SlotIndex::Full(full - 1)
+                    let slot = SlotIndex::Full { row: full, rows };
+                    full += rows as usize;
+                    slot
                 }
             })
             .collect();
@@ -411,6 +421,18 @@ impl Logits {
         }
     }
 
+    /// Full rows `data` and `reduced` rows interleaved as `is_reduced` says, one flag per
+    /// sequence: the full rows belong to the sequences with `false` in order, the reduced rows
+    /// to those with `true`.
+    pub fn mixed(
+        vocab: usize,
+        data: Vec<f32>,
+        reduced: Vec<ReducedRow>,
+        is_reduced: impl IntoIterator<Item = bool>,
+    ) -> Logits {
+        Self::mixed_rows(vocab, data, reduced, is_reduced.into_iter().map(|r| (r, 1)))
+    }
+
     /// Full row `r` of `data`; panics when `r >= rows`.
     pub fn row(&self, r: usize) -> &[f32] {
         assert!(r < self.rows, "logits row {r} of {}", self.rows);
@@ -422,19 +444,36 @@ impl Logits {
         self.slots.len()
     }
 
-    /// Sequence `i`'s logits; panics when `i >= slots()`.
+    /// Sequence `i`'s logits; panics when `i >= slots()`. A multi-row sequence's slot is its
+    /// last position's row (the sampled one; P5p S-9).
     pub fn slot(&self, i: usize) -> LogitsSlot<'_> {
         match self.slots[i] {
-            SlotIndex::Full(r) => LogitsSlot::Full(self.row(r)),
+            SlotIndex::Full { row, rows } => {
+                let r = row + usize::try_from(rows).unwrap_or(1) - 1;
+                LogitsSlot::Full(self.row(r))
+            }
             SlotIndex::Reduced(r) => LogitsSlot::Reduced(&self.reduced[r]),
         }
     }
 
-    /// The row of `data` holding sequence `i`'s full logits; `None` when it was reduced.
+    /// The first row of `data` holding sequence `i`'s full logits; `None` when it was reduced.
+    /// A multi-row sequence's rows follow from [`Logits::rows_of`].
     pub fn full_row_index(&self, i: usize) -> Option<usize> {
         match self.slots[i] {
-            SlotIndex::Full(r) => Some(r),
+            SlotIndex::Full { row, .. } => Some(row),
             SlotIndex::Reduced(_) => None,
+        }
+    }
+
+    /// Every full row of sequence `i`, concatenated row-major in position order (P5p S-9);
+    /// panics when `i >= slots()` or the sequence's row was reduced.
+    pub fn rows_of(&self, i: usize) -> &[f32] {
+        match self.slots[i] {
+            SlotIndex::Full { row, rows } => {
+                let rows = usize::try_from(rows).unwrap_or(1);
+                &self.data[row * self.vocab..(row + rows) * self.vocab]
+            }
+            SlotIndex::Reduced(_) => panic!("rows_of on sequence {i}, whose row was reduced"),
         }
     }
 }

@@ -92,10 +92,12 @@ pub(crate) fn simulation(
     Simulation::new(p, pool, exec, arrivals).with_policy(policy)
 }
 
-/// 1,000 seeded Poisson arrivals; `paused` is paused for iterations 200..260.
+/// 1,000 seeded Poisson arrivals; `paused` is paused for iterations 200..260. Every 7th
+/// iteration extends the first decoding sequence (P5p S-9), always fully accepted.
 pub(crate) fn poisson_run(policy: Policy, paused: Option<SeqId>) -> SimReport {
     let arrivals = ArrivalProcess::poisson(4.0, 42).with_limit(1000);
-    let mut sim = simulation(policy, params(), pool(1024), realistic_cost(), arrivals);
+    let mut sim =
+        simulation(policy, params(), pool(1024), realistic_cost(), arrivals).with_extensions(7, 3);
     if let Some(seq) = paused {
         sim.pause_at(200, seq);
         sim.resume_at(260, seq);

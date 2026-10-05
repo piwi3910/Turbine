@@ -631,6 +631,7 @@ impl WorkerRank {
                 block_table: &s.block_table,
                 block_formats: &[],
                 reduce,
+                logits_rows: 1,
             });
             tokens.extend_from_slice(&s.tokens);
             positions.extend_from_slice(&s.positions);
@@ -1558,6 +1559,7 @@ mod tests {
             block_table: table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         let logits = exec.forward(&BatchInput {
             tokens,

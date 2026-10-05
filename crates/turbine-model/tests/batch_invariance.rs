@@ -169,6 +169,7 @@ impl Harness {
                 block_table: table,
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             });
         }
         self.exec.set_trace(trace);

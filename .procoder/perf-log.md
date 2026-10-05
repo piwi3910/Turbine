@@ -1298,3 +1298,14 @@ novanas GPU 0, same-day A/B, medians of 3 of `scripts/lab-bench.sh --model llama
 | `default` (t9-def1/2/3)    | 0.9147    | 11 110                   | 7 085                    | 489.2    | bc1c7952 / 3e8ded58 / 05794349 |
 
 Verdict against the S-13 targets: mt tok/s 1.002× (≥ 0.98×) — **pass**; first p99 1.02× (≤ 1.5×) — **pass**; `mt_ttft_later_p50` 0.96× (≤ 0.85×) — **miss**, though `cache_aware` is better in all three paired runs; `mt_cached` 0.9143 vs 0.9147 (≥) — **miss** (equal). The profile cannot separate the policies: its 64 sessions share one 2,000-word system prefix, so every waiting request carries a near-equal `cached_prefix_tokens` and the affinity term ties, leaving the windowed FIFO ≈ `default`. The saturated profile is also bimodal for both policies — one run per policy fell into a low-reuse regime (ca3 cached 0.818 / 347.1 tok/s, def2 0.810 / 347.6), the other four held 0.914 / ~490. Recommendation recorded for the coordinator: keep `default` as the serving default; `cache_aware` stays available (`scheduler.policy: cache_aware`) and is equal-or-better on later-turn TTFT in this profile.
+
+### S-9 plumbing: multi-token append and multi-row logits (plan Task 10, commit a03f42ac, 2026-10-05)
+
+Enabler landing; nothing uses extensions yet (the verified jump-forward wires them in Task 12), so only the no-regression bound applies. `scripts/lab-bench.sh --quick` on GPU 0 (64 requests), golden c1 PASS and `failed=0` on both:
+
+| Model | tok/s (quick, c16) | previous recorded state         | host_share | labbook |
+| ----- | ------------------ | ------------------------------- | ---------- | ------- |
+| Llama | **879.1**          | 854.1-853.4 (t9 base, t7t8 c16) | 0.0305     | -       |
+| OLMoE | **636.4**          | 615.5-612.8 (t9 base, t7t8)     | 0.0153     | -       |
+
+Both within or above the recent band — no regression. `scripts/lab-test.sh novanas --tier quick`: every target ok except the four `kv_gpu` tests already red on the tip before this task (`prefix_reuse_matches_cold{,_fp8_kv}`, `lossy_tier_reuse{,_tq4}` — the documented HIP mid-block warm-prefill numerics finding of the S-4/S-5 landing above, awaiting the lead decision); this task's paths are bit-identical at one row per sequence.

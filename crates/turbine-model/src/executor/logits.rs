@@ -66,15 +66,17 @@ pub fn reduce_requirement(cfg: &ModelArchConfig) -> OpRequirement {
 }
 
 /// Contiguous runs of the final norm: `(source token row, destination row, length)` so that
-/// destination row `p` receives token row `last_rows[order[p]]`. The identity order of a batch
-/// whose last rows are consecutive (every decode batch) is one run.
-pub(super) fn norm_runs(last_rows: &[usize], order: &[usize]) -> Vec<(usize, usize, usize)> {
+/// destination row `p` receives token row `row_src[p]` — one source per logits row (P5p S-9: a
+/// multi-row sequence's rows are its last `logits_rows` token rows, consecutive), reduced
+/// sequences first. Runs join consecutive sources, so the identity order of a decode batch is
+/// one run.
+pub(super) fn norm_runs(row_src: &[usize]) -> Vec<(usize, usize, usize)> {
     let mut runs = Vec::new();
     let mut p = 0;
-    while p < order.len() {
-        let src = last_rows[order[p]];
+    while p < row_src.len() {
+        let src = row_src[p];
         let mut len = 1;
-        while p + len < order.len() && last_rows[order[p + len]] == src + len {
+        while p + len < row_src.len() && row_src[p + len] == src + len {
             len += 1;
         }
         runs.push((src, p, len));
@@ -107,11 +109,16 @@ pub(super) struct LogitsHead {
     /// Staging for the `inputs` upload and for the reads; `None` without host staging.
     input_staging: Option<StagingPair>,
     read_staging: Option<StagingPair>,
-    /// Destination row → sequence of the current forward: reduced sequences first.
+    /// Destination row → sequence of the current forward, one entry per logits row (P5p S-9:
+    /// a multi-row sequence contributes `logits_rows` consecutive rows): reduced sequences
+    /// first, then full sequences each contributing its rows.
     order: Vec<usize>,
     /// Sequences of the current forward, and how many of them are reduced.
     seqs: usize,
     reduced: usize,
+    /// Per sequence `(is_reduced, rows)` in sequence order, and the total logits rows.
+    row_counts: Vec<(bool, u32)>,
+    rows_total: u64,
     /// Per reduced row (in `order`), what it asked for.
     requests: Vec<RowReduce>,
     /// Reads enqueued and not yet collected, oldest first.
@@ -128,7 +135,8 @@ struct PendingRead {
     r: usize,
     top_n: usize,
     requests: Vec<RowReduce>,
-    is_reduced: Vec<bool>,
+    /// Per sequence `(is_reduced, rows)`, in sequence order (P5p S-9).
+    row_counts: Vec<(bool, u32)>,
     /// Words of `out` read, from row `r` on: the full rows, then the results.
     words: usize,
     /// The staging buffer holding the read; `None`: read synchronously at collect.
@@ -193,6 +201,8 @@ impl LogitsHead {
             order: Vec::with_capacity(max_seqs),
             seqs: 0,
             reduced: 0,
+            row_counts: Vec::with_capacity(max_seqs),
+            rows_total: 0,
             requests: Vec::with_capacity(max_seqs),
             pending: VecDeque::with_capacity(2),
             last_tokens: Vec::with_capacity(max_seqs),
@@ -225,21 +235,32 @@ impl LogitsHead {
     }
 
     /// Orders the batch's rows (reduced sequences first, each group in sequence order) and
-    /// returns destination row → sequence, for the final norm.
+    /// returns destination row → sequence, for the final norm. A multi-row sequence's rows are
+    /// consecutive destination rows (P5p S-9); `rows_of` returns `rows_total` and the per-
+    /// sequence row counts through [`LogitsHead::row_counts`].
     pub fn plan(&mut self, seqs: &[SeqSlice<'_>]) -> &[usize] {
         let wants = |s: &SeqSlice<'_>| self.reduce.is_some() && s.reduce.is_some();
         self.order.clear();
         self.requests.clear();
+        self.row_counts.clear();
+        self.rows_total = 0;
+        // Row counts in sequence order (a `false` sequence's rows, `true` = reduced).
+        self.row_counts.resize(seqs.len(), (false, 1));
         for (i, s) in seqs.iter().enumerate() {
             if let Some(r) = s.reduce.filter(|_| wants(s)) {
                 self.order.push(i);
                 self.requests.push(r);
+                self.row_counts[i] = (true, 1);
+                self.rows_total += 1;
             }
         }
         self.reduced = self.order.len();
         for (i, s) in seqs.iter().enumerate() {
             if !wants(s) {
-                self.order.push(i);
+                self.order
+                    .extend(std::iter::repeat_n(i, s.logits_rows as usize));
+                self.row_counts[i] = (false, s.logits_rows);
+                self.rows_total += u64::from(s.logits_rows);
             }
         }
         self.seqs = seqs.len();
@@ -329,7 +350,7 @@ impl LogitsHead {
         profiler: &Profiler,
         mem: &dyn DeviceMemory,
     ) -> Result<(), ModelError> {
-        let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
+        let (n, r, vocab) = (self.rows_total as usize, self.reduced, self.vocab);
         let top_n = self.batch_top_n();
         let base = n * vocab;
         if let (Some(cfg), true) = (self.reduce, r > 0) {
@@ -365,7 +386,7 @@ impl LogitsHead {
     /// [`LogitsHead::collect`]), and records which words hold the device's token choices for
     /// the next forward's feeds.
     pub fn launch_read(&mut self) -> Result<(), ModelError> {
-        let (n, r, vocab) = (self.seqs, self.reduced, self.vocab);
+        let (n, r, vocab) = (self.rows_total as usize, self.reduced, self.vocab);
         let top_n = self.batch_top_n();
         let base = n * vocab;
         let result = if r > 0 { r * result_words(top_n) } else { 0 };
@@ -379,12 +400,9 @@ impl LogitsHead {
             }
             None => None,
         };
-        let mut is_reduced = vec![false; n];
-        for &s in &self.order[..r] {
-            is_reduced[s] = true;
-        }
         self.last_tokens.clear();
-        self.last_tokens.resize(n, None);
+        // Indexed by sequence slot (the next launch's feeds name sequences, not rows).
+        self.last_tokens.resize(self.seqs, None);
         if self.reduce.is_some() {
             for (k, q) in self.requests.iter().enumerate() {
                 self.last_tokens[self.order[k]] = device_choice_word(base, r, top_n, k, q);
@@ -395,7 +413,7 @@ impl LogitsHead {
             r,
             top_n,
             requests: self.requests.clone(),
-            is_reduced,
+            row_counts: self.row_counts.clone(),
             words,
             staged,
         });
@@ -457,7 +475,7 @@ impl LogitsHead {
                 }
             })
             .collect();
-        Ok(Logits::mixed(vocab, data, reduced, p.is_reduced))
+        Ok(Logits::mixed_rows(vocab, data, reduced, p.row_counts))
     }
 }
 
@@ -468,16 +486,14 @@ mod tests {
     #[test]
     fn norm_runs_follow_the_order() {
         // Decode batch, identity order: one run.
-        assert_eq!(norm_runs(&[0, 1, 2, 3], &[0, 1, 2, 3]), vec![(0, 0, 4)]);
-        // Sequences 1 and 3 reduced first.
+        assert_eq!(norm_runs(&[0, 1, 2, 3]), vec![(0, 0, 4)]);
+        // Reduced rows first, then a multi-row block: the sources stay consecutive.
+        assert_eq!(norm_runs(&[9, 10, 11, 2]), vec![(9, 0, 3), (2, 3, 1)]);
+        assert_eq!(norm_runs(&[5]), vec![(5, 0, 1)]);
         assert_eq!(
-            norm_runs(&[0, 1, 2, 3], &[1, 3, 0, 2]),
-            vec![(1, 0, 1), (3, 1, 1), (0, 2, 1), (2, 3, 1)]
-        );
-        // A prefill chunk ends at row 9, decodes follow.
-        assert_eq!(
-            norm_runs(&[9, 10, 11], &[1, 2, 0]),
-            vec![(10, 0, 2), (9, 2, 1)]
+            norm_runs(&[7, 8, 2, 3]),
+            vec![(7, 0, 2), (2, 2, 2)],
+            "a multi-row block followed by another sequence's row"
         );
     }
 }
