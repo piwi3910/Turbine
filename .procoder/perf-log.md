@@ -1251,3 +1251,19 @@ serving path yet (`kv_sim partial_match_falls_back_to_block_reuse` pins the atta
 until Task 7). Mutation checks: dropping the exact-class rule, the 64-child scan limit, the
 `reuse_cap_tokens` cap, or the per-parent LRU eviction each fails `directory::tests::
 token_granular_match` or `planner::tests::token_granular_cap`.
+### S-4/S-5 landing: token-granular prefix reuse (plan Tasks 7-8, commits ee9c15b4 + bee93c7c + a6351905, 2026-10-05)
+
+novanas GPU 0, bench + port locks held per run, `phase2c` configs, release client on novanas, one `lab-bench.sh --multi-turn` run per row; the ON legs run the defaults, the OFF legs add `--set kv.partial_prefix_reuse=false` (A/B). Golden c1 PASS and `requests_failed` 0 on every run. The S-2 baseline row is the reference (cached 0.9065, later-turn TTFT p50 80 ms, Llama c16 852.2 tok/s).
+
+| Leg (median of 3) | cached_tokens_ratio | later-turn TTFT p50 (ms) | mt tok/s | c16 tok/s | labbook |
+| ----------------- | ------------------- | ------------------------ | -------- | --------- | ------- |
+| ON  (t7t8-on1/2/3)   | **0.9192** (0.9190-0.9193) | 78 (75-80) | 342.8 | 853.4 | 57c0a8c0/d6f32eb1/f4457a30 |
+| OFF (t7t8-off1/2/3)  | 0.9064 (0.9057-0.9071)     | 80 (74-109) | 334.0 | 851.3 | 6cfaa1c6/c8afa968/51ca547b |
+| saturated ON  (t7t8-sat-on)  | 0.9149 | 10 760 | 493.7 | 854.4 | aef3b8f1 |
+| saturated OFF (t7t8-sat-off) | 0.9097 | 10 769 | 487.4 | 851.9 | c0439a0d |
+| OLMoE ON (t7t8-olmoe-on, standard c16) | - | - | - | 612.8 | f22a1e26 |
+
+Verdict against the S-13 targets (baseline 0.9065 / 80 ms / 852.2): `mt_cached` median **0.9192 ≥ 0.9165** (baseline + 0.0127) — **pass**; c16 tok/s 853.4 ≥ 0.98 × 852.2 — **pass** (OLMoE 612.8 = 0.996 × 615.4 — within the no-regression bound); golden c1 PASS — **pass**; `mt_ttft_later_p50` 78 ms against ≤ 76 (0.95 ×) — **strict miss by 2 ms (2.5 %)**. The OFF control's own later-turn p50 spread (74/80/109) is wider than the ON/OFF delta, and ON is equal-or-better on every multi-turn number (cached +1.3 pp, later p50 −2 ms, mt tok/s +8.8); the first-turn p50s are noisier under ON (109-162 vs 158-230 OFF) with p99 equal or better (460-463 vs 490-502). Recommendation recorded for the coordinator: keep `kv.partial_prefix_reuse` on.
+
+**Open finding (HIP numerics, needs a lead decision):** a warm request whose reuse ends mid-block is **not bit-equal to cold on HIP** — the prefill starts at an arbitrary token offset, the chunk boundaries differ from the cold run's, and hipBLASLt's per-chunk tiling shifts logprobs by ~0.005-0.05 (text identical except at near-tied greedy decisions; `kv_gpu prefix_reuse_matches_cold` and the `lossy_tier_reuse{,_tq4}` deny-equality asserts caught it; the cpu backend stays bit-exact — `engine::r#loop::tests::partial_prefix_reuse_matches_cold`). Whole-block reuse was bit-exact because its chunk starts fell on block boundaries. Options: (a) tolerance-based comparison (the golden gate's batched bounds) for the HIP prefix tests, (b) a kernel-path investigation for mid-block warm prefills, (c) `kv.partial_prefix_reuse: false` in the lab configs until (b). The `kv_gpu` prefix tests and the two lossy tests are red on the tip until this is decided.
+

@@ -210,10 +210,10 @@ Interfaces:
 - [x] Write the ignored lab test `kv_gpu prefix_reuse_partial_block_matches_cold` (prefill-written prefixes ending 1, 2, 17, 64, 100, 126, 127 tokens into a block and one divergence inside a full block; greedy 64 tokens, `top_logprobs` 5; text and every logprob bit-equal to cold) and update `prefix_reuse_suffix_lengths_match_cold`'s expected `cached_tokens` to `prompt − 2` capped by the cached length.
 - [x] Implement the engine and orchestrator wiring; turn the hierarchy's `partial_prefix_reuse` on from config.
 - [x] Run: `scripts/remote-cargo.sh test -p turbine-server && scripts/remote-cargo.sh test -p turbine-api --test api` — PASS (whole workspace green)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Gate: `scripts/gate.sh` — `gate: ok` (977 tests)
 - [ ] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-server --test kv_gpu` — expect exit 0 with `prefix_reuse_partial_block_matches_cold`, `prefix_reuse_matches_cold`, `prefix_reuse_suffix_lengths_match_cold` and `nvme_round_trip_matches_cold` ok
-- [ ] Landing measurement (GPU 0): `scripts/lab-bench.sh --model llama --multi-turn` three times and `scripts/lab-bench.sh --model olmoe` once — expect golden1 PASS, tok/s ≥ 0.98 × the Task 3 baseline, TTFT p50 ≤ 1.10 ×, median `mt_cached` ≥ baseline + 0.01 and median `mt_ttft_later_p50` ≤ 0.95 × baseline; record the lines in `.procoder/perf-log.md`. If a target is missed, keep the code, set `kv.partial_prefix_reuse` false in the lab configs and report to the coordinator before Task 9.
-- [ ] Commit: `perf(server): token-granular prefix reuse through a copy-on-write tail block`
+- [x] Landing measurement (GPU 0): `scripts/lab-bench.sh --model llama --multi-turn` three times and `scripts/lab-bench.sh --model olmoe` once — expect golden1 PASS, tok/s ≥ 0.98 × the Task 3 baseline, TTFT p50 ≤ 1.10 ×, median `mt_cached` ≥ baseline + 0.01 and median `mt_ttft_later_p50` ≤ 0.95 × baseline; record the lines in `.procoder/perf-log.md`. If a target is missed, keep the code, set `kv.partial_prefix_reuse` false in the lab configs and report to the coordinator before Task 9.
+- [x] Commit: `perf(server): token-granular prefix reuse through a copy-on-write tail block`
 
 ## Task 9: `cache_aware` scheduling policy — landing (S-7, S-8)
 
