@@ -3305,3 +3305,11 @@ inversions unbounded). The multi-turn A/B ties (cached 0.9143 vs 0.9147, tok/s 4
 shared system prefix ties the affinity term. Lead decisions: `default` stays the serving default (`cache_aware` is
 opt-in via `scheduler.policy`); a heterogeneous-prefix profile (mixed warm/cold requests) is the honest A/B for
 `cache_aware`'s benefit and is recorded as an exit-criteria refinement for the 5p phase exit.
+
+## Phase sequencing: ~90 % of roofline before Phase 8 (user direction, 2026-10-04)
+
+The user sets the sequencing principle: speculative decoding (Phase 8) starts only when the batch-1 decode base is at
+~90 % of the (corrected) memory-bandwidth roofline — otherwise its multiplier computes on an unoptimized base and
+leaves performance on the table. Consequence: the remaining Task 18 decode-bandwidth items (K-split small-m MoE GEMV,
+routing-chain fusion, Llama gap/attention/fusion work) are tasked now in 5p, and Phase 8 waits for the ~90 % target.
+The CK rmsnorm-at-n=2048 item stays blocked by the `rmsnorm_sharded` bitwise TP constraint unless the user relaxes it.
