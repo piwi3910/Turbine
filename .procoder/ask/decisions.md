@@ -3352,6 +3352,12 @@ compares within the tier bitwise and across the boundary against the recorded 0.
 pre-2026-09-27 kernels, ~575 GB/s op-level at 4-16 tokens) was rejected: the same numerics-class
 problem with no chain relation to the tiers above.
 
+**Superseded (2026-10-06, `p5p-olmoe-inv` 200d074d):** the cross-tier tolerance broke
+`olmoe_rows_are_batch_invariant` (132 runs first differing at `moe_out`), and OLMoE invariance stays unrelaxed (user
+decision, "5p decode-BW floor"). The grouped and prefill MoE kernels now sum the K-split shapes in the K-split's slice
+order, so every tier is bitwise equal again (0 differing at 65 and 1,536 tokens); the 0.25 cross-tier bound is
+removed. The K-split decode gain is kept; OLMoE c16 quick 630.2 -> 624.4 (-0.9 %, within 0.97x), golden c1 PASS.
+
 ## 5p decode bandwidth II: the gap floor and the batch-1 attention / fusion evaluations (2026-10-05)
 
 From `p5p-decodebw2`, continuing the ~90 %-of-roofline tasking after the K-split small-m MoE GEMV
