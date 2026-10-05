@@ -454,6 +454,12 @@ impl Drop for TempFile {
 
 impl LabServer {
     fn start(model_dir: &Path) -> LabServer {
+        LabServer::start_with(model_dir, "")
+    }
+
+    /// [`LabServer::start`] with `extra` appended to the config (a `structured_output`
+    /// section, say).
+    fn start_with(model_dir: &Path, extra: &str) -> LabServer {
         let addr = free_addr();
         let config = TempFile(
             std::env::temp_dir().join(format!("turbine-lab-openai-{}.yaml", std::process::id())),
@@ -462,7 +468,7 @@ impl LabServer {
             &config.0,
             format!(
                 "server:\n  listen: {addr}\nmodel:\n  path: {}\n  served_name: {SERVED_NAME}\n\
-                 execution:\n  backend: hip\n",
+                 execution:\n  backend: hip\n{extra}",
                 model_dir.display()
             ),
         )
@@ -473,6 +479,7 @@ impl LabServer {
             .arg("--config")
             .arg(&config.0)
             .env("RUST_LOG", "info")
+            .env("RUST_BACKTRACE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -558,6 +565,161 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: Option<&str>) -> (u
         reader.read_to_string(&mut out).expect("read body");
     }
     (status, out)
+}
+
+/// Reads one series' value from the server's `/metrics` text.
+fn metric_value(addr: SocketAddr, series: &str) -> f64 {
+    let (_, text) = request(addr, "GET", "/metrics", None);
+    text.lines()
+        .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// The token ids of a chat choice (`logprobs` with the default string tokens — the ids are
+/// `"token_id:<n>"` when `return_tokens_as_token_ids` is set).
+fn lab_token_ids(choice: &Value) -> Vec<Option<u32>> {
+    choice["logprobs"]["tokens"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no logprobs.tokens: {choice}"))
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .and_then(|s| s.strip_prefix("token_id:"))
+                .and_then(|s| s.parse().ok())
+        })
+        .collect()
+}
+
+/// The per-position logprobs of a chat choice.
+fn lab_logprobs(choice: &Value) -> Vec<f64> {
+    choice["logprobs"]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no logprobs.content: {choice}"))
+        .iter()
+        .map(|e| e["logprob"].as_f64().expect("logprob"))
+        .collect()
+}
+
+/// P5p S-10 (lab): the four JSON cases at temperature 0, the verified jump-forward on and off
+/// — the same token ids (a divergence excused only at a near-tie under the golden token
+/// rule), logprobs within the strict golden bound, schema-valid content, and at most 0.8 ×
+/// the forward steps and 0.9 × the wall time summed over the four.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn json_schema_jump_forward_matches() {
+    if !require_backend("hip") {
+        return;
+    }
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let tolerance: Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/golden/llama-3.2-3b-instruct/tolerance.json"
+        ))
+        .expect("the Llama tolerance"),
+    )
+    .expect("tolerance JSON");
+    let likely = tolerance["max_abs_logprob_diff_likely"].as_f64().unwrap();
+    let floor = tolerance["likely_logprob_floor"].as_f64().unwrap();
+    let tail = tolerance["max_abs_logprob_diff_tail"].as_f64().unwrap();
+
+    let on = LabServer::start_with(&model_dir, "");
+    let off = LabServer::start_with(&model_dir, "structured_output:\n  jump_forward: false\n");
+    let cases: Vec<ToolRequest> = load_fixture()
+        .into_iter()
+        .filter(|c| c.id.starts_with("json_"))
+        .collect();
+    assert_eq!(cases.len(), 4, "the fixture's four JSON cases");
+
+    let (mut steps_on_sum, mut steps_off_sum) = (0.0f64, 0.0f64);
+    let (mut time_on_sum, mut time_off_sum) = (0.0f64, 0.0f64);
+    for case in &cases {
+        let expect = expectation(&case.request).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        let mut body = case.request.clone();
+        body["model"] = json!(SERVED_NAME);
+        body["temperature"] = json!(0.0);
+        body["logprobs"] = json!(true);
+        body["top_logprobs"] = json!(5);
+        let run = |server: &LabServer| {
+            let started = Instant::now();
+            let (status, text) = request(
+                server.addr,
+                "POST",
+                "/v1/chat/completions",
+                Some(&body.to_string()),
+            );
+            let wall = started.elapsed().as_secs_f64();
+            assert_eq!(status, 200, "{}: {text}", case.id);
+            let response: Value = serde_json::from_str(&text).expect("response JSON");
+            (response, wall)
+        };
+        let (jumped, time_on) = run(&on);
+        let (masked, time_off) = run(&off);
+        time_on_sum += time_on;
+        time_off_sum += time_off;
+
+        check_response(&expect, &jumped).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        check_response(&expect, &masked).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        let (ids_on, ids_off) = (
+            lab_token_ids(&jumped["choices"][0]),
+            lab_token_ids(&masked["choices"][0]),
+        );
+        assert_eq!(ids_on.len(), ids_off.len(), "{}: token counts", case.id);
+        let (lp_on, lp_off) = (
+            lab_logprobs(&jumped["choices"][0]),
+            lab_logprobs(&masked["choices"][0]),
+        );
+        for (i, (a, b)) in ids_on.iter().zip(&ids_off).enumerate() {
+            if a == b {
+                let bound = if lp_on[i] > floor { likely } else { tail };
+                assert!(
+                    (lp_on[i] - lp_off[i]).abs() <= bound,
+                    "{}: logprob {i} differs by {} ({:?} vs {:?})",
+                    case.id,
+                    (lp_on[i] - lp_off[i]).abs(),
+                    lp_on[i],
+                    lp_off[i]
+                );
+                continue;
+            }
+            // A divergence is excused only at a near-tie: the masked run's top two candidates
+            // within `margin_nats` of each other (the golden token rule).
+            let top = &masked["choices"][0]["logprobs"]["content"][i]["top_logprobs"];
+            let top = top.as_array().expect("top_logprobs");
+            assert!(
+                top.len() >= 2,
+                "{}: {i}: tokens differ off a near-tie",
+                case.id
+            );
+            let margin = tolerance["margin_nats"].as_f64().unwrap();
+            assert!(
+                top[0]["logprob"].as_f64().unwrap() - top[1]["logprob"].as_f64().unwrap() <= margin,
+                "{}: {i}: tokens differ ({a:?} vs {b:?}) off a near-tie",
+                case.id
+            );
+        }
+        // The baseline the jump-forward is judged against: the off run's completion tokens
+        // (each of them a forward step there).
+        let tokens_off = jumped["usage"]["completion_tokens"].as_f64().unwrap();
+        steps_on_sum = metric_value(on.addr, "turbine_jump_forward_steps_total");
+        steps_off_sum += tokens_off;
+        println!(
+            "{}: wall on={time_on:.2}s off={time_off:.2}s, completion tokens={tokens_off}",
+            case.id
+        );
+    }
+    println!(
+        "jump_forward totals: steps on={steps_on_sum} off={steps_off_sum}, \
+         wall on={time_on_sum:.2}s off={time_off_sum:.2}s"
+    );
+    assert!(
+        steps_on_sum <= 0.8 * steps_off_sum,
+        "forward steps on={steps_on_sum} must be at most 0.8 x off={steps_off_sum}"
+    );
+    assert!(
+        time_on_sum <= 0.9 * time_off_sum,
+        "wall time on={time_on_sum} must be at most 0.9 x off={time_off_sum}"
+    );
 }
 
 #[test]

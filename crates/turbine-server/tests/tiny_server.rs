@@ -72,6 +72,7 @@ fn spawn_with_env(config: &Path, env: &[(&str, String)]) -> Child {
         .env_remove("TURBINE_KERNEL_LIBRARY")
         .env(SEND_BUFFER_ENV, HELD_SOCKET_BUFFER.to_string())
         .env("RUST_LOG", "info")
+        .env("RUST_BACKTRACE", "1")
         .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2711,6 +2712,125 @@ fn response_format_json_schema() {
         ),
         Some(2.0),
         "{metrics}"
+    );
+}
+
+/// P5p S-10: with the verified jump-forward on, every constrained output is exactly the
+/// token-by-token output — the same tokens, logprobs and finish reasons across `json_schema`,
+/// `json_object` and a named tool call, greedy and seeded, with a stop string completed
+/// inside a forced span and `max_tokens` cutting one — the jump counters show accepted forced
+/// tokens on the jump-forward server and none on the masked one, and a constrained request
+/// still runs with the feature off.
+#[test]
+fn jump_forward_matches_token_by_token() {
+    // The tool-call prompt (the tools rendered into the chat template) is past the tiny
+    // checkpoint's 512 positions, so both servers patch them to the long horizon.
+    let on = TinyServer::start_long("");
+    let off = TinyServer::start_long("structured_output:\n  jump_forward: false\n");
+    let schema_format = json!({"type": "json_schema",
+        "json_schema": {"name": "small", "schema": small_schema()}});
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let cases: Vec<(&str, Value)> = vec![
+        // Greedy with logprobs, and a seeded draw at temperature 0.8.
+        (
+            "schema_greedy",
+            json!({"response_format": schema_format.clone(),
+                                 "temperature": 0.0, "logprobs": true, "top_logprobs": 5}),
+        ),
+        (
+            "schema_seeded",
+            json!({"response_format": schema_format.clone(),
+                                 "temperature": 0.8, "seed": 9,
+                                 "logprobs": true, "top_logprobs": 5}),
+        ),
+        (
+            "json_object",
+            json!({"response_format": {"type": "json_object"},
+                               "temperature": 0.0, "logprobs": true}),
+        ),
+        (
+            "tool_call",
+            json!({"tools": weather_tools(), "tool_choice": named,
+                             "temperature": 0.0, "logprobs": true}),
+        ),
+        // The first property's key is forced by the schema: the stop string fires inside a
+        // forced span on both servers alike.
+        (
+            "stop_in_span",
+            json!({"response_format": schema_format.clone(),
+                                "temperature": 0.0, "stop": ["flag"]}),
+        ),
+        (
+            "max_tokens_cut",
+            json!({"response_format": schema_format.clone(),
+                                  "temperature": 0.0, "max_tokens": 3}),
+        ),
+    ];
+    for (label, extra) in cases {
+        let body = |server: &TinyServer| {
+            let mut b = json!({"model": server.model,
+                               "messages": [{"role": "user", "content": "Describe a thing."}],
+                               "max_tokens": 64});
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            let resp = server.post("/v1/chat/completions", &b);
+            assert_eq!(resp.status, 200, "{label}: {}", resp.body);
+            resp.json()
+        };
+        let (jumped, masked) = (body(&on), body(&off));
+        assert_eq!(
+            jumped["choices"][0], masked["choices"][0],
+            "{label}: {jumped} vs {masked}"
+        );
+    }
+    let finish = |server: &TinyServer, extra: &Value| {
+        // The named tool's grammar is longer than the cases above: give it room to finish.
+        let mut b = json!({"model": server.model,
+                           "messages": [{"role": "user", "content": "Describe a thing."}],
+                           "max_tokens": 300, "temperature": 0.0});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        server.post("/v1/chat/completions", &b).json()["choices"][0]["finish_reason"].clone()
+    };
+    let tools = json!({"tools": weather_tools(), "tool_choice": named});
+    assert_eq!(finish(&on, &tools), "tool_calls");
+    assert_eq!(finish(&off, &tools), "tool_calls");
+    let metrics = on.metrics();
+    let accepted = sample(
+        &metrics,
+        r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#,
+    );
+    assert!(
+        accepted.unwrap_or(0.0) > 0.0,
+        "forced tokens were accepted: {metrics}"
+    );
+    // A correct matcher can still be rejected: the model may prefer another mask-allowed
+    // spelling of the same bytes (a non-canonical split), which the verification takes and
+    // the rest of the run rolls back. Mostly the model confirms the run.
+    let rolled = sample(
+        &metrics,
+        r#"turbine_jump_forward_tokens_total{outcome="rolled_back"}"#,
+    )
+    .unwrap_or(0.0);
+    assert!(
+        rolled < accepted.unwrap_or(0.0),
+        "mostly accepted: {metrics}"
+    );
+    assert_eq!(
+        sample(&metrics, "turbine_jump_forward_steps_total"),
+        Some(16.0),
+        "every constrained request jumped"
+    );
+    let metrics = off.metrics();
+    assert_eq!(
+        sample(
+            &metrics,
+            r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#
+        ),
+        None,
+        "the masked server never jumps: {metrics}"
     );
 }
 
