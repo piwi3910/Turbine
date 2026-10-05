@@ -126,6 +126,15 @@ pub trait TokenMatcher: Send {
     fn commit(&mut self, token: u32) -> Result<(), ModelError>;
     /// Whether the output so far is complete, so EOS may end it.
     fn accepts_eos(&self) -> bool;
+    /// The run of tokens the constraint forces next, at most `max` of them, empty when the
+    /// next token is a model choice (P5p S-10). The engine verifies the run against the model
+    /// and commits the accepted tokens one at a time with `commit`, so this never advances the
+    /// matcher and never re-tokenizes the last committed token: the run is a continuation, and
+    /// every token of it is allowed by the mask at its point.
+    fn forced_tokens(&mut self, max: usize) -> Vec<u32> {
+        let _ = max;
+        Vec::new()
+    }
 }
 
 /// Fills `mask` for the next step of `matcher`: its allowed ids, with every id of
@@ -368,6 +377,21 @@ impl TokenMatcher for LlguidanceMatcher {
     fn accepts_eos(&self) -> bool {
         self.accepting
     }
+
+    fn forced_tokens(&mut self, max: usize) -> Vec<u32> {
+        // llguidance re-tokenizes the last committed token together with the forced bytes and
+        // chops what could merge with what follows, then drains the committed tokens from the
+        // run: the result continues exactly what was committed. A run never contains EOS (an
+        // accepting state forces no bytes), but a defensive cut keeps one from ever being fed
+        // as a forced token.
+        let run = self.matcher.compute_ff_tokens();
+        let cut = run
+            .iter()
+            .position(|t| self.eos_token_ids.contains(t))
+            .unwrap_or(run.len())
+            .min(max);
+        run.into_iter().take(cut).collect()
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +405,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::ModelError;
     use crate::sampler::Sampler;
+    use crate::testing::TempDir;
+    use crate::testing::tiny::{TINY_EOS, write_tiny_llama};
     use crate::tokenizer::Tokenizer;
 
     /// Allows exactly `ids`; accepts EOS once `accept_after` tokens were committed.
@@ -498,6 +524,77 @@ pub(crate) mod tests {
         assert!(eos_after_accept > 0, "EOS is reachable once accepted");
     }
 
+    /// A tiny byte-level tokenizer for the matcher tests: token id = byte value, so a forced
+    /// run's ids are the forced JSON bytes.
+    fn tiny_tokenizer(name: &str) -> (TempDir, Tokenizer) {
+        let dir = TempDir::new(name);
+        let spec = write_tiny_llama(dir.path(), 3);
+        (
+            dir,
+            Tokenizer::from_file(&spec.dir.join("tokenizer.json")).expect("tiny tokenizer"),
+        )
+    }
+
+    /// Commits `tokens` through the normal mask path: a run that re-tokenized the last
+    /// committed token would put a disallowed id in it and fail here.
+    fn feed_forced(m: &mut dyn TokenMatcher, tokens: &[u32], vocab: usize, eos: &[u32]) {
+        for &t in tokens {
+            let mut mask = TokenMask::new_none(vocab);
+            step_mask(m, eos, &mut mask).expect("mask");
+            assert!(mask.is_allowed(t), "token {t} not allowed by the mask");
+            m.commit(t).expect("commit");
+        }
+    }
+
+    #[test]
+    fn forced_tokens_follow_llguidance() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-structured-ff");
+        let vocab = tokenizer.vocab_size() as usize;
+        let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).expect("token trie");
+        let limits = GrammarLimits {
+            max_schema_bytes: 64 * 1024,
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}, "n": {"type": "integer"}},
+            "required": ["key", "n"],
+            "additionalProperties": false
+        });
+        let mut m = compiler
+            .compile(&ConstraintSpec::JsonSchema { schema }, &limits)
+            .expect("compile");
+        // The tiny tokenizer is byte-level (token id = byte value): the forced ids are the
+        // forced JSON bytes.
+        // From the start the grammar forces `{`; the run stops before the model's choice of
+        // whitespace (the x-guidance whitespace pattern is a model choice, possibly empty).
+        let run = m.forced_tokens(usize::MAX);
+        assert_eq!(run, vec![123]);
+        feed_forced(m.as_mut(), &run, vocab, &TINY_EOS);
+        // After `{` the whitespace is a model choice, so the run is empty; the key literal
+        // takes over once the opening quote is committed.
+        assert!(m.forced_tokens(usize::MAX).is_empty(), "ws choice");
+        feed_forced(m.as_mut(), &[34], vocab, &TINY_EOS); // the opening `"`
+        let run = m.forced_tokens(usize::MAX);
+        assert_eq!(run, vec![107, 101, 121, 34]); // the key `key` and its closing `"`
+        assert_eq!(m.forced_tokens(2), run[..2], "capped by max");
+        assert_eq!(m.forced_tokens(0), Vec::<u32>::new(), "max 0 is empty");
+        assert_eq!(m.forced_tokens(usize::MAX), run, "twice without a commit");
+        feed_forced(m.as_mut(), &run, vocab, &TINY_EOS);
+        // `: `, then the value's opening `"`: inside the free string the next token is the
+        // model's, so the run is empty.
+        feed_forced(m.as_mut(), &[58, 32, 34], vocab, &TINY_EOS);
+        assert!(m.forced_tokens(usize::MAX).is_empty(), "free string");
+        feed_forced(m.as_mut(), &[120, 33], vocab, &TINY_EOS); // `x`, `!` of the content
+        assert!(m.forced_tokens(usize::MAX).is_empty());
+        // The closing quote hands control back to the grammar: the run resumes; its exact
+        // shape is the grammar's, but every token of it must be mask-allowed.
+        feed_forced(m.as_mut(), &[34], vocab, &TINY_EOS); // the closing `"`
+        assert!(m.forced_tokens(usize::MAX).is_empty(), "ws choice");
+        feed_forced(m.as_mut(), &[44, 34], vocab, &TINY_EOS); // `,` then the `"` of `"n"`
+        let tail = m.forced_tokens(usize::MAX);
+        assert!(!tail.is_empty(), "run resumed after the free string");
+        feed_forced(m.as_mut(), &tail, vocab, &TINY_EOS);
+    }
     fn llama_tokenizer() -> Tokenizer {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/llama-3.2-3b-instruct/tokenizer.json");
