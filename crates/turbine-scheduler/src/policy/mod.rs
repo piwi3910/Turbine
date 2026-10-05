@@ -10,10 +10,12 @@
 //! (`sim::tests`). Policies are consulted per decision, so they must be cheap and
 //! deterministic: no clock, no randomness, no state.
 
+mod cache_aware;
 #[cfg(test)]
 pub(crate) mod conformance;
 mod default;
 
+pub use cache_aware::CacheAwarePolicy;
 pub use default::DefaultPolicy;
 
 use std::time::Duration;
@@ -35,6 +37,13 @@ pub struct AdmissionInfo {
     pub preempted: bool,
     /// The queue's counter when this push happened (equals `submit_no` on submission).
     pub push_no: u64,
+    /// The prompt's length (Phase 5p S-7).
+    pub prompt_tokens: u32,
+    /// The prefix attached before the admission gate, whose blocks cannot be reclaimed while
+    /// the request waits (Phase 4 decision; Phase 5p S-7).
+    pub cached_prefix_tokens: u32,
+    /// The `cache_aware` window (`scheduler.cache_aware_window`).
+    pub window: Duration,
 }
 
 /// Admission order of the waiting queue: the smallest key is admitted first. The queue
@@ -44,6 +53,9 @@ pub struct AdmissionKey {
     pub tier: u8,
     pub priority: Priority,
     pub arrival: Duration,
+    /// Cached-prefix affinity: `u32::MAX - cached_prefix_tokens` for `cache_aware`, 0 for
+    /// `default` (Phase 5p S-7). Smaller goes first within an arrival window.
+    pub affinity: u64,
     pub order: u64,
 }
 
@@ -77,7 +89,7 @@ pub trait SchedulingPolicy: Module {
 }
 
 static REGISTRY: Registry<dyn SchedulingPolicy> =
-    Registry::new("scheduling_policy", &[&DefaultPolicy]);
+    Registry::new("scheduling_policy", &[&DefaultPolicy, &CacheAwarePolicy]);
 
 /// Every registered scheduling policy (`scheduling_policy`).
 pub fn registry() -> &'static Registry<dyn SchedulingPolicy> {
@@ -101,6 +113,9 @@ mod tests {
             submit_no,
             preempted: false,
             push_no: submit_no,
+            prompt_tokens: 0,
+            cached_prefix_tokens: 0,
+            window: Duration::from_secs(1),
         }
     }
 
@@ -147,7 +162,19 @@ mod tests {
     #[test]
     fn default_policy_orders_like_main() {
         let p = &DefaultPolicy;
-        assert_eq!(p.name(), "default");
+        // Phase 5p S-7: the default policy's affinity stays 0, so its keys order exactly as
+        // they did before the field existed.
+        assert_eq!(p.admission_key(&waiting(0, 1, 3)).affinity, 0);
+        assert_eq!(
+            p.admission_key(&waiting(0, 1, 3)),
+            AdmissionKey {
+                tier: 1,
+                priority: Priority(0),
+                arrival: Duration::from_secs(1),
+                affinity: 0,
+                order: 3
+            }
+        );
 
         // Priority −1 before 0 before 1, regardless of arrival.
         let mut keys = [
@@ -223,5 +250,106 @@ mod tests {
             ),
             64
         );
+    }
+
+    fn cached_info(
+        priority: i32,
+        arrival: Duration,
+        prefix: u32,
+        submit_no: u64,
+        window: Duration,
+    ) -> AdmissionInfo {
+        AdmissionInfo {
+            priority: Priority(priority),
+            arrival,
+            submit_no,
+            preempted: false,
+            push_no: submit_no,
+            prompt_tokens: 512,
+            cached_prefix_tokens: prefix,
+            window,
+        }
+    }
+
+    /// S-7: `cache_aware` orders by window bucket, then cached prefix, then arrival; priority
+    /// dominates; preempted requests key exactly as `default` keys them; the delegation of the
+    /// other choices to `default`; the policy is registered.
+    #[test]
+    fn cache_aware_orders_by_window_then_prefix() {
+        let p = &CacheAwarePolicy;
+        assert_eq!(p.name(), "cache_aware");
+        assert!(
+            registry().get("cache_aware").is_some(),
+            "cache_aware must be registered after default"
+        );
+
+        let window = Duration::from_secs(1);
+        let key = |priority: i32, arrival: Duration, prefix: u32, submit_no: u64| {
+            p.admission_key(&cached_info(priority, arrival, prefix, submit_no, window))
+        };
+
+        // Within one window the longer cached prefix goes first, whatever the arrival and
+        // submission order inside the window.
+        assert!(
+            key(0, Duration::from_millis(100), 400, 0) < key(0, Duration::from_millis(50), 100, 1),
+            "same window: affinity (cached 400 before 100)"
+        );
+        // Across windows the earlier window wins, whatever the prefix: the starvation bound.
+        assert!(
+            key(0, Duration::from_secs(5), 0, 99) < key(0, Duration::from_secs(6), 512, 0),
+            "an uncached request of window 5 beats every cached request of window 6"
+        );
+        assert!(
+            key(0, Duration::from_millis(5_900), 0, 99) < key(0, Duration::from_secs(6), 512, 0),
+            "5.9 s shares window 5; 6 s opens window 6"
+        );
+        // Priority dominates window and prefix.
+        assert!(key(-1, Duration::from_secs(9), 0, 0) < key(0, Duration::from_secs(5), 512, 1));
+        // The affinity term is `u32::MAX - cached_prefix_tokens`.
+        assert_eq!(
+            key(0, Duration::ZERO, 400, 0).affinity,
+            u64::from(u32::MAX - 400)
+        );
+        assert_eq!(key(0, Duration::ZERO, 0, 0).affinity, u64::from(u32::MAX));
+
+        // A preempted request keys exactly as `default` keys it (affinity ignored).
+        for (priority, submit_no, push_no) in [(0, 1, 20), (-5, 7, 3)] {
+            let pre = AdmissionInfo {
+                preempted: true,
+                push_no,
+                ..cached_info(priority, Duration::ZERO, 512, submit_no, window)
+            };
+            assert_eq!(p.admission_key(&pre), DefaultPolicy.admission_key(&pre));
+        }
+
+        // preemption_rank, pick_victim and chunk_cap are `default`'s.
+        let running = |n: u128, priority: i32, admitted: Option<u64>| RunningInfo {
+            id: id(n),
+            priority: Priority(priority),
+            admitted,
+        };
+        let candidates: Vec<(RequestId, PreemptionRank)> = [
+            running(1, 0, Some(0)),
+            running(2, 1, Some(1)),
+            running(3, 0, None),
+        ]
+        .iter()
+        .map(|r| (r.id, p.preemption_rank(r)))
+        .collect();
+        assert_eq!(
+            p.pick_victim(&candidates),
+            DefaultPolicy.pick_victim(&candidates)
+        );
+        assert_eq!(
+            p.preemption_rank(&running(4, 2, Some(9))),
+            DefaultPolicy.preemption_rank(&running(4, 2, Some(9)))
+        );
+        for chunked in [true, false] {
+            let limits = IterationLimits::default();
+            assert_eq!(
+                p.chunk_cap(&params(chunked), &limits),
+                DefaultPolicy.chunk_cap(&params(chunked), &limits)
+            );
+        }
     }
 }

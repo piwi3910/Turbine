@@ -104,6 +104,9 @@ mod tests {
             submit_no: order,
             preempted,
             push_no: order,
+            prompt_tokens: 0,
+            cached_prefix_tokens: 0,
+            window: Duration::from_secs(1),
         });
         q.push(id(n), key);
     }

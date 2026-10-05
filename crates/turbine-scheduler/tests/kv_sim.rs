@@ -19,7 +19,11 @@ use turbine_kv::tier::{KvTier, MemTier, TierId};
 use turbine_kv::transfer::SimTransferBackend;
 use turbine_kv::{BlockPool, BlockPoolConfig};
 use turbine_observability::MetricsRegistry;
+use turbine_scheduler::policy::{
+    AdmissionInfo, AdmissionKey, CacheAwarePolicy, PreemptionRank, RunningInfo, SchedulingPolicy,
+};
 use turbine_scheduler::scheduler::BatchKind;
+use turbine_scheduler::scheduler::IterationLimits;
 use turbine_scheduler::sim::KvSimDriver;
 use turbine_scheduler::{Scheduler, SchedulerParams};
 use turbine_tensor::DeviceMemory;
@@ -1847,4 +1851,202 @@ fn partial_match_falls_back_to_block_reuse() {
     assert_eq!(d.prefilled_tokens(rid(3)), 2);
     assert_eq!(d.violations(), &[] as &[String]);
     assert_eq!(d.pool().referenced_blocks(), 0, "references return to 0");
+}
+
+/// The test-only unbounded variant of `cache_aware` (S-8): every arrival shares one window,
+/// so the affinity term orders the whole queue and the uncached requests starve behind the
+/// cached flood. Not registered; the control leg of `cache_aware_starvation_bound`.
+#[derive(Clone, Copy, Debug, Default)]
+struct UnboundedCacheAware;
+
+impl turbine_core::registry::Module for UnboundedCacheAware {
+    fn name(&self) -> &'static str {
+        "cache_aware_unbounded"
+    }
+}
+
+impl turbine_scheduler::policy::SchedulingPolicy for UnboundedCacheAware {
+    fn admission_key(&self, req: &AdmissionInfo) -> AdmissionKey {
+        CacheAwarePolicy.admission_key(&AdmissionInfo {
+            arrival: Duration::ZERO,
+            window: Duration::MAX,
+            ..*req
+        })
+    }
+    fn preemption_rank(&self, running: &RunningInfo) -> PreemptionRank {
+        CacheAwarePolicy.preemption_rank(running)
+    }
+    fn pick_victim(&self, candidates: &[(RequestId, PreemptionRank)]) -> Option<RequestId> {
+        CacheAwarePolicy.pick_victim(candidates)
+    }
+    fn chunk_cap(&self, params: &SchedulerParams, limits: &IterationLimits) -> u32 {
+        CacheAwarePolicy.chunk_cap(params, limits)
+    }
+}
+
+static UNBOUNDED: UnboundedCacheAware = UnboundedCacheAware;
+
+/// S-8: the `cache_aware` starvation bound over a saturated flood. 2,000 seeded arrivals of
+/// 128-token prompts sharing a fully cached 128-token primer, one uncached request every 50
+/// arrivals, `max_running_requests` 4, window 1 s: `cache_aware` completes every request with
+/// an empty `admission_inversions`; the unbounded variant (all arrivals in one window)
+/// accumulates inversions and a larger maximum wait for the uncached requests.
+#[test]
+fn cache_aware_starvation_bound() {
+    struct Leg {
+        inversions: Vec<(RequestId, RequestId)>,
+        completed: usize,
+        max_uncached_wait_s: f64,
+        max_cached_wait_s: f64,
+    }
+    let leg = |policy: &'static dyn SchedulingPolicy| -> Leg {
+        let Setup { driver, clock, .. } = setup_full(
+            8192,
+            0,
+            0,
+            KvConfig::default(),
+            MemoryKind::Dedicated,
+            |_| {},
+            |_| {},
+            |p| {
+                p.max_running_requests = 4;
+                p.max_queued_requests = 4096;
+                p.cache_aware_window = Duration::from_secs(1);
+            },
+        );
+        let d = &mut driver.with_policy(policy);
+        const REQUESTS: u128 = 2_000;
+        const MAX_TOKENS: u32 = 16;
+
+        // The primer: a 128-token prompt every flood request shares, prefilled and finished
+        // before the flood arrives, so every flood request is fully cached.
+        let primer: Vec<u32> = (9_000..9_128).collect();
+        let primer_id = rid(1);
+        d.submit(primer_id, primer.clone(), MAX_TOKENS);
+        for _ in 0..1_000 {
+            if d.is_idle() {
+                break;
+            }
+            d.step();
+        }
+        assert!(
+            d.generated_of(primer_id).is_some(),
+            "the primer completed before the flood"
+        );
+
+        // Seeded arrivals: 3-6 ms apart, ~8 s of arrivals against ~40 s of service.
+        use rand_chacha::rand_core::{RngCore as _, SeedableRng as _};
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(6);
+        let mut dues = Vec::new();
+        let mut due = Duration::ZERO;
+        for _ in 0..REQUESTS {
+            dues.push(due);
+            due += Duration::from_millis(3 + (rng.next_u64() % 4));
+        }
+
+        let start = clock.now_mono();
+        let mut submitted = 0;
+        while submitted < REQUESTS as usize {
+            d.step();
+            let now = clock.now_mono().saturating_sub(start);
+            while submitted < REQUESTS as usize && dues[submitted] <= now {
+                let k = submitted as u128;
+                let (prompt, _uncached) = if k % 50 == 49 {
+                    let unique: Vec<u32> =
+                        (20_000..20_128).map(|t| t + (k as u32) * 1_000).collect();
+                    (unique, true)
+                } else {
+                    (primer.clone(), false)
+                };
+                d.submit(rid(10_000 + k), prompt, MAX_TOKENS);
+                submitted += 1;
+            }
+        }
+        for _ in 0..200_000 {
+            if d.is_idle() {
+                break;
+            }
+            d.step();
+        }
+        assert!(
+            d.is_idle(),
+            "the flood drained: queued {} running {} driver-reqs {} free blocks {}",
+            d.scheduler().queue_len(),
+            d.scheduler().running_ids().len(),
+            d.scheduler().snapshot().waiting + d.scheduler().running_ids().len() as u32,
+            d.pool().free_blocks(),
+        );
+
+        let mut completed = 0;
+        for k in 0..REQUESTS {
+            if d.generated_of(rid(10_000 + k)).is_some() {
+                completed += 1;
+            }
+        }
+        let mut max_uncached = 0.0f64;
+        let mut max_cached = 0.0f64;
+        for k in 0..REQUESTS {
+            let Some((arrival, admitted)) = d.admission_span(rid(10_000 + k)) else {
+                continue;
+            };
+            let wait = admitted.saturating_sub(arrival).as_secs_f64();
+            if k % 50 == 49 {
+                max_uncached = max_uncached.max(wait);
+            } else {
+                max_cached = max_cached.max(wait);
+            }
+        }
+        assert!(
+            d.violations().is_empty(),
+            "violations: {:?}",
+            d.violations()
+        );
+        Leg {
+            inversions: d.admission_inversions(),
+            completed,
+            max_uncached_wait_s: max_uncached,
+            max_cached_wait_s: max_cached,
+        }
+    };
+
+    let cache_aware: &'static dyn turbine_scheduler::policy::SchedulingPolicy =
+        turbine_scheduler::policy::registry()
+            .get("cache_aware")
+            .unwrap();
+    let ca = leg(cache_aware);
+    let un = leg(&UNBOUNDED);
+
+    // The policy's bound: no equal-priority, never-preempted pair where a request that
+    // arrived at least one window later was admitted first, and everything completes.
+    assert!(
+        ca.inversions.is_empty(),
+        "cache_aware had {} inversions, first {:?}",
+        ca.inversions.len(),
+        ca.inversions.first()
+    );
+    assert_eq!(
+        ca.completed, 2_000,
+        "every request completes under cache_aware"
+    );
+    assert!(
+        un.max_uncached_wait_s > ca.max_uncached_wait_s,
+        "the unbounded variant must starve the uncached requests longer: \
+         unbounded max wait {:.2}s vs cache_aware {:.2}s",
+        un.max_uncached_wait_s,
+        ca.max_uncached_wait_s
+    );
+    assert!(
+        !un.inversions.is_empty(),
+        "the unbounded variant must report inversions"
+    );
+    // Informational: the legs' shape, for the perf log.
+    println!(
+        "cache_aware_starvation_bound: cache_aware max uncached wait {:.2}s / max cached \
+         wait {:.2}s; unbounded {:.2}s / {:.2}s; unbounded inversions {}",
+        ca.max_uncached_wait_s,
+        ca.max_cached_wait_s,
+        un.max_uncached_wait_s,
+        un.max_cached_wait_s,
+        un.inversions.len()
+    );
 }

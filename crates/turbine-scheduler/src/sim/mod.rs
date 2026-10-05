@@ -84,6 +84,10 @@ pub struct SimReport {
     /// Time to first token of every request that got one, in virtual seconds from its arrival
     /// to the end of the iteration that sampled it, in the order the first tokens came.
     pub ttft_s: Vec<f64>,
+    /// Phase 5p S-8: pairs (earlier, later) of equal priority,
+    /// never preempted, arrival gap ≥ `cache_aware_window`, where the later was admitted
+    /// first — non-empty means the policy violated the S-7 starvation bound.
+    pub admission_inversions: Vec<(RequestId, RequestId)>,
     /// Tokens sampled over the run (every choice counted).
     pub generated_tokens: u64,
 }
@@ -104,6 +108,77 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// The Phase 5p S-7/S-8 admission ledger: the first admission of every request in admission
+/// order, so a run can be judged against the S-7 starvation bound. The ledger is filled by
+/// the simulators (`Simulation::run`, `KvSimDriver::step`) from the scheduler's running set;
+/// `inversions` lists every pair (earlier, later) of equal priority, never preempted, arrival
+/// gap ≥ `window`, where the later-arrived was admitted first.
+#[derive(Default)]
+struct AdmissionLedger {
+    admitted: Vec<AdmittedReq>,
+    index: HashMap<RequestId, usize>,
+}
+
+struct AdmittedReq {
+    id: RequestId,
+    arrival: Duration,
+    priority: Priority,
+    admitted_at: Duration,
+    preempted: bool,
+}
+
+impl AdmissionLedger {
+    /// Record the request's first admission (`info` carries the submission-time arrival and
+    /// priority the scheduler was given; `at` is the clock at the plan's start).
+    fn admit(&mut self, id: RequestId, info: &(Duration, Priority), at: Duration) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.index.entry(id) {
+            e.insert(self.admitted.len());
+            self.admitted.push(AdmittedReq {
+                id,
+                arrival: info.0,
+                priority: info.1,
+                admitted_at: at,
+                preempted: false,
+            });
+        }
+    }
+
+    /// Mark requests the plan just preempted, so the bound ignores them.
+    fn preempted(&mut self, ids: impl Iterator<Item = RequestId>) {
+        for id in ids {
+            if let Some(&i) = self.index.get(&id) {
+                self.admitted[i].preempted = true;
+            }
+        }
+    }
+
+    /// Every pair (earlier, later): equal priority, neither ever preempted, the later arrived
+    /// at least one `window` after the earlier, and the ledger admitted the later first.
+    fn inversions(&self, window: Duration) -> Vec<(RequestId, RequestId)> {
+        let mut out = Vec::new();
+        for (i, a) in self.admitted.iter().enumerate() {
+            // `a` was admitted before `b`; `a` arriving ≥ 1 window after `b` means `b`
+            // (the earlier-arrived) waited behind `a` — the S-7 inversion.
+            for b in &self.admitted[i + 1..] {
+                if a.priority != b.priority || a.preempted || b.preempted {
+                    continue;
+                }
+                if a.arrival.saturating_sub(b.arrival) >= window {
+                    out.push((b.id, a.id));
+                }
+            }
+        }
+        out
+    }
+
+    /// `(arrival, admitted-at)` of the request's first admission.
+    fn span(&self, id: RequestId) -> Option<((Duration, Priority), Duration)> {
+        let &i = self.index.get(&id)?;
+        let r = &self.admitted[i];
+        Some(((r.arrival, r.priority), r.admitted_at))
+    }
+}
+
 struct SimSeq {
     request: RequestId,
     prompt: u32,
@@ -117,6 +192,7 @@ struct SimReq {
     seqs: SmallVec<[SeqId; 1]>,
     shared_done: bool,
     arrival: Duration,
+    priority: Priority,
     first_token: bool,
 }
 
@@ -139,6 +215,7 @@ pub struct Simulation {
     reqs: HashMap<RequestId, SimReq>,
     hooks: BTreeMap<u64, Vec<Hook>>,
     report: SimReport,
+    ledger: AdmissionLedger,
 }
 
 impl Simulation {
@@ -161,6 +238,7 @@ impl Simulation {
             reqs: HashMap::new(),
             hooks: BTreeMap::new(),
             report: SimReport::default(),
+            ledger: AdmissionLedger::default(),
         }
     }
 
@@ -242,6 +320,7 @@ impl Simulation {
 
             let plan = self.sched.plan(&mut self.pool, &self.limits);
             self.check(&plan, &decodable);
+            self.observe_admissions(&plan);
             for (id, _) in &plan.dropped {
                 self.forget(*id);
             }
@@ -274,7 +353,28 @@ impl Simulation {
             let done = u64::from(self.report.completed - completed) + plan.dropped.len() as u64;
             self.arrivals.on_done(done, now + duration);
         }
+        self.report.admission_inversions = self
+            .ledger
+            .inversions(self.sched.params().cache_aware_window);
         std::mem::take(&mut self.report)
+    }
+
+    /// Phase 5p S-8: record every request the plan admitted (first admission only) and the
+    /// requests it preempted, so the run can be judged against the S-7 starvation bound.
+    fn observe_admissions(&mut self, plan: &IterationPlan) {
+        let at = self.clock.now_mono();
+        for id in self.sched.running_ids() {
+            if let Some(r) = self.reqs.get(&id) {
+                self.ledger.admit(id, &(r.arrival, r.priority), at);
+            }
+        }
+        if !plan.preempted.is_empty() {
+            let ids = plan
+                .preempted
+                .iter()
+                .filter_map(|(seq, _)| self.seqs.get(seq).map(|s| s.request));
+            self.ledger.preempted(ids);
+        }
     }
 
     fn submit_arrivals(&mut self, now: Duration) {
@@ -309,6 +409,7 @@ impl Simulation {
                             seqs,
                             shared_done: false,
                             arrival: a.at,
+                            priority: a.priority,
                             first_token: false,
                         },
                     );
@@ -552,6 +653,10 @@ pub struct KvSimDriver {
     attached: HashMap<RequestId, AttachRecord>,
     /// Tokens the finished requests sampled (`generated_of` also answers after `forget`).
     done_generated: HashMap<RequestId, Vec<u32>>,
+    /// Submission-time `(arrival, priority)` the driver handed the scheduler, keyed by
+    /// request (the ledger's input; Phase 5p S-8).
+    submitted: HashMap<RequestId, (Duration, Priority)>,
+    ledger: AdmissionLedger,
     violations: Vec<String>,
 }
 
@@ -594,8 +699,32 @@ impl KvSimDriver {
             prefilled: HashMap::new(),
             attached: HashMap::new(),
             done_generated: HashMap::new(),
+            submitted: HashMap::new(),
+            ledger: AdmissionLedger::default(),
             violations: Vec::new(),
         }
+    }
+
+    /// Run under `policy` (`scheduler.policy`); set before the first submission: queued
+    /// requests keep the keys of the policy they were queued under.
+    pub fn with_policy(mut self, policy: &'static dyn SchedulingPolicy) -> KvSimDriver {
+        self.sched = self.sched.with_policy(policy);
+        self
+    }
+
+    /// Phase 5p S-8: the run's admission inversions (pairs (earlier, later) of equal
+    /// priority, never preempted, arrival gap ≥ the `cache_aware` window, where the
+    /// later-arrived was admitted first).
+    pub fn admission_inversions(&self) -> Vec<(RequestId, RequestId)> {
+        self.ledger
+            .inversions(self.sched.params().cache_aware_window)
+    }
+
+    /// `(arrival, admitted-at)` of a request the driver saw admitted (Phase 5p S-8 waits).
+    pub fn admission_span(&self, id: RequestId) -> Option<(Duration, Duration)> {
+        self.ledger
+            .span(id)
+            .map(|(arrival, admitted)| (arrival.0, admitted))
     }
 
     /// A request arrives; it attaches its cached prefix on the next `step`.
@@ -703,6 +832,7 @@ impl KvSimDriver {
 
         let plan = self.sched.plan(&mut self.pool, &self.limits);
         self.kv.after_plan(&mut self.pool);
+        self.observe_admissions(&plan);
         self.check_writes(&plan);
         for (id, _) in &plan.dropped {
             self.kv.request_done(&mut self.pool, *id, true);
@@ -865,7 +995,8 @@ impl KvSimDriver {
         }
     }
 
-    /// Hands a request and its attached prefix to the scheduler.
+    /// Hands a request and its attached prefix to the scheduler; records the submission-time
+    /// `(arrival, priority)` for the S-8 admission ledger.
     fn schedule(&mut self, id: RequestId, attach: PrefixAttach) {
         let Some(r) = self.reqs.get_mut(&id) else {
             // Cancelled while its promotions were in flight.
@@ -891,6 +1022,7 @@ impl KvSimDriver {
         let mut sr = SchedRequest::new(id, smallvec::smallvec![r.seq], prompt, r.max_tokens, bt);
         sr.arrival = self.clock.now_mono();
         sr.attach_prefix(attach, bt);
+        self.submitted.insert(id, (sr.arrival, sr.priority));
         self.estimates.insert(id, sr.estimate);
         let blocks = sr.cached_prefix.as_ref().map(|a| a.blocks.clone());
         if let Err(e) = self.sched.submit(sr, self.pool.total_blocks()) {
@@ -904,6 +1036,23 @@ impl KvSimDriver {
         }
     }
 
+    /// Phase 5p S-8: record every request the plan admitted (first admission only) and the
+    /// requests it preempted, so the run can be judged against the S-7 starvation bound.
+    fn observe_admissions(&mut self, plan: &IterationPlan) {
+        let at = self.clock.now_mono();
+        for id in self.sched.running_ids() {
+            if let Some(info) = self.submitted.get(&id) {
+                self.ledger.admit(id, info, at);
+            }
+        }
+        if !plan.preempted.is_empty() {
+            let ids = plan
+                .preempted
+                .iter()
+                .filter_map(|(seq, _)| self.seq_request.get(seq).copied());
+            self.ledger.preempted(ids);
+        }
+    }
     /// Every block a batch item writes must be held by that sequence alone.
     fn check_writes(&mut self, plan: &IterationPlan) {
         let bt = self.sched.params().block_tokens.max(1);
