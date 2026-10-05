@@ -192,6 +192,10 @@ pub struct BatchItem {
     pub seq: SeqId,
     pub kind: BatchKind,
     pub block_table: BlockTable,
+    /// The verified jump-forward's forced-token run this item feeds after its sampled token
+    /// (P5p S-10): empty for every other item. The engine verifies the run against the model
+    /// in one multi-row step and reports the kept tokens and the rollback.
+    pub draft: Vec<u32>,
 }
 
 /// A choice forked from the shared prefill (`n > 1`): `dst` shares `src`'s full blocks; the
@@ -409,7 +413,7 @@ struct SeqEntry {
     /// this decoding sequence as one prefill-kind item. Cleared wherever the table drops
     /// (preemption, finish, removal) and decided by every plan: planned, or dropped for a
     /// plain decode when the budget, the logits-row capacity or the pool cannot cover it.
-    extend_pending: Option<u32>,
+    extend_pending: Option<Vec<u32>>,
 }
 
 /// A plan awaiting `complete`.
@@ -930,14 +934,14 @@ impl Scheduler {
     /// plan additionally caps the item by the policy's chunk cap and the request's own
     /// `prompt_len + max_new_tokens`. A sequence that is not decoding (prefilling, waiting,
     /// paused, finished, untracked) is `SchedError::NotDecoding`; `tokens` 0 is a no-op.
-    pub fn extend(&mut self, seq: SeqId, tokens: u32) -> Result<(), SchedError> {
+    pub fn extend(&mut self, seq: SeqId, tokens: Vec<u32>) -> Result<(), SchedError> {
         let Some(e) = self.seqs.get_mut(&seq) else {
             return Err(SchedError::NotDecoding);
         };
         if e.state != RequestState::Decoding {
             return Err(SchedError::NotDecoding);
         }
-        if tokens > 0 {
+        if !tokens.is_empty() {
             e.extend_pending = Some(tokens);
         }
         Ok(())
@@ -1743,6 +1747,7 @@ impl Scheduler {
                 seq: *seq,
                 kind: BatchKind::Decode,
                 block_table: e.table.clone(),
+                draft: Vec::new(),
             });
         }
     }
@@ -1875,8 +1880,10 @@ impl Scheduler {
                 )
             };
             // Nothing left to append (the engine extended past `prompt_len + max_new_tokens`):
-            // a plain decode.
-            let Some(len) = u32::checked_add(1, tokens)
+            // a plain decode. The plan may cap the run (the request's own ceiling): the item
+            // carries the truncated draft.
+            let Some(len) = u32::try_from(tokens.len() + 1)
+                .ok()
                 .map(|l| l.min(ceiling.saturating_sub(table_tokens)))
                 .filter(|&l| l > 1)
             else {
@@ -1886,7 +1893,11 @@ impl Scheduler {
                 (f64::from(token_cap.saturating_sub(candidates.len() as u32 - replaced_decodes))
                     * fraction)
                     .floor() as u32;
-            if len > budget || *rows + len > rows_cap {
+            // The plan's logits rows also cover the decodes planned after this (`rows_cap` =
+            // `max_running_requests`): every other candidate still decodes unless its
+            // extension was planned, so reserve a row per remaining candidate.
+            let decodes_left = (candidates.len() as u32).saturating_sub(1 + replaced_decodes);
+            if len > budget || *rows + len + decodes_left > rows_cap {
                 continue; // dropped: the sequence decodes
             }
             let need = e.table.blocks_needed(len, bt);
@@ -1912,6 +1923,7 @@ impl Scheduler {
                 seq,
                 kind: BatchKind::Prefill { start, len },
                 block_table: e.table.clone(),
+                draft: tokens[..(len - 1) as usize].to_vec(),
             });
         }
         (extended, reserved)
@@ -1984,6 +1996,7 @@ impl Scheduler {
         plan.items.push(BatchItem {
             seq,
             kind: BatchKind::Prefill { start, len },
+            draft: Vec::new(),
             block_table: e.table.clone(),
         });
         true
@@ -2572,7 +2585,7 @@ mod tests {
         // A 100-token prompt waits behind the extension's 6 tokens (budget 64 − 6 = 58, the
         // chunk cap keeps its first chunk at 32).
         s.submit(request(2, 2, 100, 10), p.total_blocks()).unwrap();
-        s.extend(SeqId(1), 5).unwrap();
+        s.extend(SeqId(1), vec![1, 2, 3, 4, 5]).unwrap();
         let plan = s.plan(&mut p, &IterationLimits::default());
         assert_eq!(
             kinds(&plan),
@@ -2606,15 +2619,15 @@ mod tests {
         complete_all(&mut s, &mut p, &plan, &[]);
 
         // Extending a prefilling, paused or unknown sequence is refused.
-        s.extend(SeqId(2), 3).unwrap_err(); // still between prefill chunks
+        s.extend(SeqId(2), vec![1, 2, 3]).unwrap_err(); // still between prefill chunks
         s.pause(SeqId(1));
         assert!(matches!(
-            s.extend(SeqId(1), 3),
+            s.extend(SeqId(1), vec![1, 2, 3]),
             Err(SchedError::NotDecoding)
         ));
         s.resume(SeqId(1));
         assert!(matches!(
-            s.extend(SeqId(99), 3),
+            s.extend(SeqId(99), vec![1, 2, 3]),
             Err(SchedError::NotDecoding)
         ));
 
@@ -2624,7 +2637,7 @@ mod tests {
             prefill_budget_fraction: 0.0,
             ..IterationLimits::default()
         };
-        s.extend(SeqId(1), 5).unwrap();
+        s.extend(SeqId(1), vec![1, 2, 3, 4, 5]).unwrap();
         let plan = s.plan(&mut p, &no_prefill);
         assert_eq!(kinds(&plan), [(1, BatchKind::Decode)]);
         complete_all(&mut s, &mut p, &plan, &[]);
@@ -2647,7 +2660,7 @@ mod tests {
         complete_all(&mut s, &mut p, &plan, &[]);
         let plan = s.plan(&mut p, &IterationLimits::default());
         complete_all(&mut s, &mut p, &plan, &[]); // table 13 tokens, 1 block
-        s.extend(SeqId(1), 5).unwrap();
+        s.extend(SeqId(1), vec![1, 2, 3, 4, 5]).unwrap();
         let plan = s.plan(&mut p, &IterationLimits::default());
         assert_eq!(
             kinds(&plan),
@@ -2701,7 +2714,7 @@ mod tests {
             ]
         );
         complete_all(&mut s, &mut p, &plan, &[]);
-        s.extend(SeqId(2), 3).unwrap();
+        s.extend(SeqId(2), vec![1, 2, 3]).unwrap();
         // Both decode until they cross their first block boundary together; the pool of 3
         // blocks cannot cover the two new blocks, so the worse-ranked request 2 is preempted.
         let mut preempted = None;
@@ -2722,7 +2735,7 @@ mod tests {
         let plan = preempted.expect("the pool forced a preemption");
         complete_all(&mut s, &mut p, &plan, &[]);
         assert!(matches!(
-            s.extend(SeqId(2), 3),
+            s.extend(SeqId(2), vec![1, 2, 3]),
             Err(SchedError::NotDecoding)
         ));
         // Request 2 is recomputed from scratch and decodes again — without its extension.

@@ -339,7 +339,7 @@ impl Simulation {
             {
                 let next = self.sched.snapshot().iterations_total + 1;
                 let k = 1 + next as u32 % max_k;
-                let _ = self.sched.extend(seq, k);
+                let _ = self.sched.extend(seq, (0..k).map(|i| 300 + i).collect());
             }
 
             let plan = self.sched.plan(&mut self.pool, &self.limits);
