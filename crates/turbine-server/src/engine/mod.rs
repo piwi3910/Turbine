@@ -433,6 +433,7 @@ pub fn spawn(
                     max_seq_len,
                     scheduler: params,
                     overlap_scheduling,
+                    structured_output,
                     reliability,
                     ..
                 } = prepared;
@@ -473,6 +474,8 @@ pub fn spawn(
                     overlap: overlap_scheduling,
                     reliability: parts.engine,
                     pipeline: stats,
+                    jump_forward: structured_output.jump_forward,
+                    jump_forward_max_tokens: structured_output.jump_forward_max_tokens,
                 });
                 backend.set_ready(
                     replica,

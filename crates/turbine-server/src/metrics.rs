@@ -73,6 +73,11 @@ pub struct GraphOutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct JumpOutcomeLabels {
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReasonLabels {
     pub reason: &'static str,
 }
@@ -114,6 +119,12 @@ pub struct ServerMetrics {
     /// window did not judge; `kv_copy`: the step overlapped an in-flight KV tier copy
     /// (decision "6b: step-time drift during KV promotions", C).
     pub unjudged_decode_steps: Family<ReasonLabels, Counter>,
+    /// `turbine_jump_forward_tokens_total{outcome}`: grammar-forced tokens the model
+    /// confirmed (`accepted`) or that were rolled back after a disagreement (`rolled_back`)
+    /// (P5p S-10).
+    pub jump_forward_tokens: Family<JumpOutcomeLabels, Counter>,
+    /// `turbine_jump_forward_steps_total`: forward steps that verified a forced run.
+    pub jump_forward_steps: Counter,
 }
 
 impl ServerMetrics {
@@ -172,7 +183,33 @@ impl ServerMetrics {
                 "Pure decode steps the step-time drift window did not judge, by reason",
                 Family::default(),
             ),
+            jump_forward_tokens: reg.register(
+                "turbine_jump_forward_tokens",
+                "Grammar-forced tokens accepted or rolled back by the verified jump-forward",
+                Family::default(),
+            ),
+            jump_forward_steps: reg.register(
+                "turbine_jump_forward_steps",
+                "Forward steps that verified a grammar-forced token run",
+                Counter::default(),
+            ),
         }
+    }
+
+    /// Counts one verified jump-forward step: `accepted` confirmed forced tokens,
+    /// `rolled_back` forced tokens the model rejected.
+    pub fn jump_forward(&self, accepted: u64, rolled_back: u64) {
+        self.jump_forward_tokens
+            .get_or_create(&JumpOutcomeLabels {
+                outcome: "accepted",
+            })
+            .inc_by(accepted);
+        self.jump_forward_tokens
+            .get_or_create(&JumpOutcomeLabels {
+                outcome: "rolled_back",
+            })
+            .inc_by(rolled_back);
+        self.jump_forward_steps.inc();
     }
 
     /// Counts one forward's logits rows: `reduced` reduced on the device, `full` copied whole.

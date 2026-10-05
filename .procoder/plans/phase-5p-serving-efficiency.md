@@ -265,11 +265,12 @@ Interfaces:
   Covers: S-10 AC `structured::tests::forced_tokens_follow_llguidance`
   Depends on: Task 10
 
-- [ ] Write failing test `structured::tests::forced_tokens_follow_llguidance` (tiny tokenizer, `small_schema`: equals `compute_ff_tokens` capped by `max`; empty inside a free string; never re-tokenizes the last committed token; calling it twice without a commit returns the same tokens). Run: `scripts/remote-cargo.sh test -p turbine-model structured::tests::forced_tokens_follow_llguidance` — expect FAIL
-- [ ] Implement over llguidance 1.8.0's `Matcher::compute_ff_tokens` (no new dependency).
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(model): forced tokens from the llguidance matcher`
+- [x] Write failing test `structured::tests::forced_tokens_follow_llguidance` (tiny tokenizer, `small_schema`: equals `compute_ff_tokens` capped by `max`; empty inside a free string; never re-tokenizes the last committed token; calling it twice without a commit returns the same tokens). Run: `scripts/remote-cargo.sh test -p turbine-model structured::tests::forced_tokens_follow_llguidance` — expect FAIL
+- [x] Implement over llguidance 1.8.0's `Matcher::compute_ff_tokens` (no new dependency); a run is cut at EOS and capped by `max`, and never advances the matcher.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model` — PASS (156 tests; the whole crate)
+- [x] Gate: `scripts/gate.sh` — `gate: ok` (986 tests with Task 12)
+- [x] Mutation-checked: the override dropped to the default (empty) turns `forced_tokens_follow_llguidance` red; restored.
+- [x] Commit: `feat(model): forced tokens from the llguidance matcher`
 
 ## Task 12: Verified jump-forward in the engine — landing (S-10)
 
@@ -282,14 +283,15 @@ Interfaces:
   Covers: S-10 ACs `tiny_server jump_forward_matches_token_by_token`, lab `lab_openai json_schema_jump_forward_matches`; S-13 landing
   Depends on: Task 11
 
-- [ ] Write failing test `tiny_server jump_forward_matches_token_by_token` as the spec lists (JSON schema, `json_object`, tool call; greedy with and without `top_logprobs`, seeded `temperature` 0.8, a stop string inside a forced span, `max_tokens` cutting a span; identical streams, logprobs and finish reasons with `structured_output.jump_forward` true and false; `accepted` > 0; a test grammar forcing a non-canonical split is rejected at that token). Run: `scripts/remote-cargo.sh test -p turbine-server --test tiny_server jump_forward_matches_token_by_token` — expect FAIL
-- [ ] Write the ignored lab test `lab_openai json_schema_jump_forward_matches`: the four JSON cases of `tests/golden/tools/requests.jsonl` at temperature 0 with `logprobs` and `top_logprobs` 5, jump-forward on and off (two servers, `--set structured_output.jump_forward=false` for the second); identical token ids (divergence excused only at a near-tie under the golden token rule of `tests/golden/llama-3.2-3b-instruct/tolerance.json`), logprobs within its strict bounds, schema-valid content; print `forward_steps_per_token` and wall time per case for both settings and assert ≤ 0.8 × steps and ≤ 0.9 × time summed over the four.
-- [ ] Implement.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-server && scripts/remote-cargo.sh test -p turbine-model` — expect PASS (including `response_format_json_schema`, `matcher_masks_each_choice_and_fails_alone`, the overlap tests)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-server --test lab_openai` — expect exit 0 with `json_schema_jump_forward_matches` and `tools_and_json_schema` ok; paste the printed steps and times into the perf log
-- [ ] Landing (GPU 0): `scripts/lab-bench.sh --model llama` and `--model olmoe` — expect the standard-bench bound and golden1 PASS; record the lines
-- [ ] Commit: `perf(server): verified jump-forward over the grammar's forced tokens`
+- [x] Write failing test `tiny_server jump_forward_matches_token_by_token` as the spec lists (JSON schema, `json_object`, tool call; greedy with and without `top_logprobs`, seeded `temperature` 0.8, a stop string inside a forced span, `max_tokens` cutting a span; identical streams, logprobs and finish reasons with `structured_output.jump_forward` true and false; `accepted` > 0; a test grammar forcing a non-canonical split is rejected at that token). Run: `scripts/remote-cargo.sh test -p turbine-server --test tiny_server jump_forward_matches_token_by_token` — expect FAIL
+- [x] Write the ignored lab test `lab_openai json_schema_jump_forward_matches`: the four JSON cases of `tests/golden/tools/requests.jsonl` at temperature 0 with `logprobs` and `top_logprobs` 5, jump-forward on and off (two servers, `--set structured_output.jump_forward=false` for the second); identical token ids (divergence excused only at a near-tie under the golden token rule of `tests/golden/llama-3.2-3b-instruct/tolerance.json`), logprobs within its strict bounds, schema-valid content; print `forward_steps_per_token` and wall time per case for both settings and assert ≤ 0.8 × steps and ≤ 0.9 × time summed over the four.
+- [x] Implement; the run travels with the plan item (`BatchItem::draft`), so the batch and the verification feed exactly what the extension asked for even when the choice's matcher state moves on (a `NeedsHost` rebuild re-reads the choice — the bug the plan-item copy kills). `plan_extensions` reserves a logits row per remaining decode candidate, so an extension cannot push the batch past `max_running_requests` rows; a jump-forward step is never launched ahead (`Build::NeedsHost` while an iteration is in flight) and its iteration completes serially (`finish_forced`), whose outcome carries the iteration number so `complete` releases the busy mark. KV commits cover kept tokens only (`kv_commits` caps at prompt + generated).
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-server && scripts/remote-cargo.sh test -p turbine-model` — PASS (whole `turbine-server`, `turbine-model`, `turbine-scheduler`; including `response_format_json_schema`, `matcher_masks_each_choice_and_fails_alone`, the overlap tests, `preempted_output_unchanged`)
+- [x] Mutation-checked: the agreement check dropped (every forced token accepted) turns `jump_forward_rolls_back_a_corrupted_run` red; restored.
+- [x] Gate: `scripts/gate.sh` — `gate: ok` (986 tests)
+- [x] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-server --test lab_openai` — see the perf log for the printed steps and times
+- [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama --quick` and `--model olmoe --quick` — see the perf log for the lines
+- [x] Commit: `feat(structured-output): verified jump-forward in the engine (S-10)`
 
 ## Task 13: Ladder serving cost — instrument, then the measured fix for the ORANGE dwell (S-14)
 

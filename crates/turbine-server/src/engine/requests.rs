@@ -88,6 +88,18 @@ pub(crate) struct Step {
     pub detokenize: Duration,
 }
 
+/// The result of a jump-forward step (P5p S-10): how many forced tokens the model confirmed,
+/// the token the step leaves as the choice's newest generated one (the last row's sample; the
+/// model's own when it disagreed), the finish that ended the choice inside the span, and one
+/// `Step` per generated token in order. `steps.len() == accepted + usize::from(next.is_some())`.
+#[derive(Debug)]
+pub(crate) struct ForcedOutcome {
+    pub accepted: u32,
+    pub next: Option<SampledToken>,
+    pub finished: Option<FinishReason>,
+    pub steps: Vec<Step>,
+}
+
 /// Where an event went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
@@ -467,6 +479,72 @@ impl ActiveRequest {
             detokenize: detokenize_started.elapsed(),
         })
     }
+
+    /// The grammar's forced-token run for `choice`, at most `max` tokens, empty without a
+    /// constraint (P5p S-10). Does not advance the matcher; the engine verifies the run
+    /// against the model and commits the accepted tokens with `step`/`step_sampled`.
+    pub fn forced_tokens(&mut self, choice: usize, max: usize) -> Vec<u32> {
+        match self.choices[choice].matcher.as_mut() {
+            Some(matcher) => matcher.forced_tokens(max),
+            None => Vec::new(),
+        }
+    }
+
+    /// The verified jump-forward step (P5p S-10): `rows` are the choice's logits rows for the
+    /// fed tokens `[t, f1..fk]` (`rows.len() == forced.len() + 1`, in position order), each
+    /// stepped exactly as a token-by-token step would be — matcher mask, logits processors,
+    /// sampler with its own uniform, logprobs. Row `j < k` accepts its sample while it equals
+    /// `forced[j]`; at the first disagreement the model's own token stands and the remaining
+    /// forced tokens are rolled back (the engine reports the rollback to the scheduler). A
+    /// finish inside the span (stop string, EOS, `max_tokens`) ends the choice there the same
+    /// way a token-by-token run would. The last row's sample is the genuinely generated token
+    /// either way.
+    pub fn step_forced(
+        &mut self,
+        choice: usize,
+        rows: Vec<&mut [f32]>,
+        forced: &[u32],
+        max_seq_len: u32,
+        metrics: Option<&ModelMetrics>,
+    ) -> Result<ForcedOutcome, ModelError> {
+        let mut steps = Vec::with_capacity(rows.len());
+        let mut accepted: u32 = 0;
+        let mut next = None;
+        let mut finished = None;
+        for (j, row) in rows.into_iter().enumerate() {
+            let step = self.step(choice, row, max_seq_len, metrics)?;
+            let sampled = match &step.events[0] {
+                GenerationEvent::Token {
+                    token_id,
+                    logprob,
+                    top_logprobs,
+                    ..
+                } => SampledToken {
+                    token: *token_id,
+                    logprob: *logprob,
+                    top_logprobs: top_logprobs.clone(),
+                },
+                _ => unreachable!("a step's first event is its Token"),
+            };
+            let agree = j < forced.len() && sampled.token == forced[j];
+            steps.push(step);
+            if agree && steps.last().is_some_and(|s| s.finish.is_none()) {
+                accepted += 1;
+                continue;
+            }
+            finished = steps.last().unwrap().finish;
+            if finished.is_none() {
+                next = Some(sampled);
+            }
+            break;
+        }
+        Ok(ForcedOutcome {
+            accepted,
+            next,
+            finished,
+            steps,
+        })
+    }
 }
 
 /// Where a choice's output text goes (see the module comment on tool calls).
@@ -673,6 +751,141 @@ mod tests {
         (s.events[0].clone(), s.finish)
     }
 
+    /// The forced matcher of the jump-forward tests: allows exactly `ids`, reports `forced`
+    /// as the forced run.
+    struct Forced {
+        ids: Vec<u32>,
+        forced: Vec<u32>,
+    }
+
+    impl TokenMatcher for Forced {
+        fn allowed(&mut self, mask: &mut TokenMask) -> Result<(), ModelError> {
+            mask.clear();
+            for &id in &self.ids {
+                mask.allow(id);
+            }
+            Ok(())
+        }
+        fn commit(&mut self, token: u32) -> Result<(), ModelError> {
+            assert!(self.ids.contains(&token), "committed disallowed {token}");
+            Ok(())
+        }
+        fn accepts_eos(&self) -> bool {
+            false
+        }
+        fn forced_tokens(&mut self, max: usize) -> Vec<u32> {
+            self.forced[..max.min(self.forced.len())].to_vec()
+        }
+    }
+
+    /// The step's tokens in order.
+    fn step_tokens(out: &ForcedOutcome) -> Vec<u32> {
+        out.steps
+            .iter()
+            .filter_map(|s| match &s.events[0] {
+                GenerationEvent::Token { token_id, .. } => Some(*token_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn forced_rows(data: &mut Vec<f32>, rows: Vec<Vec<f32>>, vocab: usize) -> Vec<&mut [f32]> {
+        data.extend(rows.into_iter().flatten());
+        data.chunks_mut(vocab).collect()
+    }
+
+    /// P5p S-10: `step_forced` runs the normal step per row, accepts while the sampled token
+    /// equals the forced one, takes the model's token at the first disagreement and stops the
+    /// choice inside the span like a token-by-token run would.
+    #[test]
+    fn step_forced_verifies_row_by_row() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-forced");
+        let vocab = tokenizer.vocab_size() as usize;
+        let mk = |ids: Vec<u32>, forced: Vec<u32>| Forced { ids, forced };
+
+        // Full acceptance: the rows favour [f1, f2, next]; f1 and f2 are accepted, row 2's
+        // sample is the next generated token.
+        let req = request(&[256], 10, &[]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(
+            Submission {
+                matchers: vec![Box::new(mk(vec![110, 111, 112], vec![110, 111]))],
+                ..req.into()
+            },
+            tx,
+            &[SeqId(1)],
+            &tokenizer,
+        );
+        let mut data = Vec::new();
+        let rows = forced_rows(
+            &mut data,
+            vec![row(110, vocab), row(111, vocab), row(112, vocab)],
+            vocab,
+        );
+        let out = r
+            .step_forced(0, rows, &[110, 111], 512, None)
+            .expect("step_forced");
+        assert_eq!(out.accepted, 2);
+        assert_eq!(out.next.as_ref().map(|s| s.token), Some(112));
+        assert_eq!(out.finished, None);
+        assert_eq!(step_tokens(&out), [110, 111, 112]);
+        assert_eq!(r.choices[0].generated, [110, 111, 112]);
+
+        // A disagreement at row 0: the model's token stands, the whole run rolls back.
+        let req = request(&[256], 10, &[]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(
+            Submission {
+                matchers: vec![Box::new(mk(vec![110, 111], vec![111]))],
+                ..req.into()
+            },
+            tx,
+            &[SeqId(2)],
+            &tokenizer,
+        );
+        let mut data = Vec::new();
+        let rows = forced_rows(&mut data, vec![row(110, vocab), row(111, vocab)], vocab);
+        let out = r
+            .step_forced(0, rows, &[111], 512, None)
+            .expect("step_forced");
+        assert_eq!(out.accepted, 0);
+        assert_eq!(out.next.as_ref().map(|s| s.token), Some(110));
+        assert_eq!(step_tokens(&out), [110]);
+        assert_eq!(r.choices[0].generated, [110]);
+
+        // A stop string completed by a forced token ends the choice there; nothing after it
+        // is generated.
+        let req = request(&[256], 10, &["ab"]);
+        let (tx, _rx) = mpsc::channel(8);
+        let mut r = ActiveRequest::new(
+            Submission {
+                matchers: vec![Box::new(mk(vec![97, 98, 99], vec![97, 98, 99]))],
+                ..req.into()
+            },
+            tx,
+            &[SeqId(3)],
+            &tokenizer,
+        );
+        let mut data = Vec::new();
+        let rows = forced_rows(
+            &mut data,
+            vec![row(97, vocab), row(98, vocab), row(99, vocab)],
+            vocab,
+        );
+        let out = r
+            .step_forced(0, rows, &[97, 98, 99], 512, None)
+            .expect("step_forced");
+        assert_eq!(out.accepted, 1, "the stop string fired on the second token");
+        assert_eq!(out.next, None);
+        assert_eq!(out.finished, Some(FinishReason::Stop));
+        assert_eq!(step_tokens(&out), [97, 98]);
+        assert_eq!(r.choices[0].generated, [97, 98]);
+        assert_eq!(
+            r.choices[0].finish,
+            Some(FinishReason::Stop),
+            "`max_tokens`, EOS and the tool-call rules see every accepted token"
+        );
+    }
     fn tiny_tokenizer(name: &str) -> (TempDir, Arc<Tokenizer>) {
         let dir = TempDir::new(name);
         let spec = write_tiny_llama(dir.path(), 7);

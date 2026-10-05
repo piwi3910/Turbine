@@ -1883,6 +1883,8 @@ mod tests {
             reliability: parts.engine,
             kv,
             pipeline: None,
+            jump_forward: true,
+            jump_forward_max_tokens: 32,
         });
         (engine, tx, shared, reg)
     }

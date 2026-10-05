@@ -109,7 +109,7 @@ use turbine_scheduler::{
 
 use super::deadlines::{Deadlines, Timeouts};
 use super::pp::PipelineStats;
-use super::requests::{ActiveRequest, Delivery, Flush, Submission};
+use super::requests::{ActiveRequest, Delivery, Flush, Step, Submission};
 use super::stages::{Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
@@ -151,6 +151,11 @@ pub(crate) struct EngineParts {
     /// ([`super::pp::PpExecutor`]) and the engine keeps up to its micro-batches in flight
     /// ([`EngineLoop::turn_pipelined`]); `None` otherwise.
     pub pipeline: Option<Arc<PipelineStats>>,
+    /// `structured_output.jump_forward` (P5p S-10): the engine verifies the grammar's forced
+    /// tokens against the model in one multi-row step.
+    pub jump_forward: bool,
+    /// `structured_output.jump_forward_max_tokens`: the longest forced run fed in one step.
+    pub jump_forward_max_tokens: u32,
 }
 
 /// The message of the `slow_client` error event.
@@ -227,6 +232,11 @@ pub(crate) struct EngineLoop {
     tail_done: Vec<RequestId>,
     /// Each planned sequence's last table block ([`EngineLoop::note_table_blocks`]).
     last_table_block: HashMap<SeqId, BlockId>,
+    /// The forced-token run each sequence's planned extension feeds (P5p S-10): snapshotted
+    /// when the extension was asked for, so the batch and the verification see exactly what
+    /// was requested even if the choice's matcher state moves on; removed when the run was
+    /// verified or its extension was dropped.
+    jump_drafts: HashMap<SeqId, Vec<u32>>,
     /// Choice 0's final partial block per request that finished at sampling time
     /// (`sample_choice`, serial and pipelined paths): published before the iteration's
     /// `complete` releases the finished tables, dropped when the iteration failed.
@@ -243,6 +253,10 @@ pub(crate) struct EngineLoop {
     pipe: VecDeque<PipeFlight>,
     /// Pipeline parallelism: when the last micro-batch was collected (the step cadence).
     last_collect: Option<Instant>,
+    /// `structured_output.jump_forward` (P5p S-10): verify the grammar's forced tokens.
+    jump_forward: bool,
+    /// `structured_output.jump_forward_max_tokens`.
+    jump_forward_max_tokens: u32,
 }
 
 /// A micro-batch launched into the pipeline's stages before the last, waiting for its last
@@ -293,6 +307,9 @@ struct RowInfo {
     feedable: bool,
     /// The next launch took this row's token on the device: the host's token must match it.
     fed_next: bool,
+    /// A verified jump-forward item (P5p S-10): the number `k` of forced tokens fed after the
+    /// sampled one, so the row group holds `k + 1` logits rows to verify.
+    forced: Option<u32>,
 }
 
 /// One batch built from a plan: token ids (placeholders where fed), positions, the plan item
@@ -400,12 +417,15 @@ impl EngineLoop {
             kv_done: Vec::new(),
             tail_done: Vec::new(),
             last_table_block: HashMap::new(),
+            jump_drafts: HashMap::new(),
             pending_publishes: Vec::new(),
             retire_later: Vec::new(),
             reattaching: HashSet::new(),
             pipeline: p.pipeline,
             pipe: VecDeque::new(),
             last_collect: None,
+            jump_forward: p.jump_forward,
+            jump_forward_max_tokens: p.jump_forward_max_tokens,
         };
         engine.publish(false);
         engine.publish_stats();
@@ -1391,6 +1411,9 @@ impl EngineLoop {
             let Some(r) = self.requests.get(&id) else {
                 continue;
             };
+            // Kept tokens only (P5p S-10): a jump-forward item's table covers its forced run,
+            // but the host may have rolled tokens back; only positions with a token commit.
+            let end = end.min(r.prompt_len() + r.choices[0].generated.len() as u32);
             let tokens: Option<Vec<u32>> = (0..end).map(|p| r.token_at(0, p)).collect();
             if let Some(tokens) = tokens {
                 out.push((id, item.block_table.blocks.clone(), tokens));
@@ -1745,6 +1768,9 @@ impl EngineLoop {
             kv_len: u32,
             prefill: bool,
             yields: bool,
+            /// The item feeds a verified jump-forward run: the forced tokens after the
+            /// sampled one (P5p S-10).
+            forced: Option<u32>,
             /// `prev`'s slot whose device choice is this item's newest token.
             feed: Option<usize>,
         }
@@ -1773,15 +1799,49 @@ impl EngineLoop {
             };
             let r = self
                 .requests
-                .get(&id)
+                .get_mut(&id)
                 .ok_or_else(|| format!("request {} is not tracked", id.0))?;
             if self.overlap && (r.done || r.choices[choice].finish.is_some()) {
                 continue;
             }
-            let yields = !prefill || self.sched.prefill_target(item.seq) == Some(start + len);
+            // A verified jump-forward item (P5p S-10): a prefill-kind item of a decoding
+            // choice that starts at the sampled token's position and whose run the engine
+            // snapshotted when it asked for the extension — the snapshot, not the choice's
+            // live matcher state, is what the batch and the verification feed. A prefill item
+            // anywhere else in a decoding choice is a re-prefill after preemption (the
+            // history feeds it); a decode item retires the snapshot (the plan dropped the
+            // extension and the choice decodes).
+            let forced = match item.kind {
+                // The plan may have capped the extension below the asked-for run (the
+                // request's own ceiling): the draft truncates with it.
+                BatchKind::Prefill { start, .. }
+                    if !r.choices[choice].generated.is_empty()
+                        && start
+                            == r.prompt_len() + r.choices[choice].generated.len() as u32 - 1
+                        && !item.draft.is_empty() =>
+                {
+                    Some((len - 1).min(item.draft.len() as u32))
+                }
+                BatchKind::Decode => {
+                    self.jump_drafts.remove(&item.seq);
+                    None
+                }
+                BatchKind::Prefill { .. } => {
+                    self.jump_drafts.remove(&item.seq);
+                    None
+                }
+            };
+            if forced.is_some() && prev.is_some() {
+                // A jump-forward step is never launched ahead (S-10): its verification is the
+                // host work this launch would build on.
+                return Ok(Build::NeedsHost);
+            }
+            let yields = forced.is_some()
+                || !prefill
+                || self.sched.prefill_target(item.seq) == Some(start + len);
             let mut feed = None;
             for p in start..start + len {
-                if r.token_at(choice, p).is_some() {
+                if r.token_at(choice, p).is_some() || (forced.is_some() && p > start) {
                     continue;
                 }
                 match feedable.get(&item.seq) {
@@ -1804,6 +1864,7 @@ impl EngineLoop {
                 kv_len,
                 prefill,
                 yields,
+                forced,
                 feed,
             });
         }
@@ -1822,15 +1883,42 @@ impl EngineLoop {
             let seq = plan.items[it.index].seq;
             // A token of `prev` for this choice is not observed yet: its sampler asks one ahead.
             let ahead = usize::from(prev.is_some_and(|p| p.yielders.contains(&seq)));
-            let reduce = if reduces && it.yields {
+            let reduce = if reduces && it.yields && it.forced.is_none() {
                 self.device_reduce(it.prefill, it.id, it.choice, ahead)
             } else {
                 None
             };
             let r = &self.requests[&it.id];
             let q_start = built.tokens.len() as u32;
-            for p in it.start..it.start + it.len {
-                built.tokens.push(r.token_at(it.choice, p).unwrap_or(0));
+            // A jump-forward item's tokens past the sampled one are its plan's forced run
+            // (P5p S-10); the row count `k + 1` covers every fed position. The run goes to
+            // the verification map here, so `sample_forced` verifies exactly what this item
+            // feeds.
+            let pending = it
+                .forced
+                .map(|k| plan.items[it.index].draft[..k as usize].to_vec())
+                .unwrap_or_default();
+            if it.forced.is_some() {
+                self.jump_drafts.insert(seq, pending.clone());
+            }
+            for (i, p) in (it.start..it.start + it.len).enumerate() {
+                built.tokens.push(match r.token_at(it.choice, p) {
+                    Some(tok) => tok,
+                    // A forced position (P5p S-10); 0 stays the placeholder where the launch
+                    // feeds the device's token (overlap scheduling).
+                    None if i > 0 => *pending.get(i - 1).unwrap_or_else(|| {
+                        panic!(
+                            "jf seq={} i={i} len={} draft={} gen={} item_draft={:?} start={}",
+                            seq.0,
+                            it.len,
+                            pending.len(),
+                            r.choices[it.choice].generated.len(),
+                            plan.items[it.index].draft,
+                            it.start,
+                        )
+                    }),
+                    None => 0,
+                });
                 built.positions.push(p);
             }
             if let Some(slot) = it.feed {
@@ -1860,6 +1948,7 @@ impl EngineLoop {
                 reduce,
                 feedable,
                 fed_next: false,
+                forced: it.forced,
             });
         }
         Ok(Build::Ready(built))
@@ -1970,6 +2059,19 @@ impl EngineLoop {
             if r.done {
                 continue;
             }
+            if let Some(k) = row.forced {
+                // A verified jump-forward row group (P5p S-10): the choice's `k + 1` rows
+                // for its fed tokens, verified row by row through the normal step.
+                let vocab = logits.vocab;
+                let Some(first) = logits.full_row_index(slot) else {
+                    continue;
+                };
+                let data = &mut logits.data[first * vocab..(first + k as usize + 1) * vocab];
+                let rows: Vec<&mut [f32]> = data.chunks_mut(vocab).collect();
+                let draft = self.jump_drafts.remove(&row.seq).unwrap_or_default();
+                self.sample_forced(id, choice, rows, &draft, outcome);
+                continue;
+            }
             let forks = if choice == 0 && row.prefill {
                 r.forking_choices()
             } else {
@@ -2073,6 +2175,38 @@ impl EngineLoop {
         (drawn, diverged)
     }
 
+    /// The overlap completion of the iteration in flight (P2c): holds the KV it writes,
+    /// completes the scheduler from what is known before its tokens, and puts it back in
+    /// flight for its host work at [`EngineLoop::finish`].
+    fn complete_overlap_ahead(&mut self, mut prev: InFlight) -> Result<(), String> {
+        // The KV the iteration writes is held until it is collected (Phase 4): the ahead
+        // completion may release a finished sequence's blocks before then. Its input tokens
+        // are all on the host now (the iteration before it was collected last turn).
+        if prev.launched {
+            prev.commits = self.kv_commits(&prev.plan);
+            for (_, blocks, _) in &prev.commits {
+                for &b in blocks {
+                    self.pool.incref(b);
+                }
+            }
+        }
+        let outcome = self.ahead_outcome(&prev);
+        // The finished requests' partial tails are held the same way as the commits (one
+        // reference on the block) and published in `finish` on success: the completion
+        // below releases their tables.
+        prev.publishes = self.publishes_of(&prev.plan, &finished_of(&outcome));
+        for (_, block, _) in &prev.publishes {
+            self.pool.incref(*block);
+        }
+        self.sched.complete(&mut self.pool, outcome);
+        // The tail copies of the completed iteration ran: their sources go back.
+        for id in std::mem::take(&mut self.tail_done) {
+            self.kv.tail_copied(&mut self.pool, id);
+        }
+        self.in_flight = Some(prev);
+        Ok(())
+    }
+
     /// One turn under overlap scheduling (P2c): the iteration launched last turn (`in_flight`)
     /// runs on the device while this turn takes commands, completes it in the scheduler from
     /// what is known before its tokens (the tokens it appends, and `max_tokens` and context
@@ -2094,32 +2228,16 @@ impl EngineLoop {
         self.stages.mark(Stage::Emit);
         self.detect_disconnects();
         self.expire_deadlines();
-        if let Some(mut prev) = self.in_flight.take() {
-            // The KV the iteration writes is held until it is collected (Phase 4): the ahead
-            // completion may release a finished sequence's blocks before then. Its input tokens
-            // are all on the host now (the iteration before it was collected last turn).
-            if prev.launched {
-                prev.commits = self.kv_commits(&prev.plan);
-                for (_, blocks, _) in &prev.commits {
-                    for &b in blocks {
-                        self.pool.incref(b);
-                    }
-                }
+        if let Some(prev) = self.in_flight.take() {
+            if prev.launched && prev.rows.iter().any(|r| r.forced.is_some()) {
+                // A jump-forward step's iteration completes serially (P5p S-10): its
+                // verification decides the appended tokens and any rollback, so the host work
+                // runs before the scheduler completes it; no iteration is launched ahead.
+                self.finish_forced(prev)?;
+                // Fall through: the plan below launches with nothing in flight.
+            } else {
+                self.complete_overlap_ahead(prev)?;
             }
-            let outcome = self.ahead_outcome(&prev);
-            // The finished requests' partial tails are held the same way as the commits (one
-            // reference on the block) and published in `finish` on success: the completion
-            // below releases their tables.
-            prev.publishes = self.publishes_of(&prev.plan, &finished_of(&outcome));
-            for (_, block, _) in &prev.publishes {
-                self.pool.incref(*block);
-            }
-            self.sched.complete(&mut self.pool, outcome);
-            // The tail copies of the completed iteration ran: their sources go back.
-            for id in std::mem::take(&mut self.tail_done) {
-                self.kv.tail_copied(&mut self.pool, id);
-            }
-            self.in_flight = Some(prev);
         }
         let limits = self.read_snapshot()?;
         self.kv_before_plan();
@@ -2417,12 +2535,80 @@ impl EngineLoop {
         }
     }
 
-    /// Waits for the launched iteration `p` (only it; the next keeps running) and does its host
-    /// work: sampling, detokenisation, events. Finishes it learns go to the next completion.
+    /// Samples a verified jump-forward row group (P5p S-10): the choice's `k + 1` logits rows
+    /// for its fed tokens `[t, f1..fk]`, each stepped through the normal path by
+    /// [`ActiveRequest::step_forced`]. Accepted forced tokens become generated tokens one
+    /// step at a time; at the first disagreement the model's token stands and the rest of the
+    /// run is rolled back (S-9). The accepted and rolled-back counts go into `outcome` once;
+    /// a plain decode never touches them (overlap scheduling completes this iteration from
+    /// the real sample).
+    fn sample_forced(
+        &mut self,
+        id: RequestId,
+        choice: usize,
+        rows: Vec<&mut [f32]>,
+        draft: &[u32],
+        outcome: &mut IterationOutcome,
+    ) {
+        let k = draft.len() as u32;
+        let Some(r) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if r.done || r.choices[choice].finish.is_some() {
+            return;
+        }
+        let seq = r.choices[choice].seq;
+        let http_id = r.request.http_request_id.clone();
+        let metrics = Some(&self.metrics.model);
+        let stepped = r.step_forced(choice, rows, draft, self.max_seq_len, metrics);
+        let forced = match stepped {
+            Ok(forced) => forced,
+            Err(e) => {
+                self.constraint_failed(id, &e.to_string(), outcome);
+                return;
+            }
+        };
+        if let Some(reason) = forced.finished {
+            tracing::debug!(
+                event = "jump_forward_finished",
+                request_id = %r.request.http_request_id,
+                choice,
+                accepted = forced.accepted,
+                reason = reason.as_str(),
+                "the forced run ended inside its span"
+            );
+        }
+        // One appended token per step comes from `deliver_choice`; the rollback is the only
+        // count the plain path never sees.
+        for step in forced.steps {
+            self.deliver_choice(id, choice, seq, step, outcome);
+        }
+        let rolled_back = k.saturating_sub(forced.accepted);
+        if rolled_back > 0 {
+            outcome.rolled_back.push((seq, rolled_back));
+            tracing::debug!(
+                event = "jump_forward_rollback",
+                request_id = %http_id,
+                choice,
+                accepted = forced.accepted,
+                rolled_back,
+                taken = forced.next.as_ref().map(|s| s.token),
+                "the model rejected the forced run's tail"
+            );
+        }
+        self.metrics
+            .server
+            .jump_forward(u64::from(forced.accepted), u64::from(rolled_back));
+    }
+
+    /// Waits for the launched iteration `p` (only it; the next keeps running) and does its
+    /// host work: sampling, detokenisation, events. Finishes it learns go to the next
+    /// completion.
     fn finish(&mut self, mut p: InFlight) -> Result<(), String> {
         let commits = std::mem::take(&mut p.commits);
         let publishes = std::mem::take(&mut p.publishes);
-        let ok = self.collect_in_flight(p);
+        let (ok, outcome) = self.collect_in_flight(&mut p);
+        self.late_finished.extend(outcome.finished);
         // The held KV enters the cache only when the iteration that wrote it succeeded; the
         // hold is dropped either way.
         for (id, blocks, tokens) in commits {
@@ -2440,10 +2626,39 @@ impl EngineLoop {
         Ok(())
     }
 
+    /// A jump-forward step's iteration completes serially (P5p S-10): its verification
+    /// decides the appended tokens and any rollback, so the host work runs before the
+    /// scheduler completes the iteration, whose KV then commits the kept tokens only.
+    fn finish_forced(&mut self, mut p: InFlight) -> Result<(), String> {
+        let (ok, mut outcome) = self.collect_in_flight(&mut p);
+        outcome
+            .finished
+            .extend(std::mem::take(&mut self.late_finished));
+        if ok {
+            for (id, blocks, tokens) in self.kv_commits(&p.plan) {
+                self.kv.commit(&mut self.pool, id, &blocks, &tokens);
+            }
+            for (id, block, tokens) in self.publishes_of(&p.plan, &finished_of(&outcome)) {
+                self.kv.publish_tail(&mut self.pool, id, block, &tokens);
+            }
+        }
+        let tail_requests: Vec<RequestId> = p
+            .plan
+            .tail_copies
+            .iter()
+            .filter_map(|(s, _, _)| self.seqs.get(s).map(|(id, _)| *id))
+            .collect();
+        self.sched.complete(&mut self.pool, outcome);
+        for id in tail_requests {
+            self.kv.tail_copied(&mut self.pool, id);
+        }
+        Ok(())
+    }
+
     /// [`EngineLoop::finish`]'s device wait and host work; true when the iteration succeeded.
-    fn collect_in_flight(&mut self, p: InFlight) -> bool {
+    fn collect_in_flight(&mut self, p: &mut InFlight) -> (bool, IterationOutcome) {
         if !p.launched {
-            return false;
+            return (false, IterationOutcome::default());
         }
         let started = Instant::now();
         let collected = self.exec.collect();
@@ -2463,15 +2678,23 @@ impl EngineLoop {
             });
         match logits {
             Ok(logits) => {
-                let mut outcome = IterationOutcome::default();
+                let mut outcome = IterationOutcome {
+                    iteration: p.plan.iteration,
+                    ..IterationOutcome::default()
+                };
                 self.sample(&p.rows, logits, &mut outcome);
-                self.late_finished.extend(outcome.finished);
                 self.observe(&p.plan, (p.launch_time + waited).as_secs_f64(), p.copies);
-                true
+                (true, outcome)
             }
             Err(error) => {
                 self.device_failure(&p.requests, p.plan.iteration, error);
-                false
+                (
+                    false,
+                    IterationOutcome {
+                        iteration: p.plan.iteration,
+                        ..IterationOutcome::default()
+                    },
+                )
             }
         }
     }
@@ -2552,7 +2775,81 @@ impl EngineLoop {
                 return false;
             }
         };
+        self.deliver_choice(id, choice, seq, step, outcome);
+        self.request_forced(id, choice);
+        true
+    }
+
+    /// After a constrained choice sampled (P5p S-10): asks its matcher for llguidance's
+    /// forced tokens and, when the grammar forces at least one and the request has room,
+    /// plans the verified multi-token step for the sequence (`Scheduler::extend`). The run is
+    /// a draft: `sample_forced` verifies it against the model and the scheduler rolls back
+    /// what the model rejected.
+    fn request_forced(&mut self, id: RequestId, choice: usize) {
+        let Some(r) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if !self.jump_forward {
+            return;
+        }
+        let c = &r.choices[choice];
+        let seq = c.seq;
+        // Choice 0 only: the fork rows of an `n` > 1 request sample the shared prefill and
+        // are unaffected (S-10). A run whose extension was asked for but not planned yet
+        // stands; asking again would reset it behind the matcher's state.
+        if choice != 0
+            || c.finish.is_some()
+            || c.generated.is_empty()
+            || !c.is_constrained()
+            || self.jump_drafts.contains_key(&seq)
+        {
+            return;
+        }
+        let generated = c.generated.len() as u32;
+        let max = self
+            .jump_forward_max_tokens
+            // The step always yields one token beyond the run: leave room for it under
+            // `max_tokens` and the context, exactly as a token-by-token run would.
+            .min(r.request.stop.max_tokens.saturating_sub(generated + 1))
+            .min(
+                self.max_seq_len
+                    .saturating_sub(r.prompt_len() + generated + 1),
+            ) as usize;
+        if max == 0 {
+            return;
+        }
+        let run = r.forced_tokens(choice, max);
+        if run.is_empty() {
+            return;
+        }
+        let seq = r.choices[choice].seq;
+        self.jump_drafts.insert(seq, run.clone());
+        if let Err(e) = self.sched.extend(seq, run) {
+            self.jump_drafts.remove(&seq);
+            tracing::debug!(
+                event = "jump_forward_skip",
+                seq = seq.0,
+                error = %e,
+                "the forced run's extension is not planned"
+            );
+        }
+    }
+
+    /// The delivery of one stepped token ([`EngineLoop::sample_choice`] and the verified
+    /// jump-forward rows share it): the latency samples, `appended`, the finish events and
+    /// the request accounting.
+    fn deliver_choice(
+        &mut self,
+        id: RequestId,
+        choice: usize,
+        seq: SeqId,
+        step: Step,
+        outcome: &mut IterationOutcome,
+    ) {
         let now = Instant::now();
+        let Some(r) = self.requests.get_mut(&id) else {
+            return;
+        };
         let probe = self.probe.as_ref().is_some_and(|(p, _)| *p == id);
         let c = &mut r.choices[choice];
         match c.last_token_at {
@@ -2609,7 +2906,6 @@ impl EngineLoop {
             self.retire(id);
             self.stages.mark(Stage::Complete);
         }
-        true
     }
 
     /// A matcher failed mid-generation (llguidance step limit, a stuck constraint): that
@@ -2827,7 +3123,7 @@ fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>
                 block_table: &plan.items[index].block_table.blocks,
                 block_formats: formats,
                 reduce: row.reduce,
-                logits_rows: 1,
+                logits_rows: row.forced.map_or(1, |k| k + 1),
             },
         )
         .collect()
@@ -2974,6 +3270,7 @@ mod tests {
     use crate::kv_orchestrator::{CopyDevice, KvStart, kv_format};
     use crate::metrics::ServerMetrics;
     use crate::reliability::{DeviceReserve, ReliabilityInputs};
+    use turbine_model::{TokenMask, TokenMatcher};
 
     const BLOCK_TOKENS: u32 = 16;
 
@@ -3243,6 +3540,8 @@ mod tests {
             reliability: parts.engine,
             kv,
             pipeline,
+            jump_forward: true,
+            jump_forward_max_tokens: 32,
         });
         TestEngine {
             engine,
@@ -3930,6 +4229,211 @@ mod tests {
     }
 
     /// One choice's stream: its tokens, its text and how it ended.
+    /// [`run_streams`] over constrained requests with fresh matchers from `matchers`, and
+    /// `structured_output.jump_forward` set to `jump_forward`; returns the streams and the
+    /// metrics registry.
+    fn run_submissions(
+        spec: &TinySpec,
+        tokenizer: &Arc<Tokenizer>,
+        requests: &[GenerationRequest],
+        matchers: &(dyn Fn() -> Vec<Box<dyn TokenMatcher>> + Sync),
+        jump_forward: bool,
+        overlap: bool,
+    ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
+        let t = engine_with(
+            tiny_reducing_executor(spec, 8),
+            Arc::clone(tokenizer),
+            params(4, 8),
+            overlap,
+        );
+        let mut engine = t.engine;
+        engine.jump_forward = jump_forward;
+        let mut acks = Vec::new();
+        let streams: Vec<_> = requests
+            .iter()
+            .map(|req| {
+                let submission = Submission {
+                    matchers: matchers(),
+                    ..req.clone().into()
+                };
+                let (events, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+                let (ack, admitted) = oneshot::channel();
+                if t.tx
+                    .try_send(EngineCommand::Submit(Box::new(submission), events, ack))
+                    .is_err()
+                {
+                    panic!("command channel full");
+                }
+                acks.push(admitted);
+                rx
+            })
+            .collect();
+        let handle = std::thread::spawn(move || {
+            loop {
+                let turn = if engine.overlap {
+                    engine.turn_overlap()
+                } else {
+                    engine.turn()
+                };
+                match turn {
+                    Ok(Turn::Continue) => {}
+                    Ok(Turn::Stop) => break,
+                    Err(e) => panic!("engine turn failed: {e}"),
+                }
+            }
+        });
+        let mut out = Vec::new();
+        for (mut rx, req) in streams.into_iter().zip(requests) {
+            let mut choices: Vec<ChoiceStream> =
+                (0..req.n).map(|_| ChoiceStream::default()).collect();
+            let mut finished = 0;
+            while finished < req.n {
+                match rx.blocking_recv().expect("stream ended early") {
+                    GenerationEvent::Token {
+                        choice,
+                        token_id,
+                        logprob,
+                        ..
+                    } => {
+                        let c = &mut choices[choice as usize];
+                        c.tokens.push(token_id);
+                        c.logprobs.push(logprob);
+                    }
+                    GenerationEvent::Finished {
+                        choice,
+                        reason,
+                        usage,
+                    } => {
+                        choices[choice as usize].finish =
+                            Some((reason, usage.unwrap().completion_tokens));
+                        finished += 1;
+                    }
+                    GenerationEvent::Started { .. } => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            out.push(choices);
+        }
+        for ack in acks {
+            assert_eq!(ack.blocking_recv().unwrap(), Ok(()));
+        }
+        drop(t.tx);
+        handle.join().unwrap();
+        (out, t.reg)
+    }
+    /// P5p S-10: the jump-forward under overlap scheduling with a real grammar matcher — the
+    /// streams match the masked path's, serial and overlapped, and the accepted forced tokens
+    /// are counted.
+    #[test]
+    fn jump_forward_overlap_matches_serial() {
+        let (_dir, spec, tokenizer) = tiny();
+        let compiler = turbine_model::GrammarCompiler::new(
+            &tokenizer,
+            &turbine_model::testing::tiny::TINY_EOS,
+        )
+        .expect("token trie");
+        let limits = turbine_model::GrammarLimits {
+            max_schema_bytes: 64 * 1024,
+        };
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"flag": {"type": "boolean"}, "n": {"type": "integer"}},
+            "required": ["flag", "n"],
+            "additionalProperties": false
+        });
+        let grammar = || {
+            vec![
+                compiler
+                    .compile(
+                        &turbine_core::request::ConstraintSpec::JsonSchema {
+                            schema: schema.clone(),
+                        },
+                        &limits,
+                    )
+                    .expect("compile"),
+            ]
+        };
+        // The tiny model fills the grammar's whitespace gaps with tabs (up to
+        // JSON_MAX_WHITESPACE per gap), so the forced spans need room.
+        let req = request(&[256, 72, 101, 108, 108, 111], 64);
+        let requests = [req];
+        let (serial_on, reg) = run_submissions(&spec, &tokenizer, &requests, &grammar, true, false);
+        let (overlap_on, reg_overlap) =
+            run_submissions(&spec, &tokenizer, &requests, &grammar, true, true);
+        let (serial_off, _) = run_submissions(&spec, &tokenizer, &requests, &grammar, false, false);
+        let (overlap_off, _) = run_submissions(&spec, &tokenizer, &requests, &grammar, false, true);
+        assert_eq!(
+            serial_on, serial_off,
+            "jump on matches the masked path (serial)"
+        );
+        assert_eq!(
+            overlap_on, overlap_off,
+            "jump on matches the masked path (overlap)"
+        );
+        assert_eq!(serial_on, overlap_on, "overlap matches serial");
+        let series = |reg: &MetricsRegistry, name: &str| metric(reg, name);
+        let metrics = reg.render().unwrap();
+        assert!(
+            series(&reg, "turbine_jump_forward_steps_total")
+                + series(&reg_overlap, "turbine_jump_forward_steps_total")
+                > 0.0,
+            "the constrained choices jumped: {metrics}"
+        );
+    }
+
+    /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is
+    /// `forced` (empty = no run reported).
+    struct AnyMask {
+        forced: Vec<u32>,
+    }
+
+    impl TokenMatcher for AnyMask {
+        fn allowed(&mut self, mask: &mut TokenMask) -> Result<(), ModelError> {
+            let vocab = mask.vocab();
+            *mask = TokenMask::new_all(vocab);
+            Ok(())
+        }
+        fn commit(&mut self, _token: u32) -> Result<(), ModelError> {
+            Ok(())
+        }
+        fn accepts_eos(&self) -> bool {
+            true
+        }
+        fn forced_tokens(&mut self, max: usize) -> Vec<u32> {
+            self.forced[..max.min(self.forced.len())].to_vec()
+        }
+    }
+
+    /// P5p S-10: a deliberately corrupted forced run is caught by the verification and rolled
+    /// back, and the choice's stream is exactly what the masked path produces.
+    #[test]
+    fn jump_forward_rolls_back_a_corrupted_run() {
+        let (_dir, spec, tokenizer) = tiny();
+        let req = request(&[256, 72, 101, 108, 108, 111], 8);
+        let requests = [req];
+        let poisoned = || {
+            vec![Box::new(AnyMask {
+                forced: vec![7, 8, 9],
+            }) as Box<dyn TokenMatcher>]
+        };
+        let (on, reg) = run_submissions(&spec, &tokenizer, &requests, &poisoned, true, false);
+        let (off, _) = run_submissions(&spec, &tokenizer, &requests, &poisoned, false, false);
+        assert_eq!(on, off, "the corrupted run must not change the stream");
+        assert!(
+            metric(
+                &reg,
+                r#"turbine_jump_forward_tokens_total{outcome="rolled_back"}"#
+            ) >= 3.0,
+            "every reported forced token was rejected"
+        );
+        assert_eq!(
+            metric(
+                &reg,
+                r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#
+            ),
+            0.0
+        );
+    }
     #[derive(Debug, Default, PartialEq)]
     struct ChoiceStream {
         tokens: Vec<u32>,
