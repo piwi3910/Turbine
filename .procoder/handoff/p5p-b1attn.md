@@ -63,22 +63,52 @@ reuse rule, 2026-10-05)" landed first, 5866edaf).
   (3) the append condition without the `kv_len - 1 < k1` bound (the bug found and fixed in
   review) writes several splits' rows and fails the pool-exact comparison.
 
-## Results (fill on the GPU runs)
+## Results — GPU runs still PENDING (the blocker)
 
-GPU 0 of novanas, bench + port locks per run. NOTE: the first GPU window was blocked ~2.5 h by
-the user's own `kuvryn-ai-workloads` pod holding both `amd.com/gpu` claims (not touched, per the
-lab rules); the correctness runs and measurements below happened when it freed.
+novanas's GPUs were held the whole task window (13:20 onward, 5 h+) by the user's own
+`kuvryn-ai-workloads` pod — both `amd.com/gpu` claims, not touched per the lab rules. Everything
+else is done: gate-clean commits, the kernel compiles for gfx1201 (lab build), the reuse
+evaluation, the tests, the perf-log section. The GPU work below lands as soon as the claims free,
+in this order (each holds the bench lock through the scripts):
 
-| Measurement                                            | Before (CK splitkv) | After (b1) |
-| ------------------------------------------------------ | ------------------- | ---------- |
+1. `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops -- paged_b1_decode_matches_cpu
+paged_decode_splitkv_matches_cpu paged_prefill_ck_128_matches_cpu` — correctness vs CPU.
+2. `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_batch_invariance --
+b1_decode_rows_are_batch_invariant` — bitwise within the tier; TIGHTEN the 0.05 cross-tier
+   placeholder to the printed max_abs + headroom.
+3. `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops -- decode_attention_timings`
+   — the op-level A/B in one sweep (CK splitkv 19.5 + 2.1 µs/layer recorded vs b1 at b = 1..8;
+   re-place `kTurbineB1MaxSeqs` from the lines if the crossover is not between 8 and 9).
+4. Mutation checks (snapshot the file, mutate, run, restore): (a) combine skips the last split →
+   test 1 must fail; (b) split count derived from `num_seqs` → the invariance bitwise cases must
+   fail; (c) the append condition without `kv_len - 1 < k1` (found and fixed in review) → the
+   pool-exact comparison must fail.
+5. `scripts/lab-bench.sh --quick --c1 --model llama --label b1attn-c1` (golden c1 + c1 tok/s vs
+   the S-2 row 77.8 / ITL 12.7 ms) and `scripts/lab-bench.sh --quick --model llama --label
+b1attn-c16` (vs 879.1 quick c16; bound 0.97x).
+6. `scripts/lab-decode-profile.sh --model llama --label b1attn` + `scripts/decode-profile-report.py
+target/decodebw/b1attn-llama --weights 6431025664` — served attention µs/layer vs 21.7 incl.
+   merge; effective bandwidth vs the 640 GB/s peak.
+7. Record the numbers in the perf-log section above and in decisions ("5p b1 attention" result
+   note); then this handoff's Results table.
+
+Target (floor decision B): attention ≤ ~10 µs/layer, Llama c1 toward ≥ 90 tok/s. If the b1
+kernel misses the µs target, the `decode_attention_timings` lines say whether the split count
+(neither 4 nor 16 was measured — kSplits is one constant), the wave layout, or the append/combine
+fusion is the residual; the op bench cycles pools cold, so judge served, not op-level only (the
+Task 18 attribution caveat).
+
+| Measurement                                               | Before (CK splitkv) | After (b1) |
+| --------------------------------------------------------- | ------------------- | ---------- |
 | attention µs/layer, b=1 kv~768 (decode_attention_timings) | 19.5 + 2.1 combine  | TODO       |
 | served attention µs/layer (lab-decode-profile, Llama c1)  | 21.7 incl. merge    | TODO       |
 | Llama c1 tok/s / ITL p50 (lab-bench --quick)              | 77.8 / 12.7 ms      | TODO       |
 | c16 tok/s (bound 0.97×)                                   | 852-879 band        | TODO       |
 | golden c1                                                 | PASS                | TODO       |
 
-Perf-log entry: `.procoder/perf-log.md` Phase 5p "Task 20" section (the decode-BW round's
-handed-off item). Decisions: the evaluation entry + the result note.
+Perf-log entry: `.procoder/perf-log.md` Phase 5p, "b1 attention: the own kernel lands" (the
+decode-BW round's handed-off item). Decisions: the evaluation entry (5866edaf) + a result note
+once the numbers are in.
 
 ## Open questions for the lead / next builder
 
