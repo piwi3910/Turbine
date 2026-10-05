@@ -3424,3 +3424,7 @@ outputs are a kernel-project with golden-tolerance verification, not bitwise), r
 relaxing other invariances. Target: Llama toward ~0.81× of the 640 GB/s peak (the floor analysis's handed-off item:
 ~9–10 µs/layer CK b1 attention replaced by an own launch-efficient kernel, plus the 10 % inter-kernel gap work).
 The other two relaxations (OLMoE invariance, rmsnorm bitwise) stay unrelaxed.
+
+## Phase 5p close → pause for the new PSU install (user, 2026-10-04)
+
+The user received the replacement PSU for novanas. Phase 5p runs to completion (Tasks 11–12, the b1 attention validation when the GPUs free, Tasks 13–17 as scheduled, the Task 19 exit tiers), then everything pauses and the host is handed over for the PSU install — the exit runs BEFORE the install, on the old PSU (one-GPU-job rules stay until the new PSU is in and confirmed). After the install and the user's go: the one-GPU-job limitation lifts and the next phase starts.
