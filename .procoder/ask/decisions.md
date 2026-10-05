@@ -3296,3 +3296,12 @@ prefill therefore drifts logprobs ~0.005–0.05 vs cold on HIP (cpu is bit-exact
 HIP bit-exactness. Lead decision: those tests judge by the batched-bounds tolerance (golden's likely/tail split) on
 HIP instead of bit-exactness; cpu-backend bit-exactness tests stay. Cites the 2026-09-26 precedent; test-policy
 detail, not a user decision.
+
+## 5p Task 9: cache_aware lands; default stays the serving default (lead decisions, 2026-10-05)
+
+From `p5p-t9` (merged). `cache_aware` (affinity = u32::MAX − cached_prefix_tokens within arrival windows) is in the
+registry with the starvation bound proven (2,000-request flood: 0 inversions, max uncached wait 32.8 s vs 30,055
+inversions unbounded). The multi-turn A/B ties (cached 0.9143 vs 0.9147, tok/s 490.2 vs 489.2) because the profile's
+shared system prefix ties the affinity term. Lead decisions: `default` stays the serving default (`cache_aware` is
+opt-in via `scheduler.policy`); a heterogeneous-prefix profile (mixed warm/cold requests) is the honest A/B for
+`cache_aware`'s benefit and is recorded as an exit-criteria refinement for the 5p phase exit.
