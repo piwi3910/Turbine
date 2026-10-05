@@ -3338,3 +3338,51 @@ compares within the tier bitwise and across the boundary against the recorded 0.
 (`Outcome::bounded`; mutation-checked: bound 0 fails). The scalar-FMA alternative (the
 pre-2026-09-27 kernels, ~575 GB/s op-level at 4-16 tokens) was rejected: the same numerics-class
 problem with no chain relation to the tiers above.
+
+## 5p decode bandwidth II: the gap floor and the batch-1 attention / fusion evaluations (2026-10-05)
+
+From `p5p-decodebw2`, continuing the ~90 %-of-roofline tasking after the K-split small-m MoE GEMV
+landed (previous entry). The served traces (novanas GPU 0, `lab-decode-profile.sh` at 16af9991;
+Llama 228 steps, OLMoE 424) size what is left, and three items are evaluated rather than landed:
+
+- **The inter-kernel gaps are a device-side floor, not a host defect.** Both models replay ONE
+  graph per decode step, yet ~3.6 us of dead time remains at every dependent-kernel boundary
+  (Llama ~300 kernels/step -> 1.32 ms; OLMoE ~330 -> 1.21 ms). Kernels are graph-owned, no
+  memory ops run between them, kernarg placement is a no-op (the previous builder's finding):
+  the cost is dispatch/drain latency of small dependent kernels on RDNA4. Only fusion shrinks
+  the boundary count; host-side levers are exhausted.
+- **Batch-1 attention (CK splitkv, 21.7 us/layer Llama, ~27.5 OLMoE -- KV ~3 MB at ctx 768,
+  ~140 GB/s effective, launch-bound).** Candidates evaluated: llama.cpp's RDNA4 decode kernels
+  are not reusable as an implementation -- they are coupled to llama.cpp's contiguous KV and
+  unpaged, non-batched layout, none of which Turbine's paged-KV + GQA + continuous-batching
+  decode attention can present; worth mining for ideas only. CK's own non-split pagedkv variant
+  saves the merge launch but keeps the same tiling family. The only candidate with real
+  headroom is an own split-KV decode kernel (a wave per sequence x kv-head streaming the
+  sequence's pages, fixed summation order): estimated ~9-10 us/layer vs 21.7, i.e. ~0.34 ms/step
+  Llama, ~0.25 OLMoE -- but it is a new numerics class (golden tolerance + invariance amend, as
+  with the K-split GEMV) and a kernel-plus-tests project of its own. NOT tasked by this entry;
+  recorded for the next decode-bandwidth pass.
+- **rope fused into the paged append (bit-exact, ~0.18 ms/step Llama, ~0.1 OLMoE):** rope only
+  needs to write q for attention (the appended k lands in the pool anyway), so the append kernel
+  can rope k in place while copying and rope q alongside -- same math, same order, bit-exact.
+  Requires the attention-decode descriptor to carry the rope parameters (ABI extension) and the
+  executor to skip the standalone rope op on decode steps. Also NOT landed here; handed off.
+- **Routing-chain fusion (OLMoE)**: the bit-exact fraction is small -- positions (1.6 us) is
+  one launch per layer whose inverse permutation the scatter could compute only by an
+  O(rows) scan per block (bad above decode batches), or via an ABI extension letting
+  `moe_route`'s group kernel write pos where it already writes sorted_rows (bit-exact, one
+  launch saved); and the scatter's accumulator can switch to write-first (round(0 + x) = x, so
+  the bits are unchanged), deleting the per-layer add-two-zero-buffers launch. The sized
+  ~0.4 ms included fusing the router GEMM (10.5 us/layer, launch-bound) into the route kernel --
+  a numerics-class change to the logits feeding softmax/topk. The bit-exact fraction (~0.15 ms)
+  is handed off with the designs; the router-GEMM fusion is a numerics-class item for the next
+  pass.
+
+With the K-split landing, the measured state: Llama 491 GB/s (0.77x), OLMoE 339 GB/s (0.53x).
+The floor if the handed-off items land: Llama ~12.3 ms -> ~520 GB/s (81 %), OLMoE ~6.3 ms ->
+~375 GB/s (59 %). The ~90 % target (576 GB/s) is not reachable within the current design: the
+binding constraints are the ~3.6 us/kernel gap floor across ~300 kernels/step, OLMoE's all-steps
+GEMM row-invariance (which locks its attention projections to the invariant hipBLASLt rows at
+258-462 GB/s), and the `rmsnorm_sharded` bitwise TP constraint on the CK rmsnorm. Reaching
+farther needs either megakernel-scale fusion of the whole decode step or relaxed invariance
+constraints -- both design decisions above this task's authority.
