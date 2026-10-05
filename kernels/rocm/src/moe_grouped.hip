@@ -41,7 +41,19 @@
 // ascending k), so two runs are bitwise identical, and so is a row computed by
 // the small-row blocks below (the small-m tier): the result of a row does not
 // depend on the batch it is in.
+//
+// Slice-summed order: where the K-split decode GEMV serves the small-m tier
+// (moe_gemv_ksplit_shape, e.g. OLMoE: hidden and inter multiples of 1,024),
+// it splits a projection's depth into kGemvSplits equal slices, runs the chain
+// above over each slice from a zero accumulator and adds the slice partials in
+// ascending slice order to a zero F32 total. For those shapes every tier runs
+// that same order (kSliced: at each slice boundary, which every k step size
+// divides, the slice's accumulator is added to the total and zeroed), so a
+// row's bits stay those of the small-m tier whatever its batch's routed row
+// count (decision 2026-09-27; the K-split GEMV, 2026-10-05, had broken this
+// across moe_small_max_rows until the tiers above took its order).
 #include <algorithm>
+#include <type_traits>
 
 #include "bf16.hpp"
 #include "turbine_hip.hpp"
@@ -59,6 +71,10 @@ constexpr int kLanes = 32;
 constexpr int kMma = 16;
 // Depth of one pipeline step (one LDS tile).
 constexpr int kTileK = 64;
+// The k slices of the K-split decode GEMV (moe_wmma_gemv_ksplit_kernel) and,
+// for the shapes it serves (moe_gemv_ksplit_shape), of every tier above it:
+// see "Slice-summed order" above.
+constexpr int kGemvSplits = 8;
 // LDS row of a tile: kTileK BF16 plus 8 of padding (144 bytes), so the 16 rows
 // one WMMA operand load reads fall on distinct banks.
 constexpr int kLdsRow = kTileK + 8;
@@ -175,11 +191,11 @@ using SmallBlockK64 = Shape<1, 4, 1, 1, 1>;
 //   else:    out[p, n] = bf16(in[p] . w0_n), n < hidden.
 // w0/w1 are [num_local_experts, n_out, depth]; out is [rows, n_out], indexed
 // by position.
-template <typename S, bool kGateUp>
+template <typename S, bool kGateUp, bool kSliced>
 __global__ __launch_bounds__(S::kThreads) void moe_wmma_kernel(
     const Bf16 *in, const Bf16 *w0, const Bf16 *w1, const int32_t *sorted_rows,
     const int32_t *offsets, int32_t expert_begin, int32_t num_local,
-    int32_t top_k, int32_t depth, int32_t n_out, Bf16 *out) {
+    int32_t top_k, int32_t depth, int32_t n_out, int32_t slice_k, Bf16 *out) {
   constexpr int kPA = S::kPassesA;
   constexpr int kPB = S::kPassesB;
   constexpr int kPF = S::kPrefetch;
@@ -238,12 +254,21 @@ __global__ __launch_bounds__(S::kThreads) void moe_wmma_kernel(
   const int frag_k = (lane / kMma) * 8;
   v8f acc0[S::kFragsM][S::kFragsN];
   v8f acc1[S::kFragsM][S::kFragsN];
+  // kSliced: the sum of the finished slices' chains ("Slice-summed order");
+  // unused (and eliminated) otherwise.
+  v8f tot0[S::kFragsM][S::kFragsN];
+  v8f tot1[S::kFragsM][S::kFragsN];
 #pragma unroll
   for (int i = 0; i < S::kFragsM; ++i) {
 #pragma unroll
     for (int j = 0; j < S::kFragsN; ++j) {
       acc0[i][j] = v8f{};
       acc1[i][j] = v8f{};
+      if (kSliced) {
+        tot0[i][j] = v8f{};
+        if (kGateUp)
+          tot1[i][j] = v8f{};
+      }
     }
   }
 
@@ -320,6 +345,20 @@ __global__ __launch_bounds__(S::kThreads) void moe_wmma_kernel(
           }
         }
       }
+      if (kSliced && (k0 + (b + 1) * kTileK) % slice_k == 0) {
+#pragma unroll
+        for (int i = 0; i < S::kFragsM; ++i) {
+#pragma unroll
+          for (int j = 0; j < S::kFragsN; ++j) {
+            tot0[i][j] += acc0[i][j];
+            acc0[i][j] = v8f{};
+            if (kGateUp) {
+              tot1[i][j] += acc1[i][j];
+              acc1[i][j] = v8f{};
+            }
+          }
+        }
+      }
     }
   }
 
@@ -336,16 +375,24 @@ __global__ __launch_bounds__(S::kThreads) void moe_wmma_kernel(
             begin + (wm * S::kFragsM + i) * kMma + (lane / kMma) * 8 + v;
         if (p >= end)
           continue;
-        float value = acc0[i][j][v];
+        float value = kSliced ? tot0[i][j][v] : acc0[i][j][v];
         if (kGateUp) {
           const float g = round_bf16(value);
-          const float u = round_bf16(acc1[i][j][v]);
+          const float u = round_bf16(kSliced ? tot1[i][j][v] : acc1[i][j][v]);
           value = round_bf16(g / (1.0f + expf(-g))) * u;
         }
         out[static_cast<size_t>(p) * n_out + n] = f32_to_bf16(value);
       }
     }
   }
+}
+
+// The slice depth of a projection of depth `depth` in the slice-summed order,
+// or 0 for the plain chain: the K-split GEMV's slices wherever it serves the
+// shape (moe_gemv_ksplit_shape), so every tier sums a row in its order. A
+// multiple of kGemvStep (128), which every tier's k step divides.
+int32_t slice_depth(const turbine_moe_experts_desc *d, int32_t depth) {
+  return turbine_hip::moe_gemv_ksplit_shape(d) ? depth / kGemvSplits : 0;
 }
 
 template <typename S, bool kGateUp>
@@ -357,13 +404,15 @@ int32_t launch_proj(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   // Every expert's last row tile may be partial: at most one extra tile each.
   const int64_t row_tiles = (rows + S::kTileM - 1) / S::kTileM + num_local;
   const int64_t n_tiles = (n_out + S::kTileN - 1) / S::kTileN;
+  const int32_t slice_k = slice_depth(d, depth);
+  auto kernel = slice_k > 0 ? moe_wmma_kernel<S, kGateUp, true>
+                            : moe_wmma_kernel<S, kGateUp, false>;
   hipLaunchKernelGGL(
-      (moe_wmma_kernel<S, kGateUp>),
-      dim3(static_cast<unsigned>(row_tiles * n_tiles)), dim3(S::kThreads), 0,
-      ctx->stream, static_cast<const Bf16 *>(in), static_cast<const Bf16 *>(w0),
-      static_cast<const Bf16 *>(w1), d->sorted_rows, d->expert_offsets,
-      d->expert_begin, num_local, d->top_k, depth, n_out,
-      static_cast<Bf16 *>(out));
+      kernel, dim3(static_cast<unsigned>(row_tiles * n_tiles)),
+      dim3(S::kThreads), 0, ctx->stream, static_cast<const Bf16 *>(in),
+      static_cast<const Bf16 *>(w0), static_cast<const Bf16 *>(w1),
+      d->sorted_rows, d->expert_offsets, d->expert_begin, num_local, d->top_k,
+      depth, n_out, slice_k, static_cast<Bf16 *>(out));
   return check_hip(ctx, hipGetLastError(),
                    kGateUp ? "moe wmma gate-up kernel launch"
                            : "moe wmma down kernel launch");
@@ -409,11 +458,11 @@ struct Stream {
                 "the A load passes cover the row tile");
 };
 
-template <typename S, bool kGateUp>
+template <typename S, bool kGateUp, bool kSliced>
 __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
     const Bf16 *in, const Bf16 *w0, const Bf16 *w1, const int32_t *sorted_rows,
     const int32_t *offsets, int32_t expert_begin, int32_t num_local,
-    int32_t top_k, int32_t depth, int32_t n_out, Bf16 *out) {
+    int32_t top_k, int32_t depth, int32_t n_out, int32_t slice_k, Bf16 *out) {
   constexpr int kPA = S::kPassesA;
   constexpr int kA = S::kTileM * S::kLdsRow;
   constexpr int kFN = S::kFragsN;
@@ -471,6 +520,10 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
   }
   v8f acc0[S::kFragsM][kFN];
   v8f acc1[kGateUp ? S::kFragsM : 1][kGateUp ? kFN : 1];
+  // kSliced: the sum of the finished slices' chains ("Slice-summed order");
+  // unused (and eliminated) otherwise.
+  v8f tot0[S::kFragsM][kFN];
+  v8f tot1[kGateUp ? S::kFragsM : 1][kGateUp ? kFN : 1];
 #pragma unroll
   for (int i = 0; i < S::kFragsM; ++i) {
 #pragma unroll
@@ -478,6 +531,11 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
       acc0[i][j] = v8f{};
       if (kGateUp)
         acc1[i][j] = v8f{};
+      if (kSliced) {
+        tot0[i][j] = v8f{};
+        if (kGateUp)
+          tot1[i][j] = v8f{};
+      }
     }
   }
   u32x4 ra[kPA];
@@ -547,6 +605,20 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
           }
         }
       }
+      if (kSliced && next % slice_k == 0) {
+#pragma unroll
+        for (int i = 0; i < S::kFragsM; ++i) {
+#pragma unroll
+          for (int j = 0; j < kFN; ++j) {
+            tot0[i][j] += acc0[i][j];
+            acc0[i][j] = v8f{};
+            if (kGateUp) {
+              tot1[i][j] += acc1[i][j];
+              acc1[i][j] = v8f{};
+            }
+          }
+        }
+      }
       if (next < depth)
         store_a(st ^ 1);
       __syncthreads();
@@ -566,10 +638,10 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
             begin + (wm * S::kFragsM + i) * kMma + (lane / kMma) * 8 + v;
         if (p >= end)
           continue;
-        float value = acc0[i][j][v];
+        float value = kSliced ? tot0[i][j][v] : acc0[i][j][v];
         if (kGateUp) {
           const float g = round_bf16(value);
-          const float u = round_bf16(acc1[i][j][v]);
+          const float u = round_bf16(kSliced ? tot1[i][j][v] : acc1[i][j][v]);
           value = round_bf16(g / (1.0f + expf(-g))) * u;
         }
         out[static_cast<size_t>(p) * n_out + n] = f32_to_bf16(value);
@@ -578,7 +650,8 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
   }
 }
 
-template <typename S, bool kGateUp>
+// kSliced: the slice-summed order (the caller checked slice_depth > 0).
+template <typename S, bool kGateUp, bool kSliced>
 int32_t launch_stream(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                       const void *in, const void *w0, const void *w1,
                       int32_t depth, int32_t n_out, void *out) {
@@ -587,13 +660,13 @@ int32_t launch_stream(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   // Every expert's last row tile may be partial: at most one extra tile each.
   const int64_t row_tiles = (rows + S::kTileM - 1) / S::kTileM + num_local;
   const int64_t n_tiles = (n_out + S::kTileN - 1) / S::kTileN;
+  const int32_t slice_k = kSliced ? slice_depth(d, depth) : 0;
   hipLaunchKernelGGL(
-      (moe_stream_kernel<S, kGateUp>),
-      dim3(static_cast<unsigned>(row_tiles * n_tiles)), dim3(S::kThreads), 0,
-      ctx->stream, static_cast<const Bf16 *>(in), static_cast<const Bf16 *>(w0),
-      static_cast<const Bf16 *>(w1), d->sorted_rows, d->expert_offsets,
-      d->expert_begin, num_local, d->top_k, depth, n_out,
-      static_cast<Bf16 *>(out));
+      (moe_stream_kernel<S, kGateUp, kSliced>), dim3(static_cast<unsigned>(row_tiles * n_tiles)),
+      dim3(S::kThreads), 0, ctx->stream, static_cast<const Bf16 *>(in),
+      static_cast<const Bf16 *>(w0), static_cast<const Bf16 *>(w1),
+      d->sorted_rows, d->expert_offsets, d->expert_begin, num_local, d->top_k,
+      depth, n_out, slice_k, static_cast<Bf16 *>(out));
   return check_hip(ctx, hipGetLastError(),
                    kGateUp ? "moe prefill gate-up kernel launch"
                            : "moe prefill down kernel launch");
@@ -609,10 +682,35 @@ int32_t launch_stream(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 // average expert fills kWideTiles row tiles (each A tile then serves twice
 // the columns): at 8,192 routed rows the narrow tile takes 0.61 ms against
 // 0.68, at 16,384 the wide one 0.78 ms against 0.89.
+// In the slice-summed order (slice_depth > 0) the gate-up kernel holds a total
+// beside each accumulator, which spills at k steps of 128 (256 VGPRs, 112
+// spilled), so it takes k steps of 64 there (the down tiles fit: 235-236).
 using PrefillGateUp = Stream<1, 8, 4, 1, 128>;
+using PrefillGateUpSliced = Stream<1, 8, 4, 1, 64>;
 using PrefillDown = Stream<1, 8, 4, 1, 128>;
 using PrefillDownWide = Stream<1, 8, 4, 2, 64>;
 constexpr int kWideTiles = 3;
+
+template <bool kSliced>
+int32_t launch_prefill(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                       void *act, void *down) {
+  using GateUp = std::conditional_t<kSliced, PrefillGateUpSliced, PrefillGateUp>;
+  if (int32_t rc = launch_stream<GateUp, true, kSliced>(
+          ctx, d, d->x, d->w_gate, d->w_up, d->hidden, d->inter, act);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  // The average expert's routed rows against the wide tile's row tiles. Only
+  // the tiling changes, never an output's WMMA chain.
+  const int64_t rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
+  if (rows >= static_cast<int64_t>(d->num_experts) * PrefillDownWide::kTileM *
+                  kWideTiles) {
+    return launch_stream<PrefillDownWide, false, kSliced>(
+        ctx, d, act, d->w_down, nullptr, d->inter, d->hidden, down);
+  }
+  return launch_stream<PrefillDown, false, kSliced>(
+      ctx, d, act, d->w_down, nullptr, d->inter, d->hidden, down);
+}
 
 template <typename S>
 int32_t launch_shape(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
@@ -805,13 +903,11 @@ __global__ __launch_bounds__(kGemvWaves *kLanes) void moe_wmma_gemv_kernel(
 // moe_wmma_gemv_kernel (16-wide k slices ascending), and the block then adds
 // the per-wave partials in ascending slice order through LDS. The grouping is
 // fixed by the shape (the slice count is a compile-time constant, the slice
-// bounds by the depth), so a row's output does not depend on its batch -- but
-// the sum order differs from the unsplit chains of the tiers above, so this is
-// a numerics class of its own, not bitwise the tiers' (recorded as such,
-// decision 2026-10-05): batch invariance now holds within the small-m tier,
-// across the tier boundary within the measured tolerance.
-constexpr int kGemvSplits = 8;
-
+// bounds by the depth), so a row's output does not depend on its batch. The
+// tiers above run the same slice-summed order for the shapes this kernel
+// serves (moe_wmma_kernel / moe_stream_kernel with kSliced, "Slice-summed
+// order" at the top), so a row is bitwise the same across moe_small_max_rows
+// too.
 template <int kSplits, bool kGateUp>
 __global__ __launch_bounds__(kSplits *kLanes) void moe_wmma_gemv_ksplit_kernel(
     const Bf16 *in, const Bf16 *w0, const Bf16 *w1, const int32_t *sorted_rows,
@@ -1016,21 +1112,9 @@ int32_t launch_moe_wmma_prefill(turbine_ctx *ctx,
                                 void *act, void *down) {
   if (int32_t rc = launch_moe_positions(ctx, d, pos); rc != TURBINE_OK)
     return rc;
-  if (int32_t rc = launch_stream<PrefillGateUp, true>(
-          ctx, d, d->x, d->w_gate, d->w_up, d->hidden, d->inter, act);
-      rc != TURBINE_OK) {
-    return rc;
-  }
-  // The average expert's routed rows against the wide tile's row tiles. Only
-  // the tiling changes, never an output's WMMA chain.
-  const int64_t rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
-  if (rows >= static_cast<int64_t>(d->num_experts) * PrefillDownWide::kTileM *
-                  kWideTiles) {
-    return launch_stream<PrefillDownWide, false>(
-        ctx, d, act, d->w_down, nullptr, d->inter, d->hidden, down);
-  }
-  return launch_stream<PrefillDown, false>(ctx, d, act, d->w_down, nullptr,
-                                           d->inter, d->hidden, down);
+  if (slice_depth(d, d->hidden) > 0)
+    return launch_prefill<true>(ctx, d, act, down);
+  return launch_prefill<false>(ctx, d, act, down);
 }
 
 bool moe_gemv_shape(const turbine_moe_experts_desc *d) {
