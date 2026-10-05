@@ -1,6 +1,6 @@
 # Adding a scheduling policy
 
-A scheduling policy makes the scheduler's three free choices: the admission order of the waiting queue, the preemption victim, and the prefill chunk size. Everything else stays in the mechanism (`Scheduler::plan` in `crates/turbine-scheduler/src/scheduler.rs`): stage order (drop cancelled → decode → forks → continuing prefills → admit), block accounting, preemption eligibility and every bound. Point name `scheduling_policy`; selected by `scheduler.policy` (default `default`).
+A scheduling policy makes the scheduler's three free choices: the admission order of the waiting queue, the preemption victim, and the prefill chunk size. Everything else stays in the mechanism (`Scheduler::plan` in `crates/turbine-scheduler/src/scheduler.rs`): stage order (drop cancelled → decode → forks → continuing prefills → admit), block accounting, preemption eligibility and every bound. Point name `scheduling_policy`; selected by `scheduler.policy` (default `default`). The registry ships two policies: `default` (`crates/turbine-scheduler/src/policy/default.rs`) and `cache_aware` (`crates/turbine-scheduler/src/policy/cache_aware.rs`), which orders the waiting queue by arrival window, then cached-prefix length, with a windowed starvation bound.
 
 ## The trait
 
@@ -15,6 +15,8 @@ A scheduling policy makes the scheduler's three free choices: the admission orde
 | `chunk_cap(&SchedulerParams, &IterationLimits)` | The largest prefill chunk this iteration, at least 1, within `prefill_chunk_tokens` (chunked prefill) or `max_batch_tokens`, and within `limits.prefill_chunk_tokens` when set. Nothing checks it for you except the conformance suite.                                                                                                                                                        |
 
 Policies are called per decision: cheap, deterministic, stateless — no clock, no randomness, no fields that change.
+
+The `admission_key` input grew in Phase 5p (S-7): `AdmissionInfo` carries `prompt_tokens`, `cached_prefix_tokens` (the prefix attached before the admission gate, whose blocks cannot be reclaimed while the request waits) and `window` (`scheduler.cache_aware_window`), and `AdmissionKey` carries `affinity` between `arrival` and `order` (`default` sets 0, so its order is unchanged; `cache_aware` sets `u32::MAX - cached_prefix_tokens`). The pressure gate (Phase 3, with 6b's GREEN admission headroom capped at the RED threshold 0.90) runs before the policy: a policy orders what the gate admits, never past it.
 
 ## Files to add
 
@@ -73,6 +75,7 @@ Nothing else: the server validates `scheduler.policy` against `registry().names(
 
 - `scripts/remote-cargo.sh test -p turbine-scheduler registry_conformance` — the suite over the registry.
 - `scripts/remote-cargo.sh test -p turbine-scheduler sim::tests` — the simulator invariants over every policy.
+- `scripts/remote-cargo.sh test -p turbine-scheduler --test kv_sim cache_aware_starvation_bound` — the S-8 starvation-bound test: `cache_aware` completes a saturated flood of fully cached requests (one uncached every 50 arrivals) with no admission inversion (`SimReport.admission_inversions`), while a test-only unbounded variant starves them.
 
 ## Lab checks
 
@@ -84,4 +87,5 @@ A new policy changes nothing until `scheduler.policy` names it, so landing it ne
 - Non-unique keys make the queue order depend on insertion; always end the key with a counter.
 - A preempted request is re-queued with `preempted: true` and a new `push_no`; `default` puts it ahead of every new request. If yours does not, a preempted request can wait behind new arrivals — the suite still requires it to complete.
 - `chunk_cap` returning 0 or above the budgets fails `chunk_budget`; never read a clock or RNG (the digests of `default_policy_plan_digests_match_main` and the determinism checks rely on replayable runs).
+- The admission key is computed once at push: a request keeps the key it was queued under even if its `cached_prefix_tokens` or the configured window changes afterwards. `Scheduler::with_policy` / `KvSimDriver::with_policy` must therefore be called before the first submission, and a re-attach mid-queue does not re-order the queue.
 - `Scheduler::with_policy` must be called before the first submission: queued requests keep the keys of the policy they were queued under.

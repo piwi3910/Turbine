@@ -603,6 +603,7 @@ impl Scheduler {
         }
         let block_tokens = self.params.block_tokens;
         let submit_no = self.queue.next_order();
+        let window = self.params.cache_aware_window;
         let Some(gate) = self.gate.as_mut() else {
             self.enqueue(r, None, submit_no);
             return Ok(());
@@ -620,13 +621,9 @@ impl Scheduler {
                 .batch_growth_limit
                 .is_none_or(|g| admitted < self.prev_admitted + g as usize);
         // The gate's queue is ordered by the policy's key, like the scheduler's own queue.
-        let key = self.policy.admission_key(&AdmissionInfo {
-            priority: r.priority,
-            arrival: r.arrival,
-            submit_no,
-            preempted: false,
-            push_no: submit_no,
-        });
+        let key = self.policy.admission_key(&Self::admission_info(
+            window, &r, submit_no, false, submit_no,
+        ));
         match gate.offer(r, key, submit_no, slot_free) {
             Ok(GateOutcome::Admitted(r, reservation)) => {
                 self.enqueue(*r, Some(reservation), submit_no);
@@ -674,6 +671,29 @@ impl Scheduler {
         Ok(())
     }
 
+    /// The admission info the policy sees for `r` (Phase 5p S-7): the estimate's prompt and
+    /// attached-prefix lengths and the configured `cache_aware` window. An associated
+    /// function without `&self`, so a call site can use it while the gate or the request map
+    /// is mutably borrowed; copy `self.params.cache_aware_window` before that borrow.
+    fn admission_info(
+        window: Duration,
+        r: &SchedRequest,
+        submit_no: u64,
+        preempted: bool,
+        push_no: u64,
+    ) -> AdmissionInfo {
+        AdmissionInfo {
+            priority: r.priority,
+            arrival: r.arrival,
+            submit_no,
+            preempted,
+            push_no,
+            prompt_tokens: r.estimate.prompt_tokens,
+            cached_prefix_tokens: r.estimate.cached_prefix_tokens,
+            window,
+        }
+    }
+
     fn count_rejection(&self, id: RequestId, e: SubmitError) {
         tracing::info!(event = "reject", request_id = %id.0, reason = e.as_str(), "request rejected");
         if let Some(m) = &self.metrics {
@@ -690,13 +710,13 @@ impl Scheduler {
                 .as_ref()
                 .is_some_and(|g| g.is_expensive(&r.estimate));
         let now = self.clock.now_mono();
-        let key = self.policy.admission_key(&AdmissionInfo {
-            priority: r.priority,
-            arrival: r.arrival,
+        let key = self.policy.admission_key(&Self::admission_info(
+            self.params.cache_aware_window,
+            &r,
             submit_no,
-            preempted: false,
-            push_no: submit_no,
-        });
+            false,
+            submit_no,
+        ));
         self.queue.push(r.id, key);
         for &seq in &r.seqs {
             self.seqs.insert(
@@ -1443,6 +1463,7 @@ impl Scheduler {
     /// requests drain the pool; when the queue is full it is answered `overloaded`. Requests
     /// that started (running, or preempted with KV to recompute) keep theirs.
     fn requeue_unstarted(&mut self, pool: &mut BlockPool, plan: &mut IterationPlan) {
+        let window = self.params.cache_aware_window;
         let Some(gate) = self.gate.as_mut() else {
             return;
         };
@@ -1478,13 +1499,9 @@ impl Scheduler {
             if let Some(a) = req.cached_prefix.take() {
                 pool.release(&a.blocks);
             }
-            let key = self.policy.admission_key(&AdmissionInfo {
-                priority: req.priority,
-                arrival: req.arrival,
-                submit_no,
-                preempted: false,
-                push_no: submit_no,
-            });
+            let key = self.policy.admission_key(&Self::admission_info(
+                window, &req, submit_no, false, submit_no,
+            ));
             if gate.requeue(req, key, submit_no) {
                 tracing::info!(event = "survival_requeue", request_id = %id.0, "admitted request returned to the admission queue");
                 if let Some(m) = &self.metrics {
@@ -1872,15 +1889,16 @@ impl Scheduler {
         };
         self.running.retain(|r| *r != id);
         let push_no = self.queue.next_order();
+        let window = self.params.cache_aware_window;
         let r = self.requests.get_mut(&id).expect("running request tracked");
         r.admitted = None;
-        let key = self.policy.admission_key(&AdmissionInfo {
-            priority: r.req.priority,
-            arrival: r.req.arrival,
-            submit_no: r.submit_no,
-            preempted: true,
+        let key = self.policy.admission_key(&Self::admission_info(
+            window,
+            &r.req,
+            r.submit_no,
+            true,
             push_no,
-        });
+        ));
         let seqs = r.req.seqs.clone();
         for seq in seqs {
             let e = self.seqs.get_mut(&seq).expect("sequence tracked");

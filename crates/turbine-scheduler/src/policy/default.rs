@@ -30,6 +30,7 @@ impl SchedulingPolicy for DefaultPolicy {
                 tier: 0,
                 priority: Priority(0),
                 arrival: Duration::ZERO,
+                affinity: 0,
                 order: u64::MAX - req.push_no,
             }
         } else {
@@ -37,6 +38,7 @@ impl SchedulingPolicy for DefaultPolicy {
                 tier: 1,
                 priority: req.priority,
                 arrival: req.arrival,
+                affinity: 0,
                 order: req.submit_no,
             }
         }
