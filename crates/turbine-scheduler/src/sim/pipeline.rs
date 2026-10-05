@@ -245,7 +245,7 @@ impl Simulation {
                 }
                 let mb = in_flight.remove(&it).expect("micro-batch in flight");
                 let completed = self.report.completed;
-                let outcome = self.execute(&mb.plan, t);
+                let outcome = self.execute(&mb.plan, &[], t);
                 let tokens: u32 = outcome.appended.iter().map(|(_, k)| *k).sum();
                 report.completed_micro_batches.push(MicroBatchTrace {
                     iteration: it,

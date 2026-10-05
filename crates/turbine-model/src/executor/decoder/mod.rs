@@ -1402,6 +1402,7 @@ impl DecoderExecutor {
             } else if start >= split {
                 second.push(SeqSlice {
                     q_start: s.q_start - split as u32,
+                    logits_rows: 1,
                     ..*s
                 });
             } else {
@@ -1410,6 +1411,7 @@ impl DecoderExecutor {
                     q_len: head,
                     kv_len: s.kv_len - (s.q_len - head),
                     reduce: None,
+                    logits_rows: 1,
                     ..*s
                 });
                 second.push(SeqSlice {
@@ -2002,7 +2004,16 @@ impl DecoderExecutor {
             .final_norm
             .as_ref()
             .ok_or_else(|| invalid("final norm on a pipeline stage before the last".into()))?;
-        for (src, dst, len) in logits::norm_runs(&p.last_rows, order) {
+        // One source per destination row (P5p S-9): sequence order[p]'s k-th destination row
+        // reads its k-th returned position, i.e. `logits_first + k`.
+        let mut offset = vec![0u32; p.logits_rows.len()];
+        let mut row_src = Vec::with_capacity(order.len());
+        for &s in order {
+            let k = offset[s];
+            offset[s] += 1;
+            row_src.push(p.logits_first[s] + k as usize);
+        }
+        for (src, dst, len) in logits::norm_runs(&row_src) {
             self.rmsnorm(x.rows(src, len), final_norm, b.last.view().rows(dst, len))?;
         }
         Ok(())
@@ -2021,7 +2032,7 @@ impl DecoderExecutor {
         halves: Option<&[(usize, Packed); 2]>,
     ) -> Result<(), ModelError> {
         let b = &self.bufs;
-        let (t, n) = (p.total_q, p.num_seqs);
+        let t = p.total_q;
         self.step_prefill.store(!p.is_decode(), Ordering::Relaxed);
         if let Some(pp) = self.pp.as_ref().filter(|s| !s.is_first()) {
             // The residual stream of the stage before, in place of the embedding.
@@ -2083,6 +2094,8 @@ impl DecoderExecutor {
             return self.pp_send(pp, t);
         }
         self.final_norm_last_rows(p, order)?;
+        // The head's rows: one per logits row (P5p S-9), `order` carrying one entry per row.
+        let n = order.len();
         self.record(None, "final_norm", rows(&b.last, n))?;
         let head = self
             .lm_head
@@ -2550,6 +2563,7 @@ mod tests {
                             block_table: table,
                             block_formats: &[],
                             reduce,
+                            logits_rows: 1,
                         })
                         .collect()
                 };
@@ -2627,6 +2641,7 @@ mod tests {
             block_table: &table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         let prefill = BatchInput {
             tokens: &[1, 2],
@@ -2651,6 +2666,7 @@ mod tests {
                     block_table: &[],
                     block_formats: &[],
                     reduce: None,
+                    logits_rows: 1,
                 };
                 start += q_len;
                 s

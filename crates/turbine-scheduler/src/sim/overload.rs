@@ -885,6 +885,7 @@ impl OverloadSim {
             iteration: plan.iteration,
             finished,
             appended,
+            rolled_back: Vec::new(),
             failed: None,
         }
     }

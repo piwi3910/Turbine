@@ -192,8 +192,11 @@ pub(crate) struct Packed {
     pub max_kv_len: u32,
     /// Columns of the packed block table (the longest sequence's block count).
     pub max_blocks_per_seq: u32,
-    /// Row in the token batch of each sequence's last token, in `seqs` order.
-    pub last_rows: Vec<usize>,
+    /// First token row of each sequence's returned logits block (its `q_start + q_len −
+    /// logits_rows`), in `seqs` order.
+    pub logits_first: Vec<usize>,
+    /// Logits rows per sequence (P5p S-9), in `seqs` order.
+    pub logits_rows: Vec<u32>,
 }
 
 impl Packed {
@@ -279,15 +282,26 @@ impl HostBatch {
             max_q_len: 0,
             max_kv_len: 0,
             max_blocks_per_seq: 0,
-            last_rows: Vec::with_capacity(n),
+            logits_first: Vec::with_capacity(n),
+            logits_rows: Vec::with_capacity(n),
         };
+        let mut total_rows = 0u64;
         for s in batch.seqs {
             self.check_seq(s, next_row, batch, limits)?;
             next_row += s.q_len;
             packed.max_q_len = packed.max_q_len.max(s.q_len);
             packed.max_kv_len = packed.max_kv_len.max(s.kv_len);
             packed.max_blocks_per_seq = packed.max_blocks_per_seq.max(s.kv_len.div_ceil(bt));
-            packed.last_rows.push(next_row as usize - 1);
+            let rows = s.logits_rows;
+            packed.logits_first.push(next_row as usize - rows as usize);
+            packed.logits_rows.push(rows);
+            total_rows += u64::from(rows);
+        }
+        if total_rows > limits.max_seqs as u64 {
+            return Err(invalid(format!(
+                "the batch's {total_rows} logits rows exceed max_seqs {}",
+                limits.max_seqs
+            )));
         }
         if next_row as usize != t {
             return Err(invalid(format!(
@@ -379,6 +393,18 @@ impl HostBatch {
             return Err(invalid(format!(
                 "sequence {id}: q_len {} must be in 1..=kv_len {}",
                 s.q_len, s.kv_len
+            )));
+        }
+        if s.logits_rows == 0 || s.logits_rows > s.q_len {
+            return Err(invalid(format!(
+                "sequence {id}: logits_rows {} must be in 1..=q_len {}",
+                s.logits_rows, s.q_len
+            )));
+        }
+        if s.logits_rows > 1 && s.reduce.is_some() {
+            return Err(invalid(format!(
+                "sequence {id}: logits_rows {} > 1 is never device-reduced",
+                s.logits_rows
             )));
         }
         let end = u64::from(s.q_start) + u64::from(s.q_len);
@@ -717,6 +743,7 @@ impl SequenceKv {
             block_table: &self.table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         let logits = exec.forward(&BatchInput {
             tokens,
@@ -798,6 +825,7 @@ mod tests {
                 block_table: &a,
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             },
             SeqSlice {
                 seq: SeqId(11),
@@ -807,6 +835,7 @@ mod tests {
                 block_table: &b,
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             },
         ];
         let batch = BatchInput {
@@ -825,7 +854,8 @@ mod tests {
                 max_q_len: 5,
                 max_kv_len: 10,
                 max_blocks_per_seq: 3,
-                last_rows: vec![0, 5],
+                logits_first: vec![0, 5],
+                logits_rows: vec![1, 1],
             }
         );
         assert!(!packed.is_decode());
@@ -933,6 +963,7 @@ mod tests {
                 block_table,
                 block_formats,
                 reduce: None,
+                logits_rows: 1,
             }
         }
         let mut host = HostBatch::default();

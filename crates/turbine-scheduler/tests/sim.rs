@@ -270,6 +270,7 @@ fn pipeline_cancel_in_flight() {
         IterationOutcome {
             iteration: g.iteration,
             appended: vec![(SeqId(2), 1)],
+            rolled_back: Vec::new(),
             finished: vec![(SeqId(2), FinishReason::Stop)],
             failed: None,
         },

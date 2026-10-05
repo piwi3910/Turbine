@@ -716,6 +716,7 @@ fn forward_rejects_invalid_batches() {
         block_table: &table,
         block_formats: &[],
         reduce: None,
+        logits_rows: 1,
     };
     let mut run = |tokens: &[u32], positions: &[u32], seqs: &[SeqSlice<'_>]| {
         invalid(exec.forward(&BatchInput {
@@ -1526,6 +1527,7 @@ fn paged_llama_single_sequence() {
             block_table: &table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         exec.forward(&BatchInput {
             tokens,
@@ -1594,6 +1596,7 @@ fn ragged_batch_rows_match_single_sequences() {
         block_table: &ta,
         block_formats: &[],
         reduce: None,
+        logits_rows: 1,
     }];
     let positions: Vec<u32> = (0..20).collect();
     exec.forward(&BatchInput {
@@ -1614,6 +1617,7 @@ fn ragged_batch_rows_match_single_sequences() {
             block_table: &ta,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
         SeqSlice {
             seq: SeqId(2),
@@ -1623,6 +1627,7 @@ fn ragged_batch_rows_match_single_sequences() {
             block_table: &tb,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
         SeqSlice {
             seq: SeqId(3),
@@ -1632,6 +1637,7 @@ fn ragged_batch_rows_match_single_sequences() {
             block_table: &tc,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
     ];
     let logits = exec
@@ -1662,6 +1668,7 @@ fn ragged_batch_rows_match_single_sequences() {
             block_table: table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         exec.forward(&BatchInput {
             tokens: &[7],
@@ -1772,6 +1779,7 @@ fn run_seq(
         block_table: table,
         block_formats: &[],
         reduce: None,
+        logits_rows: 1,
     }];
     let logits = exec
         .forward(&BatchInput {
@@ -2461,6 +2469,7 @@ fn olmoe_decode_single_device_copy() {
                     block_table: &tables[*s],
                     block_formats: &[],
                     reduce: None,
+                    logits_rows: 1,
                 });
                 tokens.extend_from_slice(toks);
                 positions.extend(*start..start + toks.len() as u32);
@@ -2627,6 +2636,7 @@ fn paged_matches_contiguous() {
                         block_table: &tables[s],
                         block_formats: &[],
                         reduce: None,
+                        logits_rows: 1,
                     });
                     q_start += q_lens[s];
                 }
@@ -2656,6 +2666,324 @@ fn paged_matches_contiguous() {
                 assert!(diff <= 1e-4, "{arch:?} decode {i} of sequence {s}: {diff}");
             }
         }
+    }
+}
+
+/// [`cpu_model_with`] for batches of up to `max_seqs` sequences.
+fn cpu_model_seqs(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+    reduce: bool,
+) -> Box<dyn ModelExecutor> {
+    let opts = ExecutorOptions::default();
+    cpu_model_opts(
+        spec,
+        mem,
+        max_batch_tokens,
+        max_seqs,
+        opts,
+        cpu_reference_provider(),
+        reduce,
+    )
+}
+
+/// [`cpu_model_with`] with an explicit sequence bound (P5p S-9: an iteration's total logits
+/// rows are bounded by it).
+fn cpu_model_opts(
+    spec: &TinySpec,
+    mem: &Arc<dyn DeviceMemory>,
+    max_batch_tokens: u32,
+    max_seqs: u32,
+    opts: ExecutorOptions,
+    provider: Arc<dyn KernelProvider>,
+    reduce: bool,
+) -> Box<dyn ModelExecutor> {
+    let cfg = &spec.config;
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let slots = cfg.family.0.weight_slots(cfg);
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let mut reqs =
+        executor::available_requirements(cfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    if reduce {
+        reqs.push(executor::logits::reduce_requirement(cfg));
+    }
+    let card = provider.card_profile();
+    let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+        .expect("every op has a provider");
+    build_executor(
+        cfg,
+        weights,
+        Arc::new(registry),
+        Arc::clone(mem),
+        BLOCK_TOKENS,
+        max_batch_tokens,
+        max_seqs,
+        opts,
+    )
+    .expect("executor")
+}
+
+/// P5p S-9: on both tiny checkpoints (CPU provider), a decoding sequence whose next step is
+/// fed 1 + 7 tokens with `logits_rows` 8 returns 8 full rows equal within the Phase 1 CPU
+/// tolerance to the rows of 8 single-token steps; reduced decode rows in the same batch are
+/// unchanged; `logits_rows` beyond `q_len` (and 0) are refused.
+#[test]
+fn multi_row_logits_match_single_steps() {
+    const PRE: u32 = 20;
+    const ROWS: u32 = 8;
+    const MAX_SEQS_ROWS: u32 = 12;
+    let tmp = TempDir::new("tiny-model-multi-row");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.family;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut exec = cpu_model_seqs(&spec, &mem, 64, MAX_SEQS_ROWS, true);
+        let layout = *exec.kv_layout();
+        let storage = pool(&mem, &layout, 8);
+        let kv = pool_view(&storage, &layout, 8);
+        let ta = vec![BlockId(1), BlockId(4)];
+        let tb = vec![BlockId(2)];
+        let tokens: Vec<u32> = (0..PRE).map(|i| (i * 37 + 11) % spec.vocab).collect();
+        // Sequence 1's prompt; sequence 2 prefill for the reduced decode beside it.
+        let positions: Vec<u32> = (0..PRE).collect();
+        let seqs = [SeqSlice {
+            seq: SeqId(1),
+            q_start: 0,
+            q_len: PRE,
+            kv_len: PRE,
+            block_table: &ta,
+            block_formats: &[],
+            reduce: None,
+            logits_rows: 1,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &tokens,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("prefill seq 1");
+        let b: Vec<u32> = (0..4).map(|i| (i * 53 + 5) % spec.vocab).collect();
+        let positions = (0..4).collect::<Vec<u32>>();
+        let seqs = [SeqSlice {
+            seq: SeqId(2),
+            q_start: 0,
+            q_len: 4,
+            kv_len: 4,
+            block_table: &tb,
+            block_formats: &[],
+            reduce: None,
+            logits_rows: 1,
+        }];
+        exec.forward(&BatchInput {
+            tokens: &b,
+            positions: &positions,
+            seqs: &seqs,
+            kv: &kv,
+        })
+        .expect("prefill seq 2");
+
+        // The greedy reduced decode of sequence 2 beside the multi-row step.
+        let greedy = RowReduce {
+            top_n: 4,
+            temperature: 0.0,
+            uniform: None,
+            top_p: 1.0,
+        };
+        let decode_b = |exec: &mut dyn ModelExecutor| match exec
+            .forward(&BatchInput {
+                tokens: &[9],
+                positions: &[4],
+                seqs: &[SeqSlice {
+                    seq: SeqId(2),
+                    q_start: 0,
+                    q_len: 1,
+                    kv_len: 5,
+                    block_table: &tb,
+                    block_formats: &[],
+                    reduce: Some(greedy),
+                    logits_rows: 1,
+                }],
+                kv: &kv,
+            })
+            .expect("decode b")
+            .slot(0)
+        {
+            LogitsSlot::Reduced(r) => r.clone(),
+            other => panic!("{arch:?}: expected a reduced row, got {other:?}"),
+        };
+
+        // Reference: the 8 extension tokens (the sampled token and 7 forced ones) fed one
+        // token per step, and sequence 2's decode run alone.
+        let forced: Vec<u32> = (0..ROWS).map(|i| (i * 29 + 7) % spec.vocab).collect();
+        let mut want_rows = Vec::new();
+        for (i, &t) in forced.iter().enumerate() {
+            let positions = [PRE + i as u32];
+            let seqs = [SeqSlice {
+                seq: SeqId(1),
+                q_start: 0,
+                q_len: 1,
+                kv_len: PRE + i as u32 + 1,
+                block_table: &ta,
+                block_formats: &[],
+                reduce: None,
+                logits_rows: 1,
+            }];
+            let logits = exec
+                .forward(&BatchInput {
+                    tokens: &[t],
+                    positions: &positions,
+                    seqs: &seqs,
+                    kv: &kv,
+                })
+                .expect("single step");
+            want_rows.push(logits.row(0).to_vec());
+        }
+        let want_b = decode_b(exec.as_mut());
+
+        // The multi-row step: 1 + 7 tokens of sequence 1 with `logits_rows` 8, in one batch
+        // with sequence 2's reduced decode.
+        let tokens: Vec<u32> = forced.iter().copied().chain(std::iter::once(9)).collect();
+        let positions: Vec<u32> = (PRE..PRE + ROWS).chain(std::iter::once(4)).collect();
+        let seqs = [
+            SeqSlice {
+                seq: SeqId(1),
+                q_start: 0,
+                q_len: ROWS,
+                kv_len: PRE + ROWS,
+                block_table: &ta,
+                block_formats: &[],
+                reduce: None,
+                logits_rows: ROWS,
+            },
+            SeqSlice {
+                seq: SeqId(2),
+                q_start: ROWS,
+                q_len: 1,
+                kv_len: 5,
+                block_table: &tb,
+                block_formats: &[],
+                reduce: Some(greedy),
+                logits_rows: 1,
+            },
+        ];
+        let logits = exec
+            .forward(&BatchInput {
+                tokens: &tokens,
+                positions: &positions,
+                seqs: &seqs,
+                kv: &kv,
+            })
+            .expect("multi-row forward");
+        assert_eq!(logits.slots(), 2, "{arch:?}");
+        assert_eq!(logits.rows, ROWS as usize, "{arch:?}");
+        for (i, want) in want_rows.iter().enumerate() {
+            let got = &logits.rows_of(0)[i * logits.vocab..(i + 1) * logits.vocab];
+            let diff = max_abs_diff(got, want);
+            assert!(diff <= 1e-4, "{arch:?} row {i}: max abs diff {diff}");
+        }
+        // The last (sampled) position's row is the sequence's `slot`.
+        let LogitsSlot::Full(last) = logits.slot(0) else {
+            panic!("{arch:?}: a multi-row sequence holds full rows")
+        };
+        assert_eq!(last, &logits.rows_of(0)[7 * logits.vocab..]);
+        match (logits.slot(1), &want_b) {
+            (LogitsSlot::Reduced(got), want) => {
+                // The greedy draw of a reduced row is its best candidate; ties go to the lower id.
+                let eq_pair = |a: &(u32, f32), b: &(u32, f32)| {
+                    a.0 == b.0 && (a.1 - b.1).abs() <= 1e-6_f32.max(1e-6 * b.1.abs())
+                };
+                assert!(
+                    got.top.len() == want.top.len()
+                        && got.top.iter().zip(&want.top).all(|(a, b)| eq_pair(a, b)),
+                    "{arch:?}"
+                );
+                assert!(
+                    got.sampled.is_some() == want.sampled.is_some()
+                        && got
+                            .sampled
+                            .iter()
+                            .zip(&want.sampled)
+                            .all(|(a, b)| eq_pair(a, b)),
+                    "{arch:?}"
+                );
+                assert!(
+                    (got.lse - want.lse).abs() <= 1e-6 * want.lse.abs().max(1.0),
+                    "{arch:?}: reduced decode changed beside a multi-row sequence"
+                );
+            }
+            (got, want) => panic!("{arch:?}: {got:?} vs {want:?}"),
+        }
+
+        // `logits_rows` beyond `q_len` (and 0) are refused.
+        for rows in [0, ROWS + 1] {
+            let seqs = [SeqSlice {
+                seq: SeqId(1),
+                q_start: 0,
+                q_len: 2,
+                kv_len: PRE + 2,
+                block_table: &ta,
+                block_formats: &[],
+                reduce: None,
+                logits_rows: rows,
+            }];
+            let err = exec
+                .forward(&BatchInput {
+                    tokens: &[1, 2],
+                    positions: &[PRE, PRE + 1],
+                    seqs: &seqs,
+                    kv: &kv,
+                })
+                .expect_err("logits_rows must respect q_len");
+            assert!(err.to_string().contains("logits_rows"), "{arch:?}: {err}");
+        }
+
+        // A total beyond the executor's row capacity is refused too (rows are bounded by
+        // `max_seqs`, which sizes the head buffers).
+        let seqs = [
+            SeqSlice {
+                seq: SeqId(1),
+                q_start: 0,
+                q_len: PRE + ROWS,
+                kv_len: PRE + ROWS,
+                block_table: &ta,
+                block_formats: &[],
+                reduce: None,
+                logits_rows: PRE + ROWS,
+            },
+            SeqSlice {
+                seq: SeqId(2),
+                q_start: PRE + ROWS,
+                q_len: 1,
+                kv_len: PRE + ROWS + 1,
+                block_table: &ta,
+                block_formats: &[],
+                reduce: None,
+                logits_rows: 1,
+            },
+        ];
+        let tokens: Vec<u32> = (0..PRE + ROWS + 1)
+            .map(|i| (i * 3 + 1) % spec.vocab)
+            .collect();
+        let err = exec
+            .forward(&BatchInput {
+                tokens: &tokens,
+                positions: &(0..PRE + ROWS + 1).collect::<Vec<u32>>(),
+                seqs: &seqs,
+                kv: &kv,
+            })
+            .expect_err("the row capacity");
+        assert!(err.to_string().contains("logits rows"), "{arch:?}: {err}");
     }
 }
 
@@ -2800,6 +3128,7 @@ fn graph_decode_run(
             block_table: table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         exec.forward(&BatchInput {
             tokens: &tokens,
@@ -2827,6 +3156,7 @@ fn graph_decode_run(
                     uniform: Some(0.1 + 0.05 * s as f32),
                     top_p: if s % 2 == 0 { 1.0 } else { 0.9 },
                 }),
+                logits_rows: 1,
             })
             .collect();
         out.push(
@@ -3313,6 +3643,7 @@ fn check_reduced_rows(
                             block_table: &tables[s],
                             block_formats: &[],
                             reduce: reduce[s],
+                            logits_rows: 1,
                         };
                         q_start += q_lens[s];
                         slice
@@ -3526,6 +3857,7 @@ fn check_launch_ahead(
                     block_table: &tables[s],
                     block_formats: &[],
                     reduce: Some(reduce(s, step)),
+                    logits_rows: 1,
                 };
                 q_start += q_lens[s];
                 slice
@@ -3627,6 +3959,7 @@ fn check_launch_ahead(
             block_table: &tables[s],
             block_formats: &[],
             reduce: Some(if s == 1 { top_k } else { reduce(s, 0) }),
+            logits_rows: 1,
         })
         .collect();
     let positions: Vec<u32> = (0..3).map(|s| kv_lens[s] - 1).collect();
@@ -3773,6 +4106,7 @@ fn op_profile_accounts_forward() {
                 block_table: table,
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             })
             .collect();
         let batch = BatchInput {
@@ -3896,6 +4230,7 @@ fn single_sequence(
             block_table: &table,
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         }];
         exec.forward(&BatchInput {
             tokens,
@@ -4070,6 +4405,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
             block_table: &tables[0],
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
         SeqSlice {
             seq: SeqId(2),
@@ -4079,6 +4415,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
             block_table: &tables[1],
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
     ];
     let mut logits = exec
@@ -4106,6 +4443,7 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
                 block_table: &tables[s],
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             })
             .collect();
         logits = exec
@@ -5476,6 +5814,7 @@ fn scripted_pair(
             block_table: &tables[0],
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
         SeqSlice {
             seq: SeqId(2),
@@ -5485,6 +5824,7 @@ fn scripted_pair(
             block_table: &tables[1],
             block_formats: &[],
             reduce: None,
+            logits_rows: 1,
         },
     ];
     let mut steps = vec![
@@ -5508,6 +5848,7 @@ fn scripted_pair(
                 block_table: &tables[s],
                 block_formats: &[],
                 reduce: None,
+                logits_rows: 1,
             })
             .collect();
         steps.push(

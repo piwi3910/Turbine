@@ -8,10 +8,14 @@
 //! --ignored --nocapture`. A workload of several runs digests the list of its runs' digests.
 
 /// `(workload, plan digest)`, one per seeded workload of the invariant tests.
+///
+/// 2026-10-05 (P5p Task 10): `decode_never_starved` and `chunk_budget_respected` re-recorded —
+/// their runs schedule a multi-token append every 7th iteration (`Simulation::with_extensions`,
+/// S-9), so their plans differ from main's by design; every other workload is unchanged.
 pub const MAIN_DIGESTS: &[(&str, u64)] = &[
     ("ts_section7_iteration_pattern", 15134313254342144953),
-    ("decode_never_starved", 18073904047034566365),
-    ("chunk_budget_respected", 1693678059956144883),
+    ("decode_never_starved", 10772755057896660484),
+    ("chunk_budget_respected", 15676167015522452859),
     ("preemption_by_recompute", 8945296441604707762),
     (
         "preemption_by_recompute_at_128_token_pages",

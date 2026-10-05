@@ -114,6 +114,7 @@ fn prefill(
         block_table: &table,
         block_formats: &[],
         reduce: None,
+        logits_rows: 1,
     }];
     let logits = exec
         .forward(&BatchInput {
@@ -218,6 +219,7 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
                                 block_table: &[],
                 block_formats: &[],
                                 reduce: None,
+                                logits_rows: 1,
                             }],
                             n as usize,
                             BLOCK_TOKENS as usize,

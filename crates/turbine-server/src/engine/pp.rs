@@ -94,6 +94,7 @@ struct OwnedSeq {
     kv_len: u32,
     block_table: Vec<BlockId>,
     reduce: Option<RowReduce>,
+    logits_rows: u32,
 }
 
 /// A batch every stage runs (tokens, positions and sequence slices; each stage its own pool).
@@ -119,6 +120,7 @@ impl OwnedBatch {
                     kv_len: s.kv_len,
                     block_table: s.block_table.to_vec(),
                     reduce: s.reduce,
+                    logits_rows: s.logits_rows,
                 })
                 .collect(),
         }
@@ -135,6 +137,7 @@ impl OwnedBatch {
                 block_table: &s.block_table,
                 block_formats: &[],
                 reduce: s.reduce,
+                logits_rows: s.logits_rows,
             })
             .collect()
     }
@@ -1266,6 +1269,7 @@ mod tests {
                         block_table: &tables[s],
                         block_formats: &[],
                         reduce: None,
+                        logits_rows: 1,
                     };
                     (tokens, positions, [slice])
                 })
@@ -1350,6 +1354,7 @@ mod tests {
                     block_table: &tables[s],
                     block_formats: &[],
                     reduce: None,
+                    logits_rows: 1,
                 }]
             };
             let (b0, b1) = (batch(0), batch(1));

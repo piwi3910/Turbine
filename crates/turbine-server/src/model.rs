@@ -1549,6 +1549,7 @@ pub(crate) fn warm_up(
             block_table: &blocks,
             block_formats: &formats[0],
             reduce: None,
+            logits_rows: 1,
         }];
         exec.forward(&BatchInput {
             tokens: &[token],
