@@ -289,8 +289,8 @@ Interfaces:
 - [x] Run: `scripts/remote-cargo.sh test -p turbine-server && scripts/remote-cargo.sh test -p turbine-model` — PASS (whole `turbine-server`, `turbine-model`, `turbine-scheduler`; including `response_format_json_schema`, `matcher_masks_each_choice_and_fails_alone`, the overlap tests, `preempted_output_unchanged`)
 - [x] Mutation-checked: the agreement check dropped (every forced token accepted) turns `jump_forward_rolls_back_a_corrupted_run` red; restored.
 - [x] Gate: `scripts/gate.sh` — `gate: ok` (986 tests)
-- [x] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-server --test lab_openai` — see the perf log for the printed steps and times
-- [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama --quick` and `--model olmoe --quick` — see the perf log for the lines
+- [x] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-server --test lab_openai` — correctness holds (identical tokens, strict logprob bounds, schema-valid; `tools_and_json_schema` ok); **the targets miss**: steps 0.899 × (≤ 0.8), wall 0.989 × (≤ 0.9) — short forced runs on the Llama tokenizer; open for a user decision (perf log 5p, S-10 lab legs). The quick tier's other failure, `olmoe_rows_are_batch_invariant`, is outside this path (reported).
+- [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama --quick` 875.3 tok/s and `--model olmoe --quick` 630.2 tok/s, golden1 PASS, failed=0 — no regression
 - [x] Commit: `feat(structured-output): verified jump-forward in the engine (S-10)`
 
 ## Task 13: Ladder serving cost — instrument, then the measured fix for the ORANGE dwell (S-14)

@@ -41,6 +41,10 @@ const READY_LIMIT: Duration = Duration::from_secs(900);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(200);
 
+/// The lab tests start one server each; every server sizes its KV pool to the whole card, so
+/// they run one at a time.
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// JSON Schema keywords the validator below implements.
 const SUPPORTED_KEYWORDS: &[&str] = &[
     "type",
@@ -575,31 +579,6 @@ fn metric_value(addr: SocketAddr, series: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The token ids of a chat choice (`logprobs` with the default string tokens — the ids are
-/// `"token_id:<n>"` when `return_tokens_as_token_ids` is set).
-fn lab_token_ids(choice: &Value) -> Vec<Option<u32>> {
-    choice["logprobs"]["tokens"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no logprobs.tokens: {choice}"))
-        .iter()
-        .map(|t| {
-            t.as_str()
-                .and_then(|s| s.strip_prefix("token_id:"))
-                .and_then(|s| s.parse().ok())
-        })
-        .collect()
-}
-
-/// The per-position logprobs of a chat choice.
-fn lab_logprobs(choice: &Value) -> Vec<f64> {
-    choice["logprobs"]["content"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no logprobs.content: {choice}"))
-        .iter()
-        .map(|e| e["logprob"].as_f64().expect("logprob"))
-        .collect()
-}
-
 /// P5p S-10 (lab): the four JSON cases at temperature 0, the verified jump-forward on and off
 /// — the same token ids (a divergence excused only at a near-tie under the golden token
 /// rule), logprobs within the strict golden bound, schema-valid content, and at most 0.8 ×
@@ -623,89 +602,126 @@ fn json_schema_jump_forward_matches() {
     let floor = tolerance["likely_logprob_floor"].as_f64().unwrap();
     let tail = tolerance["max_abs_logprob_diff_tail"].as_f64().unwrap();
 
-    let on = LabServer::start_with(&model_dir, "");
-    let off = LabServer::start_with(&model_dir, "structured_output:\n  jump_forward: false\n");
+    // One server at a time: each sizes its KV pool to the whole card.
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let cases: Vec<ToolRequest> = load_fixture()
         .into_iter()
         .filter(|c| c.id.starts_with("json_"))
         .collect();
     assert_eq!(cases.len(), 4, "the fixture's four JSON cases");
-
-    let (mut steps_on_sum, mut steps_off_sum) = (0.0f64, 0.0f64);
-    let (mut time_on_sum, mut time_off_sum) = (0.0f64, 0.0f64);
-    for case in &cases {
-        let expect = expectation(&case.request).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+    let body_of = |case: &ToolRequest| {
         let mut body = case.request.clone();
         body["model"] = json!(SERVED_NAME);
         body["temperature"] = json!(0.0);
         body["logprobs"] = json!(true);
         body["top_logprobs"] = json!(5);
-        let run = |server: &LabServer| {
-            let started = Instant::now();
-            let (status, text) = request(
-                server.addr,
-                "POST",
-                "/v1/chat/completions",
-                Some(&body.to_string()),
-            );
-            let wall = started.elapsed().as_secs_f64();
-            assert_eq!(status, 200, "{}: {text}", case.id);
-            let response: Value = serde_json::from_str(&text).expect("response JSON");
-            (response, wall)
-        };
-        let (jumped, time_on) = run(&on);
-        let (masked, time_off) = run(&off);
-        time_on_sum += time_on;
-        time_off_sum += time_off;
+        body
+    };
+    // Every case on one server (after one warm-up request): responses, wall times, and the
+    // accepted forced tokens each case added.
+    let serve = |extra: &str| {
+        let server = LabServer::start_with(&model_dir, extra);
+        let warm = body_of(&cases[0]);
+        let _ = request(
+            server.addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&warm.to_string()),
+        );
+        let accepted = r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#;
+        cases
+            .iter()
+            .map(|case| {
+                let before = metric_value(server.addr, accepted);
+                let started = Instant::now();
+                let (status, text) = request(
+                    server.addr,
+                    "POST",
+                    "/v1/chat/completions",
+                    Some(&body_of(case).to_string()),
+                );
+                let wall = started.elapsed().as_secs_f64();
+                assert_eq!(status, 200, "{}: {text}", case.id);
+                let response: Value = serde_json::from_str(&text).expect("response JSON");
+                (response, wall, metric_value(server.addr, accepted) - before)
+            })
+            .collect::<Vec<_>>()
+    };
+    let on = serve("");
+    let off = serve("structured_output:\n  jump_forward: false\n");
 
-        check_response(&expect, &jumped).unwrap_or_else(|e| panic!("{}: {e}", case.id));
-        check_response(&expect, &masked).unwrap_or_else(|e| panic!("{}: {e}", case.id));
-        let (ids_on, ids_off) = (
-            lab_token_ids(&jumped["choices"][0]),
-            lab_token_ids(&masked["choices"][0]),
-        );
-        assert_eq!(ids_on.len(), ids_off.len(), "{}: token counts", case.id);
-        let (lp_on, lp_off) = (
-            lab_logprobs(&jumped["choices"][0]),
-            lab_logprobs(&masked["choices"][0]),
-        );
-        for (i, (a, b)) in ids_on.iter().zip(&ids_off).enumerate() {
-            if a == b {
-                let bound = if lp_on[i] > floor { likely } else { tail };
+    let (mut steps_on_sum, mut steps_off_sum) = (0.0f64, 0.0f64);
+    let (mut time_on_sum, mut time_off_sum) = (0.0f64, 0.0f64);
+    for (case, ((jumped, time_on, accepted), (masked, time_off, accepted_off))) in
+        cases.iter().zip(on.iter().zip(&off))
+    {
+        let expect = expectation(&case.request).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        assert_eq!(*accepted_off, 0.0, "{}: the masked server jumped", case.id);
+        check_response(&expect, jumped).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        check_response(&expect, masked).unwrap_or_else(|e| panic!("{}: {e}", case.id));
+        let content_on = jumped["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .expect("logprobs.content (on)");
+        let content_off = masked["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .expect("logprobs.content (off)");
+        let margin = tolerance["margin_nats"].as_f64().unwrap();
+        let mut diverged = false;
+        for (i, (a, b)) in content_on.iter().zip(content_off).enumerate() {
+            let (lp_on, lp_off) = (
+                a["logprob"].as_f64().unwrap(),
+                b["logprob"].as_f64().unwrap(),
+            );
+            if a["token"] == b["token"] {
+                let bound = if lp_off > floor { likely } else { tail };
                 assert!(
-                    (lp_on[i] - lp_off[i]).abs() <= bound,
-                    "{}: logprob {i} differs by {} ({:?} vs {:?})",
+                    (lp_on - lp_off).abs() <= bound,
+                    "{}: logprob {i} differs by {} ({lp_on} vs {lp_off})",
                     case.id,
-                    (lp_on[i] - lp_off[i]).abs(),
-                    lp_on[i],
-                    lp_off[i]
+                    (lp_on - lp_off).abs()
                 );
                 continue;
             }
             // A divergence is excused only at a near-tie: the masked run's top two candidates
-            // within `margin_nats` of each other (the golden token rule).
-            let top = &masked["choices"][0]["logprobs"]["content"][i]["top_logprobs"];
-            let top = top.as_array().expect("top_logprobs");
+            // within `margin_nats` of each other (the golden token rule); the rest of the two
+            // outputs then follow different prefixes and are not compared.
+            let top = b["top_logprobs"].as_array().expect("top_logprobs");
             assert!(
-                top.len() >= 2,
-                "{}: {i}: tokens differ off a near-tie",
-                case.id
+                top.len() >= 2
+                    && top[0]["logprob"].as_f64().unwrap() - top[1]["logprob"].as_f64().unwrap()
+                        <= margin,
+                "{}: {i}: tokens differ ({} vs {}) off a near-tie",
+                case.id,
+                a["token"],
+                b["token"]
             );
-            let margin = tolerance["margin_nats"].as_f64().unwrap();
-            assert!(
-                top[0]["logprob"].as_f64().unwrap() - top[1]["logprob"].as_f64().unwrap() <= margin,
-                "{}: {i}: tokens differ ({a:?} vs {b:?}) off a near-tie",
+            println!("{}: excused near-tie divergence at token {i}", case.id);
+            diverged = true;
+            break;
+        }
+        if !diverged {
+            assert_eq!(
+                content_on.len(),
+                content_off.len(),
+                "{}: token counts",
                 case.id
             );
         }
-        // The baseline the jump-forward is judged against: the off run's completion tokens
-        // (each of them a forward step there).
-        let tokens_off = jumped["usage"]["completion_tokens"].as_f64().unwrap();
-        steps_on_sum = metric_value(on.addr, "turbine_jump_forward_steps_total");
+        // Forward steps: the masked run decodes one token per step; a verified step yields
+        // its accepted forced tokens plus one, so the jump-forward run takes
+        // `completion_tokens - accepted` steps.
+        let tokens_on = jumped["usage"]["completion_tokens"].as_f64().unwrap();
+        let tokens_off = masked["usage"]["completion_tokens"].as_f64().unwrap();
+        let steps_on = tokens_on - accepted;
+        steps_on_sum += steps_on;
         steps_off_sum += tokens_off;
+        time_on_sum += time_on;
+        time_off_sum += time_off;
         println!(
-            "{}: wall on={time_on:.2}s off={time_off:.2}s, completion tokens={tokens_off}",
-            case.id
+            "{}: tokens={tokens_off} accepted={accepted} steps on={steps_on} off={tokens_off} \
+             ({:.3} steps/token), wall on={time_on:.2}s off={time_off:.2}s",
+            case.id,
+            steps_on / tokens_on.max(1.0)
         );
     }
     println!(
@@ -730,6 +746,7 @@ fn tools_and_json_schema() {
     }
     let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
     let cases = load_fixture();
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let server = LabServer::start(&model_dir);
 
     let mut failures = Vec::new();
