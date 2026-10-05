@@ -1024,11 +1024,14 @@ fn paged_attention_rows_are_batch_invariant() {
 }
 
 /// The b1 decode kernel's rows are bitwise batch-invariant at every batch size (a constant split
-/// count, every sequence independent): one decode row (24/8 heads, a 768-token context) alone and
-/// inside decode batches of 2, 8, 16 and 64 at the first, a middle and the last position. The b1
-/// kernel is the decode default at every batch size (selection is per op config, so no sequence
-/// tier exists and no cross-implementation bound is needed). Breaks if the splits depend on the
-/// batch, a split reads another sequence's rows, or the combine order depends on arrival.
+/// count, every sequence independent): 24 target decode rows (24/8 heads, contexts of 97 to 4,000
+/// tokens, each its own q/k/v), each alone and inside decode batches of 2, 16 and 64 at the first,
+/// a middle and the last position. One BF16 row is a weak witness of a changed F32 summation
+/// order (a re-partitioned split flips ~1 element of 3,072), so the case compares 24 rows ×
+/// 9 batch shapes; mutation-checked against a split count that depends on the grid. The b1 kernel
+/// is the decode default at every batch size (selection is per op config, so there is no sequence
+/// tier and no cross-implementation bound). Breaks if the splits depend on the batch, a split
+/// reads another sequence's rows, or the combine order depends on arrival.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn b1_decode_rows_are_batch_invariant() {
@@ -1038,44 +1041,47 @@ fn b1_decode_rows_are_batch_invariant() {
     let h = setup();
     let mut rng = Rng(31);
     let (q_heads, kv_heads) = (24usize, 8usize);
-    let decode = Seq {
-        q_len: 1,
-        kv_len: 768,
-    };
     let d = |kv_len: usize| Seq { q_len: 1, kv_len };
-    let rows: [Vec<f32>; 3] = [
-        rng.normal(q_heads * HEAD_DIM, 1.0),
-        rng.normal(kv_heads * HEAD_DIM, 1.0),
-        rng.normal(kv_heads * HEAD_DIM, 1.0),
-    ];
-    let run = |seqs: &[Seq], at: usize| {
-        paged_run_heads(
-            &h,
-            AttentionKind::DecodePaged,
-            seqs,
-            at,
-            &rows,
-            99,
-            q_heads,
-            kv_heads,
-        )
-    };
-    let (alone, impl_name) = run(&[decode], 0);
-    assert_eq!(impl_name, "turbine_hip_b1_decode");
     let others: Vec<Seq> = (0..64).map(|i| d(20 + 37 * i)).collect();
     let mut out = Vec::new();
-    for n in [2usize, 8, 16, 64] {
-        for at in [0, n / 2, n - 1] {
-            let mut seqs = others[..n].to_vec();
-            seqs[at] = decode;
-            let (got, name) = run(&seqs, at);
-            assert_eq!(name, "turbine_hip_b1_decode");
-            out.push(Outcome::of(
-                format!("b1 decode {n} decodes at {at}"),
-                &alone,
-                &got,
-                &impl_name,
-            ));
+    for t in 0..24usize {
+        let target = d(97 + (t * 1_571) % 3_904);
+        let rows: [Vec<f32>; 3] = [
+            rng.normal(q_heads * HEAD_DIM, 1.0),
+            rng.normal(kv_heads * HEAD_DIM, 1.0),
+            rng.normal(kv_heads * HEAD_DIM, 1.0),
+        ];
+        let seed = 99 + t as u64;
+        let run = |seqs: &[Seq], at: usize| {
+            paged_run_heads(
+                &h,
+                AttentionKind::DecodePaged,
+                seqs,
+                at,
+                &rows,
+                seed,
+                q_heads,
+                kv_heads,
+            )
+        };
+        let (alone, impl_name) = run(&[target], 0);
+        assert_eq!(impl_name, "turbine_hip_b1_decode");
+        for n in [2usize, 16, 64] {
+            for at in [0, n / 2, n - 1] {
+                let mut seqs = others[..n].to_vec();
+                seqs[at] = target;
+                let (got, name) = run(&seqs, at);
+                assert_eq!(name, "turbine_hip_b1_decode");
+                out.push(Outcome::of(
+                    format!(
+                        "b1 decode target {t} (kv_len {}) in {n} decodes at {at}",
+                        target.kv_len
+                    ),
+                    &alone,
+                    &got,
+                    &impl_name,
+                ));
+            }
         }
     }
     assert_invariant(&out);
