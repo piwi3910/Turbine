@@ -3324,3 +3324,5 @@ golden tolerance instead of bitwise.
 - A) Keep the bitwise constraint; the CK rmsnorm item stays out of the decode-bandwidth task
 - B) Relax to golden-tolerance for single-GPU only (TP keeps the sharded kernel); the TP bit-exactness tests change
   to tolerance — needs your explicit numerics call
+
+**Decision (user, 2026-10-05): A.** The bitwise TP constraint stays; the CK rmsnorm item remains out of scope.
