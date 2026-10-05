@@ -34,14 +34,15 @@
 # --dry-run prints every command that would contact the host instead of running it.
 # TURBINE_LAB_SERVE_TIMEOUT: seconds to wait for /ready once the pod runs (default 3600; a cold
 #   run compiles Composable Kernel and the release server).
-# One GPU job at a time (coordinator rule 2026-09-29, until novanas's PSU is replaced;
-#   TURBINE_LAB_ONE_GPU_JOB=0 turns it off): a start first takes /home/piwi/turbine-ci/bench.lock
-#   exclusively (through bench.gate, like scripts/bench-lock.sh) in a holder process on novanas
+# bench.lock: a start first takes /home/piwi/turbine-ci/bench.lock shared (passing bench.gate
+#   first, like scripts/bench-lock.sh --shared) in a holder process on novanas
 #   (runs/serve-locks/<run id>.sh) that keeps it while the serve Job exists and releases it when
-#   the Job is gone (--stop, a failed start, an interrupt), so it covers the whole life of a
-#   server this script leaves running. Under a caller that already holds bench.lock exclusively
-#   (scripts/bench-lock.sh exports TURBINE_BENCH_LOCK_HELD) no second lock is taken; under a
-#   shared hold the start is refused (it would wait for itself). --gpus 2 is refused.
+#   the Job is gone (--stop, a failed start, an interrupt), so a benchmark (exclusive) waits for
+#   a server this script leaves running while one serve or test Job per card runs side by side.
+#   Under a caller that already holds bench.lock (scripts/bench-lock.sh exports
+#   TURBINE_BENCH_LOCK_HELD) no second lock is taken. TURBINE_LAB_ONE_GPU_JOB=1 restores the
+#   one-GPU-job rule of 2026-09-29 (lifted with the new PSU, decision 2026-10-05): the hold is
+#   exclusive, a caller's shared hold is refused (it would wait for itself) and --gpus 2 is refused.
 #   Every exit before the Job is applied (upload failure, apply failure, interrupt) releases the
 #   holder at once (EXIT trap); a holder whose Job has not appeared 15 min after it got the lock
 #   (TURBINE_LAB_HOLDER_GRACE seconds) releases itself, even if the script was killed outright.
@@ -548,7 +549,7 @@ start_vllm() {
 	fi
 }
 
-ONE_GPU_JOB="${TURBINE_LAB_ONE_GPU_JOB:-1}"
+ONE_GPU_JOB="${TURBINE_LAB_ONE_GPU_JOB:-0}"
 LOCK_DIR="${CI_ROOT}/runs/serve-locks"
 LOCK_TAG="${LOCK_DIR}/${RUN_ID}.sh"
 LOCK_HELD=0
@@ -560,15 +561,19 @@ HOLDER_GRACE="${TURBINE_LAB_HOLDER_GRACE:-900}"
 # host has it. The holder waits up to HOLDER_GRACE (15 min) for the Job to appear (upload and apply), then holds
 # while `kubectl get job` finds it; a kubectl error counts as still present.
 gpu_lock() {
-	[[ "$ONE_GPU_JOB" == 1 ]] || return 0
-	local gpus=$SERVE_GPUS
+	local gpus=$SERVE_GPUS lock_word=shared
 	[[ "$MODE" == vllm ]] && gpus=$VLLM_GPUS
-	if [[ $gpus -eq 2 && $DRY_RUN -eq 1 ]]; then
-		echo "+ a real run refuses --gpus 2 while one GPU job at a time holds (TURBINE_LAB_ONE_GPU_JOB=0 overrides)"
-		return 0
-	fi
-	if [[ $gpus -eq 2 ]]; then
-		fail "--gpus 2 refused: one GPU job at a time on novanas until its PSU is replaced (TURBINE_LAB_ONE_GPU_JOB=0 overrides)" 2
+	local take="flock -x ${CI_ROOT}/bench.gate true && exec flock -s ${CI_ROOT}/bench.lock sh ${LOCK_TAG}"
+	if [[ "$ONE_GPU_JOB" == 1 ]]; then
+		lock_word=exclusive
+		take="exec flock -x ${CI_ROOT}/bench.gate flock -x ${CI_ROOT}/bench.lock sh ${LOCK_TAG}"
+		if [[ $gpus -eq 2 && $DRY_RUN -eq 1 ]]; then
+			echo "+ a real run refuses --gpus 2 while one GPU job at a time holds (TURBINE_LAB_ONE_GPU_JOB=1)"
+			return 0
+		fi
+		if [[ $gpus -eq 2 ]]; then
+			fail "--gpus 2 refused: one GPU job at a time on novanas (TURBINE_LAB_ONE_GPU_JOB=1)" 2
+		fi
 	fi
 	case " ${TURBINE_BENCH_LOCK_HELD:-} " in
 	*" bench:x "*)
@@ -576,11 +581,15 @@ gpu_lock() {
 		return 0
 		;;
 	*" bench:s "*)
-		fail "bench.lock is held shared by the caller; one GPU job at a time needs it exclusively (wrap in scripts/bench-lock.sh without --shared)" 2
+		if [[ "$ONE_GPU_JOB" == 1 ]]; then
+			fail "bench.lock is held shared by the caller; one GPU job at a time needs it exclusively (wrap in scripts/bench-lock.sh without --shared)" 2
+		fi
+		say "bench.lock already held shared by the caller"
+		return 0
 		;;
 	esac
 	if [[ $DRY_RUN -eq 1 ]]; then
-		echo "+ hold ${CI_ROOT}/bench.lock exclusively on ${HOST} (holder ${LOCK_TAG}) while job ${JOB} exists"
+		echo "+ hold ${CI_ROOT}/bench.lock ${lock_word} on ${HOST} (holder ${LOCK_TAG}) while job ${JOB} exists"
 		return 0
 	fi
 	remote_stdin "mkdir -p ${LOCK_DIR} && cat >${LOCK_TAG}" <<HOLDER || fail "cannot write the bench.lock holder ${LOCK_TAG}"
@@ -600,11 +609,11 @@ done
 while present; do sleep 5; done
 rm -f ${LOCK_TAG}.state
 HOLDER
-	remote "setsid nohup flock -x ${CI_ROOT}/bench.gate flock -x ${CI_ROOT}/bench.lock sh ${LOCK_TAG} >${LOCK_TAG}.log 2>&1 </dev/null &" ||
+	remote "setsid nohup sh -c '${take}' >${LOCK_TAG}.log 2>&1 </dev/null &" ||
 		fail "cannot start the bench.lock holder on ${HOST}"
 	LOCK_HELD=1
 	trap on_interrupt INT TERM
-	say "waiting for ${CI_ROOT}/bench.lock (exclusive; one GPU job at a time)"
+	say "waiting for ${CI_ROOT}/bench.lock (${lock_word})"
 	local waited=0
 	until remote "test -e ${LOCK_TAG}.state"; do
 		if ((waited % 300 == 0 && waited > 0)); then say "still waiting for bench.lock (${waited} s)"; fi

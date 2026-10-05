@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
 #
-#   scripts/lab-bench.sh [--dry-run] [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests]
+#   scripts/lab-bench.sh [--dry-run] [--gpu 0|1] [--model <model>] [--label L] [--with-tests] [--skip-tests]
 #                         [--golden16] [--batched-bounds] [--c1] [--quality] [--quick]
 #                         [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>]
 #                         [-- <--set k=v>...]
@@ -18,10 +18,8 @@
 #    kernel library (CMake, cached); workspace tests only with --with-tests (off by default:
 #    a bench-only landing step should not pay for a full test build; --skip-tests is accepted as
 #    a no-op alias for that same default, kept for compatibility with older call sites).
-# 2. Starts the server directly on the host, pinned to GPU 0 with ROCR_VISIBLE_DEVICES, so every
-#    step runs on the same card. GPU 0 is the only card with a throughput-comparable PCIe link;
-#    --gpu only accepts 0 and refuses anything else with a clear message, rather than silently
-#    producing numbers that are not comparable with earlier runs.
+# 2. Starts the server directly on the host, pinned to --gpu (0, the default, or 1) with
+#    ROCR_VISIBLE_DEVICES, so every step runs on the same card; any other value is refused.
 # 3. Under the exclusive benchmark lock: golden at concurrency 1 (the gate; always), golden at 16
 #    only with --golden16 (opt-in: it roughly doubles the golden time for a number this step does
 #    not gate on; --batched-bounds judges golden c1 and c16 by the slug's batched logprob bounds, the
@@ -64,7 +62,7 @@ mt_sessions=0
 mt_conc=0
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4" >&2
 	exit 2
 }
@@ -144,13 +142,16 @@ while [[ $# -gt 0 ]]; do
 	*) usage ;;
 	esac
 done
-# GPU 0 is the only card perf numbers are comparable across: GPU 1's PCIe link is fixed at a
-# different (lower) bandwidth, so a throughput run there would silently mislead. lab-bench.sh is
-# a throughput/perf tool end to end, so this refuses rather than warns.
-if [[ "$gpu" != 0 ]]; then
-	echo "lab-bench: --gpu $gpu refused: throughput and golden numbers must come from GPU 0 (GPU 1's PCIe link is not comparable); functional-only lab-test.sh runs may use GPU 1" >&2
+# novanas has two R9700s. GPU 0 holds the recorded baselines; GPU 1 is benched since the new
+# PSU (decision 2026-10-05) and its comparability with GPU 0 is the GPU 1 benchmark's verdict.
+case "$gpu" in
+0) ;;
+1) echo "lab-bench: WARN --gpu 1: compare its numbers only with GPU 1 runs until the GPU 1 vs GPU 0 benchmark rules (decision 2026-10-05)" >&2 ;;
+*)
+	echo "lab-bench: --gpu is 0 or 1 (novanas has two R9700s), got: $gpu" >&2
 	exit 2
-fi
+	;;
+esac
 # model → weights directory (under /home/piwi/turbine-models), golden slug (under tests/golden)
 # and lab config. The BF16 models keep their phase2c configs so baselines stay comparable; each
 # Phase 6a checkpoint gets scripts/lab/phase6-novanas-<model>.yaml in the task that proves it.
@@ -279,7 +280,7 @@ fi
 # CPU fixture jobs (scripts/golden/*) are paused from here to the end (scripts/fixture-pause.sh
 # explains why: their swap-in pushes the server's pressure controller into SURVIVAL).
 # From here to the end the run also holds bench.lock exclusively (the gate first, as
-# scripts/bench-lock.sh does): GPU 0 serves this run only, so kernel evaluations (bench-lock),
+# scripts/bench-lock.sh does): the card serves this run only, so kernel evaluations (bench-lock),
 # lab-test and lab-serve Jobs wait for it; builds do not (nice 19 on cores 12-15, away from 0-11).
 if [[ $dry -eq 1 ]]; then
 	echo "+ ssh -o BatchMode=yes $host flock -x bench.gate flock -x bench.lock (the exclusive bench lock)"
