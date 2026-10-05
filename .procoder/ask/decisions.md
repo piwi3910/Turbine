@@ -3445,3 +3445,18 @@ intact); the two-GPU fault-injection full tier passed (66 targets, 0 failed); th
 dual-GPU serve+bench passes PASS with no crash, no GPU drop-out and no link downtrain. The user judged the soak good.
 The one-GPU-job rule (coordinator 2026-09-29, "until novanas's PSU is replaced") is lifted; the GPU-0-only perf rule
 waits on the GPU 1 benchmark (decision "New PSU validation sequence, then the GPU 1 benchmark").
+
+## 5p jump-forward misses its speed targets on Llama (2026-10-06)
+
+Lab result (`p5p-t11t12-lab` 8eba452d): `json_schema_jump_forward_matches` on Llama-3.2-3B is correct — the four JSON
+cases give identical tokens with jump-forward on and off, logprobs within the strict golden bounds, schema-valid —
+but the S-10 speed targets miss: forward steps 0.899× (target ≤ 0.8×), wall time 0.989× (target ≤ 0.9×). Only 15 of
+148 tokens were forced: Llama's tokenizer merges JSON keys, so the grammar forces 1–3 tokens at a time, and
+`json_object` forces none. Benches unchanged (Llama 875.3, OLMoE 630.2 tok/s quick, golden c1 PASS).
+
+- A) Keep jump-forward on by default; re-bound the S-10 targets to what the workload measures (no cost, correct)
+- B) Keep it on; defer the speed targets to a longer-key or tool-heavy workload measured later
+- C) Make it opt-in until a workload shows the gain
+
+**Decision (user, 2026-10-06): A.** Jump-forward stays on by default; the S-10 speed targets are re-bound to the
+measured Llama workload (steps 0.899×, wall 0.989×; correctness unchanged) and Tasks 11–12 close.
