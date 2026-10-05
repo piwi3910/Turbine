@@ -16,12 +16,15 @@
 //                                  (multiple of 128), 5
 //                                  turbine_hip_mixed_staged, 6
 //                                  turbine_hip_mixed
-//   attention_decode_paged       0 ck_tile_fmha_splitkv [ck] (grouped query
+//   attention_decode_paged       0 turbine_hip_b1_decode [turbine_hip]
+//                                  (batch-1 decode of grouped query heads, at
+//                                  most 8 sequences, any page size),
+//                                  1 ck_tile_fmha_splitkv [ck] (grouped query
 //                                  heads, pages of a multiple of 128 tokens),
-//                                  1 ck_tile_fmha_pagedkv [ck], 2 turbine_hip
-//                                  (BF16 pages); FP8 pages: 3
-//                                  turbine_hip_fp8_decode, 4 turbine_hip_fp8;
-//                                  mixed-format pages (v2.11): 5
+//                                  2 ck_tile_fmha_pagedkv [ck], 3 turbine_hip
+//                                  (BF16 pages); FP8 pages: 4
+//                                  turbine_hip_fp8_decode, 5 turbine_hip_fp8;
+//                                  mixed-format pages (v2.11): 6
 //                                  turbine_hip_mixed
 //   copy_blocks                  0 hip_memcpy_d2d [turbine_hip]
 //   moe_experts                  0 turbine_hip_moe_small_m (hidden and inter
@@ -206,6 +209,8 @@ const ImplEntry kPrefillPagedImpls[] = {
                                                          kTurbine),
 };
 const ImplEntry kDecodePagedImpls[] = {
+    entry<Paged<kDecodePaged, PagedPath::TurbineB1>>("turbine_hip_b1_decode",
+                                                     kTurbine),
     entry<Paged<kDecodePaged, PagedPath::CkSplitkv>>(
         "ck_tile_fmha_splitkv", kCk, 0, page_multiple_allows),
     entry<Paged<kDecodePaged, PagedPath::CkPagedkv>>(

@@ -801,10 +801,25 @@ fn paged_run(
     target_rows: &[Vec<f32>; 3],
     pool_seed: u64,
 ) -> (Vec<f32>, String) {
+    paged_run_heads(h, kind, seqs, target, target_rows, pool_seed, HEADS, HEADS)
+}
+
+/// [`paged_run`] at explicit head counts: the b1 kernel's grouped-head tier.
+#[allow(clippy::too_many_arguments)]
+fn paged_run_heads(
+    h: &Hip,
+    kind: AttentionKind,
+    seqs: &[Seq],
+    target: usize,
+    target_rows: &[Vec<f32>; 3],
+    pool_seed: u64,
+    q_heads: usize,
+    kv_heads: usize,
+) -> (Vec<f32>, String) {
     let cfg = AttentionConfig {
         kind,
-        num_q_heads: HEADS as u32,
-        num_kv_heads: HEADS as u32,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: kv_heads as u32,
         head_dim: HEAD_DIM as u32,
         dtype: DType::BF16,
         block_tokens: Some(BLOCK_TOKENS as u32),
@@ -813,7 +828,7 @@ fn paged_run(
     let kernel = h.provider.attention().expect("hip attention");
     assert!(kernel.supports(&cfg), "{cfg}");
     let impl_name = kernel.implementation(&cfg);
-    let row = HEADS * HEAD_DIM;
+    let row = q_heads * HEAD_DIM;
     let blocks_of: Vec<usize> = seqs
         .iter()
         .map(|s| s.kv_len.div_ceil(BLOCK_TOKENS))
@@ -838,7 +853,7 @@ fn paged_run(
     // The pool history: the same seeded values in every run, so the target's blocks match.
     let pool = upload(
         h,
-        &[num_blocks, 2, BLOCK_TOKENS, HEADS, HEAD_DIM],
+        &[num_blocks, 2, BLOCK_TOKENS, kv_heads, HEAD_DIM],
         DType::BF16,
         &Rng(pool_seed).normal(pool_len, 1.0),
     );
@@ -853,7 +868,7 @@ fn paged_run(
     for (d, t) in data.iter_mut().zip(target_rows) {
         d[start * row..(start + seqs[target].q_len) * row].copy_from_slice(t);
     }
-    let shape = [total_q, HEADS, HEAD_DIM];
+    let shape = [total_q, q_heads, HEAD_DIM];
     let q = upload(h, &shape, DType::BF16, &data[0]);
     let k = upload(h, &shape, DType::BF16, &data[1]);
     let v = upload(h, &shape, DType::BF16, &data[2]);
@@ -1000,6 +1015,101 @@ fn paged_attention_rows_are_batch_invariant() {
                 &impl_name,
             ));
         }
+    }
+    assert_invariant(&out);
+}
+
+/// The b1 decode kernel's rows are bitwise batch-invariant within its tier (fixed splits, every
+/// sequence independent): one decode row (24/8 heads, a ~768-token context) alone and inside
+/// decode batches of 2 and 8 (the tier edge), at the first and last position. Above the tier CK's
+/// split-KV kernel serves and its numerics class differs (CK's FMHA chain vs the b1 kernel's F32
+/// P), so the 16-decode comparisons are bounded, not bitwise. Breaks if the splits depend on the
+/// batch, a split reads another sequence's rows, or the tier boundary moved.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn b1_decode_rows_are_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    let h = setup();
+    let mut rng = Rng(31);
+    let (q_heads, kv_heads) = (24usize, 8usize);
+    let row = q_heads * HEAD_DIM;
+    let decode = Seq {
+        q_len: 1,
+        kv_len: 768,
+    };
+    let d = |kv_len: usize| Seq { q_len: 1, kv_len };
+    let rows: [Vec<f32>; 3] = [
+        rng.normal(row, 1.0),
+        rng.normal(row, 1.0),
+        rng.normal(row, 1.0),
+    ];
+    let (alone, impl_name) = paged_run_heads(
+        &h,
+        AttentionKind::DecodePaged,
+        &[decode],
+        0,
+        &rows,
+        99,
+        q_heads,
+        kv_heads,
+    );
+    assert_eq!(impl_name, "turbine_hip_b1_decode");
+    let mut out = Vec::new();
+    // Within the tier: the same bits whatever the batch.
+    let decodes: Vec<Seq> = (0..15).map(|i| d(20 + 37 * i)).collect();
+    let with = |n: usize, at: usize| {
+        let mut v = decodes[..n].to_vec();
+        v[at] = decode;
+        v
+    };
+    for (name, seqs, at) in [
+        ("2 decodes at 0", with(2, 0), 0),
+        ("2 decodes at 1", with(2, 1), 1),
+        ("8 decodes at 0", with(8, 0), 0),
+        ("8 decodes at 7", with(8, 7), 7),
+    ] {
+        let (got, _) = paged_run_heads(
+            &h,
+            AttentionKind::DecodePaged,
+            &seqs,
+            at,
+            &rows,
+            99,
+            q_heads,
+            kv_heads,
+        );
+        out.push(Outcome::of(
+            format!("b1 decode {name}"),
+            &alone,
+            &got,
+            &impl_name,
+        ));
+    }
+    // Across the tier (CK splitkv serves at 16): a recorded bound, like the
+    // small-m MoE tier's cross-tier comparisons. The run prints the actual
+    // max_abs, so a growing spread stays visible.
+    for at in [0usize, 8] {
+        let seqs = with(16, at);
+        let (got, other) = paged_run_heads(
+            &h,
+            AttentionKind::DecodePaged,
+            &seqs,
+            at,
+            &rows,
+            99,
+            q_heads,
+            kv_heads,
+        );
+        assert_eq!(other, "ck_tile_fmha_splitkv");
+        out.push(Outcome::bounded(
+            format!("b1 decode vs splitkv at 16 decodes ({other}) at {at}"),
+            &alone,
+            &got,
+            &impl_name,
+            0.05,
+        ));
     }
     assert_invariant(&out);
 }
