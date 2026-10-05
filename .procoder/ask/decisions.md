@@ -3326,3 +3326,93 @@ golden tolerance instead of bitwise.
   to tolerance — needs your explicit numerics call
 
 **Decision (user, 2026-10-05): A.** The bitwise TP constraint stays; the CK rmsnorm item remains out of scope.
+
+## 5p decode bandwidth II: the K-split small-m MoE GEMV lands as a numerics class (2026-10-05)
+
+From `p5p-decodebw2` (the "~90 % of roofline before Phase 8" tasking, 2026-10-04). The small-m
+MoE GEMV streams one 16-column weight strip through one wave from k = 0 to depth; at one routed
+row per expert that is 512 waves (OLMoE gate-up) whose 16-byte loads keep too few bytes in
+flight. The landed kernel splits k across the block's 8 waves instead of the columns -- every
+wave 16 columns and a 1/8 slice, partials combined through LDS in ascending slice order -- 8x
+the waves. Served OLMoE b1 on novanas GPU 0: expert GEMVs 428-490 -> ~610 GB/s, step 7.95 ->
+6.96 ms, effective b1 bandwidth 297 -> 339 GB/s, c1 tok/s 136.3 -> 156.8 (+15 %), c16 630.0 ->
+624.4 (within the 0.97x bound), golden c1 PASS. Op-level (cache-cycled): 264.5 -> 201.7 us per
+layer at 8 routed rows, 575-607 GB/s at 128-512 rows.
+
+The tasking accepted a numerics-class change, so the slice-summed order replaces the 2026-09-27
+tiers-are-bitwise-equal design at the decode tier: within the small-m tier a row's output is
+still bitwise batch-invariant (0 differing at every tested batch shape, 8-512 routed rows);
+across `moe_small_max_rows` the same row now agrees with the unsplit prefill/grouped chains only
+within 1 BF16 ulp (measured: max_abs 0.125, 377 of 133,120 outputs at 520 rows, 19,054 of
+3,145,728 at 12,288, heavy-tailed activations). A request whose batch crosses the 512-row
+boundary can therefore change its rounding there -- the property the 2026-09-27 OLMoE
+concurrency-16 golden flip restored is now a tolerance property. `moe_rows_are_batch_invariant`
+compares within the tier bitwise and across the boundary against the recorded 0.25 bound
+(`Outcome::bounded`; mutation-checked: bound 0 fails). The scalar-FMA alternative (the
+pre-2026-09-27 kernels, ~575 GB/s op-level at 4-16 tokens) was rejected: the same numerics-class
+problem with no chain relation to the tiers above.
+
+## 5p decode bandwidth II: the gap floor and the batch-1 attention / fusion evaluations (2026-10-05)
+
+From `p5p-decodebw2`, continuing the ~90 %-of-roofline tasking after the K-split small-m MoE GEMV
+landed (previous entry). The served traces (novanas GPU 0, `lab-decode-profile.sh` at 16af9991;
+Llama 228 steps, OLMoE 424) size what is left, and three items are evaluated rather than landed:
+
+- **The inter-kernel gaps are a device-side floor, not a host defect.** Both models replay ONE
+  graph per decode step, yet ~3.6 us of dead time remains at every dependent-kernel boundary
+  (Llama ~300 kernels/step -> 1.32 ms; OLMoE ~330 -> 1.21 ms). Kernels are graph-owned, no
+  memory ops run between them, kernarg placement is a no-op (the previous builder's finding):
+  the cost is dispatch/drain latency of small dependent kernels on RDNA4. Only fusion shrinks
+  the boundary count; host-side levers are exhausted.
+- **Batch-1 attention (CK splitkv, 21.7 us/layer Llama, ~27.5 OLMoE -- KV ~3 MB at ctx 768,
+  ~140 GB/s effective, launch-bound).** Candidates evaluated: llama.cpp's RDNA4 decode kernels
+  are not reusable as an implementation -- they are coupled to llama.cpp's contiguous KV and
+  unpaged, non-batched layout, none of which Turbine's paged-KV + GQA + continuous-batching
+  decode attention can present; worth mining for ideas only. CK's own non-split pagedkv variant
+  saves the merge launch but keeps the same tiling family. The only candidate with real
+  headroom is an own split-KV decode kernel (a wave per sequence x kv-head streaming the
+  sequence's pages, fixed summation order): estimated ~9-10 us/layer vs 21.7, i.e. ~0.34 ms/step
+  Llama, ~0.25 OLMoE -- but it is a new numerics class (golden tolerance + invariance amend, as
+  with the K-split GEMV) and a kernel-plus-tests project of its own. NOT tasked by this entry;
+  recorded for the next decode-bandwidth pass.
+- **rope fused into the paged append (bit-exact, ~0.18 ms/step Llama, ~0.1 OLMoE):** rope only
+  needs to write q for attention (the appended k lands in the pool anyway), so the append kernel
+  can rope k in place while copying and rope q alongside -- same math, same order, bit-exact.
+  Requires the attention-decode descriptor to carry the rope parameters (ABI extension) and the
+  executor to skip the standalone rope op on decode steps. Also NOT landed here; handed off.
+- **Routing-chain fusion (OLMoE)**: the bit-exact fraction is small -- positions (1.6 us) is
+  one launch per layer whose inverse permutation the scatter could compute only by an
+  O(rows) scan per block (bad above decode batches), or via an ABI extension letting
+  `moe_route`'s group kernel write pos where it already writes sorted_rows (bit-exact, one
+  launch saved); and the scatter's accumulator can switch to write-first (round(0 + x) = x, so
+  the bits are unchanged), deleting the per-layer add-two-zero-buffers launch. The sized
+  ~0.4 ms included fusing the router GEMM (10.5 us/layer, launch-bound) into the route kernel --
+  a numerics-class change to the logits feeding softmax/topk. The bit-exact fraction (~0.15 ms)
+  is handed off with the designs; the router-GEMM fusion is a numerics-class item for the next
+  pass.
+
+With the K-split landing, the measured state: Llama 491 GB/s (0.77x), OLMoE 339 GB/s (0.53x).
+The floor if the handed-off items land: Llama ~12.3 ms -> ~520 GB/s (81 %), OLMoE ~6.3 ms ->
+~375 GB/s (59 %). The ~90 % target (576 GB/s) is not reachable within the current design: the
+binding constraints are the ~3.6 us/kernel gap floor across ~300 kernels/step, OLMoE's all-steps
+GEMM row-invariance (which locks its attention projections to the invariant hipBLASLt rows at
+258-462 GB/s), and the `rmsnorm_sharded` bitwise TP constraint on the CK rmsnorm. Reaching
+farther needs either megakernel-scale fusion of the whole decode step or relaxed invariance
+constraints -- both design decisions above this task's authority.
+
+## 5p decode-BW round 2: the ~90 % roofline floor (decision open, 2026-10-04)
+
+From `p5p-decodebw2` (merged): the K-split small-m MoE GEMV landed (OLMoE c1 136.3 → 156.8 tok/s, +15 %; expert GEMVs
+~610 GB/s; a new numerics class — bitwise batch-invariant within the small-m tier, cross-tier bounded 0.25). The user's
+~90 % target (decision 2026-10-04, "Phase sequencing") is **not reachable in the current design**; the floor analysis:
+(1) ~3.6 µs dead time per dependent-kernel boundary inside the single graph replay (~300 kernels/step ≈ 1.2–1.3 ms —
+only fusion shrinks it); (2) OLMoE's all-steps row-invariance GEMM lockout; (3) the `rmsnorm_sharded` bitwise TP
+constraint (user decision 2026-10-05 A kept it). Final: Llama 491 GB/s (0.77×), OLMoE 339 GB/s (0.53×); with the
+handed-off items (b1 attention own kernel, rope-into-append, bit-exact route-chain fraction): Llama ~520 GB/s (0.81×),
+OLMoE ~375 (0.59×).
+
+- A) Accept the floor as 5p's decode-bandwidth exit state; Phase 8 (speculative decoding — the multiplier) specs next;
+  these items stay recorded
+- B) Task the b1 attention own kernel now (new numerics class, kernel project) — Llama ~0.81×
+- C) Relax the OLMoE all-steps GEMM invariance (→ per-m GEMV) — OLMoE gains, breaks the invariance guarantee
+- D) Relax the `rmsnorm_sharded` bitwise TP constraint (→ CK rmsnorm n=2048) — ~0.5 ms OLMoE

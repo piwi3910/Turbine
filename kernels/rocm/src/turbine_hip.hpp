@@ -282,6 +282,15 @@ int32_t launch_moe_wmma_gemv(turbine_ctx *ctx,
                              void *act, void *down);
 // hidden and inter are multiples of the decode kernels' load step (128).
 bool moe_gemv_shape(const turbine_moe_experts_desc *d);
+// The K-split decode GEMV (moe_grouped.hip): the decode GEMV with the depth
+// split across the block's waves, the partials combined through LDS in
+// ascending slice order -- 8x the waves, one 1/kSplits stream per wave. A
+// numerics class of its own (the slice-summed order is not bitwise the tiers'
+// unsplit chains, decision 2026-10-05). Needs moe_gemv_ksplit_shape(d).
+bool moe_gemv_ksplit_shape(const turbine_moe_experts_desc *d);
+int32_t launch_moe_wmma_gemv_ksplit(turbine_ctx *ctx,
+                                    const turbine_moe_experts_desc *d,
+                                    int32_t *pos, void *act, void *down);
 // The prefill kernels (moe_grouped.hip, impl "turbine_hip_moe_wmma_prefill"):
 // the same WMMA chain and outputs as launch_moe_wmma, with the expert weights
 // streamed from memory straight into the WMMA registers and only the gathered

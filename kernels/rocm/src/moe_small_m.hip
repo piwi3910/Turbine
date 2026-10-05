@@ -3,16 +3,17 @@
 // moe_small_max_rows routed rows, num_tokens * top_k).
 //
 // When hidden and inter are multiples of 64 (moe_wmma_shape, e.g. OLMoE) the
-// implementation runs WMMA kernels of moe_grouped.hip -- the decode kernels
-// (launch_moe_wmma_gemv, one wave per 16 columns, operands straight from
-// memory) for multiples of 128, else the grouped kernels with 16-row tiles
-// (launch_moe_wmma_small) -- with the same per-element WMMA chain as the tier
-// above it, so a row's output does not depend on how many rows share its batch
-// (decision 2026-09-27, the OLMoE concurrency-16 golden flip: these scalar
-// kernels sum in another order than the WMMA tier, and a decode row that shared
-// a batch with a prefill chunk crossed the tier boundary and changed its
-// rounding). The scalar kernels below serve the other shapes (multiples of 8);
-// for those the tiers are not bitwise equal.
+// implementation runs WMMA kernels of moe_grouped.hip -- the K-split decode
+// GEMV (launch_moe_wmma_gemv_ksplit, the decode kernels' slice-summed order,
+// a numerics class of its own since decision 2026-10-05) for multiples of
+// 1,024, the decode kernels (launch_moe_wmma_gemv, one wave per 16 columns,
+// operands straight from memory) for multiples of 128, else the grouped
+// kernels with 16-row tiles (launch_moe_wmma_small) -- bitwise equal to the
+// tier above except at the K-split kernel, whose rows are batch-invariant
+// within the tier and within the recorded tolerance across it (the
+// hip_batch_invariance Outcome::bounded comparisons). The scalar kernels below
+// serve the other shapes (multiples of 8); for those the tiers are not bitwise
+// equal.
 //
 // The scalar kernels:
 // every group size is read from expert_offsets on the device, so the caller
@@ -329,7 +330,12 @@ int32_t launch_moe_small_m(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                            int32_t *pos, void *act, void *down) {
   // Batch invariance: where the grouped WMMA path serves the shape, the small-m
   // tier runs its kernels with small row tiles, so a row gets the same bits
-  // whichever tier its batch's row count selects.
+  // whichever tier its batch's row count selects. The K-split decode GEMV is
+  // the exception since 2026-10-05: its slice-summed order is a numerics class
+  // of its own (decision 2026-10-05), batch-invariant within the tier, within
+  // tolerance across it.
+  if (moe_gemv_ksplit_shape(d))
+    return launch_moe_wmma_gemv_ksplit(ctx, d, pos, act, down);
   if (moe_gemv_shape(d))
     return launch_moe_wmma_gemv(ctx, d, pos, act, down);
   if (moe_wmma_shape(d))
