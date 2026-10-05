@@ -1299,41 +1299,49 @@ novanas GPU 0, same-day A/B, medians of 3 of `scripts/lab-bench.sh --model llama
 
 Verdict against the S-13 targets: mt tok/s 1.002× (≥ 0.98×) — **pass**; first p99 1.02× (≤ 1.5×) — **pass**; `mt_ttft_later_p50` 0.96× (≤ 0.85×) — **miss**, though `cache_aware` is better in all three paired runs; `mt_cached` 0.9143 vs 0.9147 (≥) — **miss** (equal). The profile cannot separate the policies: its 64 sessions share one 2,000-word system prefix, so every waiting request carries a near-equal `cached_prefix_tokens` and the affinity term ties, leaving the windowed FIFO ≈ `default`. The saturated profile is also bimodal for both policies — one run per policy fell into a low-reuse regime (ca3 cached 0.818 / 347.1 tok/s, def2 0.810 / 347.6), the other four held 0.914 / ~490. Recommendation recorded for the coordinator: keep `default` as the serving default; `cache_aware` stays available (`scheduler.policy: cache_aware`) and is equal-or-better on later-turn TTFT in this profile.
 
-### b1 attention: the own kernel lands (branch `p5p-b1attn`, commits 5866edaf + b1c072ce, 2026-10-05)
+### b1 attention: the own kernel lands (branch `p5p-b1attn`, commits 5866edaf … 7d3c8cad, 2026-10-05/06)
 
-The decode-BW floor decision (user **B**, 2026-10-04) tasked the batch-1 attention own kernel. The
-kernel-reuse evaluation is recorded in decisions ("5p b1 attention: provider evaluation", 5866edaf):
-llama.cpp's `fattn` kernels not reusable (contiguous ggml K/V, no page table, no ragged decode batch),
-CK splitkv occupancy-bound at batch 1 (8 workgroups) and its multi-split numerics the rejected
-"Pre-Phase-5 #3" class, CK pagedkv 1.2-5x slower, hipBLASLt has no attention primitive.
+User decision **B** (decode-BW floor) tasked the batch-1 attention own kernel; the reuse evaluation
+is recorded in decisions ("5p b1 attention: provider evaluation", 5866edaf). Impl
+`turbine_hip_b1_decode` (`kernels/rocm/src/paged_attention_b1.hip`): one launch per layer where CK's
+path was three (append + splitkv + combine) — grid (sequences, KV heads, 8 splits), the append fused
+into the owning split, the split combine fused into the last-arriving workgroup (ascending split
+order, capture-safe, counters in their own always-zero buffer), P kept in F32. Grouped heads only
+(group ≤ 8, BF16 flat pages, any page size); OLMoE (16/16) keeps CK pagedkv.
 
-`feat(rocm)` (b1c072ce) lands impl `turbine_hip_b1_decode` (`kernels/rocm/src/paged_attention_b1.hip`):
-**one launch per layer** where CK's b1 path was three (Turbine append + CK splitkv + CK combine) —
-grid (sequences, KV heads, 8 splits) so batch 1 runs 64 workgroups instead of 8; the append fused into
-the owning split's workgroup; the split combine fused into the last-arriving workgroup (ascending
-split order, deterministic, capture-safe; counters in a dedicated ctx workspace, zero between calls,
-re-zeroed on a shape change). **P stays F32 through the P·V product**, so the split-local maxima cost
-only F32 rescale roundings — the design answer to the multi-split BF16-P drift that made
-"Pre-Phase-5 #3" pin CK at one split. Tier: grouped heads, GQA group ≤ 8, ≤ 8 sequences, BF16 flat
-pages, any page size; above it (and for equal heads) the CK defaults stand. Fixed splits ⇒ a row's
-bits are batch-independent within the tier (the small-m MoE pattern). Tests: `hip_ops::
-paged_b1_decode_matches_cpu` (1/3/5/8 sequences, groups 3-8, both page sizes, pool exact after the
-fused append), the splitkv/prefill decode expectations split by the tier, and `hip_batch_invariance::
-b1_decode_rows_are_batch_invariant` (bitwise within the tier, bounded vs CK at 16 decodes).
+GPU validation on the new PSU (novanas, all perf on GPU 0 under the bench lock, same-day baseline =
+`p6b-stack` a004fd93):
 
-Gate-clean (982 host tests); the kernel compiles for gfx1201 (lab build). **The GPU runs are pending
-at recording time**: novanas's GPUs are held by the user's `kuvryn-ai-workloads` pod (both
-`amd.com/gpu` claims, ~13:20 onward; not touched per the lab rules). Pending when it frees, in order:
-`lab-test.sh novanas -- -p turbine-kernels --test hip_ops -- paged_b1_decode_matches_cpu
-paged_decode_splitkv_matches_cpu paged_prefill_ck_128_matches_cpu`, `--test hip_batch_invariance --
-b1_decode_rows_are_batch_invariant` (tighten its 0.05 cross-tier placeholder to the measured max_abs),
-`--test hip_ops -- decode_attention_timings` (the A/B: CK splitkv 19.5 + 2.1 µs/layer recorded above
-vs the b1 kernel at b = 1..8), mutation checks (skip-last-split combine; a batch-dependent split
-count), `lab-bench.sh --quick --c1 --model llama` (golden c1 + c1 tok/s against the S-2 row 77.8)
-and `--quick` (c16 quick against 879.1), then `lab-decode-profile.sh --model llama --label b1attn`
-(served attention µs/layer against 21.7 incl. merge). Target per the floor decision: attention
-≤ ~10 µs/layer, Llama c1 toward ≥ 90 tok/s. The handoff (`.procoder/handoff/p5p-b1attn.md`) carries
-the full command list and the design details.
+| Measurement                                       | CK splitkv (base) | b1 everywhere (17cccc2b) | b1 + dispatch (7d3c8cad) |
+| ------------------------------------------------- | ----------------- | ------------------------ | ------------------------ |
+| op µs/layer b=1 kv~768 (cold pools, incl. append) | 42.5              | **23.9**                 | 23.9                     |
+| op µs/layer b=1 kv~8k                             | 320.3             | **83.8**                 | 83.8                     |
+| op µs/layer b=4 / b=16 kv~768                     | 46.2 / 103.6      | 48.3 / 136.8             | CK above 3 seqs          |
+| served attention µs/layer (Llama c1 trace)        | 21.7 + 2.9 append | **16.8** (append fused)  | 16.8                     |
+| served step / gaps (ms)                           | 13.09 / 1.32      | 12.73 / 1.12             | —                        |
+| effective weight-read BW (6.43 GB)                | 491 GB/s (0.77×)  | **505 GB/s (0.79×)**     | —                        |
+| c1 tok/s / ITL p50 (`lab-bench --c1`)             | 80.0 / 12.29 ms   | 81.3 / 12.09             | **81.2 / 12.10**         |
+| c16 tok/s (200 req)                               | 853.2             | 833.5 (0.977×)           | **853.0 (1.000×)**       |
+| golden c1 / c16                                   | PASS / PASS       | PASS / PASS              | PASS / PASS              |
+
+The b1 kernel wins at small batches and loses from b = 8 (fewer, longer CK tiles amortise better),
+so `7d3c8cad` keeps the b1 entry (selection is per op config — the registry binds one index; a
+sequence-count tier cannot be selected) and dispatches inside it: from `kTurbineB1CkSeqs` = 4
+sequences it runs CK splitkv when CK serves the page size. Correctness: `paged_b1_decode_matches_cpu`
+(1–64 sequences, groups 3–8, both page sizes; max |Δ| 1.56e-2 = 1 BF16 ulp, pool exact after the
+fused append), `paged_decode_splitkv_matches_cpu` (default and CK bound alone), `b1_decode_rows_are_batch_invariant`
+(24 rows × 12 shapes: bitwise within each side; across the edge max |Δ| 3.906e-3 measured, bound
+7.8125e-3), `paged_attention_rows_are_batch_invariant` (OLMoE) green. Mutation checks (lab): combine
+skipping the last split and an append that drops V fail `paged_b1_decode_matches_cpu`; a split count
+derived from the grid fails the invariance test (117/216 shapes) — it first **survived** the
+one-row version of that test (a re-partitioned F32 sum flips ~1 of 3,072 BF16 elements), which is
+why the test compares 24 rows.
+
+Verdict against the floor decision: attention 21.7 + 2.9 → 16.8 µs/layer served — **the ≤ ~10 µs
+target is missed**; Llama c1 +1.5 % (80.0 → 81.2), bandwidth 0.77× → 0.79×, short of the ~0.81× /
+≥ 90 tok/s mark. The served gain is smaller than the op-level one because served CK reads warm KV
+(21.7 vs 42.5 µs cold); the measurable win is the two removed boundaries per layer (gaps −0.20 ms)
+plus ~5 µs/layer of attention. c16 unchanged.
 
 ### S-9 plumbing: multi-token append and multi-row logits (plan Task 10, commit a03f42ac, 2026-10-05)
 
