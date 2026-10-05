@@ -1023,15 +1023,16 @@ fn paged_attention_rows_are_batch_invariant() {
     assert_invariant(&out);
 }
 
-/// The b1 decode kernel's rows are bitwise batch-invariant at every batch size (a constant split
-/// count, every sequence independent): 24 target decode rows (24/8 heads, contexts of 97 to 4,000
-/// tokens, each its own q/k/v), each alone and inside decode batches of 2, 16 and 64 at the first,
-/// a middle and the last position. One BF16 row is a weak witness of a changed F32 summation
-/// order (a re-partitioned split flips ~1 element of 3,072), so the case compares 24 rows ×
-/// 9 batch shapes; mutation-checked against a split count that depends on the grid. The b1 kernel
-/// is the decode default at every batch size (selection is per op config, so there is no sequence
-/// tier and no cross-implementation bound). Breaks if the splits depend on the batch, a split
-/// reads another sequence's rows, or the combine order depends on arrival.
+/// The b1 decode entry's rows (24/8 heads, 128-token pages): below 4 sequences the b1 kernel runs,
+/// from 4 on CK split-KV (`kTurbineB1CkSeqs`). 24 target decode rows (contexts of 97 to 4,000
+/// tokens, each its own q/k/v), each alone and inside decode batches of 2, 3, 16 and 64 at the
+/// first, a middle and the last position: bitwise equal to the target alone in batches of 2 and
+/// 3 (the b1 kernel: constant split count, every sequence independent), bitwise equal to each
+/// other in batches of 16 and 64 (CK with one split), and within [`B1_CK_EDGE_BOUND`] of the
+/// target alone across the edge. One BF16 row is a weak witness of a changed F32 summation order
+/// (a re-partitioned split flips ~1 element of 3,072), hence 24 rows; mutation-checked against a
+/// split count that depends on the grid. Breaks if the splits depend on the batch, a split reads
+/// another sequence's rows, the combine order depends on arrival, or the edge moves.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn b1_decode_rows_are_batch_invariant() {
@@ -1052,40 +1053,78 @@ fn b1_decode_rows_are_batch_invariant() {
             rng.normal(kv_heads * HEAD_DIM, 1.0),
         ];
         let seed = 99 + t as u64;
-        let run = |seqs: &[Seq], at: usize| {
+        let run = |n: usize, at: usize| {
+            let mut seqs = others[..n].to_vec();
+            seqs[at] = target;
             paged_run_heads(
                 &h,
                 AttentionKind::DecodePaged,
-                seqs,
+                &seqs,
                 at,
                 &rows,
                 seed,
                 q_heads,
                 kv_heads,
             )
+            .0
         };
-        let (alone, impl_name) = run(&[target], 0);
-        assert_eq!(impl_name, "turbine_hip_b1_decode");
-        for n in [2usize, 16, 64] {
+        let alone = run(1, 0);
+        let what = |n: usize, at: usize| {
+            format!(
+                "b1 decode target {t} (kv_len {}) in {n} decodes at {at}",
+                target.kv_len
+            )
+        };
+        for n in [2usize, 3] {
             for at in [0, n / 2, n - 1] {
-                let mut seqs = others[..n].to_vec();
-                seqs[at] = target;
-                let (got, name) = run(&seqs, at);
-                assert_eq!(name, "turbine_hip_b1_decode");
                 out.push(Outcome::of(
-                    format!(
-                        "b1 decode target {t} (kv_len {}) in {n} decodes at {at}",
-                        target.kv_len
-                    ),
+                    what(n, at),
                     &alone,
-                    &got,
-                    &impl_name,
+                    &run(n, at),
+                    "turbine_hip_b1_decode",
                 ));
             }
+        }
+        let ck = run(16, 0);
+        for (n, at) in [
+            (16usize, 0usize),
+            (16, 8),
+            (16, 15),
+            (64, 0),
+            (64, 32),
+            (64, 63),
+        ] {
+            let got = if (n, at) == (16, 0) {
+                ck.clone()
+            } else {
+                run(n, at)
+            };
+            if (n, at) != (16, 0) {
+                out.push(Outcome::of(
+                    format!("{} vs 16 at 0", what(n, at)),
+                    &ck,
+                    &got,
+                    "ck_tile_fmha_splitkv",
+                ));
+            }
+            out.push(Outcome::bounded(
+                format!("{} vs alone (across the edge)", what(n, at)),
+                &alone,
+                &got,
+                "ck_tile_fmha_splitkv vs turbine_hip_b1_decode",
+                B1_CK_EDGE_BOUND,
+            ));
         }
     }
     assert_invariant(&out);
 }
+
+/// The largest |Δ| allowed between a decode row on the b1 kernel (alone) and the same row on CK
+/// split-KV (a batch of 4 or more): two numerics classes, each within the CPU reference's BF16
+/// tolerance (`hip_ops` paged decode tests). Measured on the R9700 (lab run 1005215708, 24 rows ×
+/// 6 batch shapes): max |Δ| 3.906e-3 — one BF16 ulp in [0.5, 1) — on up to 1,317 of 3,072
+/// elements; the bound is twice that (one ulp in [1, 2)), so a drift past one rounding step fails.
+const B1_CK_EDGE_BOUND: f32 = 7.8125e-3;
 
 /// Lab timing (perf tier): the device-offset `moe_experts` implementations (small-m, prefill WMMA
 /// and grouped WMMA; the card profile's row tiers pick the first two) bound one at a time, at

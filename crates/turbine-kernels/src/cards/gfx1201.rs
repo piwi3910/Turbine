@@ -6,9 +6,9 @@
 //! Composable Kernel paged attention
 //! serves pages of a multiple of 128 tokens. Paged decode prefers the own b1 kernel (decision
 //! "5p decode-BW floor", user decision B): grouped query heads only, grid (sequences, KV heads,
-//! splits) with the append and the split combine fused into the launch, measured against CK's
-//! split-KV kernel in `hip_ops decode_attention_timings`; CK's split-KV kernel stays next, which
-//! merges the query heads of a KV head into one tile (1.2-5x faster
+//! splits) with the append and the split combine fused into the launch; from 4 sequences that
+//! entry runs CK's split-KV kernel itself (faster there, `hip_ops decode_attention_timings`),
+//! which merges the query heads of a KV head into one tile (1.2-5x faster
 //! than `fmha_fwd_pagedkv` for Llama's 24/8 heads) and refuses equal head counts (OLMoE), which
 //! keep `fmha_fwd_pagedkv` and its batch-invariant numerics.
 

@@ -21,10 +21,11 @@
 //
 // Batch invariance: kSplits is a constant and every sequence is independent,
 // so a row's bits do not depend on the batch it decodes in (the same
-// small-m MoE tier's within-tier property, here at every batch size). It
-// serves decode batches of any size: kernel selection is per op config (the
-// registry binds one implementation index; the batch size is not part of the
-// config), so a sequence-count tier could not be dispatched.
+// small-m MoE tier's within-tier property). Kernel selection is per op config
+// (the registry binds one implementation index; the batch size is not part of
+// the config), so this entry receives every decode batch; paged_attention.cpp
+// hands batches of kTurbineB1CkSeqs sequences and more to CK fmha_fwd_splitkv,
+// faster there, whenever CK serves the page size.
 //
 // Numerics (a numerics class of its own; not bitwise CK): scores q.k
 // accumulated in F32 over the head dimension in chunks of ascending index
