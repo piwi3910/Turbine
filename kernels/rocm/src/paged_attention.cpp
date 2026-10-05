@@ -21,8 +21,8 @@
 //   merged into one tile (grouped query heads only), one split, rounded by
 //   CK's split-KV combine kernel;
 // - the Turbine b1 decode kernel (impl "turbine_hip_b1_decode", decode only;
-//   paged_attention_b1.hip): grouped query heads, at most kTurbineB1MaxSeqs
-//   sequences, BF16 flat pages; grid (sequences, KV heads, splits) fills the
+//   paged_attention_b1.hip): grouped query heads (group <= 8), any batch,
+//   BF16 flat pages; grid (sequences, KV heads, splits) fills the
 //   card at batch 1, the append and the split combine are fused into the same
 //   launch, and P stays F32 (a numerics class of its own, not bitwise CK);
 // - the Turbine HIP paged kernel (impl "turbine_hip"), any page size.

@@ -21,10 +21,10 @@
 //
 // Batch invariance: kSplits is a constant and every sequence is independent,
 // so a row's bits do not depend on the batch it decodes in (the same
-// within-tier property as the small-m MoE tier). The b1 tier serves at most
-// kTurbineB1MaxSeqs sequences; above it CK fmha_fwd_splitkv stays the default
-// and a request crossing the boundary changes its rounding once (the
-// small-m-tier pattern).
+// small-m MoE tier's within-tier property, here at every batch size). It
+// serves decode batches of any size: kernel selection is per op config (the
+// registry binds one implementation index; the batch size is not part of the
+// config), so a sequence-count tier could not be dispatched.
 //
 // Numerics (a numerics class of its own; not bitwise CK): scores q.k
 // accumulated in F32 over the head dimension in chunks of ascending index
@@ -400,79 +400,69 @@ int32_t paged_b1_group(const turbine_attention_paged_desc *d) {
 
 bool b1_serves(const turbine_attention_paged_desc *d) {
   // Decode (one query per sequence) of grouped query heads, at most
-  // kTurbineB1MaxGroup heads per KV head (the instantiated templates) and
-  // kTurbineB1MaxSeqs sequences (the tier above which CK fmha_fwd_splitkv
-  // stays the default).
+  // kTurbineB1MaxGroup heads per KV head (the instantiated templates), any
+  // number of sequences.
   return d->max_q_len <= 1 && d->total_q <= d->num_seqs &&
          d->num_q_heads > d->num_kv_heads &&
-         paged_b1_group(d) <= kTurbineB1MaxGroup &&
-         d->num_seqs <= kTurbineB1MaxSeqs;
+         paged_b1_group(d) <= kTurbineB1MaxGroup;
 }
 
 int32_t run_b1_decode(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                       const std::string & /*entry (the launcher names its own
                       launch error)*/) {
   const int32_t group = paged_b1_group(d);
-  // The workspace: one (accumulator, maximum, sum) triple per
-  // (sequence, KV head, split, head) and one arrival counter per
-  // (sequence, KV head). Grown outside a capture only, like the split-KV
-  // scratch; a decode graph's capture never needs more than the eager run of
-  // the same key before it. The counters must start zeroed and stay zero
-  // between calls (the kernel resets them), so this is a dedicated buffer: a
-  // staged prefill reusing the split-KV scratch would leave garbage in them.
+  // Two device buffers, each grown outside a capture only (a decode graph's
+  // capture never needs more than the eager run of the same key before it);
+  // a replaced buffer is retired, not freed, because a captured graph may
+  // still use it:
+  // - the partials, one (accumulator, maximum, sum) record per (sequence, KV
+  //   head, split, head), written before they are read in every call;
+  // - the arrival counters, one per (sequence, KV head), zeroed when the
+  //   buffer is created and returned to zero by the kernel at the end of every
+  //   call. They live in a buffer of their own so that no other shape's
+  //   partials (another decode graph's batch size) can land on them: every
+  //   graph and every eager call finds them zero, whatever ran before.
   const int64_t per_sh = static_cast<int64_t>(d->num_seqs) * d->num_kv_heads;
   const int64_t partial_floats = per_sh * kSplits * group * (kHeadDim + 2);
-  const size_t bytes = static_cast<size_t>(partial_floats * 4 + per_sh * 4);
-  // Another geometry's calls may have written its partials over this shape's
-  // counter region: a shape change re-zeroes it (never under a capture -- the
-  // graph's shape is fixed, and its eager run re-zeroed before the capture).
-  const int64_t shape = per_sh * 16 + group;
-  const bool rezero = ctx->attn_b1_shape != shape;
-  if (rezero) {
-    if (ctx->capturing) {
-      return refuse_while_capturing(
-          ctx, "turbine_attention_decode_paged (first call at a new b1 shape)");
-    }
-  }
-  if (ctx->attn_b1_scratch_bytes < bytes) {
-    if (ctx->capturing) {
-      return refuse_while_capturing(
-          ctx, "turbine_attention_decode_paged (growing the b1 workspace)");
-    }
+  auto grow = [&](void *&buf, size_t &have, size_t need, bool zero,
+                  const char *what) -> int32_t {
+    if (have >= need)
+      return TURBINE_OK;
+    if (ctx->capturing)
+      return refuse_while_capturing(ctx, what);
     size_t grown = 1;
-    while (grown < bytes)
+    while (grown < need)
       grown <<= 1;
-    void *grown_ptr = nullptr;
-    const std::string what =
-        "hipMalloc b1 attention workspace " + std::to_string(grown) + " bytes";
-    if (int32_t rc = check_hip(ctx, hipMalloc(&grown_ptr, grown), what.c_str());
-        rc != TURBINE_OK) {
+    void *p = nullptr;
+    const std::string msg = std::string("hipMalloc ") + what + " " +
+                            std::to_string(grown) + " bytes";
+    if (int32_t rc = check_hip(ctx, hipMalloc(&p, grown), msg.c_str());
+        rc != TURBINE_OK)
       return rc;
+    if (zero) {
+      if (int32_t rc = check_hip(ctx, hipMemsetAsync(p, 0, grown, ctx->stream),
+                                 "b1 attention counter zeroing");
+          rc != TURBINE_OK)
+        return rc;
     }
-    if (int32_t rc =
-            check_hip(ctx, hipMemsetAsync(grown_ptr, 0, grown, ctx->stream),
-                      "b1 attention workspace zeroing");
-        rc != TURBINE_OK) {
-      return rc;
-    }
-    if (ctx->attn_b1_scratch != nullptr)
-      ctx->attn_split_retired.push_back(ctx->attn_b1_scratch);
-    ctx->attn_b1_scratch = grown_ptr;
-    ctx->attn_b1_scratch_bytes = grown;
-  }
+    if (buf != nullptr)
+      ctx->attn_split_retired.push_back(buf);
+    buf = p;
+    have = grown;
+    return TURBINE_OK;
+  };
+  if (int32_t rc = grow(ctx->attn_b1_scratch, ctx->attn_b1_scratch_bytes,
+                        static_cast<size_t>(partial_floats) * 4, false,
+                        "b1 attention partials");
+      rc != TURBINE_OK)
+    return rc;
+  if (int32_t rc =
+          grow(ctx->attn_b1_counters, ctx->attn_b1_counters_bytes,
+               static_cast<size_t>(per_sh) * 4, true, "b1 attention counters");
+      rc != TURBINE_OK)
+    return rc;
   auto *partials = static_cast<float *>(ctx->attn_b1_scratch);
-  auto *counters = reinterpret_cast<int32_t *>(partials + partial_floats);
-  if (rezero) {
-    if (int32_t rc = check_hip(ctx,
-                               hipMemsetAsync(counters, 0,
-                                              static_cast<size_t>(per_sh) * 4,
-                                              ctx->stream),
-                               "b1 attention counter zeroing");
-        rc != TURBINE_OK) {
-      return rc;
-    }
-    ctx->attn_b1_shape = shape;
-  }
+  auto *counters = static_cast<int32_t *>(ctx->attn_b1_counters);
 
   const dim3 grid(static_cast<unsigned>(d->num_seqs),
                   static_cast<unsigned>(d->num_kv_heads),

@@ -1612,14 +1612,14 @@ fn paged_prefill_ck_128_matches_cpu() {
     }
 }
 
-/// Perf item #3: paged decode of grouped query heads at 128-token pages: up to 8 sequences the
-/// Turbine b1 kernel serves (decision "5p decode-BW floor", B), above them CK
-/// `fmha_fwd_splitkv` (the query heads of a KV head merged into one tile); both match the CPU
-/// reference: one sequence of ~8k tokens, sequences of 1-129 tokens around the page edge, a
+/// Perf item #3: paged decode of grouped query heads at 128-token pages: the library default (the
+/// Turbine b1 kernel, decision "5p decode-BW floor", B, at every batch size) and CK
+/// `fmha_fwd_splitkv` bound alone (the query heads of a KV head merged into one tile); both match
+/// the CPU reference: one sequence of ~8k tokens, sequences of 1-129 tokens around the page edge, a
 /// short and a long sequence together, a ragged batch of 16 around the served ~768 tokens, 64
 /// sequences, and the GQA ratios 3 (Llama 3.2 3B), 4 (Llama 3.1 8B) and 7 (Qwen2.5 7B). Breaks
 /// if the head merge maps a query head to the wrong KV head or row, a split or the combine
-/// loses a key, or the b1 tier boundary sits anywhere but between 8 and 9 sequences.
+/// loses a key, or the default stops being the b1 kernel at some batch size.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_decode_splitkv_matches_cpu() {
@@ -1638,34 +1638,45 @@ fn paged_decode_splitkv_matches_cpu() {
         &ragged16,
         &many,
     ];
-    for heads in [(Q_HEADS, KV_HEADS), (32, 8), (28, 4)] {
-        for kv_lens in batches {
-            let got = paged_case(
-                &p,
-                &mut rng,
-                AttentionKind::DecodePaged,
-                heads,
-                128,
-                &vec![1; kv_lens.len()],
-                kv_lens,
-            );
-            // Up to 8 sequences the b1 kernel serves (any of the three head
-            // shapes: groups 3, 4 and 7 are within its instantiated range);
-            // above the tier CK's split-KV kernel stays the default.
-            let want = if kv_lens.len() <= 8 {
-                "turbine_hip_b1_decode"
-            } else {
-                "ck_tile_fmha_splitkv"
-            };
-            assert_eq!(got, want, "heads={heads:?} kv_lens={kv_lens:?}");
+    // The library's default (the b1 kernel, every batch size) and CK split-KV bound alone.
+    let spec = OpConfig::Attention(AttentionConfig {
+        kind: AttentionKind::DecodePaged,
+        num_q_heads: Q_HEADS as u32,
+        num_kv_heads: KV_HEADS as u32,
+        head_dim: HEAD_DIM as u32,
+        dtype: DType::BF16,
+        block_tokens: Some(128),
+        causal: true,
+    });
+    let splitkv = p
+        .hip
+        .implementations(OpKind::AttentionDecodePaged)
+        .into_iter()
+        .find(|i| i.name == "ck_tile_fmha_splitkv")
+        .expect("ck_tile_fmha_splitkv is listed");
+    let ck = bound(&p, &spec, splitkv.index);
+    for (pair, want) in [(&p, "turbine_hip_b1_decode"), (&ck, "ck_tile_fmha_splitkv")] {
+        for heads in [(Q_HEADS, KV_HEADS), (32, 8), (28, 4)] {
+            for kv_lens in batches {
+                let got = paged_case(
+                    pair,
+                    &mut rng,
+                    AttentionKind::DecodePaged,
+                    heads,
+                    128,
+                    &vec![1; kv_lens.len()],
+                    kv_lens,
+                );
+                assert_eq!(got, want, "heads={heads:?} kv_lens={kv_lens:?}");
+            }
         }
     }
 }
 
 /// The Turbine b1 decode kernel (decision "5p decode-BW floor", B) matches the CPU reference at
-/// every GQA ratio it instantiates and both page sizes: decode batches of 1, 3, 5 and 8 sequences
-/// (a single ~8k-token sequence, page-edge sequences around 128/129, a ragged 8 around the served
-/// ~768 tokens), groups 3 (Llama 3.2 3B), 4 (Llama 3.1 8B), 6, 7 (Qwen2.5 7B) and 8; the pool is
+/// every GQA ratio it instantiates and both page sizes: decode batches of 1, 3, 5, 8, 16 and 64
+/// sequences (a single ~8k-token sequence, page-edge sequences around 128/129, ragged 8 and 16
+/// around the served ~768 tokens, 64 of 1-1,500 tokens), groups 3 (Llama 3.2 3B), 4 (Llama 3.1 8B), 6, 7 (Qwen2.5 7B) and 8; the pool is
 /// compared exactly after the append (fused into the kernel). Breaks if a split's key range is
 /// wrong (tier and page edges, a missing page), the fused append writes the wrong slot or head,
 /// the combine loses or double-counts a split, or the arrival counter is left nonzero.
@@ -1679,7 +1690,16 @@ fn paged_b1_decode_matches_cpu() {
     let p = setup();
     let mut rng = Rng(47);
     let ragged8: Vec<usize> = (0..8).map(|s| 740 + (37 * s) % 90).collect();
-    let batches: [&[usize]; 4] = [&[8000], &[1, 2, 127, 128, 129], &[1, 3000, 5], &ragged8];
+    let ragged16: Vec<usize> = (0..16).map(|s| 740 + (37 * s) % 90).collect();
+    let many: Vec<usize> = (0..64).map(|s| 1 + (97 * s) % 1500).collect();
+    let batches: [&[usize]; 6] = [
+        &[8000],
+        &[1, 2, 127, 128, 129],
+        &[1, 3000, 5],
+        &ragged8,
+        &ragged16,
+        &many,
+    ];
     for heads in [(Q_HEADS, KV_HEADS), (32, 8), (28, 4), (48, 8), (16, 2)] {
         for block_tokens in [128usize, 16] {
             for kv_lens in batches {

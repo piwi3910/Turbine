@@ -849,7 +849,8 @@ fn paged_run_heads(
         }
     }
     let num_blocks = next;
-    let pool_len = num_blocks * 2 * BLOCK_TOKENS * row;
+    let kv_row = kv_heads * HEAD_DIM;
+    let pool_len = num_blocks * 2 * BLOCK_TOKENS * kv_row;
     // The pool history: the same seeded values in every run, so the target's blocks match.
     let pool = upload(
         h,
@@ -859,19 +860,22 @@ fn paged_run_heads(
     );
     let total_q: usize = seqs.iter().map(|s| s.q_len).sum();
     let mut rng = Rng(pool_seed ^ 0x5eed);
+    // q rows are q_heads wide, the new K/V rows kv_heads wide.
+    let widths = [row, kv_row, kv_row];
     let mut data: [Vec<f32>; 3] = [
         rng.normal(total_q * row, 1.0),
-        rng.normal(total_q * row, 1.0),
-        rng.normal(total_q * row, 1.0),
+        rng.normal(total_q * kv_row, 1.0),
+        rng.normal(total_q * kv_row, 1.0),
     ];
     let start: usize = seqs[..target].iter().map(|s| s.q_len).sum();
-    for (d, t) in data.iter_mut().zip(target_rows) {
-        d[start * row..(start + seqs[target].q_len) * row].copy_from_slice(t);
+    for ((d, t), w) in data.iter_mut().zip(target_rows).zip(widths) {
+        d[start * w..(start + seqs[target].q_len) * w].copy_from_slice(t);
     }
     let shape = [total_q, q_heads, HEAD_DIM];
+    let kv_shape = [total_q, kv_heads, HEAD_DIM];
     let q = upload(h, &shape, DType::BF16, &data[0]);
-    let k = upload(h, &shape, DType::BF16, &data[1]);
-    let v = upload(h, &shape, DType::BF16, &data[2]);
+    let k = upload(h, &kv_shape, DType::BF16, &data[1]);
+    let v = upload(h, &kv_shape, DType::BF16, &data[2]);
     let o = upload(h, &shape, DType::BF16, &vec![0.0; total_q * row]);
     let mut indptr = vec![0f32];
     for s in seqs {
@@ -1019,12 +1023,12 @@ fn paged_attention_rows_are_batch_invariant() {
     assert_invariant(&out);
 }
 
-/// The b1 decode kernel's rows are bitwise batch-invariant within its tier (fixed splits, every
-/// sequence independent): one decode row (24/8 heads, a ~768-token context) alone and inside
-/// decode batches of 2 and 8 (the tier edge), at the first and last position. Above the tier CK's
-/// split-KV kernel serves and its numerics class differs (CK's FMHA chain vs the b1 kernel's F32
-/// P), so the 16-decode comparisons are bounded, not bitwise. Breaks if the splits depend on the
-/// batch, a split reads another sequence's rows, or the tier boundary moved.
+/// The b1 decode kernel's rows are bitwise batch-invariant at every batch size (a constant split
+/// count, every sequence independent): one decode row (24/8 heads, a 768-token context) alone and
+/// inside decode batches of 2, 8, 16 and 64 at the first, a middle and the last position. The b1
+/// kernel is the decode default at every batch size (selection is per op config, so no sequence
+/// tier exists and no cross-implementation bound is needed). Breaks if the splits depend on the
+/// batch, a split reads another sequence's rows, or the combine order depends on arrival.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn b1_decode_rows_are_batch_invariant() {
@@ -1034,82 +1038,45 @@ fn b1_decode_rows_are_batch_invariant() {
     let h = setup();
     let mut rng = Rng(31);
     let (q_heads, kv_heads) = (24usize, 8usize);
-    let row = q_heads * HEAD_DIM;
     let decode = Seq {
         q_len: 1,
         kv_len: 768,
     };
     let d = |kv_len: usize| Seq { q_len: 1, kv_len };
     let rows: [Vec<f32>; 3] = [
-        rng.normal(row, 1.0),
-        rng.normal(row, 1.0),
-        rng.normal(row, 1.0),
+        rng.normal(q_heads * HEAD_DIM, 1.0),
+        rng.normal(kv_heads * HEAD_DIM, 1.0),
+        rng.normal(kv_heads * HEAD_DIM, 1.0),
     ];
-    let (alone, impl_name) = paged_run_heads(
-        &h,
-        AttentionKind::DecodePaged,
-        &[decode],
-        0,
-        &rows,
-        99,
-        q_heads,
-        kv_heads,
-    );
-    assert_eq!(impl_name, "turbine_hip_b1_decode");
-    let mut out = Vec::new();
-    // Within the tier: the same bits whatever the batch.
-    let decodes: Vec<Seq> = (0..15).map(|i| d(20 + 37 * i)).collect();
-    let with = |n: usize, at: usize| {
-        let mut v = decodes[..n].to_vec();
-        v[at] = decode;
-        v
+    let run = |seqs: &[Seq], at: usize| {
+        paged_run_heads(
+            &h,
+            AttentionKind::DecodePaged,
+            seqs,
+            at,
+            &rows,
+            99,
+            q_heads,
+            kv_heads,
+        )
     };
-    for (name, seqs, at) in [
-        ("2 decodes at 0", with(2, 0), 0),
-        ("2 decodes at 1", with(2, 1), 1),
-        ("8 decodes at 0", with(8, 0), 0),
-        ("8 decodes at 7", with(8, 7), 7),
-    ] {
-        let (got, _) = paged_run_heads(
-            &h,
-            AttentionKind::DecodePaged,
-            &seqs,
-            at,
-            &rows,
-            99,
-            q_heads,
-            kv_heads,
-        );
-        out.push(Outcome::of(
-            format!("b1 decode {name}"),
-            &alone,
-            &got,
-            &impl_name,
-        ));
-    }
-    // Across the tier (CK splitkv serves at 16): a recorded bound, like the
-    // small-m MoE tier's cross-tier comparisons. The run prints the actual
-    // max_abs, so a growing spread stays visible.
-    for at in [0usize, 8] {
-        let seqs = with(16, at);
-        let (got, other) = paged_run_heads(
-            &h,
-            AttentionKind::DecodePaged,
-            &seqs,
-            at,
-            &rows,
-            99,
-            q_heads,
-            kv_heads,
-        );
-        assert_eq!(other, "ck_tile_fmha_splitkv");
-        out.push(Outcome::bounded(
-            format!("b1 decode vs splitkv at 16 decodes ({other}) at {at}"),
-            &alone,
-            &got,
-            &impl_name,
-            0.05,
-        ));
+    let (alone, impl_name) = run(&[decode], 0);
+    assert_eq!(impl_name, "turbine_hip_b1_decode");
+    let others: Vec<Seq> = (0..64).map(|i| d(20 + 37 * i)).collect();
+    let mut out = Vec::new();
+    for n in [2usize, 8, 16, 64] {
+        for at in [0, n / 2, n - 1] {
+            let mut seqs = others[..n].to_vec();
+            seqs[at] = decode;
+            let (got, name) = run(&seqs, at);
+            assert_eq!(name, "turbine_hip_b1_decode");
+            out.push(Outcome::of(
+                format!("b1 decode {n} decodes at {at}"),
+                &alone,
+                &got,
+                &impl_name,
+            ));
+        }
     }
     assert_invariant(&out);
 }

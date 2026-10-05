@@ -17,8 +17,8 @@
 //                                  turbine_hip_mixed_staged, 6
 //                                  turbine_hip_mixed
 //   attention_decode_paged       0 turbine_hip_b1_decode [turbine_hip]
-//                                  (batch-1 decode of grouped query heads, at
-//                                  most 8 sequences, any page size),
+//                                  (decode of grouped query heads, group
+//                                  <= 8, BF16 flat pages, any page size),
 //                                  1 ck_tile_fmha_splitkv [ck] (grouped query
 //                                  heads, pages of a multiple of 128 tokens),
 //                                  2 ck_tile_fmha_pagedkv [ck], 3 turbine_hip

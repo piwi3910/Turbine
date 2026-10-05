@@ -114,18 +114,14 @@ struct turbine_ctx {
   // decode graph may still read it.
   void *attn_split_scratch = nullptr;
   size_t attn_split_scratch_bytes = 0;
-  // The b1 decode attention's workspace (paged_attention_b1.hip): the split
-  // partials and their per-(sequence, KV head) arrival counters. Same
-  // discipline as the split-KV scratch; the counters must stay zeroed between
-  // calls (the kernel resets them), so this is a buffer of its own -- the
-  // staged prefills reuse attn_split_scratch and would leave garbage in the
-  // counters.
+  // The b1 decode attention's buffers (paged_attention_b1.hip): the split
+  // partials, and the per-(sequence, KV head) arrival counters in a buffer of
+  // their own (zero between calls; no other shape's partials can land on
+  // them). Same growth discipline as the split-KV scratch.
   void *attn_b1_scratch = nullptr;
   size_t attn_b1_scratch_bytes = 0;
-  // The (sequences x KV heads x group) geometry the b1 workspace is currently
-  // laid out for (0 = none): a new shape re-zeroes the counter region its
-  // offsets land in, because another shape's partials may have written there.
-  int64_t attn_b1_shape = -1;
+  void *attn_b1_counters = nullptr;
+  size_t attn_b1_counters_bytes = 0;
   std::vector<void *> attn_split_retired;
   // hipBLASLt returned a grouped-GEMM solution for this device at creation.
   bool moe_grouped = false;
@@ -386,16 +382,13 @@ enum class PagedPath {
   TurbineMixedStaged,
   TurbineMixed,
   // The own batch-1 decode kernel (decision "5p decode-BW floor", user
-  // decision B): BF16 flat pages only, grouped query heads, at most
-  // kTurbineB1MaxSeqs sequences. It appends inside the kernel, so paged_
-  // attention.cpp skips the common append for it.
+  // decision B): BF16 flat pages only, grouped query heads, any batch. It
+  // appends inside the kernel, so paged_attention.cpp skips the common append
+  // for it.
   TurbineB1
 };
-// The b1 decode kernel's limits (paged_attention_b1.hip): the instantiated
-// GQA-group templates and the tier above which CK fmha_fwd_splitkv stays the
-// default.
+// The b1 decode kernel's largest GQA group (its instantiated templates).
 constexpr int32_t kTurbineB1MaxGroup = 8;
-constexpr int32_t kTurbineB1MaxSeqs = 8;
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);

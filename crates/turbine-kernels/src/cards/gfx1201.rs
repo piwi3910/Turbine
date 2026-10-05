@@ -4,11 +4,11 @@
 //! streamed into the WMMA registers, the same per-element chain) above them, 8-16 % faster than
 //! the grouped WMMA kernels with OLMoE's real routing (`perf moe_prefill_timings`), and
 //! Composable Kernel paged attention
-//! serves pages of a multiple of 128 tokens. Paged decode prefers the own b1 kernel up to 8
-//! sequences (decision "5p decode-BW floor", user decision B): grouped query heads only, grid
-//! (sequences, KV heads, splits) with the append and the split combine fused into the launch,
-//! measured against CK's split-KV kernel in `hip_ops decode_attention_timings`; above the tier
-//! CK's split-KV kernel, which merges the query heads of a KV head into one tile (1.2-5x faster
+//! serves pages of a multiple of 128 tokens. Paged decode prefers the own b1 kernel (decision
+//! "5p decode-BW floor", user decision B): grouped query heads only, grid (sequences, KV heads,
+//! splits) with the append and the split combine fused into the launch, measured against CK's
+//! split-KV kernel in `hip_ops decode_attention_timings`; CK's split-KV kernel stays next, which
+//! merges the query heads of a KV head into one tile (1.2-5x faster
 //! than `fmha_fwd_pagedkv` for Llama's 24/8 heads) and refuses equal head counts (OLMoE), which
 //! keep `fmha_fwd_pagedkv` and its batch-invariant numerics.
 
