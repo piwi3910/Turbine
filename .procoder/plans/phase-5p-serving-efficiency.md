@@ -247,13 +247,14 @@ Interfaces:
   Covers: S-9 ACs `scheduler::tests::extend_and_roll_back`, `tiny_model multi_row_logits_match_single_steps`
   Depends on: Task 9
 
-- [ ] Write failing test `scheduler::tests::extend_and_roll_back` as the spec lists (6-token item within budget; roll-back of 3 frees an empty block; budget fallback to decode; `NotDecoding` for a prefilling sequence; preemption drops the extension). Run: `scripts/remote-cargo.sh test -p turbine-scheduler scheduler::tests::extend_and_roll_back` — expect FAIL
-- [ ] Write failing test `tiny_model multi_row_logits_match_single_steps` (both tiny checkpoints, CPU provider: 1 + 7 tokens with `logits_rows` 8 equal the rows of 8 single steps within the Phase 1 CPU tolerance; reduced decode rows in the same batch unchanged; `logits_rows` > `q_len` refused). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model multi_row_logits_match_single_steps` — expect FAIL
-- [ ] Implement; add random extensions to the simulator's invariant runs (`decode_never_starved`, budgets) and keep them passing.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-scheduler && scripts/remote-cargo.sh test -p turbine-model && scripts/remote-cargo.sh test -p turbine-server` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` (GPU-facing: `turbine-model`) — expect exit 0; `scripts/lab-bench.sh --model llama --quick` and `--model olmoe --quick` — expect the standard-bench bound (nothing uses extensions yet)
-- [ ] Commit: `feat(scheduler,model): multi-token append for running sequences and multi-row logits`
+- [x] Write failing test `scheduler::tests::extend_and_roll_back` as the spec lists (6-token item within budget; roll-back of 3 frees an empty block; budget fallback to decode; `NotDecoding` for a prefilling sequence; preemption drops the extension). Run: `scripts/remote-cargo.sh test -p turbine-scheduler scheduler::tests::extend_and_roll_back` — expect FAIL
+- [x] Write failing test `tiny_model multi_row_logits_match_single_steps` (both tiny checkpoints, CPU provider: 1 + 7 tokens with `logits_rows` 8 equal the rows of 8 single steps within the Phase 1 CPU tolerance; reduced decode rows in the same batch unchanged; `logits_rows` > `q_len` refused). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model multi_row_logits_match_single_steps` — expect FAIL
+- [x] Implement; add random extensions to the simulator's invariant runs (`decode_never_starved`, budgets) and keep them passing. (Both digests re-recorded: `decode_never_starved` 10772755057896660484, `chunk_budget_respected` 15676167015522452859; every other workload's plan unchanged.)
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-scheduler && scripts/remote-cargo.sh test -p turbine-model && scripts/remote-cargo.sh test -p turbine-server` — PASS (whole workspace; gate 981 tests)
+- [x] Gate: `scripts/gate.sh` — `gate: ok`
+- [x] Lab: `scripts/lab-test.sh novanas --tier quick` (GPU-facing: `turbine-model`) — every target ok except the four `kv_gpu` tests already red on the tip before this task (the S-4/S-5 HIP mid-block numerics finding); `scripts/lab-bench.sh --model llama --quick` 879.1 tok/s and `--model olmoe --quick` 636.4 tok/s — golden1 PASS, `failed=0`, no regression
+- [x] Mutation-checked (4): the extension budget check dropped, `rolled_back` ignored in `complete`, `logits_rows` clamped to 1 in the head's plan, and the multi-row final-norm sources not advanced per row — each turns one of the two tests red; restored.
+- [x] Commit: `feat(scheduler): multi-token append for running sequences and multi-row logits (S-9)`
 
 ## Task 11: Forced tokens from the grammar matcher (S-10, matcher side)
 
