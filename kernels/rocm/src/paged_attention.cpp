@@ -20,6 +20,11 @@
 //   same page table, one query per sequence, the query heads of a KV head
 //   merged into one tile (grouped query heads only), one split, rounded by
 //   CK's split-KV combine kernel;
+// - the Turbine b1 decode kernel (impl "turbine_hip_b1_decode", decode only;
+//   paged_attention_b1.hip): grouped query heads (group <= 8), any batch,
+//   BF16 flat pages; grid (sequences, KV heads, splits) fills the
+//   card at batch 1, the append and the split combine are fused into the same
+//   launch, and P stays F32 (a numerics class of its own, not bitwise CK);
 // - the Turbine HIP paged kernel (impl "turbine_hip"), any page size.
 // Decode is the same computation with one query per sequence and runs the same
 // paths.
@@ -82,6 +87,7 @@ namespace {
 constexpr const char *kImplCk = "ck_tile_fmha_pagedkv";
 constexpr const char *kImplCkSplitkv = "ck_tile_fmha_splitkv";
 constexpr const char *kImplTurbine = "turbine_hip";
+constexpr const char *kImplTurbineB1 = "turbine_hip_b1_decode";
 constexpr const char *kImplCkFp8Staged = "ck_tile_fmha_pagedkv_fp8_staged";
 constexpr const char *kImplTurbineFp8Decode = "turbine_hip_fp8_decode";
 constexpr const char *kImplTurbineFp8 = "turbine_hip_fp8";
@@ -307,6 +313,8 @@ bool path_serves(const turbine_attention_paged_desc *d,
     return !fp8 && ck_serves(d);
   case turbine_hip::PagedPath::CkSplitkv:
     return !fp8 && ck_serves(d) && turbine_hip::ck_splitkv_serves(d);
+  case turbine_hip::PagedPath::TurbineB1:
+    return !fp8 && turbine_hip::b1_serves(d);
   case turbine_hip::PagedPath::Turbine:
     return !fp8;
   case turbine_hip::PagedPath::CkPagedkvFp8Staged:
@@ -332,6 +340,8 @@ const char *path_name(turbine_hip::PagedPath path) {
     return kImplCk;
   case turbine_hip::PagedPath::CkSplitkv:
     return kImplCkSplitkv;
+  case turbine_hip::PagedPath::TurbineB1:
+    return kImplTurbineB1;
   case turbine_hip::PagedPath::CkPagedkvFp8Staged:
     return kImplCkFp8Staged;
   case turbine_hip::PagedPath::TurbineFp8Decode:
@@ -551,10 +561,28 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   }
   if (int32_t rc = enter(ctx); rc != TURBINE_OK)
     return rc;
-  if (int32_t rc = mixed(d) ? turbine_hip::launch_paged_append_mixed(ctx, d)
-                            : turbine_hip::launch_paged_append(ctx, d);
-      rc != TURBINE_OK)
+  // The b1 entry is selected per op config, so it receives every decode batch
+  // size; from kTurbineB1CkSeqs sequences on, CK fmha_fwd_splitkv is faster
+  // (hip_ops decode_attention_timings on the R9700: b=1 23.9 vs 42.5 us, b=4
+  // 48.3 vs 46.2, b=16 136.8 vs 103.6 us per layer at ~768 tokens), so the
+  // entry hands those batches to it when CK serves the page size. A request
+  // whose batch crosses the edge changes its rounding once (the two are
+  // different numerics classes); within each side rows are batch-invariant.
+  if (path == turbine_hip::PagedPath::TurbineB1 &&
+      d->num_seqs >= turbine_hip::kTurbineB1CkSeqs && ck_serves(d) &&
+      turbine_hip::ck_splitkv_serves(d)) {
+    path = turbine_hip::PagedPath::CkSplitkv;
+  }
+  // The b1 decode kernel appends inside the kernel; every other path takes
+  // the common append first.
+  if (int32_t rc =
+          path == turbine_hip::PagedPath::TurbineB1
+              ? TURBINE_OK
+              : (mixed(d) ? turbine_hip::launch_paged_append_mixed(ctx, d)
+                          : turbine_hip::launch_paged_append(ctx, d));
+      rc != TURBINE_OK) {
     return rc;
+  }
   switch (path) {
   case turbine_hip::PagedPath::CkPagedkvMixedStaged:
     return run_mixed_staged(ctx, d, entry, true);
@@ -566,6 +594,8 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
     return run_ck(ctx, d, entry);
   case turbine_hip::PagedPath::CkSplitkv:
     return turbine_hip::run_ck_splitkv(ctx, d, entry);
+  case turbine_hip::PagedPath::TurbineB1:
+    return turbine_hip::run_b1_decode(ctx, d, entry);
   case turbine_hip::PagedPath::CkPagedkvFp8Staged:
     return run_ck_fp8_staged(ctx, d, entry);
   case turbine_hip::PagedPath::TurbineFp8Decode:

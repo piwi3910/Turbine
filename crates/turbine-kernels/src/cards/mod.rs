@@ -201,6 +201,7 @@ mod tests {
             order(OpKind::AttentionDecodePaged),
             Some(
                 &[
+                    "turbine_hip_b1_decode",
                     "ck_tile_fmha_splitkv",
                     "ck_tile_fmha_pagedkv",
                     "turbine_hip"

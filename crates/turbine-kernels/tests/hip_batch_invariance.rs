@@ -717,10 +717,25 @@ fn paged_run(
     target_rows: &[Vec<f32>; 3],
     pool_seed: u64,
 ) -> (Vec<f32>, String) {
+    paged_run_heads(h, kind, seqs, target, target_rows, pool_seed, HEADS, HEADS)
+}
+
+/// [`paged_run`] at explicit head counts: the b1 kernel's grouped-head tier.
+#[allow(clippy::too_many_arguments)]
+fn paged_run_heads(
+    h: &Hip,
+    kind: AttentionKind,
+    seqs: &[Seq],
+    target: usize,
+    target_rows: &[Vec<f32>; 3],
+    pool_seed: u64,
+    q_heads: usize,
+    kv_heads: usize,
+) -> (Vec<f32>, String) {
     let cfg = AttentionConfig {
         kind,
-        num_q_heads: HEADS as u32,
-        num_kv_heads: HEADS as u32,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: kv_heads as u32,
         head_dim: HEAD_DIM as u32,
         dtype: DType::BF16,
         block_tokens: Some(BLOCK_TOKENS as u32),
@@ -729,7 +744,7 @@ fn paged_run(
     let kernel = h.provider.attention().expect("hip attention");
     assert!(kernel.supports(&cfg), "{cfg}");
     let impl_name = kernel.implementation(&cfg);
-    let row = HEADS * HEAD_DIM;
+    let row = q_heads * HEAD_DIM;
     let blocks_of: Vec<usize> = seqs
         .iter()
         .map(|s| s.kv_len.div_ceil(BLOCK_TOKENS))
@@ -750,29 +765,33 @@ fn paged_run(
         }
     }
     let num_blocks = next;
-    let pool_len = num_blocks * 2 * BLOCK_TOKENS * row;
+    let kv_row = kv_heads * HEAD_DIM;
+    let pool_len = num_blocks * 2 * BLOCK_TOKENS * kv_row;
     // The pool history: the same seeded values in every run, so the target's blocks match.
     let pool = upload(
         h,
-        &[num_blocks, 2, BLOCK_TOKENS, HEADS, HEAD_DIM],
+        &[num_blocks, 2, BLOCK_TOKENS, kv_heads, HEAD_DIM],
         DType::BF16,
         &Rng(pool_seed).normal(pool_len, 1.0),
     );
     let total_q: usize = seqs.iter().map(|s| s.q_len).sum();
     let mut rng = Rng(pool_seed ^ 0x5eed);
+    // q rows are q_heads wide, the new K/V rows kv_heads wide.
+    let widths = [row, kv_row, kv_row];
     let mut data: [Vec<f32>; 3] = [
         rng.normal(total_q * row, 1.0),
-        rng.normal(total_q * row, 1.0),
-        rng.normal(total_q * row, 1.0),
+        rng.normal(total_q * kv_row, 1.0),
+        rng.normal(total_q * kv_row, 1.0),
     ];
     let start: usize = seqs[..target].iter().map(|s| s.q_len).sum();
-    for (d, t) in data.iter_mut().zip(target_rows) {
-        d[start * row..(start + seqs[target].q_len) * row].copy_from_slice(t);
+    for ((d, t), w) in data.iter_mut().zip(target_rows).zip(widths) {
+        d[start * w..(start + seqs[target].q_len) * w].copy_from_slice(t);
     }
-    let shape = [total_q, HEADS, HEAD_DIM];
+    let shape = [total_q, q_heads, HEAD_DIM];
+    let kv_shape = [total_q, kv_heads, HEAD_DIM];
     let q = upload(h, &shape, DType::BF16, &data[0]);
-    let k = upload(h, &shape, DType::BF16, &data[1]);
-    let v = upload(h, &shape, DType::BF16, &data[2]);
+    let k = upload(h, &kv_shape, DType::BF16, &data[1]);
+    let v = upload(h, &kv_shape, DType::BF16, &data[2]);
     let o = upload(h, &shape, DType::BF16, &vec![0.0; total_q * row]);
     let mut indptr = vec![0f32];
     for s in seqs {
@@ -919,6 +938,109 @@ fn paged_attention_rows_are_batch_invariant() {
     }
     assert_invariant(&out);
 }
+
+/// The b1 decode entry's rows (24/8 heads, 128-token pages): below 4 sequences the b1 kernel runs,
+/// from 4 on CK split-KV (`kTurbineB1CkSeqs`). 24 target decode rows (contexts of 97 to 4,000
+/// tokens, each its own q/k/v), each alone and inside decode batches of 2, 3, 16 and 64 at the
+/// first, a middle and the last position: bitwise equal to the target alone in batches of 2 and
+/// 3 (the b1 kernel: constant split count, every sequence independent), bitwise equal to each
+/// other in batches of 16 and 64 (CK with one split), and within [`B1_CK_EDGE_BOUND`] of the
+/// target alone across the edge. One BF16 row is a weak witness of a changed F32 summation order
+/// (a re-partitioned split flips ~1 element of 3,072), hence 24 rows; mutation-checked against a
+/// split count that depends on the grid. Breaks if the splits depend on the batch, a split reads
+/// another sequence's rows, the combine order depends on arrival, or the edge moves.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn b1_decode_rows_are_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    let h = setup();
+    let mut rng = Rng(31);
+    let (q_heads, kv_heads) = (24usize, 8usize);
+    let d = |kv_len: usize| Seq { q_len: 1, kv_len };
+    let others: Vec<Seq> = (0..64).map(|i| d(20 + 37 * i)).collect();
+    let mut out = Vec::new();
+    for t in 0..24usize {
+        let target = d(97 + (t * 1_571) % 3_904);
+        let rows: [Vec<f32>; 3] = [
+            rng.normal(q_heads * HEAD_DIM, 1.0),
+            rng.normal(kv_heads * HEAD_DIM, 1.0),
+            rng.normal(kv_heads * HEAD_DIM, 1.0),
+        ];
+        let seed = 99 + t as u64;
+        let run = |n: usize, at: usize| {
+            let mut seqs = others[..n].to_vec();
+            seqs[at] = target;
+            paged_run_heads(
+                &h,
+                AttentionKind::DecodePaged,
+                &seqs,
+                at,
+                &rows,
+                seed,
+                q_heads,
+                kv_heads,
+            )
+            .0
+        };
+        let alone = run(1, 0);
+        let what = |n: usize, at: usize| {
+            format!(
+                "b1 decode target {t} (kv_len {}) in {n} decodes at {at}",
+                target.kv_len
+            )
+        };
+        for n in [2usize, 3] {
+            for at in [0, n / 2, n - 1] {
+                out.push(Outcome::of(
+                    what(n, at),
+                    &alone,
+                    &run(n, at),
+                    "turbine_hip_b1_decode",
+                ));
+            }
+        }
+        let ck = run(16, 0);
+        for (n, at) in [
+            (16usize, 0usize),
+            (16, 8),
+            (16, 15),
+            (64, 0),
+            (64, 32),
+            (64, 63),
+        ] {
+            let got = if (n, at) == (16, 0) {
+                ck.clone()
+            } else {
+                run(n, at)
+            };
+            if (n, at) != (16, 0) {
+                out.push(Outcome::of(
+                    format!("{} vs 16 at 0", what(n, at)),
+                    &ck,
+                    &got,
+                    "ck_tile_fmha_splitkv",
+                ));
+            }
+            out.push(Outcome::bounded(
+                format!("{} vs alone (across the edge)", what(n, at)),
+                &alone,
+                &got,
+                "ck_tile_fmha_splitkv vs turbine_hip_b1_decode",
+                B1_CK_EDGE_BOUND,
+            ));
+        }
+    }
+    assert_invariant(&out);
+}
+
+/// The largest |Δ| allowed between a decode row on the b1 kernel (alone) and the same row on CK
+/// split-KV (a batch of 4 or more): two numerics classes, each within the CPU reference's BF16
+/// tolerance (`hip_ops` paged decode tests). Measured on the R9700 (lab run 1005215708, 24 rows ×
+/// 6 batch shapes): max |Δ| 3.906e-3 — one BF16 ulp in [0.5, 1) — on up to 1,317 of 3,072
+/// elements; the bound is twice that (one ulp in [1, 2)), so a drift past one rounding step fails.
+const B1_CK_EDGE_BOUND: f32 = 7.8125e-3;
 
 /// Lab timing (perf tier): the device-offset `moe_experts` implementations (small-m, prefill WMMA
 /// and grouped WMMA; the card profile's row tiers pick the first two) bound one at a time, at

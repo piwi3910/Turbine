@@ -4,10 +4,13 @@
 //! streamed into the WMMA registers, the same per-element chain) above them, 8-16 % faster than
 //! the grouped WMMA kernels with OLMoE's real routing (`perf moe_prefill_timings`), and
 //! Composable Kernel paged attention
-//! serves pages of a multiple of 128 tokens. Paged decode prefers CK's split-KV kernel, which
-//! merges the query heads of a KV head into one tile: 1.2-5x faster than `fmha_fwd_pagedkv` for
-//! Llama's 24/8 heads (`hip_ops decode_attention_timings`); it refuses equal head counts
-//! (OLMoE), which keep `fmha_fwd_pagedkv` and its batch-invariant numerics.
+//! serves pages of a multiple of 128 tokens. Paged decode prefers the own b1 kernel (decision
+//! "5p decode-BW floor", user decision B): grouped query heads only, grid (sequences, KV heads,
+//! splits) with the append and the split combine fused into the launch; from 4 sequences that
+//! entry runs CK's split-KV kernel itself (faster there, `hip_ops decode_attention_timings`),
+//! which merges the query heads of a KV head into one tile (1.2-5x faster
+//! than `fmha_fwd_pagedkv` for Llama's 24/8 heads) and refuses equal head counts (OLMoE), which
+//! keep `fmha_fwd_pagedkv` and its batch-invariant numerics.
 
 use super::{CardCapabilities, CardProfile, CardThresholds, OpPreference, RowTierSpec};
 use crate::OpKind;
@@ -22,6 +25,7 @@ const MOE_SMALL_MAX_ROWS: u32 = 512;
 const RMSNORM_ORDER: &[&str] = &["ck_tile_rmsnorm2d", "turbine_hip"];
 const PAGED_ORDER: &[&str] = &["ck_tile_fmha_pagedkv", "turbine_hip"];
 const PAGED_DECODE_ORDER: &[&str] = &[
+    "turbine_hip_b1_decode",
     "ck_tile_fmha_splitkv",
     "ck_tile_fmha_pagedkv",
     "turbine_hip",

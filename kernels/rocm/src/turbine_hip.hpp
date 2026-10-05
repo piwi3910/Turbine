@@ -114,6 +114,14 @@ struct turbine_ctx {
   // decode graph may still read it.
   void *attn_split_scratch = nullptr;
   size_t attn_split_scratch_bytes = 0;
+  // The b1 decode attention's buffers (paged_attention_b1.hip): the split
+  // partials, and the per-(sequence, KV head) arrival counters in a buffer of
+  // their own (zero between calls; no other shape's partials can land on
+  // them). Same growth discipline as the split-KV scratch.
+  void *attn_b1_scratch = nullptr;
+  size_t attn_b1_scratch_bytes = 0;
+  void *attn_b1_counters = nullptr;
+  size_t attn_b1_counters_bytes = 0;
   std::vector<void *> attn_split_retired;
   // hipBLASLt returned a grouped-GEMM solution for this device at creation.
   bool moe_grouped = false;
@@ -372,8 +380,18 @@ enum class PagedPath {
   // block_formats table; the others refuse them.
   CkPagedkvMixedStaged,
   TurbineMixedStaged,
-  TurbineMixed
+  TurbineMixed,
+  // The own batch-1 decode kernel (decision "5p decode-BW floor", user
+  // decision B): BF16 flat pages only, grouped query heads, any batch. It
+  // appends inside the kernel, so paged_attention.cpp skips the common append
+  // for it.
+  TurbineB1
 };
+// The b1 decode kernel's largest GQA group (its instantiated templates).
+constexpr int32_t kTurbineB1MaxGroup = 8;
+// The decode batch size from which the b1 entry runs CK fmha_fwd_splitkv
+// instead (when CK serves the page size; paged_attention.cpp).
+constexpr int32_t kTurbineB1CkSeqs = 4;
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);
@@ -383,6 +401,12 @@ int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 bool ck_splitkv_serves(const turbine_attention_paged_desc *d);
 int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                        const std::string &entry);
+// paged_attention_b1.hip: what the own batch-1 decode kernel adds to the paged
+// checks, and its call (it appends k_new/v_new inside the kernel, so the
+// common append of paged_attention.cpp is skipped for it).
+bool b1_serves(const turbine_attention_paged_desc *d);
+int32_t run_b1_decode(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
+                      const std::string &entry);
 // moe.cpp: the five moe_experts paths.
 enum class MoePath { SmallM, WmmaPrefill, Wmma, Grouped, PerExpert };
 // The implementation name of path (impl_table.cpp's).

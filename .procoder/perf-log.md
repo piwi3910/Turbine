@@ -1299,6 +1299,50 @@ novanas GPU 0, same-day A/B, medians of 3 of `scripts/lab-bench.sh --model llama
 
 Verdict against the S-13 targets: mt tok/s 1.002× (≥ 0.98×) — **pass**; first p99 1.02× (≤ 1.5×) — **pass**; `mt_ttft_later_p50` 0.96× (≤ 0.85×) — **miss**, though `cache_aware` is better in all three paired runs; `mt_cached` 0.9143 vs 0.9147 (≥) — **miss** (equal). The profile cannot separate the policies: its 64 sessions share one 2,000-word system prefix, so every waiting request carries a near-equal `cached_prefix_tokens` and the affinity term ties, leaving the windowed FIFO ≈ `default`. The saturated profile is also bimodal for both policies — one run per policy fell into a low-reuse regime (ca3 cached 0.818 / 347.1 tok/s, def2 0.810 / 347.6), the other four held 0.914 / ~490. Recommendation recorded for the coordinator: keep `default` as the serving default; `cache_aware` stays available (`scheduler.policy: cache_aware`) and is equal-or-better on later-turn TTFT in this profile.
 
+### b1 attention: the own kernel lands (branch `p5p-b1attn`, commits 5866edaf … 7d3c8cad, 2026-10-05/06)
+
+User decision **B** (decode-BW floor) tasked the batch-1 attention own kernel; the reuse evaluation
+is recorded in decisions ("5p b1 attention: provider evaluation", 5866edaf). Impl
+`turbine_hip_b1_decode` (`kernels/rocm/src/paged_attention_b1.hip`): one launch per layer where CK's
+path was three (append + splitkv + combine) — grid (sequences, KV heads, 8 splits), the append fused
+into the owning split, the split combine fused into the last-arriving workgroup (ascending split
+order, capture-safe, counters in their own always-zero buffer), P kept in F32. Grouped heads only
+(group ≤ 8, BF16 flat pages, any page size); OLMoE (16/16) keeps CK pagedkv.
+
+GPU validation on the new PSU (novanas, all perf on GPU 0 under the bench lock, same-day baseline =
+`p6b-stack` a004fd93):
+
+| Measurement                                       | CK splitkv (base) | b1 everywhere (17cccc2b) | b1 + dispatch (7d3c8cad) |
+| ------------------------------------------------- | ----------------- | ------------------------ | ------------------------ |
+| op µs/layer b=1 kv~768 (cold pools, incl. append) | 42.5              | **23.9**                 | 23.9                     |
+| op µs/layer b=1 kv~8k                             | 320.3             | **83.8**                 | 83.8                     |
+| op µs/layer b=4 / b=16 kv~768                     | 46.2 / 103.6      | 48.3 / 136.8             | CK above 3 seqs          |
+| served attention µs/layer (Llama c1 trace)        | 21.7 + 2.9 append | **16.8** (append fused)  | 16.8                     |
+| served step / gaps (ms)                           | 13.09 / 1.32      | 12.73 / 1.12             | —                        |
+| effective weight-read BW (6.43 GB)                | 491 GB/s (0.77×)  | **505 GB/s (0.79×)**     | —                        |
+| c1 tok/s / ITL p50 (`lab-bench --c1`)             | 80.0 / 12.29 ms   | 81.3 / 12.09             | **81.2 / 12.10**         |
+| c16 tok/s (200 req)                               | 853.2             | 833.5 (0.977×)           | **853.0 (1.000×)**       |
+| golden c1 / c16                                   | PASS / PASS       | PASS / PASS              | PASS / PASS              |
+
+The b1 kernel wins at small batches and loses from b = 8 (fewer, longer CK tiles amortise better),
+so `7d3c8cad` keeps the b1 entry (selection is per op config — the registry binds one index; a
+sequence-count tier cannot be selected) and dispatches inside it: from `kTurbineB1CkSeqs` = 4
+sequences it runs CK splitkv when CK serves the page size. Correctness: `paged_b1_decode_matches_cpu`
+(1–64 sequences, groups 3–8, both page sizes; max |Δ| 1.56e-2 = 1 BF16 ulp, pool exact after the
+fused append), `paged_decode_splitkv_matches_cpu` (default and CK bound alone), `b1_decode_rows_are_batch_invariant`
+(24 rows × 12 shapes: bitwise within each side; across the edge max |Δ| 3.906e-3 measured, bound
+7.8125e-3), `paged_attention_rows_are_batch_invariant` (OLMoE) green. Mutation checks (lab): combine
+skipping the last split and an append that drops V fail `paged_b1_decode_matches_cpu`; a split count
+derived from the grid fails the invariance test (117/216 shapes) — it first **survived** the
+one-row version of that test (a re-partitioned F32 sum flips ~1 of 3,072 BF16 elements), which is
+why the test compares 24 rows.
+
+Verdict against the floor decision: attention 21.7 + 2.9 → 16.8 µs/layer served — **the ≤ ~10 µs
+target is missed**; Llama c1 +1.5 % (80.0 → 81.2), bandwidth 0.77× → 0.79×, short of the ~0.81× /
+≥ 90 tok/s mark. The served gain is smaller than the op-level one because served CK reads warm KV
+(21.7 vs 42.5 µs cold); the measurable win is the two removed boundaries per layer (gaps −0.20 ms)
+plus ~5 µs/layer of attention. c16 unchanged.
+
 ### S-9 plumbing: multi-token append and multi-row logits (plan Task 10, commit a03f42ac, 2026-10-05)
 
 Enabler landing; nothing uses extensions yet (the verified jump-forward wires them in Task 12), so only the no-regression bound applies. `scripts/lab-bench.sh --quick` on GPU 0 (64 requests), golden c1 PASS and `failed=0` on both:

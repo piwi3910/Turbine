@@ -242,9 +242,13 @@ mod tests {
                 ("page_multiple", "128".to_string())
             ]
         );
-        // Llama (grouped heads) decodes on CK split-KV, OLMoE (equal heads) on CK pagedkv, the
-        // profile's second choice: neither is the page-size fallback.
-        for decode in ["ck_tile_fmha_splitkv", "ck_tile_fmha_pagedkv"] {
+        // Llama (grouped heads) decodes on the b1 kernel (small batches) or CK split-KV, OLMoE
+        // (equal heads) on CK pagedkv: none is the page-size fallback.
+        for decode in [
+            "turbine_hip_b1_decode",
+            "ck_tile_fmha_splitkv",
+            "ck_tile_fmha_pagedkv",
+        ] {
             let on_ck = [
                 sel(OpKind::Gemm, "hipblaslt"),
                 sel(OpKind::AttentionPrefillPaged, "ck_tile_fmha_pagedkv"),

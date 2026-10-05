@@ -3431,6 +3431,29 @@ relaxing other invariances. Target: Llama toward ~0.81× of the 640 GB/s peak (t
 ~9–10 µs/layer CK b1 attention replaced by an own launch-efficient kernel, plus the 10 % inter-kernel gap work).
 The other two relaxations (OLMoE invariance, rmsnorm bitwise) stay unrelaxed.
 
+## 5p b1 attention: provider evaluation before the own kernel (kernel reuse rule, 2026-10-05)
+
+Decision B tasks the own batch-1 attention kernel; the kernel-reuse rule (2026-09-27) requires the existing
+providers evaluated and recorded first. Candidates against the decode descriptor (paged KV pool
+`[num_blocks, 2, block_tokens, Hkv, 128]` behind a per-sequence block table, GQA groups, ragged multi-sequence
+decode batches, decode graphs that capture the call with the scalars by value, per-class pages on a classed pool):
+
+| Candidate                                                                                                                                                                                                                         | Verdict                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| llama.cpp `fattn-mma-f16` / `fattn-vec` (`ggml/src/ggml-cuda/`, the HIP backend compiles the same sources; on RDNA3/4 the WMMA/mma kernels or the vec kernel serve the ncols1 = 1 decode case, `ggml_cuda_get_best_fattn_kernel`) | **Not reusable as an implementation.** ggml tensors: K/V are contiguous per-sequence slabs (the unified KV cache), there is no page table, no per-block format, no ragged multi-sequence decode batch, and the GQA path needs `K->ne[1] % FATTN_KQ_STRIDE == 0` padding. Presenting our descriptor would mean staging K/V into their layout — a full K/V copy per layer per step, the cost the landing exists to remove — and rewriting the addressing regardless. Ideas mined: the vec kernel's one-wave-per-head streaming shape (our kernel's inner loop), and its result that a lean streaming decode kernel beats tiled MMA at one query. |
+| CK `fmha_fwd_splitkv` (today's b1 path)                                                                                                                                                                                           | **Fits the descriptor** (paged, GQA head merge, block table) but is launch/occupancy bound at batch 1: one workgroup per (sequence, KV head) = 8 at batch 1 — 19.5 µs + 2.1 µs combine per layer (the p5p-decodebw trace). `num_splits > 1` was rejected on numerics ("Pre-Phase-5 #3": each split rounds P against its own maximum; tiny-Llama max logit Δ 3.8e-6 → 0.10) and still needs the separate combine launch.                                                                                                                                                                                                                        |
+| CK `fmha_fwd_pagedkv` (non-split) at decode                                                                                                                                                                                       | Saves the combine launch, same tiling family; measured 1.2–5× slower than splitkv for grouped decode (`hip_ops decode_attention_timings`; the card profile's preference note). No headroom.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| hipBLASLt / other kernel providers                                                                                                                                                                                                | No attention primitive (GEMM-only libraries).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+
+Conclusion: **nothing reusable fits — the own kernel stands (decision B).** The design that separates it from
+CK's splitkv: a fixed split count so a row's bits never depend on the batch (within-tier bitwise batch
+invariance, as the small-m MoE tier), P kept in F32 through the P·V product so split-local maxima cost only
+F32-rescale rounding (the BF16-P-per-split rounding is exactly what made CK's multi-split numerics drift), the
+split combine fused into the same launch (the last-arriving workgroup per (sequence, KV head) combines in
+ascending split order — deterministic, capture-safe, no second boundary), and the append of k_new/v_new fused
+into the owning split's workgroup. One launch per layer replaces today's three (append + splitkv + combine)
+and their two inter-kernel boundaries.
+
 ## Phase 5p close → pause for the new PSU install (user, 2026-10-04)
 
 The user received the replacement PSU for novanas. Phase 5p runs to completion (Tasks 11–12, the b1 attention validation when the GPUs free, Tasks 13–17 as scheduled, the Task 19 exit tiers), then everything pauses and the host is handed over for the PSU install — the exit runs BEFORE the install, on the old PSU (one-GPU-job rules stay until the new PSU is in and confirmed). After the install and the user's go: the one-GPU-job limitation lifts and the next phase starts.
@@ -3466,3 +3489,18 @@ but the S-10 speed targets miss: forward steps 0.899× (target ≤ 0.8×), wall 
 
 **Decision (user, 2026-10-06): A.** Jump-forward stays on by default; the S-10 speed targets are re-bound to the
 measured Llama workload (steps 0.899×, wall 0.989×; correctness unchanged) and Tasks 11–12 close.
+
+## 5p b1 attention: result — landed, the ~10 µs target missed (builder record, 2026-10-06; open for the lead)
+
+From `p5p-b1attn` (7d3c8cad; perf log 5p "b1 attention"). The own kernel serves Llama b1 attention at
+16.8 µs/layer served (CK 21.7 + 2.9 separate append), c1 80.0 → 81.2 tok/s, effective bandwidth 0.77× →
+0.79×, c16 853.2 → 853.0, golden c1/c16 PASS. It loses to CK splitkv from batch 8, and selection is per
+op config, so the b1 entry dispatches batches of 4+ sequences to CK splitkv inside the library
+(`kTurbineB1CkSeqs`); rows are bitwise batch-invariant within each side and within 7.8125e-3 across the
+edge (measured 3.906e-3). The decision-B targets (≤ ~10 µs/layer, ~0.81×, ≥ 90 tok/s) are not met.
+
+- A) Keep it as landed (small c1 gain, c16 neutral) and spend the next decode-BW effort on rope-into-append
+  fusion and the remaining boundaries — recommended: the residual is the per-boundary floor, not the
+  attention math (served 16.8 µs on ~3 MB of warm KV is still launch/latency-bound)
+- B) Iterate the kernel (split count 4/16, one wave per split, rope fused in) toward ~10 µs before merge
+- C) Revert to CK splitkv (keep the evaluation record only)
