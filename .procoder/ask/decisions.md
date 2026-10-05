@@ -3313,3 +3313,28 @@ The user sets the sequencing principle: speculative decoding (Phase 8) starts on
 leaves performance on the table. Consequence: the remaining Task 18 decode-bandwidth items (K-split small-m MoE GEMV,
 routing-chain fusion, Llama gap/attention/fusion work) are tasked now in 5p, and Phase 8 waits for the ~90 % target.
 The CK rmsnorm-at-n=2048 item stays blocked by the `rmsnorm_sharded` bitwise TP constraint unless the user relaxes it.
+
+## 5p decode bandwidth II: the K-split small-m MoE GEMV lands as a numerics class (2026-10-05)
+
+From `p5p-decodebw2` (the "~90 % of roofline before Phase 8" tasking, 2026-10-04). The small-m
+MoE GEMV streams one 16-column weight strip through one wave from k = 0 to depth; at one routed
+row per expert that is 512 waves (OLMoE gate-up) whose 16-byte loads keep too few bytes in
+flight. The landed kernel splits k across the block's 8 waves instead of the columns -- every
+wave 16 columns and a 1/8 slice, partials combined through LDS in ascending slice order -- 8x
+the waves. Served OLMoE b1 on novanas GPU 0: expert GEMVs 428-490 -> ~610 GB/s, step 7.95 ->
+6.96 ms, effective b1 bandwidth 297 -> 339 GB/s, c1 tok/s 136.3 -> 156.8 (+15 %), c16 630.0 ->
+624.4 (within the 0.97x bound), golden c1 PASS. Op-level (cache-cycled): 264.5 -> 201.7 us per
+layer at 8 routed rows, 575-607 GB/s at 128-512 rows.
+
+The tasking accepted a numerics-class change, so the slice-summed order replaces the 2026-09-27
+tiers-are-bitwise-equal design at the decode tier: within the small-m tier a row's output is
+still bitwise batch-invariant (0 differing at every tested batch shape, 8-512 routed rows);
+across `moe_small_max_rows` the same row now agrees with the unsplit prefill/grouped chains only
+within 1 BF16 ulp (measured: max_abs 0.125, 377 of 133,120 outputs at 520 rows, 19,054 of
+3,145,728 at 12,288, heavy-tailed activations). A request whose batch crosses the 512-row
+boundary can therefore change its rounding there -- the property the 2026-09-27 OLMoE
+concurrency-16 golden flip restored is now a tolerance property. `moe_rows_are_batch_invariant`
+compares within the tier bitwise and across the boundary against the recorded 0.25 bound
+(`Outcome::bounded`; mutation-checked: bound 0 fails). The scalar-FMA alternative (the
+pre-2026-09-27 kernels, ~575 GB/s op-level at 4-16 tokens) was rejected: the same numerics-class
+problem with no chain relation to the tiers above.
