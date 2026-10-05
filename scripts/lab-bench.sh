@@ -20,6 +20,7 @@
 #    a no-op alias for that same default, kept for compatibility with older call sites).
 # 2. Starts the server directly on the host, pinned to --gpu (0, the default, or 1) with
 #    ROCR_VISIBLE_DEVICES, so every step runs on the same card; any other value is refused.
+#    Both cards give comparable numbers (GPU 1 vs GPU 0 on the new PSU, 2026-10-06).
 # 3. Under the exclusive benchmark lock: golden at concurrency 1 (the gate; always), golden at 16
 #    only with --golden16 (opt-in: it roughly doubles the golden time for a number this step does
 #    not gate on; --batched-bounds judges golden c1 and c16 by the slug's batched logprob bounds, the
@@ -142,11 +143,10 @@ while [[ $# -gt 0 ]]; do
 	*) usage ;;
 	esac
 done
-# novanas has two R9700s. GPU 0 holds the recorded baselines; GPU 1 is benched since the new
-# PSU (decision 2026-10-05) and its comparability with GPU 0 is the GPU 1 benchmark's verdict.
+# novanas has two R9700s and both give comparable numbers (decision 2026-10-06, "GPU 1 vs GPU 0
+# on the new PSU": both link Gen5 x8 at the root port; GPU 1 within 0.6 % of GPU 0).
 case "$gpu" in
-0) ;;
-1) echo "lab-bench: WARN --gpu 1: compare its numbers only with GPU 1 runs until the GPU 1 vs GPU 0 benchmark rules (decision 2026-10-05)" >&2 ;;
+0 | 1) ;;
 *)
 	echo "lab-bench: --gpu is 0 or 1 (novanas has two R9700s), got: $gpu" >&2
 	exit 2

@@ -1528,10 +1528,9 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
 }
 
 /// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the
-/// --with-tests / --skip-tests / --golden16 / --quick flags and the GPU-0-only guard (GPU 1's
-/// PCIe link is not throughput-comparable). These usage cases cover what must be rejected
-/// before any host contact (the well-formed invocations are covered by the --dry-run tests
-/// below, P5p S-1).
+/// --with-tests / --skip-tests / --golden16 / --quick flags and the card guard (novanas has GPUs 0
+/// and 1). These usage cases cover what must be rejected before any host contact (the
+/// well-formed invocations are covered by the --dry-run tests below, P5p S-1).
 #[test]
 fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     for (tag, args) in [
@@ -1551,14 +1550,21 @@ fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     );
 }
 
-/// New PSU (user decision 2026-10-05): `lab-bench.sh --gpu 1` serves on GPU 1 — the server is
-/// pinned with `ROCR_VISIBLE_DEVICES=1` and the BENCH line says `gpu=1`. Breaks if GPU 1 is
-/// refused again or the pin stays on GPU 0.
+/// GPU 1 vs GPU 0 on the new PSU (decision 2026-10-06): `lab-bench.sh --gpu 1` serves on GPU 1 —
+/// the server is pinned with `ROCR_VISIBLE_DEVICES=1` — as a peer of GPU 0, with no
+/// comparability warning. Breaks if GPU 1 is refused or warned about again, or the pin stays on
+/// GPU 0.
 #[test]
 fn lab_bench_gpu_1_serves_on_gpu_1() {
     let text = dry_run("lab-bench.sh", "bench-gpu1", &["--dry-run", "--gpu", "1"]);
     assert!(text.contains("ROCR_VISIBLE_DEVICES=1 "), "{text}");
     assert!(!text.contains("ROCR_VISIBLE_DEVICES=0 "), "{text}");
+    let (out, _) = lab_script(
+        "lab-bench.sh",
+        "bench-gpu1-warn",
+        &["--dry-run", "--gpu", "1"],
+    );
+    assert!(!stderr(&out).contains("WARN"), "{}", stderr(&out));
 }
 
 /// The flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
