@@ -3437,3 +3437,11 @@ natively on GPU 1 and compared with GPU 0's recorded baselines (Llama 852.2, OLM
 re-check showed both cards on Gen5 x8 root ports, contradicting the older Gen4 note — the benchmark settles it).
 Within ~3 %: GPU 1 joins perf work and the GPU-0-only rule lifts; measurably slower: documented, GPU 1 stays
 functional-only. Only then does Phase 5p resume under the updated rules.
+
+## New PSU validated (2026-10-05)
+
+On the replacement PSU: both R9700s enumerate at PCIe Gen5 x16 (03:00.0, 06:00.0; runtime-PM `power/control=on`
+intact); the two-GPU fault-injection full tier passed (66 targets, 0 failed); three back-to-back `tp2-novanas`
+dual-GPU serve+bench passes PASS with no crash, no GPU drop-out and no link downtrain. The user judged the soak good.
+The one-GPU-job rule (coordinator 2026-09-29, "until novanas's PSU is replaced") is lifted; the GPU-0-only perf rule
+waits on the GPU 1 benchmark (decision "New PSU validation sequence, then the GPU 1 benchmark").
