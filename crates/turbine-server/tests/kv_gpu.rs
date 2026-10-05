@@ -622,6 +622,11 @@ fn prefix_reuse_partial_block_matches_cold() {
     let server = LabServer::start(&model_dir, &[]);
     let mut failed = Vec::new();
     for ((primer, target, want), cold) in cases.iter().zip(&cold) {
+        // The primer publishes the tail the target reuses; a target that does not continue
+        // its primer is the cold-equality leg only.
+        if !primer.is_empty() && target.len() > primer.len() {
+            server.complete_ids(primer, ANSWER_TOKENS);
+        }
         let warm = server.complete_ids(target, ANSWER_TOKENS);
         let label = format!("prompt {} want {want}", target.len());
         println!(
@@ -718,15 +723,14 @@ fn prefix_reuse_suffix_lengths_match_cold_with(sets: &[String]) {
             warm.prompt_tokens, warm.cached_tokens, cold.text, warm.text
         );
         assert_eq!(cold.completion_tokens, u64::from(ANSWER_TOKENS));
-        // P5p S-4/S-5: the reuse cap is token-granular — every cached token but
-        // `MIN_RECOMPUTE_TOKENS` (the primer's tail diverges from the target's suffix here, so
-        // only the shared full blocks attach; a shared final block splits at the boundary).
-        let prompt = blocks * BLOCK + suffix;
-        let want = (blocks * BLOCK).min(prompt - 2);
+        // The primer's tail diverges from the target's suffix by construction, so only the
+        // shared full blocks attach — whole-block reuse, unchanged under P5p (at least two
+        // prompt tokens are prefilled, `MIN_RECOMPUTE_TOKENS`).
+        let reused = blocks.min((blocks * BLOCK + suffix - 2) / BLOCK);
         assert_eq!(
             warm.cached_tokens,
-            u64::from(want),
-            "blocks {blocks} suffix {suffix}: the warm run reuses the shared tokens"
+            u64::from(reused * BLOCK),
+            "blocks {blocks} suffix {suffix}: the warm run reuses the shared blocks"
         );
         assert_eq!(warm.prompt_tokens, u64::from(blocks * BLOCK + suffix));
         if warm.output() != cold.output() {
