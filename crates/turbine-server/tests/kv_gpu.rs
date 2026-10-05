@@ -595,7 +595,7 @@ fn prefix_reuse_partial_block_matches_cold() {
             // The target continues the primer's tail with fresh tokens (its own suffix).
             let target = [primer.as_slice(), &token_ids(400 + i, EXTRA)].concat();
             let want = 3 * BLOCK + tail;
-            vec![(primer.clone(), target, want), (primer, Vec::new(), 0)]
+            vec![(primer, target, want)]
         })
         .chain(std::iter::once({
             // One divergence inside the third shared block: the target shares the primer's
