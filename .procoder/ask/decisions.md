@@ -3416,3 +3416,11 @@ OLMoE ~375 (0.59×).
 - B) Task the b1 attention own kernel now (new numerics class, kernel project) — Llama ~0.81×
 - C) Relax the OLMoE all-steps GEMM invariance (→ per-m GEMV) — OLMoE gains, breaks the invariance guarantee
 - D) Relax the `rmsnorm_sharded` bitwise TP constraint (→ CK rmsnorm n=2048) — ~0.5 ms OLMoE
+
+## 5p decode-BW floor: the b1 attention own kernel is tasked (user decision, 2026-10-04)
+
+The user picked **B** from the floor decision: task the batch-1 attention own kernel now (a new numerics class — its
+outputs are a kernel-project with golden-tolerance verification, not bitwise), rather than accepting the floor or
+relaxing other invariances. Target: Llama toward ~0.81× of the 640 GB/s peak (the floor analysis's handed-off item:
+~9–10 µs/layer CK b1 attention replaced by an own launch-efficient kernel, plus the 10 % inter-kernel gap work).
+The other two relaxations (OLMoE invariance, rmsnorm bitwise) stay unrelaxed.
