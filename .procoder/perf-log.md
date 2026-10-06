@@ -1871,3 +1871,28 @@ Served (`lab-bench.sh --gpu 0`, one session, commit 485c5e88, client on novanas)
 Llama c1 decode step 11.81 → 11.3 ms (0.957×, eff. BW 545 → ~569 GB/s, ~0.89×); c16 and OLMoE unchanged (OLMoE never
 binds the GEMV; its gemm selections are as recorded). `tests/lab/kernel-choices-llama.json`: the five Llama GEMMs now
 select `vllm_wvsplitk` (status `tiers`: ≤ 1 rows vllm_wvsplitk, above hipblaslt).
+
+## 5p GEMV stage B: SiLU·up fused into the down GEMV's input (2026-10-06, branch `p5p-gemv-b`)
+
+Stage B of the same decision: kernel ABI v2.14 (`turbine_gemm_desc.a_silu_mul` / `a_up_offset`). `vllm_wvsplitk`'s LDS
+staging loop stores `silu_mul(gate, up)` read from the gate/up row (elementwise.hip's arithmetic) instead of copying
+`a`, so the down projection takes the gate_up output directly and the separate `silu_mul` launch and its boundary go
+(decode steps of dense one-device BF16 decoders only; prefill keeps GEMM + `silu_mul`). Chosen over the gate_up GLU
+epilogue: no row pairing in the tile, the prologue runs once per persistent block. Output bit-identical to
+`silu_mul` + the GEMV (`hip_ops gemv_silu_mul_matches_unfused`, 3B down shape and a small one), so no numerics change.
+
+Kernel (`hip_ops gemv_silu_mul_timings`, graph-timed as stage A, down 3072×8192): `silu_mul` + GEMV 87.3 µs, fused
+85.2 µs → −2.1 µs per layer (the plain down GEMV is 83.7: the prologue costs ~1.5 µs, the removed kernel + boundary
+~3.6). Predicted −0.059 ms per step (28 layers).
+
+Served (`lab-bench.sh --gpu 0`, one session, base = `p6b-stack` 97a70b34 detached, interleaved A/B):
+
+| Run                             | tok/s                     | ITL p50 (ms)                 | TTFT p50 (ms) | golden c1 / c16 |
+| ------------------------------- | ------------------------- | ---------------------------- | ------------- | --------------- |
+| Llama c1 `--quick` base (×2)    | 87.15 / 87.13             | 11.297 / 11.300              | 54            | PASS / —        |
+| Llama c1 `--quick` stage B (×3) | **87.66 / 87.52 / 87.66** | **11.230 / 11.246 / 11.229** | 54            | PASS / —        |
+| Llama c16 200 req (`gemvb`)     | 853.9                     | 15.5                         | 206           | PASS / PASS     |
+| OLMoE c16 `--quick` (`gemvb`)   | 627.7                     | 24.2                         | 136           | PASS / —        |
+
+Llama c1 ITL 11.30 → 11.23 ms (−0.064 ms, 0.994×; the kernel prediction); c16 unchanged (853.2 at stage A); OLMoE
+unchanged (never binds the GEMV; 622.2 at stage A).

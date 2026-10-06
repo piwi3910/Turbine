@@ -123,6 +123,19 @@ typedef struct turbine_gemm_desc {
   int32_t trans_b;
   int32_t a_dtype, b_dtype, c_dtype;
   float alpha, beta;
+  /* v2.14 (Phase 5p), read only by a library reporting minor >= 14: the
+   * SwiGLU input. With a_silu_mul 1 the product's left operand is
+   * silu_mul(gate, up), gate row r at a + r * lda and up row r at
+   * a + r * lda + a_up_offset (a_dtype elements), each element computed
+   * exactly as turbine_silu_mul computes it: c equals turbine_silu_mul into an
+   * [m, k] buffer followed by this call on it, bit for bit. Only an
+   * implementation whose turbine_impl_supports accepts the descriptor takes
+   * it (turbine_gemm's own default refuses it); such an implementation may
+   * overwrite the gate columns of a with the operand when it falls back to
+   * another algorithm (the TURBINE_OPTION_GEMM_PREFILL steps). 0 (every
+   * earlier minor): a is the operand. */
+  int64_t a_up_offset;
+  int32_t a_silu_mul;
 } turbine_gemm_desc;
 
 /* Contiguous per-sequence KV. Query i sits at absolute position q_start + i;
@@ -487,8 +500,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * tq_params; no new symbol); v2.12 RoPE fused into paged decode attention
  * (the rope_* fields of turbine_attention_paged_desc; no new symbol); v2.13
  * unquantized activations into an FP8 W8A8 qgemm (turbine_qgemm_desc's
- * act_static_scale; no new symbol). */
-#define TURBINE_ABI_MINOR 13u
+ * act_static_scale; no new symbol); v2.14 the SwiGLU input of a GEMM
+ * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol). */
+#define TURBINE_ABI_MINOR 14u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

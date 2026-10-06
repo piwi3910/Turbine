@@ -125,6 +125,11 @@ impl FfnHook for SwiGlu {
         }
         run.trace("gate", &gate())?;
         run.trace("up", &up())?;
+        // Decode steps on the card's GEMV (kernel ABI v2.14): the down projection computes
+        // SiLU·up as it loads its input, bit for bit the two ops below, one launch fewer.
+        if run.linear_silu_mul(gate(), up(), w.1[DOWN].view(), run.ffn_out())? {
+            return run.trace("down", &run.ffn_out());
+        }
         let silu = activation_cfg(d);
         run.op(OpConfig::SiluMul(silu), || {
             run.registry

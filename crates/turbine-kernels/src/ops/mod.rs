@@ -1164,6 +1164,27 @@ pub trait GemmKernel: Send + Sync {
     fn supports(&self, cfg: &GemmConfig) -> bool;
     fn implementation(&self, cfg: &GemmConfig) -> String;
     fn execute(&self, ctx: &mut GemmContext<'_>) -> Result<(), KernelError>;
+    /// True when [`Self::execute_silu_mul`] runs for `rows`-row calls of `cfg` in a step that
+    /// prefills (`prefill`) or not (kernel ABI v2.14: the SwiGLU input fused into the GEMM): the
+    /// executor then skips its `silu_mul` launch. False by default.
+    fn fuses_silu_mul(&self, cfg: &GemmConfig, rows: usize, prefill: bool) -> bool {
+        let _ = (cfg, rows, prefill);
+        false
+    }
+    /// `c = silu_mul(gate, up) · bᵀ` with `gate = ctx.a` and `up` (same shape and row stride,
+    /// in the same allocation), each element of the operand exactly as the `silu_mul` op computes
+    /// it: bit for bit `silu_mul` into a buffer followed by [`Self::execute`] on it. Only for
+    /// calls [`Self::fuses_silu_mul`] accepts; the gate columns may be overwritten.
+    fn execute_silu_mul(
+        &self,
+        ctx: &mut GemmContext<'_>,
+        up: TensorView<'_>,
+    ) -> Result<(), KernelError> {
+        let _ = (ctx, up);
+        Err(KernelError::Unsupported {
+            message: "this GEMM provider does not fuse silu_mul into its input".into(),
+        })
+    }
 }
 
 /// Prefill and decode attention (`cfg.kind` selects the entry point): `execute` runs the
