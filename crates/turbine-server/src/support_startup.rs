@@ -101,38 +101,8 @@ pub fn key_before_discovery(
 /// formats are checked first ([`tier_formats`]).
 pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
     tier_formats(cfg)?;
-    partial_reuse_on_classed_l0(cfg)?;
     let (weight, kv) = format_columns(cfg);
     support::check(key_before_discovery(cfg, weight, kv))
-}
-
-/// Reason code of the 5p stopgap refusal (user decision 2026-10-06, "5p: partial prefix reuse
-/// fails on a classed L0 pool", B): token-granular reuse's tail copy fails on a GPU L0 pool
-/// classed by the ladder's L0 step.
-pub const PARTIAL_REUSE_CLASSED_L0_REASON: &str = "kv_partial_reuse_classed_l0";
-
-/// Refuses (exit 2) `kv.partial_prefix_reuse` (with `kv.prefix_sharing`) together with the
-/// ladder's L0 step (`kv.ladder.enabled` and `kv.ladder.l0`) on a GPU backend: the HIP
-/// `copy_blocks` rejects the copy-on-write tail copy on the classed L0 pool (HTTP 500 and an
-/// open circuit). The cpu reference provider copies classed pages correctly and is not refused.
-fn partial_reuse_on_classed_l0(cfg: &Config) -> Result<(), ConfigError> {
-    let kv = &cfg.kv;
-    if kv.prefix_sharing
-        && kv.partial_prefix_reuse
-        && kv.ladder.enabled
-        && kv.ladder.l0
-        && vendor(cfg) != "cpu"
-    {
-        return Err(invalid(
-            "kv.partial_prefix_reuse",
-            format!(
-                "{PARTIAL_REUSE_CLASSED_L0_REASON}: token-granular prefix reuse is not served on \
-                 the classed L0 pool of kv.ladder.l0 (with kv.ladder.enabled) yet; set \
-                 kv.partial_prefix_reuse=false or kv.ladder.l0=false"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
@@ -619,9 +589,6 @@ mod tests {
 
         let mut ladder = config("hip", llama.path());
         ladder.kv.ladder.enabled = true;
-        // The L0 step (`kv.ladder.l0`, the default) with partial reuse is the 5p stopgap
-        // refusal (`partial_reuse_refused_with_the_l0_ladder`); this test is about the formats.
-        ladder.kv.partial_prefix_reuse = false;
         // The default max_format (`tq4`) is a TurboQuant codec: supported, no longer refused.
         assert!(before_discovery(&ladder).is_ok());
         ladder.kv.ladder.max_format = name("l0");
@@ -699,42 +666,6 @@ mod tests {
             let first = before_discovery(&hip).unwrap();
             assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
         }
-    }
-
-    /// 5p stopgap (user decision 2026-10-06, B): `kv.partial_prefix_reuse` with the ladder's
-    /// L0 step on a GPU backend is refused before discovery, exit 2 naming the key and the
-    /// reason code `kv_partial_reuse_classed_l0`; partial reuse off, prefix sharing off, the
-    /// L0 step off, the ladder off or the cpu backend start. Breaks if the combination binds on
-    /// a GPU backend or the refusal spreads to the other shapes.
-    #[test]
-    fn partial_reuse_refused_with_the_l0_ladder() {
-        let llama = model_dir(
-            "llama-partial",
-            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
-        );
-        let mut cfg = config("hip", llama.path());
-        cfg.kv.ladder.enabled = true;
-        assert!(cfg.kv.ladder.l0 && cfg.kv.partial_prefix_reuse && cfg.kv.prefix_sharing);
-        let err = before_discovery(&cfg).unwrap_err();
-        assert_eq!(err.key(), Some("kv.partial_prefix_reuse"), "{err}");
-        assert!(
-            err.to_string().contains(PARTIAL_REUSE_CLASSED_L0_REASON),
-            "{err}"
-        );
-        let changes: [fn(&mut Config); 4] = [
-            |c| c.kv.partial_prefix_reuse = false,
-            |c| c.kv.prefix_sharing = false,
-            |c| c.kv.ladder.l0 = false,
-            |c| c.kv.ladder.enabled = false,
-        ];
-        for change in changes {
-            let mut ok = cfg.clone();
-            change(&mut ok);
-            assert!(before_discovery(&ok).is_ok());
-        }
-        let mut cpu = config("cpu", llama.path());
-        cpu.kv.ladder.enabled = true;
-        assert!(before_discovery(&cpu).is_ok());
     }
 
     #[test]

@@ -2403,6 +2403,97 @@ fn copy_blocks_case(p: &Pair, rng: &mut Rng) {
     );
 }
 
+/// `copy_blocks` on a classed pool (P5p, "partial prefix reuse fails on a classed L0 pool"):
+/// a BF16 base — the shape of `kv.ladder.l0` — with a smaller TurboQuant `tq4` class carved in
+/// two one-base-page slabs. Base pairs (the copy-on-write tail copy of token-granular reuse:
+/// a fresh base page from a cached base page) and class pairs, each with its pair format,
+/// against the CPU provider with the same descriptor, byte for byte over 3 layers. Breaks if
+/// the HIP library rejects a base page id of a classed pool (`block id … is outside the pool's
+/// id space`, the served HTTP 500) or addresses a base or class page differently from the CPU.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn copy_blocks_classed_matches_cpu() {
+    use turbine_tensor::{KvPageClass, KvPageClasses};
+
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(11);
+    let bt = 16usize;
+    let block_elems = 2 * bt * KV_HEADS * HEAD_DIM;
+    let base_page = block_elems * 2;
+    let class_page = mixed_page_bytes(KV_FMT_TQ4, bt, KV_HEADS);
+    assert!(class_page < base_page && class_page.is_multiple_of(2));
+    // Slab k's class pages sit in the bytes of base page k (slab_base 1), so base ids 0 and 1
+    // are retired; the base pairs use ids above them.
+    let (base_blocks, slab_base) = (8u32, 1u32);
+    let slab_stride = (base_page / class_page) as u32;
+    assert!(slab_stride >= 2);
+    let num_blocks = base_blocks + 2 * slab_stride;
+    let mut codes = vec![KV_FMT_BF16; num_blocks as usize];
+    for c in &mut codes[base_blocks as usize..] {
+        *c = KV_FMT_TQ4;
+    }
+    let classes = KvPageClasses {
+        num_blocks,
+        base_blocks,
+        base_page_bytes: base_page as u64,
+        slab_stride,
+        slab_base_blocks: slab_base,
+        page_classes: &[KvPageClass {
+            fmt: KV_FMT_TQ4,
+            per_layer_bytes: class_page as u64,
+        }],
+        class_codes: &codes,
+    };
+    let layers = 3usize;
+    let copy_cfg = KvCopyConfig {
+        num_layers: layers as u32,
+        block_bytes: base_page as u64,
+    };
+    let hip = p.hip.kv_copy().expect("hip copy_blocks");
+    let impl_name = hip.implementation(&copy_cfg);
+    let (pool_hip, pool_cpu) = twin(
+        &p,
+        &[layers, base_blocks as usize, block_elems],
+        DType::BF16,
+        &rng.normal(layers * base_blocks as usize * block_elems, 1.0),
+    );
+    let c = base_blocks;
+    let pairs = [
+        (BlockId(3), BlockId(7)),
+        (BlockId(5), BlockId(4)),
+        (BlockId(c), BlockId(c + slab_stride + 1)),
+        (BlockId(c + 1), BlockId(c + slab_stride)),
+    ];
+    let fmts = [KV_FMT_BF16, KV_FMT_BF16, KV_FMT_TQ4, KV_FMT_TQ4];
+    let runs = [
+        (hip, &pool_hip),
+        (p.cpu.kv_copy().expect("cpu copy_blocks"), &pool_cpu),
+    ];
+    for (kernel, pool) in runs {
+        kernel
+            .execute(&mut KvCopyContext {
+                pool: pool.view().slice,
+                layer_stride_bytes: u64::from(base_blocks) * base_page as u64,
+                block_bytes: base_page as u64,
+                num_layers: layers as u32,
+                pairs: &pairs,
+                classes: Some(classes),
+                pair_fmts: &fmts,
+            })
+            .expect("classed copy_blocks");
+    }
+    assert_exact(
+        &format!("classed copy_blocks {copy_cfg} pairs={pairs:?}"),
+        &impl_name,
+        &read(&pool_hip),
+        &read(&pool_cpu),
+    );
+}
+
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn paged_and_moe_ops() {

@@ -1075,12 +1075,9 @@ fn kv_dtype_tq2_exits_2_before_bind() {
 #[test]
 fn check_config_accepts_the_l0_ladder() {
     let cfg = TempConfig::new("l0-ladder", "model:\n  path: /m\n");
-    // `kv.partial_prefix_reuse=false`: the 5p stopgap refuses partial reuse with the L0 step
-    // on a GPU backend (`partial_reuse_with_the_l0_ladder_exits_2`).
     for set in [
-        "kv.ladder.enabled=true --set kv.partial_prefix_reuse=false",
-        "kv.dtype=tq4 --set kv.cpu.format=tq4 --set kv.ladder.enabled=true --set \
-         kv.partial_prefix_reuse=false",
+        "kv.ladder.enabled=true",
+        "kv.dtype=tq4 --set kv.cpu.format=tq4 --set kv.ladder.enabled=true",
     ] {
         let args = format!("--check-config --set {set}");
         let out = wait_with_timeout(
@@ -1111,27 +1108,6 @@ fn check_config_accepts_the_l0_ladder() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("kv.ladder.enabled"), "{stderr}");
-}
-
-/// 5p stopgap (user decision 2026-10-06, "5p: partial prefix reuse fails on a classed L0
-/// pool", B): the ladder's L0 step with the default `kv.partial_prefix_reuse: true` on the hip
-/// backend is exit 2 under `--check-config`, naming `kv.partial_prefix_reuse` and the reason
-/// code `kv_partial_reuse_classed_l0`. Breaks if the combination passes the check again before
-/// the tail-copy fix lands.
-#[test]
-fn partial_reuse_with_the_l0_ladder_exits_2() {
-    let cfg = TempConfig::new("l0-ladder-partial", "model:\n  path: /m\n");
-    let out = wait_with_timeout(
-        spawn_server(
-            &["--check-config", "--set", "kv.ladder.enabled=true"],
-            &cfg.path,
-        ),
-        Duration::from_secs(20),
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("kv.partial_prefix_reuse"), "{stderr}");
-    assert!(stderr.contains("kv_partial_reuse_classed_l0"), "{stderr}");
 }
 
 /// Phase 2m S-4 / S-11: `model.tool_call_parser: hermes` (and `mistral`) names a registered

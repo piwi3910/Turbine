@@ -27,18 +27,19 @@ bool supported(const turbine_copy_blocks_desc *d) {
 // Per-class page addressing (ABI v2.11, P6b S-5 / S-7): the byte offset of
 // block b's page within one layer's region, by the pair's TURBINE_KVFMT_*
 // code, or -1 when the id or the format is not one of the pool's. Flat pools
-// (page_classes NULL) keep `b * block_bytes`.
+// (page_classes NULL) keep `b * block_bytes`. On a classed pool an id below
+// base_blocks is a base page at `b * block_bytes` whatever the pair's format
+// (the base class is not listed in page_classes) — as the cpu reference's
+// KvPageClasses::page_offset; ids above it resolve through their class.
 int64_t page_offset(const turbine_copy_blocks_desc *d, int32_t b, int fmt) {
   const int64_t base_page = d->block_bytes;
   int64_t per = base_page;
-  if (d->page_classes != nullptr) {
+  if (d->page_classes != nullptr && b >= d->base_blocks) {
     per = 0;
-    if (b >= d->base_blocks) {
-      for (int32_t i = 0; i < d->num_page_classes; ++i) {
-        if (d->page_classes[i].fmt == fmt) {
-          per = d->page_classes[i].per_layer_bytes;
-          break;
-        }
+    for (int32_t i = 0; i < d->num_page_classes; ++i) {
+      if (d->page_classes[i].fmt == fmt) {
+        per = d->page_classes[i].per_layer_bytes;
+        break;
       }
     }
     if (per <= 0 || d->slab_stride <= 0 || d->slab_base_blocks <= 0)
