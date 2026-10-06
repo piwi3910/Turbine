@@ -1561,6 +1561,8 @@ fn l0_ladder_serves_on_gpu() {
         "kv.ladder.max_format=tq4".to_string(),
         "kv.cpu.enabled=true".to_string(),
         "kv.cpu.max_bytes=1GiB".to_string(),
+        // The 5p stopgap refuses partial reuse with the L0 step (`kv_partial_reuse_classed_l0`).
+        "kv.partial_prefix_reuse=false".to_string(),
     ];
     let server = LabServer::start(&model_dir, &sets);
     let (text, tokens, _) = server.complete(&prompt(7, 350), ANSWER_TOKENS);
