@@ -976,6 +976,7 @@ impl OverloadSim {
                 step_time_p95: self.decode_steps.p95(self.clock.now_mono()),
                 queue_len: self.gate_len() as u32,
                 iterations: self.iterations,
+                ladder_rewrites_in_flight: 0,
             };
             // As the server's pressure thread: an iteration since the last tick marks the
             // engine busy (drift and thermal count only then).

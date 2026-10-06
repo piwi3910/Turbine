@@ -187,6 +187,31 @@ impl LadderReason {
 /// The `to` label of a `floor_evict` ladder action: the copy left the tier.
 pub const LADDER_EVICT: &str = "evict";
 
+/// What the compression ladder spent time on (`turbine_kv_ladder_action_seconds_total{tier,action}`,
+/// P5p S-14): the host time of a tier's ladder sweep (`sweep`), the time a rewrite waited in the
+/// transfer queue before it started (`queue`), and a rewrite's run from its start to its
+/// completion as the transfer backend saw it (`rewrite`: an L1/L2 rewrite's copies, transcode
+/// and store; an L0 rewrite completes once its device work is enqueued).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LadderTime {
+    Sweep,
+    Queue,
+    Rewrite,
+}
+
+impl LadderTime {
+    pub const ALL: [LadderTime; 3] = [LadderTime::Sweep, LadderTime::Queue, LadderTime::Rewrite];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LadderTime::Sweep => "sweep",
+            LadderTime::Queue => "queue",
+            LadderTime::Rewrite => "rewrite",
+        }
+    }
+}
+
 /// Outcome of one prefetched block (`turbine_kv_prefetch_total{outcome}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrefetchOutcome {
@@ -246,6 +271,9 @@ pub struct KvMetrics {
     pub ladder_rung: Family<Labels1, Gauge>,
     /// `turbine_kv_ladder_actions_total{tier,from,to,reason}` (P6b S-6).
     pub ladder_actions: Family<Labels4, Counter>,
+    /// `turbine_kv_ladder_action_seconds_total{tier,action}` (P5p S-14): seconds the ladder
+    /// spent per tier on each [`LadderTime`].
+    pub ladder_action_seconds: Family<Labels2, Counter<f64, AtomicU64>>,
     /// `turbine_kv_copy_ahead_total{to}` (P6b S-8, decision "6b: shared-prefix eval never
     /// demotes the prefix to L1", A): copies of a shared parent into a lower tier made while
     /// its L0 copy stays.
@@ -296,6 +324,7 @@ impl KvMetrics {
             storage_latency: latency_histogram(),
             ladder_rung: Family::default(),
             ladder_actions: Family::default(),
+            ladder_action_seconds: Family::default(),
             copy_ahead: Family::default(),
             queued_prefix_detached_blocks: Counter::default(),
             partial_reuse: Family::default(),
@@ -423,6 +452,11 @@ impl KvMetrics {
             m.ladder_actions.clone(),
         );
         reg.register(
+            "turbine_kv_ladder_action_seconds",
+            "Seconds the compression ladder spent, by tier and action (sweep, queue, rewrite)",
+            m.ladder_action_seconds.clone(),
+        );
+        reg.register(
             "turbine_kv_copy_ahead",
             "Shared-prefix KV blocks copied into a slower tier while their L0 copy stays",
             m.copy_ahead.clone(),
@@ -480,6 +514,11 @@ impl KvMetrics {
                     .get_or_create(&[("tier", t.as_str()), ("reason", r.as_str())]);
             }
             let _ = self.ladder_rung.get_or_create(&[("tier", t.as_str())]);
+            for a in LadderTime::ALL {
+                let _ = self
+                    .ladder_action_seconds
+                    .get_or_create(&[("tier", t.as_str()), ("action", a.as_str())]);
+            }
         }
         let _ = self
             .drops
@@ -683,6 +722,22 @@ impl KvMetrics {
                 ("reason", reason.as_str()),
             ])
             .inc();
+    }
+
+    /// `seconds` the ladder spent on `action` for `tier` (P5p S-14).
+    pub fn ladder_seconds(&self, tier: TierId, action: LadderTime, seconds: f64) {
+        if seconds > 0.0 {
+            self.ladder_action_seconds
+                .get_or_create(&[("tier", tier.as_str()), ("action", action.as_str())])
+                .inc_by(seconds);
+        }
+    }
+
+    /// Current `turbine_kv_ladder_action_seconds_total` value of one series.
+    pub fn ladder_seconds_value(&self, tier: TierId, action: LadderTime) -> f64 {
+        self.ladder_action_seconds
+            .get_or_create(&[("tier", tier.as_str()), ("action", action.as_str())])
+            .get()
     }
 
     /// Current `turbine_kv_ladder_actions_total` value of one series.

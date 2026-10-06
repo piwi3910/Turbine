@@ -37,7 +37,7 @@ use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
 };
 use crate::metrics::{
-    EvictReason, KvMetrics, LADDER_EVICT, LadderReason, PartialOutcome, PrefetchOutcome,
+    EvictReason, KvMetrics, LADDER_EVICT, LadderReason, LadderTime, PartialOutcome, PrefetchOutcome,
 };
 use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_cost, plan_prefix, reuse_cap};
 use crate::policy::{
@@ -1726,7 +1726,17 @@ impl KvHierarchy {
             let path = t.req.path;
             match c.result {
                 Ok((took, slot)) => {
-                    if t.req.purpose != TransferPurpose::Compress {
+                    if t.req.purpose == TransferPurpose::Compress {
+                        // P5p S-14: where the ladder's rewrites spend their time.
+                        let tier = path.from();
+                        self.metrics.ladder_seconds(
+                            tier,
+                            LadderTime::Queue,
+                            c.queued.as_secs_f64(),
+                        );
+                        self.metrics
+                            .ladder_seconds(tier, LadderTime::Rewrite, took.as_secs_f64());
+                    } else {
                         self.stats.transfer_bytes += t.req.bytes;
                         self.metrics.transfer(
                             path,
@@ -3279,7 +3289,11 @@ impl KvHierarchy {
             if !self.ladder_budget() {
                 break;
             }
+            let started = self.clock.now_mono();
             self.ladder_sweep(pool, t.tier, pressure, now);
+            let took = self.clock.now_mono().saturating_sub(started);
+            self.metrics
+                .ladder_seconds(t.tier, LadderTime::Sweep, took.as_secs_f64());
         }
     }
 
@@ -4070,6 +4084,47 @@ pub(crate) mod tests {
             first + 4,
             "and back off again on the next Full"
         );
+    }
+
+    /// P5p S-14 instrumentation: a completed ladder rewrite adds its run time to
+    /// `turbine_kv_ladder_action_seconds_total{tier,action="rewrite"}` (and its queue wait to
+    /// `action="queue"`) of the tier it rewrote, and a demotion adds nothing there. Breaks if a
+    /// rewrite's time is dropped, lands on another tier, or a plain copy is counted as ladder
+    /// time.
+    #[test]
+    fn ladder_rewrite_time_is_counted_per_tier() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 8 * bb, arc));
+        let mut r = rig_kv("cost_aware", 8, Some(l1.clone()), None, clock, |kv| {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+        });
+        let prompt: Vec<u32> = (0..66).collect();
+        run(&mut r, &prompt);
+        run(&mut r, &prompt);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        r.h.poll(&mut r.pool, &mut r.backend);
+        r.clock.advance(Duration::from_millis(10));
+        r.h.poll(&mut r.pool, &mut r.backend);
+        assert_eq!(l1.len(), 4);
+        let secs = |r: &Rig, t: TierId, a: LadderTime| r.h.metrics.ladder_seconds_value(t, a);
+        assert_eq!(secs(&r, TierId::L1, LadderTime::Rewrite), 0.0, "demotions");
+        r.clock.advance(LADDER_TICK_INTERVAL);
+        let now = r.clock.now_mono();
+        r.h.ladder_tick(&mut r.pool, PressureState::Orange, now);
+        assert!(r.h.ladder_in_flight().count() > 0, "the sweep rewrites");
+        for _ in 0..3 {
+            r.clock.advance(Duration::from_millis(100));
+            r.h.poll(&mut r.pool, &mut r.backend);
+        }
+        assert_eq!(r.h.ladder_in_flight().count(), 0);
+        assert!(r.h.stats().compressions > 0);
+        assert!(secs(&r, TierId::L1, LadderTime::Rewrite) > 0.0);
+        assert!(secs(&r, TierId::L1, LadderTime::Queue) >= 0.0);
+        assert_eq!(secs(&r, TierId::L0, LadderTime::Rewrite), 0.0);
+        assert_eq!(secs(&r, TierId::L2, LadderTime::Rewrite), 0.0);
     }
 
     /// The Task 16 multi-turn regression (perf log "Compression ladder in L1/L2 on the server",

@@ -5,7 +5,7 @@ use crate::budget::{DeviceBudget, PoolKind};
 use crate::circuit::{CircuitBreaker, CircuitEvent, CircuitReason, CircuitTransition};
 use crate::document::{
     AdmissionDoc, CircuitDoc, GroupDoc, PressureDocument, ReplicaDoc, ThrottleDoc, TransitionDoc,
-    decisions_doc, device_doc, memory_doc, rfc3339_millis,
+    decisions_doc, device_doc, dwell_doc, memory_doc, rfc3339_millis,
 };
 use crate::horizon::ExhaustionHorizon;
 use crate::ledger::Ledger;
@@ -42,6 +42,31 @@ pub struct EngineStats {
     pub step_time_p95: Option<f64>,
     pub queue_len: u32,
     pub iterations: u64,
+    /// KV compression-ladder rewrites queued or in flight (P5p S-14): the controller
+    /// attributes the time to the next tick to [`DwellCause::LadderRewrites`] while any are.
+    pub ladder_rewrites_in_flight: u32,
+}
+
+/// What a pressure state's time is attributed to (`turbine_pressure_dwell_seconds_total{cause}`
+/// and the pressure document's `dwell`, P5p S-14): the stretch between two controller ticks
+/// counts as `ladder_rewrites` when the engine's last figures had compression-ladder rewrites
+/// queued or in flight, else `other`. A correlation, not a proof of cause: it shows how much of
+/// an ORANGE dwell the ladder overlaps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DwellCause {
+    LadderRewrites,
+    Other,
+}
+
+impl DwellCause {
+    pub const ALL: [DwellCause; 2] = [DwellCause::LadderRewrites, DwellCause::Other];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DwellCause::LadderRewrites => "ladder_rewrites",
+            DwellCause::Other => "other",
+        }
+    }
 }
 
 /// What the scheduler and the HTTP side read; replaced atomically on every tick.
@@ -112,6 +137,8 @@ pub struct PressureController {
     /// A tensor-parallel group's other ranks (P5 S-8): each rank's budget and ledger, listed in
     /// the document's `memory` and `devices` and as members of its group. Empty on one device.
     workers: Vec<(DeviceBudget, Arc<Ledger>)>,
+    /// The previous tick (the dwell accounting's start, P5p S-14).
+    last_tick: Option<Duration>,
 }
 
 impl PressureController {
@@ -175,6 +202,7 @@ impl PressureController {
             },
             replica: 0,
             workers: Vec::new(),
+            last_tick: None,
         };
         c.publish();
         (c, handle)
@@ -206,6 +234,21 @@ impl PressureController {
     /// One fast tick: signals → state machine → reserve → plan → circuit → snapshot.
     pub fn tick(&mut self, sample: &TelemetrySample, stats: &EngineStats) -> Option<Transition> {
         let now = self.clock.now_mono();
+        // P5p S-14: the stretch since the previous tick was spent in the state it left behind.
+        if let Some(prev) = self.last_tick.replace(now) {
+            let cause = if stats.ladder_rewrites_in_flight > 0 {
+                DwellCause::LadderRewrites
+            } else {
+                DwellCause::Other
+            };
+            self.metrics
+                .pressure_dwell_seconds
+                .get_or_create(&crate::metrics::DwellLabels {
+                    state: self.machine.state().as_str(),
+                    cause: cause.as_str(),
+                })
+                .inc_by(now.saturating_sub(prev).as_secs_f64());
+        }
         self.last_horizon = ExhaustionHorizon::predict(
             &stats.running_remaining_tokens,
             stats.decode_tokens_per_s,
@@ -438,6 +481,7 @@ impl PressureController {
                 .collect(),
             groups: vec![GroupDoc::of(self.replica, &members)],
             replicas: vec![ReplicaDoc::of(self.replica, state, self.circuit.state())],
+            dwell: dwell_doc(&self.metrics),
         };
         self.metrics.record_device_budget(&self.budget);
         for (b, _) in &self.workers {
@@ -477,6 +521,7 @@ fn empty_document(enabled: bool, plan: &ThrottlePlan) -> PressureDocument {
         devices: Vec::new(),
         groups: Vec::new(),
         replicas: Vec::new(),
+        dwell: Vec::new(),
     }
 }
 
@@ -571,6 +616,56 @@ mod tests {
             },
             storage: None,
         }
+    }
+
+    /// P5p S-14: the time between two ticks is added to the state the first tick left, under
+    /// `ladder_rewrites` while the engine reports ladder rewrites in flight and `other`
+    /// otherwise; the document's `dwell` lists every state with that breakdown. Breaks if the
+    /// stretch lands on the new state, the cause is ignored, or the document drops a state.
+    #[test]
+    fn dwell_seconds_by_state_and_cause() {
+        let (mut c, h, clock) = controller(true);
+        let calm = EngineStats {
+            block_tokens: 16,
+            free_kv_blocks: 1000,
+            ..EngineStats::default()
+        };
+        let ladder = EngineStats {
+            ladder_rewrites_in_flight: 3,
+            ..calm.clone()
+        };
+        let run = |c: &mut PressureController, ticks: u64, kv: f64, s: &EngineStats| {
+            for _ in 0..ticks {
+                clock.advance(Duration::from_millis(100));
+                c.tick(&sample(kv, 0.3), s);
+            }
+        };
+        run(&mut c, 10, 0.5, &calm);
+        run(&mut c, 10, 0.85, &calm);
+        assert_eq!(h.state(), PressureState::Orange);
+        let orange = |h: &ControllerHandle| {
+            h.document()
+                .dwell
+                .into_iter()
+                .find(|d| d.state == PressureState::Orange)
+                .expect("ORANGE is listed")
+        };
+        let before = orange(&h);
+        run(&mut c, 20, 0.85, &ladder);
+        run(&mut c, 10, 0.85, &calm);
+        let after = orange(&h);
+        let ladder_s = after.causes["ladder_rewrites"] - before.causes["ladder_rewrites"];
+        let other_s = after.causes["other"] - before.causes["other"];
+        assert!((ladder_s - 2.0).abs() < 1e-6, "{ladder_s}");
+        assert!((other_s - 1.0).abs() < 1e-6, "{other_s}");
+        assert!((after.seconds - after.causes.values().sum::<f64>()).abs() < 1e-9);
+        let doc = h.document();
+        assert_eq!(doc.dwell.len(), PressureState::ALL.len());
+        let total: f64 = doc.dwell.iter().map(|d| d.seconds).sum();
+        assert!(
+            (total - 4.9).abs() < 1e-6,
+            "every tick but the first: {total}"
+        );
     }
 
     #[test]
