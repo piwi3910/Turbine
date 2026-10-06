@@ -3882,7 +3882,7 @@ breaker makes no transition until `REQUEST_FAILURES_TO_OPEN` = 3 of one reason f
 `repeated_kernel_argument`. A key (`reliability.circuit.request_failures_to_open`) only if a deployment needs another
 count.
 
-## 5p fused batch-1 GEMV: provider evaluation and proposal (2026-10-06, open)
+## 5p fused batch-1 GEMV: provider evaluation and proposal (2026-10-06)
 
 Owed by decision "5p decode-step gaps" (B + C, the AGENTS.md kernel-reuse rule). Branch `p5p-gemv-eval`, no kernel
 landed. Harness `gemv_eval` (scratch, novanas `remote/agent-aba0d49ec7d5d3f14/gemv-eval/`): every candidate at m = 1
@@ -3971,3 +3971,8 @@ minor (the fused ops); `lab-bench --golden16` and the ITL c1 measure per landing
 
 Builder recommendation: B, staged as A first (the provider, measured served), then GLU, then the residual + norm pair;
 stop after any stage that does not measure faster. Not decided here.
+
+**Decision (user, 2026-10-06): B, staged.** First vLLM `wvSplitK` registered as the m = 1 BF16 GEMV (one file, the
+registry entry, the conformance suite); then own `wvSplitK`-structured kernels adding the silu·mul fusion; then the
+residual add with the rmsnorm fusion — one stage at a time, each measured, stopping at any stage that does not
+measure faster. TP (`rmsnorm_sharded` bitwise), prefill, OLMoE and quantized paths unchanged.
