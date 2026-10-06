@@ -1593,6 +1593,8 @@ Open items recorded for the lead (decision "5p Task 14: FP8 c1 decode"): the act
 
 Correctness only, no served change. `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model` on the tree with p6b-stack merged (ABI v2.12 fused-RoPE b1 decode): 42/42 pass. Max |Δ logit| over 32 greedy steps: `hip_matches_cpu` (decode attention bound to CK split-KV via a test card profile, plain cpu-reference) 3.8e-6, bound 1e-4; `hip_b1_matches_cpu` (default b1 decode, card-class reference with F32 P) 0.0927 (steps 0–6 ~1e-6, the single BF16 flip at step 7), bound 0.15, greedy identical; `hip_v23_library_matches_cpu` Llama 0.0927 on both libraries (now under the b1 bound; it failed at step 7 under 1e-4), OLMoE 3.7e-3. Mutations: default b1 decode against the plain BF16-P reference reads 0.103 at step 1 and 0.1548 max (greedy identical) — fails the b1 leg's 0.15 by a thin margin, and fails the strict leg's 1e-4.
 
+Bound tightened (branch `p5p-o2`, user decision 2026-10-06 "5p tiny_model A1 landed" 1 A, 2 A): `HIP_B1_MAX_ABS_LOGIT_DIFF` 0.15 → 0.12, shared by `hip_b1_matches_cpu` and the v2.3 Llama leg. Lab (`scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model`): 41/41 pass, b1 leg 0.0927 (unchanged), v2.3 Llama 0.0927 on both libraries, OLMoE 3.7e-3. Mutation (b1 leg against the plain BF16-P `cpu_executor`): fails at step 10, 0.1385 > 0.12 (max 0.1548), greedy identical.
+
 ### OLMoE MoE row tier: `wmma` from 513 rows to 11,264, `wmma_prefill` above (branch `p5p-t16c`, user decision 2026-10-06 O1)
 
 Kernel crossover (`perf moe_prefill_timings` with the new `TURBINE_MOE_TOKENS` sweep, real routing, GPU 0 natively under the bench lock; µs per call summed over layers 0/5/10/15, `wmma_prefill` ÷ `wmma`; every output bitwise equal to `wmma`): 512 rows 1.17, 1,024 1.17, 2,048 1.13, 4,096 1.12, 6,144 1.11, 8,192 1.05–1.06, 9,216 1.04, 10,240 1.02, 10,752 1.016, 11,264 1.006, 12,288 0.97, 16,384 0.88. New gfx1201 tier `MOE_WMMA_MAX_ROWS = 11_264` (1,408 prefill tokens). `moe_rows_are_batch_invariant` and `olmoe_rows_are_batch_invariant`: 0 differing (quick tier, 2026-10-06, PASS).
@@ -1816,3 +1818,28 @@ fails S-3's ≤ 1.10× bound. The extra TTFT is time in the scheduler's queue be
 only 18, most wait 16–256 ms, i.e. several iterations), not the first token's emission; pressure stayed GREEN, no
 admission-gate queueing. Its cause is not yet found (the new rule makes each such turn serial, so the hold is in
 `plan`'s admission, not a launch-ahead). Default stays `false` (S-3 rule).
+
+### OLMoE O2: sliced prefill gate-up back at k step 128 (branch `p5p-o2`, user decision 2026-10-06 O2)
+
+`PrefillGateUpSliced` = `Stream<1, 8, 4, 1, 128, BRing>`: one B register stage instead of two, each 16-k fragment reloaded with the next step's right after its WMMAs (same loads, same WMMA chain, same slice-summed order). Compiled ISA (gfx1201, `-Rpass-analysis=kernel-resource-usage`): 255 VGPRs, 0 spilled, occupancy 5 (two stages at k 128: 112 spilled; k 64: occupancy 6). `moe_rows_are_batch_invariant` and `olmoe_rows_are_batch_invariant`: 0 differing; every `moe_prefill_timings` output bitwise equal to `wmma`.
+
+Kernel (`perf moe_prefill_timings`, real routing, GPU 0 natively under the bench lock, one session, µs per call, layers 0/5/10/15, two rounds agree within 1 %):
+
+| Variant                                                            | 12,288 rows (1,536 tok)       | 16,384 rows (2,048 tok)       |
+| ------------------------------------------------------------------ | ----------------------------- | ----------------------------- |
+| base: k 64 (029b8c17)                                              | 2,475 / 2,594 / 2,477 / 2,476 | 2,812 / 2,936 / 2,795 / 2,800 |
+| **BRing, k 128 (landed)**                                          | 2,329 / 2,409 / 2,314 / 2,324 | 2,788 / 2,885 / 2,777 / 2,780 |
+| BRing + A staged in halves + `waves_per_eu(6)` (235 VGPRs, occ. 6) | 2,505 / 2,556 / 2,485 / 2,503 | 2,948 / 2,985 / 2,924 / 2,922 |
+| BRing + A staged in halves (247 VGPRs, occ. 5)                     | 2,465 / 2,558 / 2,446 / 2,468 | 2,905 / 3,017 / 2,898 / 2,897 |
+| split gate / up passes (two kernels, k 128)                        | 2,405 / 2,475 / 2,385 / 2,401 | 2,965 / 3,004 / 2,941 / 2,957 |
+| diag: down unsliced (not bitwise)                                  | –                             | 2,766 / 2,870 / 2,743 / 2,732 |
+| diag: all unsliced, k 128 (not bitwise)                            | 2,254 / 2,316 / 2,234 / 2,255 | 2,658 / 2,703 / 2,645 / 2,649 |
+
+BRing is −6 % at 12,288 rows, −1 % at 16,384. The slice order's remaining cost at 16,384 rows is the gate-up kernel (all-unsliced −130 µs; the sliced down tiles cost nothing measurable), not k step or spill; occupancy 6 by fewer A registers loses more than it gains.
+
+Served (`lab-bench.sh --model olmoe --golden16`, GPU 0, one session, 200 requests; labbook unreachable (DNS), results under `target/lab-bench/o2-*-olmoe/`):
+
+| Run         | tok/s | ITL p50 (ms) | TTFT p50 (ms) | TTFT p95 (ms) | golden c1 / c16 |
+| ----------- | ----- | ------------ | ------------- | ------------- | --------------- |
+| `o2-before` | 610.5 | 24.3         | 132.5         | 262           | PASS / PASS     |
+| `o2-after`  | 608.8 | 24.3         | 128.7         | 216           | PASS / PASS     |

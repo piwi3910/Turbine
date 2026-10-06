@@ -438,7 +438,8 @@ int32_t launch_proj(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 //
 // Each wave holds kFragsM row fragments (the block's whole row tile) and
 // kFragsN column fragments per projection.
-template <int WavesM, int WavesN, int FragsM, int FragsN, int TileK>
+template <int WavesM, int WavesN, int FragsM, int FragsN, int TileK,
+          bool BRing = false>
 struct Stream {
   static constexpr int kWavesM = WavesM;
   static constexpr int kWavesN = WavesN;
@@ -454,6 +455,10 @@ struct Stream {
   static constexpr int kPassesA =
       kTileM >= kRowsPerPass ? kTileM / kRowsPerPass : 1;
   static constexpr int kSlices = TileK / kMma;
+  // B registers: one stage, each 16-k fragment reloaded with the next step's
+  // right after its WMMAs (true), or two stages, the next step's loaded at
+  // the top of the step (false). Same loads, same WMMA order.
+  static constexpr bool kBRing = BRing;
   static_assert(kTileM % kRowsPerPass == 0 || kRowsPerPass % kTileM == 0,
                 "the A load passes cover the row tile");
 };
@@ -539,8 +544,9 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
     }
   }
   u32x4 ra[kPA];
-  v8s rb0[2][kSl][kFN];
-  v8s rb1[2][kGateUp ? kSl : 1][kGateUp ? kFN : 1];
+  constexpr int kBufs = S::kBRing ? 1 : 2;
+  v8s rb0[kBufs][kSl][kFN];
+  v8s rb1[kBufs][kGateUp ? kSl : 1][kGateUp ? kFN : 1];
   auto load_a = [&](int32_t k) {
 #pragma unroll
     for (int pass = 0; pass < kPA; ++pass)
@@ -556,17 +562,18 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
       *reinterpret_cast<u32x4 *>(&a_s[at]) = ra[pass];
     }
   };
+  auto load_b_slice = [&](int buf, int32_t k, int s) {
+#pragma unroll
+    for (int j = 0; j < kFN; ++j) {
+      rb0[buf][s][j] = *reinterpret_cast<const v8s *>(b0_g[j] + k + s * kMma);
+      if (kGateUp)
+        rb1[buf][s][j] = *reinterpret_cast<const v8s *>(b1_g[j] + k + s * kMma);
+    }
+  };
   auto load_b = [&](int buf, int32_t k) {
 #pragma unroll
-    for (int s = 0; s < kSl; ++s) {
-#pragma unroll
-      for (int j = 0; j < kFN; ++j) {
-        rb0[buf][s][j] = *reinterpret_cast<const v8s *>(b0_g[j] + k + s * kMma);
-        if (kGateUp)
-          rb1[buf][s][j] =
-              *reinterpret_cast<const v8s *>(b1_g[j] + k + s * kMma);
-      }
-    }
+    for (int s = 0; s < kSl; ++s)
+      load_b_slice(buf, k, s);
   };
   load_a(0);
   load_b(0, 0);
@@ -579,9 +586,11 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
 #pragma unroll
     for (int st = 0; st < 2; ++st) {
       const int32_t next = k0 + (st + 1) * S::kTileK;
+      const int buf = S::kBRing ? 0 : st;
       if (next < depth) {
         load_a(next);
-        load_b(st ^ 1, next);
+        if (!S::kBRing)
+          load_b(st ^ 1, next);
       }
       const Bf16 *as = a_s + st * kA;
 #pragma unroll
@@ -597,13 +606,15 @@ __global__ __launch_bounds__(S::kThreads) void moe_stream_kernel(
         for (int j = 0; j < kFN; ++j) {
 #pragma unroll
           for (int i = 0; i < S::kFragsM; ++i)
-            acc0[i][j] = mma(a[i], rb0[st][s][j], acc0[i][j]);
+            acc0[i][j] = mma(a[i], rb0[buf][s][j], acc0[i][j]);
           if (kGateUp) {
 #pragma unroll
             for (int i = 0; i < S::kFragsM; ++i)
-              acc1[i][j] = mma(a[i], rb1[st][s][j], acc1[i][j]);
+              acc1[i][j] = mma(a[i], rb1[buf][s][j], acc1[i][j]);
           }
         }
+        if (S::kBRing && next < depth)
+          load_b_slice(0, next, s);
       }
       if (kSliced && next % slice_k == 0) {
 #pragma unroll
@@ -683,10 +694,12 @@ int32_t launch_stream(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
 // the columns): at 8,192 routed rows the narrow tile takes 0.61 ms against
 // 0.68, at 16,384 the wide one 0.78 ms against 0.89.
 // In the slice-summed order (slice_depth > 0) the gate-up kernel holds a total
-// beside each accumulator, which spills at k steps of 128 (256 VGPRs, 112
-// spilled), so it takes k steps of 64 there (the down tiles fit: 235-236).
+// beside each accumulator; with two B register stages that spills at k steps
+// of 128 (112 VGPRs spilled), so it keeps one stage (BRing: each 16-k fragment
+// is reloaded right after its WMMAs) and fits at k steps of 128 (255 VGPRs, no
+// spill; the down tiles: 235-236).
 using PrefillGateUp = Stream<1, 8, 4, 1, 128>;
-using PrefillGateUpSliced = Stream<1, 8, 4, 1, 64>;
+using PrefillGateUpSliced = Stream<1, 8, 4, 1, 128, true>;
 using PrefillDown = Stream<1, 8, 4, 1, 128>;
 using PrefillDownWide = Stream<1, 8, 4, 2, 64>;
 constexpr int kWideTiles = 3;
