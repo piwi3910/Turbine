@@ -284,8 +284,15 @@ mod tests {
         let (got, want_ck) = (decode(&b1, &lens), decode(&ck, &lens));
         assert_ne!(got, want_ck, "b1 class equals the CK class bitwise");
         assert_close(&got, &want_ck, 2e-2);
-        // Four sequences: CK on the HIP side; both providers agree bitwise.
-        let lens = [200, 37, 129, 256];
+        // B1_CK_SEQS sequences: CK on the HIP side; both providers agree bitwise.
+        let lens: Vec<usize> = [200, 37, 129, 256]
+            .into_iter()
+            .cycle()
+            .take(B1_CK_SEQS)
+            .collect();
         assert_eq!(decode(&b1, &lens), decode(&ck, &lens));
+        // One below the edge: still b1 on the HIP side.
+        let lens = &lens[..B1_CK_SEQS - 1];
+        assert_ne!(decode(&b1, lens), decode(&ck, lens));
     }
 }
