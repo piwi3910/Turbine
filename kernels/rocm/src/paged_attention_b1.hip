@@ -107,6 +107,9 @@ template <int G> struct B1Lds {
   };
   float max[kDecodeWaves][G];
   float sum[kDecodeWaves][G];
+  // The combining workgroup's split maxima and sums.
+  float split_max[kSplits][G];
+  float split_sum[kSplits][G];
 };
 
 // Paged decode over BF16 pages: grid (sequences, KV heads, kSplits). Every
@@ -350,29 +353,46 @@ __global__ void __launch_bounds__(kThreads)
 
   // The last-arriving workgroup combines the splits in ascending split order
   // (deterministic whatever the arrival order) and resets the counter for the
-  // next call.
+  // next call. The splits' maxima and sums are staged in LDS first (one load
+  // each), then every thread loads its kSplits accumulators together: the
+  // per-element loop of dependent loads cost ~0.8 us more ("b1 attention
+  // II"). Same operations in the same order, so the same bits.
   __threadfence();
+  const float *base =
+      partials + (static_cast<int64_t>(seq) * kv_heads + kv_head) * kSplits *
+                     G * (kHeadDim + 2);
+  static_assert(kSplits * G <= kThreads, "one thread per (split, head)");
+  if (tid < kSplits * G) {
+    const int sp = tid / G;
+    const int g = tid % G;
+    const float *sb =
+        base + static_cast<int64_t>(sp) * G * (kHeadDim + 2) + g * (kHeadDim + 2);
+    lds.split_max[sp][g] = sb[kHeadDim];
+    lds.split_sum[sp][g] = sb[kHeadDim + 1];
+  }
+  __syncthreads();
   for (int e = tid; e < G * kHeadDim; e += kThreads) {
     const int g = e / kHeadDim;
     const int d = e % kHeadDim;
-    const float *base =
-        partials + (static_cast<int64_t>(seq) * kv_heads + kv_head) * kSplits *
-                       G * (kHeadDim + 2);
-    float mx = kNegInf;
+    float od[kSplits];
+#pragma unroll
     for (int sp = 0; sp < kSplits; ++sp)
-      mx = fmaxf(mx, base[static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
-                          g * (kHeadDim + 2) + kHeadDim]);
+      od[sp] = base[static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
+                    g * (kHeadDim + 2) + d];
+    float mx = kNegInf;
+#pragma unroll
+    for (int sp = 0; sp < kSplits; ++sp)
+      mx = fmaxf(mx, lds.split_max[sp][g]);
     float o = 0.0f;
     float total = 0.0f;
+#pragma unroll
     for (int sp = 0; sp < kSplits; ++sp) {
-      const float *sb = base + static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
-                        g * (kHeadDim + 2);
       // A split with no keys has max -inf and adds nothing.
-      if (sb[kHeadDim] == kNegInf)
+      if (lds.split_max[sp][g] == kNegInf)
         continue;
-      const float f = expf(sb[kHeadDim] - mx);
-      o += sb[d] * f;
-      total += sb[kHeadDim + 1] * f;
+      const float f = expf(lds.split_max[sp][g] - mx);
+      o += od[sp] * f;
+      total += lds.split_sum[sp][g] * f;
     }
     const int32_t h = kv_head * G + g;
     out[static_cast<int64_t>(row) * out_stride +
