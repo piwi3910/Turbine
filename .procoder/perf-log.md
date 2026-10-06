@@ -1756,3 +1756,27 @@ The other three FP8-block shapes are unchanged (qkv / o / gate_up 29.8 / 19.5 / 
 Bit-exactness: `hip_qgemm qgemm_fused_act_quant_matches_two_launches` (every 3B / 8B shape, 4 scheme × act pairings, unit-variance, zero, ×10⁴ saturating, subnormal and grid-tie rows) gives byte-identical outputs to `quantize_act` + the same kernel; the CPU reference implements the same form (`unquantized_fp8_activations_match_quantize_then_qgemm`). The estimate in the decision (~0.60×) holds for per-tensor (0.61×); FP8-dynamic lands at 0.62×.
 
 **Bisect — the per-tensor golden c1 FAIL on the base** (S-15 item 3). Per-tensor golden c1 at each point (`--concurrency 1 --quick`): 6a exit `fbddca9` PASS 16/16, numbers identical to the 6a and 6b exit runs; `c7657649` (token-granular reuse) PASS, identical except p09 (partial reuse of the shared chat-template prefix); `0d16d756`, `3963a519` PASS, identical to `c7657649`; `2951123f` (merge `p5p-b1attn`) FAIL; inside it **`b1c072ce` "the b1 decode attention kernel" FAIL**, identical to the base (its parent's code is `1c1c5105`, inside the passing range); `97050b3c` with `kv.partial_prefix_reuse=false` still FAIL (only p09 moves). The b1 kernel moves every decode-attention sum (its own split and combine order, the user-decided numerics class of 2026-10-04 B), and the per-tensor checkpoint sat at its bounds since 6a (p16 tail 2.889 against 2.99, p14 likely 1.108 against 1.36): the shift takes p14 to 1.48 and a p16 tail candidate to 5.54. BF16, FP8-dynamic and FP8-block keep PASS on it; Task 14's W8A8 kernel moved the per-tensor sums again (15/16 PASS, p13 margin). Golden c16 per-tensor fails the same way on the base (p14 1.40, p16 tail 5.27). Not a defect in a kernel; options in decisions "5p FP8 follow-ups: the per-tensor golden bisect".
+
+### S-3: overlap scheduling waits for new prefills (plan Task 4, branch `p5p-overlap`, commit 69cc4c16, 2026-10-06)
+
+User decision 2026-10-06 ("5p decode-step gaps", B + C) re-opened S-3. Under `execution.overlap_scheduling`
+a turn that finds an admitted request waiting for its first prefill chunk (`Scheduler::has_unstarted_admitted`)
+now completes the iteration in flight serially and launches nothing ahead (`finish_forced` → `finish_serial`, which
+also stops a serial completion's tail copies from being released twice). Host test
+`engine::r#loop::tests::overlap_waits_for_new_prefills` (red without the rule: `b`'s first chunk shared the plan with
+`a`'s dropped row). A/B on one build, novanas GPU 0, one session, Llama BF16 (phase2c config), `--set
+execution.overlap_scheduling=<false|true>`:
+
+| Arm              | conc              | tok/s              | ITL p50 ms | TTFT p50 ms     | host_share | golden c1 / c16 |
+| ---------------- | ----------------- | ------------------ | ---------- | --------------- | ---------- | --------------- |
+| serial (`false`) | 1 (quick, 64 req) | 82.7               | 11.9       | 54              | 0.0081     | PASS / –        |
+| overlap (`true`) | 1 (quick, 64 req) | **83.6 (+1.1 %)**  | 11.8       | 54              | 0.0052     | PASS / –        |
+| serial (`false`) | 16 (200 req)      | 853.9              | 15.5       | 207             | 0.0226     | PASS / PASS     |
+| overlap (`true`) | 16 (200 req)      | **866.6 (+1.5 %)** | 15.2       | **351 (1.70×)** | 0.0265     | PASS / PASS     |
+
+c1: ms/token 12.09 → 11.96 (−0.13 ms, the host turnaround), TTFT unchanged. c16: throughput and ITL gain, but TTFT p50
+fails S-3's ≤ 1.10× bound. The extra TTFT is time in the scheduler's queue before admission
+(`turbine_queue_wait_seconds`: sum 4.06 → 32.3 s over 232 requests; serial admits 219 of 232 within 1 ms, overlap
+only 18, most wait 16–256 ms, i.e. several iterations), not the first token's emission; pressure stayed GREEN, no
+admission-gate queueing. Its cause is not yet found (the new rule makes each such turn serial, so the hold is in
+`plan`'s admission, not a launch-ahead). Default stays `false` (S-3 rule).
