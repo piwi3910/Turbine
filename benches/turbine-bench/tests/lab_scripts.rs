@@ -722,6 +722,7 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "decode_op_timings",
         "fused_projection_timings",
         "prefill_op_timings",
+        "qgemm_mxfp4_prefill_within_hipblaslt_bound",
         "every_implementation_matches_cpu",
         "implementations_enumerated",
         "bf16_gemm_matches_cpu",

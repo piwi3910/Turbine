@@ -333,16 +333,17 @@ Files: `kernels/rocm/src/qgemm_mxfp4.hip` (the tile), `crates/turbine-kernels/sr
 Interfaces:
 
 - Reuse-first: evaluate CK `gemm_microscale_*` and llama.cpp's HIP MXFP4 (6a measured llama.cpp prefill ≈ ours) against the existing `turbine_hip_mxfp4` tile on the 6a shapes (3b.qkv / 3b.o / 3b.gate_up / 3b.down, m = 2048) before any tile work; record the evaluation in decisions.md
+- Bound (user decision 2026-10-06 A): the MXFP4 prefill GEMM at m = 2048 ≤ 1.45 × the BF16 prefill GEMM per shape (no-regression bound; the original 1.10 × target missed: no provider within 10 %, own Prefill tile 1.0–1.44 ×); served TTFT recorded, not gated; `mxfp4` stays `experimental`
 - Every change keeps prefill rows batch-invariant (`qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green — the Phase 4 bitwise prefill rule) and golden within the slug tolerance
   Covers: S-16 ACs (lab timing test + served TTFT)
   Depends on: Task 3
 
-- [ ] Provider evaluation (GPU 0, under the bench lock): CK `gemm_microscale_*` and llama.cpp mmq against the own tile on the 6a shapes; record in decisions.md; a provider that wins by ≥ 10 % is registered (one file per provider, the registry entry, the conformance suite) instead of tile work
-- [ ] Write failing lab timing test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound` (per layer shape ≤ 1.10 × the hipBLASLt BF16 time measured in the same run). Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4` — expect FAIL (tile unchanged)
-- [ ] Implement (provider or tile); `qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green
-- [ ] Landing (GPU 0): `scripts/lab-bench.sh --model llama8b-mxfp4 --concurrency 1 --quick` and the standard bench: TTFT p50 ≤ 1.05 × the same-day BF16 8B TTFT, golden c1 PASS; perf-log rows
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `perf(kernels): MXFP4 prefill at hipBLASLt speed`
+- [x] Provider evaluation (GPU 0, under the bench lock): CK `gemm_microscale_*` and llama.cpp mmq against the own tile on the 6a shapes; record in decisions.md; a provider that wins by ≥ 10 % is registered (one file per provider, the registry entry, the conformance suite) instead of tile work
+- [x] Write failing lab timing test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound` (per layer shape ≤ 1.45 × the BF16 prefill GEMM time measured in the same run; first written at 1.10 ×). Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4` — expect FAIL (tile unchanged)
+- [x] Implement (provider or tile); `qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green — own Prefill tile (no provider within 10 %); the timing test still FAILS (1.0–1.44×, 7 of 8 shapes over 1.10); open re-bound in decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss"
+- [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama8b-mxfp4 --concurrency 1 --quick` and the standard bench: TTFT p50 recorded against the same-day BF16 8B TTFT (1.25 × c1, 1.15 × c16; not gated, decision A), golden c1 unchanged; perf-log rows; timing test passes under the 1.45 × bound
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `perf(kernels): MXFP4 prefill at hipBLASLt speed` (landed as the Prefill tile commits 45506bfb and 1f6bad3c; the 1.45 × re-bound in fee70bf9)
 
 ## Task 16: OLMoE BF16 back inside the 0.98× bound with margin (S-17)
 

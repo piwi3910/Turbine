@@ -16,9 +16,11 @@
 // cores (v_wmma_f32_16x16x16_bf16, F32 accumulation), one MX group of 32 k
 // values (two WMMAs) at a time into a zero accumulator, and add that group sum
 // times the group's power-of-two scale (exact) to the running F32 sum: one
-// decode per weight, no scaling of it. The prefill kernel, where one decoded
-// weight feeds 8 row fragments, decodes the scaled weight (the exponent added
-// in the BF16 bits) and chains the WMMAs into one accumulator. Either way the
+// decode per weight, no scaling of it. The LDS kernel (one decoded weight
+// feeds 8 row fragments of a wave) and the prefill kernel (one decoded weight,
+// staged in LDS, feeds the 256 rows of a block) decode the scaled weight (the
+// exponent added in the BF16 bits) and chain the WMMAs into one accumulator,
+// in the same order, so they give a row the same bits. Either way the
 // result differs from the CPU reference (cpu::qgemm) only by the F32
 // summation order.
 //
@@ -63,9 +65,13 @@ constexpr int kStep = 64;
 // reuse rule)"): up to 16 rows one wave per 16 columns with k split over 8
 // waves (the weights of 1-16 rows stream at 400-500 GB/s); up to 32 and 64 rows
 // 2 and 4 row fragments with k split over 4; above, the LDS kernel with 128 x
-// 128 block tiles.
+// 128 block tiles. From 1,024 rows the prefill kernel's 256 x 128 tiles (one
+// decode per 256 rows, vector epilogue; Phase 5p Task 15 sweep: 10-16 % below
+// the LDS kernel at 2,048 rows, 5-9 % at 1,024 on 7 of 8 shapes; between 512
+// and 1,024 rows it wins only at multiples of 256, below 512 it loses).
 constexpr int kSmallMaxRows = 16;
 constexpr int kMediumMaxRows = 64;
+constexpr int kPrefillMinRows = 1024;
 
 typedef short v8s __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
@@ -136,6 +142,10 @@ struct Params {
   int64_t lda, ldc;
   float alpha;
   bool c_f32;
+  // BF16 out with rows of 16-byte-aligned 8-column chunks (n and ldc multiples
+  // of 8, c on 16 bytes): the prefill kernel stages its tile in LDS and
+  // writes 16 bytes per lane.
+  bool c_vec = false;
 };
 
 // FM row fragments and FN column fragments per wave (all waves of a block
@@ -461,6 +471,230 @@ __global__ __launch_bounds__(kLanes *NW) void mxfp4_gemm_lds_kernel(Params p) {
   }
 }
 
+// The prefill kernel: a BM x BN block tile walked KK k (16 or 32) per step,
+// both operands staged in LDS (double buffered) and read by a WM x WN grid of
+// waves (FM x FN fragments each). Each thread decodes 8 weights of one column
+// per B unit (their scaled BF16 values, as the LDS kernel above) into the B
+// tile, so a decoded weight feeds all BM rows of the block rather than the
+// 16 * FM rows of one wave; the next step's operands are loaded into
+// registers while the WMMAs run. The WMMAs of an output fragment chain into
+// one accumulator over the k axis in natural order, 16 k at a time -- the LDS
+// kernel's order -- so a row's bits depend on nothing but the row (batch
+// invariant, and bitwise the LDS kernel's results). With BF16 out the tile
+// leaves through LDS as 16-byte row chunks.
+template <int BM, int BN, int WM, int WN, int KK>
+__global__ __launch_bounds__(kLanes * WM *
+                             WN) void mxfp4_gemm_prefill_kernel(Params p) {
+  constexpr int kThreads = kLanes * WM * WN;
+  constexpr int FM = BM / kMma / WM;
+  constexpr int FN = BN / kMma / WN;
+  static_assert(FM * kMma * WM == BM && FN * kMma * WN == BN, "tile");
+  static_assert(KK == 16 || KK == 32, "k per step");
+  // LDS row: KK BF16 plus 8 of padding (48 or 80 bytes), so the 16 rows of a
+  // WMMA operand read fall on distinct banks.
+  constexpr int kRow = KK + 8;
+  // A: KK / 8 chunks of 16 bytes per tile row and step.
+  constexpr int kAChunks = BM * KK / 8;
+  static_assert(kAChunks % kThreads == 0, "A chunks");
+  constexpr int kAPass = kAChunks / kThreads;
+  // B: KK / 8 units of 8 weights (4 code bytes) per tile column and step.
+  constexpr int kBUnits = BN * KK / 8;
+  static_assert(kBUnits % kThreads == 0, "B units");
+  constexpr int kBPass = kBUnits / kThreads;
+  constexpr int kASize = BM * kRow;
+  constexpr int kBSize = BN * kRow;
+  __shared__ uint32_t lut[256];
+  __shared__ __attribute__((aligned(16))) Bf16 smem[2 * (kASize + kBSize)];
+  auto a_s = [&](int buf) { return smem + buf * kASize; };
+  auto b_s = [&](int buf) { return smem + 2 * kASize + buf * kBSize; };
+  const int t = static_cast<int>(threadIdx.x);
+  for (int i = t; i < 256; i += kThreads) {
+    lut[i] = static_cast<uint32_t>(kE2m1Bf16[i & 15]) |
+             (static_cast<uint32_t>(kE2m1Bf16[i >> 4]) << 16);
+  }
+  const int lane = t % kLanes;
+  const int wave = t / kLanes;
+  const int wm = wave / WN;
+  const int wn = wave % WN;
+  const int r = lane % kMma;
+  const int h = lane / kMma;
+  const int32_t blk_col = static_cast<int32_t>(blockIdx.x) * BN;
+  const int32_t blk_row = static_cast<int32_t>(blockIdx.y) * BM;
+
+  constexpr int kAPerRow = KK / 8;
+  const Bf16 *a_g[kAPass];
+  int a_l[kAPass];
+#pragma unroll
+  for (int pass = 0; pass < kAPass; ++pass) {
+    const int c = t + pass * kThreads;
+    const int64_t row = min(blk_row + c / kAPerRow, p.m - 1);
+    a_g[pass] = p.a + row * p.lda + (c % kAPerRow) * 8;
+    a_l[pass] = (c / kAPerRow) * kRow + (c % kAPerRow) * 8;
+  }
+  constexpr int kBPerCol = KK / 8;
+  const uint8_t *b_g[kBPass];
+  const uint8_t *s_g[kBPass];
+  int b_l[kBPass];
+#pragma unroll
+  for (int pass = 0; pass < kBPass; ++pass) {
+    const int u = t + pass * kThreads;
+    const int64_t col = min(blk_col + u / kBPerCol, p.n - 1);
+    b_g[pass] = p.b + col * (p.k / 2) + (u % kBPerCol) * 4;
+    s_g[pass] = p.b_scales + col * (p.k / 32);
+    b_l[pass] = (u / kBPerCol) * kRow + (u % kBPerCol) * 8;
+  }
+
+  u32x4 ra[kAPass];
+  uint32_t rb[kBPass];
+  uint32_t re[kBPass];
+  auto load = [&](int32_t s) {
+#pragma unroll
+    for (int pass = 0; pass < kAPass; ++pass)
+      ra[pass] = *reinterpret_cast<const u32x4 *>(a_g[pass] + s * KK);
+#pragma unroll
+    for (int pass = 0; pass < kBPass; ++pass) {
+      rb[pass] = *reinterpret_cast<const uint32_t *>(b_g[pass] + s * (KK / 2));
+      re[pass] = s_g[pass][(s * KK) / 32];
+    }
+  };
+  auto store = [&](int buf) {
+#pragma unroll
+    for (int pass = 0; pass < kAPass; ++pass)
+      *reinterpret_cast<u32x4 *>(&a_s(buf)[a_l[pass]]) = ra[pass];
+#pragma unroll
+    for (int pass = 0; pass < kBPass; ++pass) {
+      *reinterpret_cast<v8s *>(&b_s(buf)[b_l[pass]]) =
+          decode8_scaled(lut, rb[pass], re[pass]);
+    }
+  };
+
+  v8f acc[FM][FN];
+#pragma unroll
+  for (int i = 0; i < FM; ++i) {
+#pragma unroll
+    for (int j = 0; j < FN; ++j)
+      acc[i][j] = v8f{};
+  }
+  const int32_t steps = p.k / KK;
+  const int a_off = (wm * FM * kMma + r) * kRow + 8 * h;
+  const int b_off = (wn * FN * kMma + r) * kRow + 8 * h;
+  load(0);
+  __syncthreads(); // the byte table
+  store(0);
+  __syncthreads();
+  for (int32_t s = 0; s < steps; ++s) {
+    const int buf = s & 1;
+    const bool more = s + 1 < steps;
+    if (more)
+      load(s + 1);
+#pragma unroll
+    for (int sl = 0; sl < KK / kMma; ++sl) {
+      v8s af[FM];
+      v8s bf[FN];
+#pragma unroll
+      for (int i = 0; i < FM; ++i)
+        af[i] = *reinterpret_cast<const v8s *>(
+            &a_s(buf)[a_off + i * kMma * kRow + sl * kMma]);
+#pragma unroll
+      for (int j = 0; j < FN; ++j)
+        bf[j] = *reinterpret_cast<const v8s *>(
+            &b_s(buf)[b_off + j * kMma * kRow + sl * kMma]);
+#pragma unroll
+      for (int i = 0; i < FM; ++i) {
+#pragma unroll
+        for (int j = 0; j < FN; ++j)
+          acc[i][j] = mma(af[i], bf[j], acc[i][j]);
+      }
+    }
+    if (more)
+      store(buf ^ 1);
+    __syncthreads();
+  }
+
+  const int32_t row0 = blk_row + wm * FM * kMma;
+  const int32_t col0 = blk_col + wn * FN * kMma;
+  if (p.c_vec) {
+    // The wave's fragments go through its own LDS region (the loop's last
+    // barrier ended every read of the operand tiles), kHalf row fragments at
+    // a time, and leave as 16-byte row chunks.
+    constexpr int kHalf = FM / 2 > 0 ? FM / 2 : 1;
+    constexpr int kCols = FN * kMma;
+    constexpr int kSRow = kCols + 8;
+    constexpr int kChunks = kCols / 8;
+    constexpr int kRowsPerIter = kLanes / kChunks;
+    static_assert(kLanes % kChunks == 0 && (kHalf * kMma) % kRowsPerIter == 0,
+                  "staging layout");
+    static_assert(WM * WN * kHalf * kMma * kSRow <= 2 * (kASize + kBSize),
+                  "staging fits the operand tiles");
+    Bf16 *stage = smem + wave * (kHalf * kMma * kSRow);
+#pragma unroll
+    for (int i0 = 0; i0 < FM; i0 += kHalf) {
+#pragma unroll
+      for (int ii = 0; ii < kHalf; ++ii) {
+#pragma unroll
+        for (int j = 0; j < FN; ++j) {
+#pragma unroll
+          for (int v = 0; v < 8; ++v) {
+            stage[(ii * kMma + h * 8 + v) * kSRow + j * kMma + r] =
+                f32_to_bf16(p.alpha * acc[i0 + ii][j][v]);
+          }
+        }
+      }
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+      __builtin_amdgcn_wave_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#pragma unroll
+      for (int it = 0; it < kHalf * kMma / kRowsPerIter; ++it) {
+        const int lr = it * kRowsPerIter + lane / kChunks;
+        const int ch = lane % kChunks;
+        const int32_t row = row0 + i0 * kMma + lr;
+        const int32_t col = col0 + ch * 8;
+        const u32x4 v =
+            *reinterpret_cast<const u32x4 *>(&stage[lr * kSRow + ch * 8]);
+        if (row < p.m && col < p.n) {
+          *reinterpret_cast<u32x4 *>(static_cast<Bf16 *>(p.c) +
+                                     static_cast<int64_t>(row) * p.ldc + col) =
+              v;
+        }
+      }
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+      __builtin_amdgcn_wave_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+    }
+    return;
+  }
+#pragma unroll
+  for (int j = 0; j < FN; ++j) {
+    const int32_t col = col0 + j * kMma + r;
+    if (col >= p.n)
+      continue;
+#pragma unroll
+    for (int i = 0; i < FM; ++i) {
+#pragma unroll
+      for (int v = 0; v < 8; ++v) {
+        const int32_t row = row0 + i * kMma + h * 8 + v;
+        if (row >= p.m)
+          continue;
+        const float value = p.alpha * acc[i][j][v];
+        const int64_t at = static_cast<int64_t>(row) * p.ldc + col;
+        if (p.c_f32)
+          static_cast<float *>(p.c)[at] = value;
+        else
+          static_cast<Bf16 *>(p.c)[at] = f32_to_bf16(value);
+      }
+    }
+  }
+}
+
+template <int BM, int BN, int WM, int WN, int KK>
+hipError_t launch_prefill(hipStream_t stream, const Params &p) {
+  const dim3 grid(static_cast<unsigned>((p.n + BN - 1) / BN),
+                  static_cast<unsigned>((p.m + BM - 1) / BM));
+  hipLaunchKernelGGL((mxfp4_gemm_prefill_kernel<BM, BN, WM, WN, KK>), grid,
+                     dim3(kLanes * WM * WN), 0, stream, p);
+  return hipGetLastError();
+}
+
 template <int FM, int FN, int NW>
 hipError_t launch_lds(hipStream_t stream, const Params &p) {
   constexpr int kCols = NW * FN * kMma;
@@ -526,16 +760,22 @@ hipError_t launch_qgemm_mxfp4(hipStream_t stream, const turbine_qgemm_desc *d,
                  d->lda,
                  d->ldc,
                  d->alpha,
-                 d->c_dtype == TURBINE_DTYPE_F32};
+                 d->c_dtype == TURBINE_DTYPE_F32,
+                 d->c_dtype == TURBINE_DTYPE_BF16 && d->n % 8 == 0 &&
+                     d->ldc % 8 == 0 &&
+                     (reinterpret_cast<uintptr_t>(d->c) & 15u) == 0};
   if (p.m == 0)
     return hipSuccess;
   if (tile == Mxfp4Tile::Auto) {
-    // A prefill step always runs the Large tile: one reduction order per row
-    // whatever m is (no k split; a WMMA element depends only on its row of A,
-    // its column of B and its accumulator), so a prompt prefilled whole, in
+    // From 1,024 rows every call runs the Prefill tile. Below, a prefill step
+    // runs the Large tile; both chain each output's WMMAs in natural k order
+    // with the same scaled weights (no k split; a WMMA element depends only on
+    // its row of A, its column of B and its accumulator), so a row gets the
+    // same bits from either, whatever m is, and a prompt prefilled whole, in
     // chunks or behind a cached prefix gets the same bits (Phase 4 prefix
-    // reuse). Decode steps pick the fastest tile for m.
-    tile = d->prefill != 0         ? Mxfp4Tile::Large
+    // reuse). Decode steps below 1,024 rows pick the fastest tile for m.
+    tile = p.m >= kPrefillMinRows  ? Mxfp4Tile::Prefill
+           : d->prefill != 0       ? Mxfp4Tile::Large
            : p.m <= kSmallMaxRows  ? Mxfp4Tile::Small
            : p.m <= kMediumMaxRows ? Mxfp4Tile::Medium
                                    : Mxfp4Tile::Large;
@@ -546,6 +786,8 @@ hipError_t launch_qgemm_mxfp4(hipStream_t stream, const turbine_qgemm_desc *d,
   case Mxfp4Tile::Medium:
     return p.m <= 32 ? launch<2, 1, 2, 4, 2>(stream, p)
                      : launch<4, 1, 2, 4, 1>(stream, p);
+  case Mxfp4Tile::Prefill:
+    return launch_prefill<256, 128, 4, 2, 32>(stream, p);
   default:
     return launch_lds<8, 1, 8>(stream, p);
   }
