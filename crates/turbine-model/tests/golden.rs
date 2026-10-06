@@ -396,7 +396,7 @@ fn committed_tolerance_and_reference() {
             tol.likely_logprob_floor,
             tol.margin_nats
         ),
-        (0.15, 0.55, -2.0, 0.5)
+        (0.15, 0.56, -2.0, 0.5)
     );
     let text = std::fs::read_to_string(fixture.join("reference.jsonl")).expect("reference");
     let engines: Vec<String> = text
@@ -412,7 +412,7 @@ fn committed_tolerance_and_reference() {
 
 /// OLMoE's committed tolerance is transformers' own spread (decision "OLMoE golden gate",
 /// 2026-09-26; measurement in the README beside it): the same rule and floor as Llama, bounds
-/// 1.01 / 1.66 that every transformers variant (sdpa/eager × BF16/FP32 × incremental/full)
+/// 1.01 / 1.66 (tail 1.72 since decision "5p golden tolerance vs engine summation order" A) that every transformers variant (sdpa/eager × BF16/FP32 × incremental/full)
 /// meets against the reference, at least 14/16 prompts. Breaks if the OLMoE file drifts from
 /// the documented calibration or Llama's file is loosened with it.
 #[test]
@@ -430,7 +430,7 @@ fn olmoe_tolerance_is_the_calibrated_self_spread() {
             tol.likely_logprob_floor,
             tol.margin_nats
         ),
-        (1.01, 1.66, -2.0, 0.5)
+        (1.01, 1.72, -2.0, 0.5)
     );
     // The spread already spans GEMM shapes and kernels, so concurrency 16 gets the same bounds.
     assert_eq!(
@@ -438,10 +438,10 @@ fn olmoe_tolerance_is_the_calibrated_self_spread() {
             tol.max_abs_logprob_diff_likely_batched,
             tol.max_abs_logprob_diff_tail_batched
         ),
-        (Some(1.01), Some(1.66))
+        (Some(1.01), Some(1.72))
     );
     let readme = std::fs::read_to_string(fixture.join("README.md")).expect("README.md");
-    for bound in ["1.01", "1.66", "1.0092", "1.6569"] {
+    for bound in ["1.01", "1.66", "1.72", "1.0092", "1.6569"] {
         assert!(readme.contains(bound), "README.md lacks {bound}");
     }
     let llama = read_tolerance(&golden_dir().join("llama-3.2-3b-instruct/tolerance.json"));
@@ -450,7 +450,7 @@ fn olmoe_tolerance_is_the_calibrated_self_spread() {
             llama.max_abs_logprob_diff_likely,
             llama.max_abs_logprob_diff_tail
         ),
-        (0.15, 0.55)
+        (0.15, 0.56)
     );
 }
 
