@@ -24,7 +24,7 @@ use turbine_kernels::{
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
     MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpConfig,
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    ShimLibrary, card_reference_provider, cpu_reference_provider, shim_provider,
 };
 use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, TqHeadTables, TqParams};
 use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
@@ -174,6 +174,17 @@ fn cpu_executor(spec: &TinySpec) -> Single {
     executor(
         spec,
         cpu_reference_provider(),
+        HostMemory::new(DeviceId(0), 1 << 30),
+    )
+}
+
+/// The reference a run on `ctx` is held to: the cpu-reference in the numerics classes of the
+/// context's card (`turbine_kernels::cpu::card_reference`: P kept in F32 where the library runs
+/// its b1 decode kernel, BF16 where CK runs; user decision 2026-10-06 A).
+fn hip_reference_executor(spec: &TinySpec, ctx: &Arc<ShimContext>) -> Single {
+    executor(
+        spec,
+        card_reference_provider(shim_provider(ctx.clone()).card_profile()),
         HostMemory::new(DeviceId(0), 1 << 30),
     )
 }
@@ -2988,10 +2999,12 @@ fn multi_row_logits_match_single_steps() {
 }
 
 /// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint. With the
-/// cpu-reference attention in CK's order (BF16 unnormalised probabilities for P·V, f32 row
-/// sum), every op models the HIP numerics and the measured worst case over 32 steps on an R9700
-/// is 3.8e-6 (0.097 while the cpu-reference kept f32 probabilities). 1e-4 leaves a 25× margin
-/// for f32 accumulation order and is ~1000× below the error one numerics-model mismatch caused.
+/// cpu-reference attention in the class the library ran (CK's order, BF16 unnormalised
+/// probabilities for P·V and an f32 row sum; P kept in F32 where the b1 decode kernel runs, via
+/// [`hip_reference_executor`]), every op models the HIP numerics and the measured worst case
+/// over 32 steps on an R9700 is 3.8e-6 (0.097 while the cpu-reference kept f32 probabilities
+/// against CK; 0.103 while it rounded them against b1). 1e-4 leaves a 25× margin for f32
+/// accumulation order and is ~1000× below the error one numerics-model mismatch caused.
 const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
 
 /// A context on the first AMD device through the library `TURBINE_KERNEL_LIBRARY` names.
@@ -3023,7 +3036,7 @@ fn hip_matches_cpu() {
 
     let tmp = TempDir::new("tiny-model-hip");
     let spec = write_gpu_tiny(tmp.path());
-    let mut cpu = cpu_executor(&spec);
+    let mut cpu = hip_reference_executor(&spec, &ctx);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = executor(&spec, shim_provider(ctx.clone()), mem);
     hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
@@ -3032,20 +3045,34 @@ fn hip_matches_cpu() {
     let mut cpu_row = forward(&mut cpu, &tokens, 0).row(0).to_vec();
     let mut hip_row = forward(&mut hip, &tokens, 0).row(0).to_vec();
     let mut worst = 0f32;
+    let mut diffs = Vec::new();
+    let mut greedy_differs = Vec::new();
     for step in 0..32 {
         let diff = max_abs_diff(&hip_row, &cpu_row);
         worst = worst.max(diff);
-        assert!(
-            diff <= HIP_MAX_ABS_LOGIT_DIFF,
-            "step {step}: max abs diff {diff}"
-        );
+        diffs.push(diff);
         let (c, h) = (argmax(&cpu_row), argmax(&hip_row));
-        assert_eq!(h, c, "greedy token {step} differs");
+        if h != c {
+            greedy_differs.push(step);
+        }
         let pos = tokens.len() as u32;
         tokens.push(c);
         cpu_row = forward(&mut cpu, &[c], pos).row(0).to_vec();
         hip_row = forward(&mut hip, &[c], pos).row(0).to_vec();
     }
+    println!(
+        "hip_matches_cpu: per-step max abs logit diff {diffs:?}; greedy differs at {greedy_differs:?}"
+    );
+    for (step, &diff) in diffs.iter().enumerate() {
+        assert!(
+            diff <= HIP_MAX_ABS_LOGIT_DIFF,
+            "step {step}: max abs diff {diff}"
+        );
+    }
+    assert!(
+        greedy_differs.is_empty(),
+        "greedy tokens differ at {greedy_differs:?}"
+    );
     let graphs = hip.graph_counters();
     assert!(
         graphs.replayed > 0 && graphs.capture_failed == 0,
@@ -3425,7 +3452,7 @@ fn hip_trace_vs_cpu() {
     let tmp = TempDir::new("tiny-model-hip-trace");
     let spec = write_gpu_tiny(tmp.path());
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let mut cpu = cpu_executor(&spec);
+    let mut cpu = hip_reference_executor(&spec, &ctx);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = executor(&spec, shim_provider(ctx), mem);
     let (traces, starts) = traced_run(&mut [&mut cpu, &mut hip], &prompt(spec.vocab), 3);
@@ -4350,7 +4377,14 @@ fn hip_v23_library_matches_cpu() {
 
         let prompt = prompt(spec.vocab);
         let n = prompt.len();
-        let mut cpu = cpu_model_with(spec, &host, 128, opts, cpu_reference_provider(), false);
+        let mut cpu = cpu_model_with(
+            spec,
+            &host,
+            128,
+            opts,
+            card_reference_provider(new.card_profile()),
+            false,
+        );
         let (feed, want) = single_sequence(cpu.as_mut(), &host, &prompt, n, 16, true);
         let mut v23 = cpu_model_with(spec, &old_mem, 128, opts, old, false);
         let (_, got) = single_sequence(v23.as_mut(), &old_mem, &feed, n, 16, false);

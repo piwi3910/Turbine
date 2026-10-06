@@ -156,9 +156,27 @@ fn sequences(
     Ok(seqs)
 }
 
+/// How the attention probabilities P reach the P·V product (float pages; the FP8, TurboQuant
+/// and mixed-format paths keep their own numerics).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PRounding {
+    /// Rounded to the activation dtype: CK FMHA's order (the cpu-reference default).
+    Activation,
+    /// Kept in F32: the b1 decode kernel (`card_reference.rs`).
+    F32,
+}
+
 /// Appends `k_new`/`v_new` into their page slots, then runs causal GQA attention per sequence
 /// over its gathered K/V history with the same math as the contiguous op.
 pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelError> {
+    attention_with(ctx, PRounding::Activation)
+}
+
+/// [`attention`] with the probabilities P rounded as `p_rounding` says.
+pub(super) fn attention_with(
+    ctx: &PagedAttentionContext<'_>,
+    p_rounding: PRounding,
+) -> Result<(), KernelError> {
     let base = kv_format_code(ctx.cfg.dtype);
     let formats = load_formats(ctx)?;
     if ctx.cfg.dtype.tq_record_bytes().is_some()
@@ -272,9 +290,17 @@ pub(super) fn attention(ctx: &PagedAttentionContext<'_>) -> Result<(), KernelErr
             causal: ctx.cfg.causal,
         };
         let rows = seq.row * hq * d..(seq.row + seq.q_len) * hq * d;
-        let o = math::attention(&q[rows.clone()], &k, &v, &shape, ctx.scale, |p| {
-            super::round_to(act, p)
-        });
+        let o = math::attention(
+            &q[rows.clone()],
+            &k,
+            &v,
+            &shape,
+            ctx.scale,
+            |p| match p_rounding {
+                PRounding::Activation => super::round_to(act, p),
+                PRounding::F32 => p,
+            },
+        );
         out[rows].copy_from_slice(&o);
     }
     store(&ctx.out, &out)
