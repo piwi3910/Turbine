@@ -4037,7 +4037,7 @@ registry entry, the conformance suite); then own `wvSplitK`-structured kernels a
 residual add with the rmsnorm fusion — one stage at a time, each measured, stopping at any stage that does not
 measure faster. TP (`rmsnorm_sharded` bitwise), prefill, OLMoE and quantized paths unchanged.
 
-## 5p Task 4: overlap scheduling A/B — c1 gains, c16 TTFT 1.70× (2026-10-06, open)
+## 5p Task 4: overlap scheduling A/B — c1 gains, c16 TTFT 1.70× (2026-10-06)
 
 From `p5p-overlap` (commit 69cc4c16; perf log 5p "S-3: overlap scheduling waits for new prefills"). Llama BF16,
 GPU 0, one build, serial vs overlap: c1 82.7 → 83.6 tok/s (ms/token 12.09 → 11.96), TTFT p50 54 = 54; c16 853.9 →
@@ -4053,3 +4053,6 @@ each), which the "wait for new prefills" rule does not remove; its cause is not 
   re-run of the four legs plus OLMoE); flip the default only if TTFT p50 ≤ 1.10× on both models.
 - C) Default on for c1-like serving only (e.g. switch overlap off while the queue is non-empty under load) — a new
   rule, needs its own spec line.
+
+**Decision (user, 2026-10-06): B.** Find why admissions are held back under overlap at c16, fix it, re-run Llama
+c1/c16 and OLMoE; the default flips on only if TTFT p50 stays within 1.10× on both models.
