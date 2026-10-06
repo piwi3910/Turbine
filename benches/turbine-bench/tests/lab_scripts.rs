@@ -2798,6 +2798,55 @@ fn lab_bench_dry_run_passes_flags() {
     );
 }
 
+/// P5p S-14: the ladder A/B recipe — `--config` serves the given lab config, `--mt-only` runs
+/// golden and then the multi-turn profile alone (no throughput bench, no stage-share),
+/// `--mt-think-time` reaches the profile, and the pressure poll and the after-profile scrapes
+/// surround it. Breaks if a flag is dropped or the throughput bench still runs.
+#[test]
+fn lab_bench_dry_run_ladder_ab_recipe() {
+    let text = dry_run(
+        "lab-bench.sh",
+        "bench-dry-ladder",
+        &[
+            "--dry-run",
+            "--config",
+            "scripts/lab/phase6-novanas-ladder.yaml",
+            "--mt-only",
+            "--multi-turn-sessions",
+            "24",
+            "--mt-think-time",
+            "1..4",
+            "--",
+            "--set",
+            "kv.ladder.l0=true",
+        ],
+    );
+    let mut last = 0;
+    for line in [
+        "--config scripts/lab/phase6-novanas-ladder.yaml",
+        "--set kv.ladder.l0=true",
+        "compare --url http://127.0.0.1:18000",
+        "/turbine/v1/pressure",
+        "--profile multi-turn --sessions 24 --turns 8 --shared-prefix-words 2000 --concurrency 24 --think-time 1..4 --session-hints",
+        "metrics-mt.txt",
+        "kv-mt.json",
+    ] {
+        let at = text
+            .find(line)
+            .unwrap_or_else(|| panic!("no {line:?} in:\n{text}"));
+        assert!(at > last, "{line:?} out of order in:\n{text}");
+        last = at;
+    }
+    assert!(
+        !text.contains("--prompt-words 512"),
+        "--mt-only runs no throughput bench:\n{text}"
+    );
+    assert!(
+        !text.contains("stage-share --before"),
+        "--mt-only computes no host share:\n{text}"
+    );
+}
+
 /// P5p S-1: the new flags parse (--dry-run exits 0 without contacting a host) and the
 /// standard workload is unchanged: without --concurrency the throughput bench runs at 16 and
 /// without the multi-turn flags no multi-turn step is printed.

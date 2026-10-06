@@ -138,6 +138,33 @@ pub trait KvTier: Send + Sync {
     /// rung only while this is above the copies in flight into it (P6b S-6: a slab tier whose
     /// slabs all hold another slot size refuses every copy of the rung's size).
     fn free_slots(&self, format: &'static str, bytes: u64) -> u64;
+    /// Starts draining one slab toward `bytes`-byte slots (P5p S-18): a slab tier picks a slab
+    /// of another slot size with no copy in flight into it — the fewest stored copies first —
+    /// and takes no new copy into it; once its last copy leaves it is reformatted to `bytes`
+    /// (at once when it is already empty). The caller evicts or re-stores the copies
+    /// [`draining_keys`](KvTier::draining_keys) names. False when the tier has no slabs to
+    /// drain (the default: a tier without slot sizes, or one that does not drain).
+    fn begin_drain(&self, bytes: u64) -> bool {
+        let _ = bytes;
+        false
+    }
+    /// The keys still stored in draining slabs.
+    fn draining_keys(&self) -> Vec<KvKey> {
+        Vec::new()
+    }
+    /// Slabs draining now and slabs reformatted by a drain since startup.
+    fn drain_status(&self) -> SlabDrainStatus {
+        SlabDrainStatus::default()
+    }
+}
+
+/// [`KvTier::drain_status`] (P5p S-18).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlabDrainStatus {
+    /// Slabs draining now.
+    pub draining: u32,
+    /// Slabs a drain reformatted since startup.
+    pub reformatted: u64,
 }
 
 /// Pressure of a tier from its utilisation, on the Phase 3 `kv_utilization` thresholds

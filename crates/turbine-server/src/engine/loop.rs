@@ -1021,6 +1021,8 @@ impl EngineLoop {
                 .gate()
                 .map_or(0, |g| u32::try_from(g.queue_len()).unwrap_or(u32::MAX)),
             iterations: self.iterations,
+            ladder_rewrites_in_flight: u32::try_from(self.kv.ladder_in_flight())
+                .unwrap_or(u32::MAX),
         });
     }
 

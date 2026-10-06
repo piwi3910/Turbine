@@ -15,7 +15,9 @@ use std::time::Duration;
 use smallvec::SmallVec;
 use turbine_core::types::PressureState;
 
-use super::{KvTier, L1PinnedTier, TierBlockMut, TierBlockRef, TierError, TierId, TierSlot};
+use super::{
+    KvTier, L1PinnedTier, SlabDrainStatus, TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
+};
 use crate::identity::KvKey;
 
 /// Pinned buffer id and byte offset of one shard's slot, in rank order.
@@ -293,5 +295,46 @@ impl KvTier for ShardedL1Tier {
             .map(|(s, &b)| s.free_slots(format, (bytes * b as u64).div_ceil(total.max(1))))
             .min()
             .unwrap_or(0)
+    }
+
+    /// P5p S-18: every shard drains one slab toward its share of `bytes`; a drain counts only
+    /// when every shard started one (a shard that cannot leaves the others' slabs draining,
+    /// which reformat as their copies leave). Under tensor parallelism the shards place a
+    /// block's parts alike, so the shards drain the slabs of the same blocks.
+    fn begin_drain(&self, bytes: u64) -> bool {
+        if let [one] = self.shards.as_slice() {
+            return one.begin_drain(bytes);
+        }
+        let total: u64 = self.shard_bytes.iter().map(|&b| b as u64).sum();
+        // Every shard is asked (no short circuit).
+        let started: SmallVec<[bool; 8]> = self
+            .shards
+            .iter()
+            .zip(&self.shard_bytes)
+            .map(|(s, &b)| s.begin_drain((bytes * b as u64).div_ceil(total.max(1))))
+            .collect();
+        started.iter().all(|&ok| ok)
+    }
+
+    /// The copies of every shard's draining slabs: evicting one evicts its parts in every
+    /// shard.
+    fn draining_keys(&self) -> Vec<KvKey> {
+        if let [one] = self.shards.as_slice() {
+            return one.draining_keys();
+        }
+        let mut keys: Vec<KvKey> = self.shards.iter().flat_map(|s| s.draining_keys()).collect();
+        keys.sort_unstable_by_key(|k| k.0);
+        keys.dedup();
+        keys
+    }
+
+    /// The most slabs any shard drains, and the fewest reformats any shard finished (a slot
+    /// of the new size exists only once every shard has one).
+    fn drain_status(&self) -> SlabDrainStatus {
+        let all: Vec<SlabDrainStatus> = self.shards.iter().map(|s| s.drain_status()).collect();
+        SlabDrainStatus {
+            draining: all.iter().map(|x| x.draining).max().unwrap_or(0),
+            reformatted: all.iter().map(|x| x.reformatted).min().unwrap_or(0),
+        }
     }
 }

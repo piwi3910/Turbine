@@ -231,6 +231,9 @@ pub struct TransferCompletion {
     /// The owner was cancelled while the copy was in flight: its bytes belong to the cache only,
     /// never to the cancelled sequence (P4 S-12).
     pub owner_cancelled: bool,
+    /// How long the copy waited in the queue before it started (P5p S-14: the ladder's
+    /// `queue` seconds).
+    pub queued: Duration,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -418,7 +421,6 @@ impl TransferEngine {
                     est_bandwidth_bps = e.bandwidth_bps,
                 );
             }
-            self.queued.remove(&ticket.id);
             let result = result.map(|(took, slot)| (took.reported(), slot));
             let owner_cancelled = ticket
                 .req
@@ -489,10 +491,7 @@ impl TransferEngine {
                 self.peak_inflight_bytes = self.peak_inflight_bytes.max(self.inflight_bytes);
                 self.inflight.push((ticket, now, None));
             }
-            Err(e) => {
-                self.queued.remove(&ticket.id);
-                self.finish(ticket, Err(e), false, out)
-            }
+            Err(e) => self.finish(ticket, Err(e), false, out),
         }
     }
 
@@ -631,10 +630,13 @@ impl TransferEngine {
         out: &mut Vec<TransferCompletion>,
     ) {
         self.unbusy(&ticket.req.key);
+        // Every ticket that reaches here has started: its entry holds the queue wait.
+        let queued = self.queued.remove(&ticket.id).unwrap_or_default();
         out.push(TransferCompletion {
             ticket,
             result,
             owner_cancelled,
+            queued,
         });
     }
 

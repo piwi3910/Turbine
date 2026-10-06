@@ -34,6 +34,44 @@ pub struct PressureDocument {
     pub groups: Vec<GroupDoc>,
     /// P5 S-7: whether the data-parallel router may pick each replica, and why not.
     pub replicas: Vec<ReplicaDoc>,
+    /// P5p S-14: seconds spent in each pressure state since startup, with the cause
+    /// breakdown of `turbine_pressure_dwell_seconds_total` (`ladder_rewrites`, `other`).
+    pub dwell: Vec<DwellDoc>,
+}
+
+/// `dwell[]` entry: one pressure state's accumulated time and its causes.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct DwellDoc {
+    pub state: PressureState,
+    pub seconds: f64,
+    pub causes: BTreeMap<&'static str, f64>,
+}
+
+/// The `dwell` list from the metric families: every state, every cause.
+pub fn dwell_doc(m: &ReliabilityMetrics) -> Vec<DwellDoc> {
+    PressureState::ALL
+        .iter()
+        .map(|&state| {
+            let causes: BTreeMap<&'static str, f64> = crate::controller::DwellCause::ALL
+                .iter()
+                .map(|c| {
+                    let v = m
+                        .pressure_dwell_seconds
+                        .get_or_create(&crate::metrics::DwellLabels {
+                            state: state.as_str(),
+                            cause: c.as_str(),
+                        })
+                        .get();
+                    (c.as_str(), v)
+                })
+                .collect();
+            DwellDoc {
+                state,
+                seconds: causes.values().sum(),
+                causes,
+            }
+        })
+        .collect()
 }
 
 /// `devices[]` entry: a device's state and its budget by component (pool).

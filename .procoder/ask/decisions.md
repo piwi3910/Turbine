@@ -3642,3 +3642,67 @@ edge moves the bitwise-invariance edge with it.
 **Decision (user, 2026-10-06): A, and re-time the edge.** The b1 attention work closes; the next decode-BW effort
 attacks the ~1.0 ms of inter-kernel gaps toward ~0.9×. The b1 → CK splitkv hand-off is re-timed at 2–8 sequences and
 moved to the measured crossover, the invariance test's edge moving with it.
+
+## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06, open)
+
+From `p5p-t13t17` (instrumentation a5f4b4a3; perf log 5p "Task 13"). 6b Task 18 recipe on today's tree, 3 + 3
+interleaved runs, GPU 0, `kv.partial_prefix_reuse=false` on both arms (see the next entry). Ladder on (L1/L2 + L0,
+`tq4`) against off, medians: tok/s 310.2 vs 341.4 (**0.909×**, S-14 ≥ 0.90 met at the edge), ORANGE samples 44 vs 26
+(**1.69×**, ≤ 2× met), recomputed tokens −6.2 % (**≥ 15 % missed**), golden c1 PASS everywhere. The 6b shape (233 vs
+304, ORANGE 131 vs 50) no longer reproduces — the 6b follow-ups removed most of it. The instrumentation:
+
+- ladder host sweeps 0.2 s per ~90 s run; the rewrite lanes overlap 0–5 s of a 20–25 s ORANGE dwell
+  (`turbine_pressure_dwell_seconds_total{cause="ladder_rewrites"}`) — the lanes are not the dwell;
+- every L1 rewrite ends `no_room` and ~1,600–1,900 demotions fall back to `l0` (`rung_no_slot`): L1 never stores a
+  compressed copy, hence the small recompute win (Task 17's problem);
+- the L0 rung never fired, yet ITL p50 is +9 % (decode forward +3.5 %): with `kv.ladder.l0=true` the L0 pool is classed
+  and decode always runs the mixed-format attention. An L1/L2-only arm (`kv.ladder.l0=false`) has ITL equal to off and
+  0.952× tok/s, with the same longer ORANGE dwell (44 samples).
+
+None of the plan's three candidate fixes (per-tick rewrite budget, ORANGE hysteresis while rewrites drain, rewrites on
+the copy kernel) targets a measured cost, so nothing is landed yet.
+
+- A) Close S-14 on these numbers: the ladder stays opt-in, document `kv.ladder.l0=false` as the cheaper opt-in shape
+  (0.95×, ITL unchanged) and re-bound the recompute target to what Task 17's drain delivers (or drop it to "> 0")
+- B) Make the classed L0 pool lazy — start flat, carve page classes only when the L0 rung first fires (or the recent
+  window needs them) — so `kv.ladder.l0=true` costs nothing until it compresses; then re-run the A/B (a new task; touches
+  the pool/executor class plumbing, no ABI change expected)
+- C) Land the plan's fix (a) anyway (`kv.ladder.max_rewrites_per_tick`, default 8) for the bound it adds, accepting no
+  measured gain
+- D) Investigate the ORANGE dwell further (per-signal dwell, ladder `rung_no_slot` effects on L0 drain timing) before choosing
+
+Builder recommendation: A now (closes the item with the trade documented, targets 1–2 met), B as a follow-up task if
+the L0 rung is meant to be used in production; not C (it bounds something that is not the cost).
+
+## 5p: partial prefix reuse fails on a classed L0 pool (2026-10-06, found in Task 13, open)
+
+With `kv.ladder.l0=true` (classed L0 pool) and the 5p default `kv.partial_prefix_reuse: true`, golden c1's warm prompts
+fail with HTTP 500 `copy_blocks failed: invalid argument: turbine_copy_blocks: block id 4 is outside the pool's id space`
+(the HIP library's class check, `kernels/rocm/src/copy_blocks.cpp`), and the engine opens the circuit for every following
+request (run `t13-on-r1`, 0/192). The tail copy (`IterationPlan.tail_copies` → `batch::copy_blocks`) passes a pair the
+library's `page_offset` rejects for the code `KvPoolView.classes` gives that id. Not diagnosed further (outside Tasks
+13/17); the Task 13/17 A/Bs ran with `kv.partial_prefix_reuse=false`.
+
+- A) Diagnose and fix the tail copy's class mapping on classed pools (with a `kv_gpu` test that serves partial reuse
+  under `kv.ladder.l0=true` / a TurboQuant L0) — builder recommendation
+- B) Stopgap: refuse `kv.partial_prefix_reuse` with a classed L0 pool at startup (exit 2, reason code), then A
+- C) Disable partial reuse silently when the pool is classed (no reason code — against TS §21 rule 7; not recommended)
+
+## 5p Task 17: drain-and-reformat vs compaction for slab mixing (2026-10-06, proposal, open)
+
+From `p5p-t13t17` (c7718a96; perf log 5p "Task 17"). Landed: the drain (plan's default path) — while the ladder asks L1
+for a rung without a free slot of its size, up to `kv.cpu.slab_drains_per_tick` (default 1) slabs drain per ladder tick:
+L1-only copies re-stored in L2, others evicted (`slab_drain`), the emptied slab reformatted to the rung size and held
+for it. Ladder multi-turn A/B with the drain: L1 ends 100 % rung-format (287–409 blocks against ~145), 16–22 reformats
+per run at 6–8 evictions + re-stores per reformat, `rung_no_slot`/`no_room` down ~5×; standard bench 849.2 tok/s
+(0.996× the S-2 baseline), golden PASS. On the ladder workload median tok/s 291 against 310 without the drain (ORANGE
+63 vs 44 samples); one run in three cut recomputed tokens by 36 %.
+
+- A) Keep the drain as landed (default budget 1): S-18 met; it only acts with the opt-in ladder on — builder
+  recommendation
+- B) Keep the drain but default `kv.cpu.slab_drains_per_tick: 0` (opt-in on top of the opt-in ladder) until the ladder's
+  throughput trade is improved (Task 13 follow-ups)
+- C) Compaction instead: move a mostly-empty slab's survivors into free same-size slots elsewhere so it empties without
+  evictions — needs free `l0` slots, which this workload's L1 (full at ORANGE) almost never has; same copy bandwidth per
+  survivor as a re-store
+- D) Both: compaction first when free same-size slots exist, the drain otherwise (more code; measure after A/B)

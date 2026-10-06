@@ -303,8 +303,8 @@ Interfaces:
   Covers: S-14 ACs (host budget test + manual A/B)
   Depends on: Task 2, Task 3
 
-- [ ] Instrument: add `turbine_kv_ladder_action_seconds_total{tier,action}` and the ORANGE cause breakdown; run: `scripts/remote-cargo.sh test -p turbine-server` — expect PASS (reporting only)
-- [ ] Run the instrumented A/B (GPU 0): `scripts/lab-bench.sh --model llama --multi-turn` with the ladder on and with the ladder off (`--set kv.ladder.enabled=…`), three runs each — the per-action times and the ORANGE breakdown name the dominant cost; the lines go into `.procoder/perf-log.md`
+- [x] Instrument: add `turbine_kv_ladder_action_seconds_total{tier,action}` and the ORANGE cause breakdown; run: `scripts/remote-cargo.sh test -p turbine-server` — expect PASS (reporting only)
+- [x] (done with the 6b Task 18 recipe as `lab-bench.sh --config scripts/lab/phase6-novanas-ladder.yaml --mt-only --multi-turn-sessions 24 --mt-think-time 1..4`, `kv.partial_prefix_reuse=false` on both arms — perf log 5p "Task 13"; the fix choice is open in decisions "5p Task 13: ladder serving cost") Run the instrumented A/B (GPU 0): `scripts/lab-bench.sh --model llama --multi-turn` with the ladder on and with the ladder off (`--set kv.ladder.enabled=…`), three runs each — the per-action times and the ORANGE breakdown name the dominant cost; the lines go into `.procoder/perf-log.md`
 - [ ] Fix per the profile, test first: write failing test `turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` (at most `max_rewrites_per_tick` rewrites submitted per tick, overflow deferred, no budget = as before). Run: `scripts/remote-cargo.sh test -p turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` — expect FAIL
 - [ ] Implement the fix the profile named (the budget, the hysteresis or the copy-kernel path); keep the 6b ladder tests (`ladder_under_pinned_pressure`, `ladder_l0_under_pinned_pressure`) passing unchanged
 - [ ] Rerun the A/B (GPU 0): meets the S-14 target, or the item closes on the user's read of the numbers (a decisions entry records it either way)
@@ -370,11 +370,11 @@ Interfaces:
   Covers: S-18 ACs (host test + manual A/B)
   Depends on: Task 3
 
-- [ ] Write failing test `tier::tests::drained_slab_reformat_stores_rung_format`: two slabs full of `l0` blocks, pressure asking for a rung format, the drain stores rung-format copies with evictions/re-stores counted, and budget 0 restores the fallback-only behavior. Run: `scripts/remote-cargo.sh test -p turbine-kv tier::tests::drained_slab_reformat_stores_rung_format` — expect FAIL
-- [ ] Implement the drain-and-reformat in the slab tier (`take_slot` asks the drain path before the fallback), bounded by `kv.cpu.slab_drains_per_tick`; keep the 6b tier tests (`l1_default_slab_size_stores_a_new_format_block_beside_occupied_old_format_slots`, the fallback test) passing
-- [ ] Landing (GPU 0): the ladder multi-turn A/B (the Task 13 recipe) with the mixing path on — a nonzero rung-format share of stored L1 copies at the final scrape, the reformat counters recorded, the standard bench within the no-regression bound, golden1 PASS; the drain-vs-compaction choice is recorded in decisions.md
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `feat(kv): slab drain-and-reformat — compressed copies actually store`
+- [x] Write failing test `tier::tests::drained_slab_reformat_stores_rung_format`: two slabs full of `l0` blocks, pressure asking for a rung format, the drain stores rung-format copies with evictions/re-stores counted, and budget 0 restores the fallback-only behavior. Run: `scripts/remote-cargo.sh test -p turbine-kv tier::tests::drained_slab_reformat_stores_rung_format` — expect FAIL
+- [x] Implement the drain-and-reformat in the slab tier (`take_slot` asks the drain path before the fallback), bounded by `kv.cpu.slab_drains_per_tick`; keep the 6b tier tests (`l1_default_slab_size_stores_a_new_format_block_beside_occupied_old_format_slots`, the fallback test) passing
+- [x] Landing (GPU 0): the ladder multi-turn A/B (the Task 13 recipe) with the mixing path on — a nonzero rung-format share of stored L1 copies at the final scrape, the reformat counters recorded, the standard bench within the no-regression bound, golden1 PASS; the drain-vs-compaction choice is recorded in decisions.md
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `feat(kv): slab drain-and-reformat — compressed copies actually store`
 
 ## Task 18: Decode bandwidth — batch-1 kernels toward peak memory bandwidth (S-19)
 

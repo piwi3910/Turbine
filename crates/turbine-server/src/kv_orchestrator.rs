@@ -931,6 +931,12 @@ impl KvOrchestrator {
         self.h.ladder_document()
     }
 
+    /// Compression-ladder rewrites queued or in flight (P5p S-14: the pressure controller's
+    /// dwell cause).
+    pub fn ladder_in_flight(&self) -> usize {
+        self.h.ladder_in_flight().count()
+    }
+
     /// Seeds every enabled path's estimate from one 64 MiB copy through the production copy
     /// paths (module comment).
     fn calibrate(

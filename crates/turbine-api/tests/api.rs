@@ -1168,6 +1168,7 @@ mod p3 {
 
         let families = [
             "turbine_pressure_state",
+            "turbine_pressure_dwell_seconds",
             "turbine_pressure_transitions",
             "turbine_pressure_signal",
             "turbine_pressure_signal_level",
@@ -1244,6 +1245,8 @@ mod p3 {
         allowed.insert("pool", PoolKind::ALL.iter().map(|p| p.as_str()).collect());
         allowed.insert("kind", vec!["capacity", "used", "reserved", "free"]);
         allowed.insert("outcome", vec!["recovered", "failed"]);
+        // P5p S-14: what a pressure state's time overlapped.
+        allowed.insert("cause", vec!["ladder_rewrites", "other"]);
         let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let Some(family) = families.iter().find(|f| line.starts_with(**f)) else {
@@ -1898,6 +1901,8 @@ fn check_labels(line: &str) {
         "no_room",
         // P5p S-5: a reclaimed L0-only partial entry.
         "partial_l0_only",
+        // P5p S-18: a copy evicted from a draining L1 slab.
+        "slab_drain",
         "all_l0",
         "retrieve_cheaper",
         "recompute_cheaper",
@@ -1952,6 +1957,14 @@ fn check_labels(line: &str) {
                 .contains(&v)
             }
             "outcome" => ["used", "wasted", "cancelled", "rejected"].contains(&v),
+            // P5p S-14: what the compression ladder spent time on.
+            "action" if line.starts_with("turbine_kv_ladder_action_seconds") => {
+                ["sweep", "queue", "rewrite"].contains(&v)
+            }
+            // P5p S-18: what a slab drain did.
+            "action" if line.starts_with("turbine_kv_slab_reformat") => {
+                ["drain_evict", "drain_restore", "reformat"].contains(&v)
+            }
             "le" => true,
             _ => false,
         };
@@ -2075,6 +2088,10 @@ async fn kv_metrics_bounded() {
         // P6b S-6: the compression ladder (its actions render once the ladder acts).
         "turbine_kv_ladder_rung{",
         "turbine_kv_ladder_actions_total{",
+        // P5p S-14: the ladder's time per tier and action (renders from startup).
+        "turbine_kv_ladder_action_seconds_total{tier=\"l1\",action=\"rewrite\"}",
+        // P5p S-18: slab drains (render from startup).
+        "turbine_kv_slab_reformat_total{tier=\"l1\",action=\"reformat\"}",
         // P5p S-4/S-5: the token-granular comparison (the six outcomes render from startup)
         // and the copy-on-write tail.
         "turbine_kv_partial_reuse_total{outcome=\"reused\"}",

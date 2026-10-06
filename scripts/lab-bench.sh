@@ -61,9 +61,12 @@ conc=16
 multi_turn=0
 mt_sessions=0
 mt_conc=0
+mt_think=""
+mt_only=0
+cfg_override=""
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4" >&2
 	exit 2
 }
@@ -128,6 +131,21 @@ while [[ $# -gt 0 ]]; do
 		multi_turn=1
 		mt_sessions="$2"
 		mt_conc="$2"
+		shift 2
+		;;
+	--mt-think-time)
+		[[ $# -ge 2 && "$2" =~ ^[0-9.]+\.\.[0-9.]+$ ]] || usage
+		mt_think="$2"
+		shift 2
+		;;
+	--mt-only)
+		multi_turn=1
+		mt_only=1
+		shift
+		;;
+	--config)
+		[[ $# -ge 2 ]] || usage
+		cfg_override="$2"
 		shift 2
 		;;
 	--print-model)
@@ -197,6 +215,9 @@ olmoe-fp8kv)
 esac
 [[ -n "$golden_slug" ]] || golden_slug="$slug"
 [[ -n "${cfg:-}" ]] || cfg="scripts/lab/phase6-novanas-$model.yaml"
+# --config replaces the model's lab config (the weights and golden slug stay the model's), e.g.
+# the compression-ladder A/B on scripts/lab/phase6-novanas-ladder.yaml (P5p S-14, S-18).
+[[ -n "$cfg_override" ]] && cfg="$cfg_override"
 if [[ $print_model -eq 1 ]]; then
 	echo "$slug $golden_slug $cfg"
 	exit 0
@@ -396,27 +417,45 @@ rm -f "$out/bench-c1.json"
 # each under this shell's bench-lock hold. The stage-share call (P5p S-1) computes the host
 # share of the throughput interval from the two scrapes on novanas (the freshly built binary
 # is always current there); the multi-turn profile runs after the throughput bench.
+rm -f "$out/bench.json" "$out/stage-share.json" "$out/mt.json" "$out/metrics-mt.txt" "$out/pressure.jsonl"
+throughput_cmd="$bench_cmd --concurrency $conc --requests $requests --prompt-words 512 --max-tokens 256 --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'"
+share_cmds=(
+	"ssh -o BatchMode=yes $host 'mkdir -p $remote/stage-share'"
+	"ssh -o BatchMode=yes $host 'cat > $remote/stage-share/before' < '$out/metrics-before.txt'"
+	"ssh -o BatchMode=yes $host 'cat > $remote/stage-share/after' < '$out/metrics.txt'"
+	"ssh -o BatchMode=yes $host '$remote/target/release/turbine-bench stage-share --before $remote/stage-share/before --after $remote/stage-share/after --output json' > '$out/stage-share.json'"
+)
+# --mt-only: the multi-turn profile alone after golden (the 6b ladder A/B recipe, P5p S-14): no
+# throughput bench, so the multi-turn run starts on the server golden left behind.
+if [[ $mt_only -eq 1 ]]; then
+	throughput_cmd=""
+	share_cmds=()
+fi
 steps=(
 	"$golden compare --url http://127.0.0.1:18000 --reference $ref --concurrency 1 $bounds > '$out/golden1.txt' 2>&1"
 	"$strict_cmd"
 	"$golden16_cmd"
 	"curl -s '$url/metrics' > '$out/metrics-before.txt'"
-	"$bench_cmd --concurrency $conc --requests $requests --prompt-words 512 --max-tokens 256 --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'"
+	"$throughput_cmd"
 	"$c1_cmd"
 	"curl -s '$url/metrics' > '$out/metrics.txt'"
 	"curl -s '$url/turbine/v1/status' > '$out/status.json'"
 	"curl -s '$url/turbine/v1/kv' > '$out/kv.json'"
-	"ssh -o BatchMode=yes $host 'mkdir -p $remote/stage-share'"
-	"ssh -o BatchMode=yes $host 'cat > $remote/stage-share/before' < '$out/metrics-before.txt'"
-	"ssh -o BatchMode=yes $host 'cat > $remote/stage-share/after' < '$out/metrics.txt'"
-	"ssh -o BatchMode=yes $host '$remote/target/release/turbine-bench stage-share --before $remote/stage-share/before --after $remote/stage-share/after --output json' > '$out/stage-share.json'"
+	${share_cmds[@]+"${share_cmds[@]}"}
 )
 if [[ $multi_turn -eq 1 ]]; then
 	[[ $mt_sessions -eq 0 ]] && mt_sessions=16
 	# Standard profile: 16 sessions at c8 (the Phase 4 command); saturated (--multi-turn-sessions):
 	# as many concurrent requests as sessions.
 	[[ $mt_conc -eq 0 ]] && mt_conc=8
-	steps+=("$bench_cmd --profile multi-turn --sessions $mt_sessions --turns 8 --shared-prefix-words 2000 --concurrency $mt_conc --session-hints --output json > '$out/mt.json' 2> '$out/mt.err'")
+	think=""
+	[[ -n "$mt_think" ]] && think=" --think-time $mt_think"
+	# The pressure document is polled every 0.5 s while the profile runs (pressure.jsonl: the
+	# ORANGE sample count of the 6b ladder A/Bs); the scrape after it carries the ladder's and
+	# the dwell's counters (P5p S-14) and the L1/L2 formats (S-18).
+	steps+=("( while :; do curl -s -m 2 '$url/turbine/v1/pressure'; echo; sleep 0.5; done > '$out/pressure.jsonl' 2>/dev/null ) & poller=\$!; $bench_cmd --profile multi-turn --sessions $mt_sessions --turns 8 --shared-prefix-words 2000 --concurrency $mt_conc$think --session-hints --output json > '$out/mt.json' 2> '$out/mt.err'; kill \$poller")
+	steps+=("curl -s '$url/metrics' > '$out/metrics-mt.txt'")
+	steps+=("curl -s '$url/turbine/v1/kv' > '$out/kv-mt.json'")
 fi
 if [[ $dry -eq 1 ]]; then
 	for step in "${steps[@]}"; do
@@ -447,9 +486,9 @@ fi
 ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; $stop_server"
 
 # 4. summary
-python3 - "$out" "$label" "$model" "$commit" "$gpu" "$tests" "$run_golden16" "$quick" "$client" "$conc" <<'EOF'
+python3 - "$out" "$label" "$model" "$commit" "$gpu" "$tests" "$run_golden16" "$quick" "$client" "$conc" "$mt_only" <<'EOF'
 import json, re, sys
-out, label, model, commit, gpu, tests, run_golden16, quick, client, conc = sys.argv[1:]
+out, label, model, commit, gpu, tests, run_golden16, quick, client, conc, mt_only = sys.argv[1:]
 g1 = open(f"{out}/golden1.txt").read().strip().splitlines()[-1][:5]
 if run_golden16 == "1":
     g16 = open(f"{out}/golden16.txt").read().strip().splitlines()[-1][:5]
@@ -461,7 +500,10 @@ try:
 except (OSError, IndexError):
     pass
 try:
-    d = json.load(open(f"{out}/bench.json"))
+    # --mt-only: no throughput bench; the line's request figures are the multi-turn run's.
+    d = json.load(open(f"{out}/{'mt.json' if mt_only == '1' else 'bench.json'}"))
+    if mt_only == "1":
+        quick_field += " mt_only=1"
 except Exception as e:
     print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1}{quick_field} BENCH FAILED ({e})")
     sys.exit(1)
@@ -537,6 +579,56 @@ except OSError:
     pass
 except Exception as e:
     mt_field = f" mt=FAILED({e})"
+# The compression ladder over the multi-turn run (P5p S-14, S-18): counters of the scrape after
+# it minus the scrape before it, the ORANGE samples of the 0.5 s pressure poll, and the stored
+# L1 copies per format at the end.
+mt_after = read(f"{out}/metrics-mt.txt")
+if mt_after:
+    def total(m, name, want=None):
+        t = 0.0
+        for line in m.splitlines():
+            if not line.startswith(name):
+                continue
+            head, _, v = line.rpartition(" ")
+            labels = dict(re.findall(r'(\w+)="([^"]*)"', head))
+            if want is None or all(labels.get(k) in vs for k, vs in want.items()):
+                try:
+                    t += float(v)
+                except ValueError:
+                    pass
+        return t
+    def delta(name, want=None):
+        return total(mt_after, name, want) - total(after, name, want)
+    ladder = {
+        "mt_recompute_tokens": round(delta("turbine_kv_recompute_tokens_total")),
+        "mt_orange_s": round(delta("turbine_pressure_dwell_seconds_total", {"state": {"ORANGE"}}), 1),
+        "mt_orange_ladder_s": round(delta("turbine_pressure_dwell_seconds_total",
+                                          {"state": {"ORANGE"}, "cause": {"ladder_rewrites"}}), 1),
+        "mt_ladder_rewrites": round(delta("turbine_kv_ladder_actions_total",
+                                          {"reason": {"fill_high_water", "would_drop", "recent_window"}})),
+        "mt_ladder_no_room": round(delta("turbine_kv_ladder_actions_total",
+                                         {"reason": {"no_room", "no_room_backoff", "rung_no_slot"}})),
+    }
+    for a in ("sweep", "queue", "rewrite"):
+        ladder[f"mt_ladder_{a}_s"] = round(delta("turbine_kv_ladder_action_seconds_total", {"action": {a}}), 2)
+    for a in ("drain_evict", "drain_restore", "reformat"):
+        ladder[f"mt_slab_{a}"] = round(delta("turbine_kv_slab_reformat_total", {"action": {a}}))
+    try:
+        samples = [json.loads(l)["state"] for l in open(f"{out}/pressure.jsonl") if l.strip()]
+        ladder["mt_orange_samples"] = sum(1 for s in samples if s == "ORANGE")
+    except Exception:
+        pass
+    try:
+        kv = json.load(open(f"{out}/kv-mt.json"))
+        l1 = next(t for t in kv["tiers"] if t["tier"] == "l1")
+        fm = {f: u["blocks"] for f, u in (l1.get("formats") or {}).items()}
+        n = sum(fm.values())
+        ladder["mt_l1_blocks"] = n
+        ladder["mt_l1_rung_share"] = round(sum(v for f, v in fm.items() if f != "l0") / n, 4) if n else 0.0
+    except Exception:
+        pass
+    values.update(ladder)
+    mt_field += "".join(f" {k}={v}" for k, v in ladder.items())
 json.dump({k: v for k, v in values.items() if v == v}, open(f"{out}/labbook-values.json", "w"))
 print(f"BENCH {label} {model} commit={commit} gpu={gpu} tests={tests} golden1={g1} golden16={g16}{quick_field}{formats}{share_field} "
       f"ok={d['requests_ok']} failed={d['requests_failed']} tok/s={d['output_token_throughput']:.1f} "
@@ -567,6 +659,8 @@ if [[ $rc -eq 0 && "${LABBOOK_UPLOAD:-1}" != 0 && -f "$uploader" && -f "$HOME/.c
 	[[ $quick -eq 1 ]] && workload+=("quick")
 	[[ $multi_turn -eq 1 ]] && workload+=("multi-turn")
 	[[ $mt_sessions -ne 0 ]] && workload+=("mt-sessions=$mt_sessions")
+	[[ $mt_only -eq 1 ]] && workload+=("mt-only")
+	[[ -n "$mt_think" ]] && workload+=("mt-think=$mt_think")
 	config_param="$(printf '%s ' "$(basename "$cfg" .yaml)" "$@" ${workload[@]+"${workload[@]}"} | sed 's/--set //g; s/ *$//')"
 	if LABBOOK_URL="${LABBOOK_URL:-https://labbook.kw.watteel.lab}" NODE_EXTRA_CA_CERTS="$HOME/.labbook/cluster-ca.crt" \
 		node "$uploader" run --type turbine-lab-bench --external-id "lab-bench:$label-$model:$commit" \

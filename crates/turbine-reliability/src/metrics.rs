@@ -19,6 +19,13 @@ pub struct StateLabel {
     pub state: &'static str,
 }
 
+/// `turbine_pressure_dwell_seconds_total{state,cause}` (P5p S-14).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DwellLabels {
+    pub state: &'static str,
+    pub cause: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TransitionLabels {
     pub from: &'static str,
@@ -101,6 +108,9 @@ pub struct CircuitTransitionLabels {
 #[derive(Clone, Debug)]
 pub struct ReliabilityMetrics {
     pub pressure_state: Family<StateLabel, Gauge>,
+    /// P5p S-14: seconds spent in each pressure state, by what the engine was doing
+    /// ([`crate::controller::DwellCause`]).
+    pub pressure_dwell_seconds: Family<DwellLabels, Counter<f64, AtomicU64>>,
     pub pressure_transitions: Family<TransitionLabels, Counter>,
     pub pressure_signal: Family<SignalLabel, FloatGauge>,
     pub pressure_signal_level: Family<SignalLabel, Gauge>,
@@ -136,6 +146,11 @@ impl ReliabilityMetrics {
             "turbine_pressure_state",
             "1 for the current pressure state, 0 otherwise",
             m.pressure_state.clone(),
+        );
+        reg.register(
+            "turbine_pressure_dwell_seconds",
+            "Seconds spent in each pressure state, by cause (ladder_rewrites in flight, other)",
+            m.pressure_dwell_seconds.clone(),
         );
         reg.register(
             "turbine_pressure_transitions",
@@ -242,6 +257,15 @@ impl ReliabilityMetrics {
             "Static-mode worker rank ledgers found different from the leader's mirror of them",
             m.ledger_mirror_divergence.clone(),
         );
+        // The dwell family renders every state and cause from startup.
+        for s in turbine_core::types::PressureState::ALL {
+            for c in crate::controller::DwellCause::ALL {
+                let _ = m.pressure_dwell_seconds.get_or_create(&DwellLabels {
+                    state: s.as_str(),
+                    cause: c.as_str(),
+                });
+            }
+        }
         m
     }
 
@@ -272,6 +296,7 @@ impl ReliabilityMetrics {
     pub fn unregistered() -> Self {
         ReliabilityMetrics {
             pressure_state: Family::default(),
+            pressure_dwell_seconds: Family::default(),
             pressure_transitions: Family::default(),
             pressure_signal: Family::default(),
             pressure_signal_level: Family::default(),

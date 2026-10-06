@@ -603,6 +603,126 @@ fn l1_default_slab_size_stores_a_new_format_block_beside_occupied_old_format_slo
     assert_eq!(old, l0_block);
 }
 
+/// P5p S-18 (the tier side of the slab drain): with both 128 MiB slabs full of `l0` slots the
+/// tier has no `tq4` slot; `begin_drain` picks the slab with the fewest copies, takes no new
+/// copy into it (a slot its eviction frees does not take an `l0` block), names its copies in
+/// `draining_keys`, and once the last one leaves reformats it to `tq4` slots — the rung
+/// format's copies then store beside the other slab's surviving `l0` copies. A tier without
+/// slabs (`MemTier`) does not drain: the 6b fallback is its only path. Breaks if the drain
+/// picks a fuller slab, refills the draining slab, never reformats, or a `MemTier` claims a
+/// drain.
+#[test]
+fn drained_slab_reformat_stores_rung_format() {
+    const L0_BLOCK: usize = 14_680_064;
+    const TQ4_BLOCK: usize = 4_128_768;
+    let slab = 128 * 1024 * 1024;
+    let cfg = L1Config {
+        enabled: true,
+        max_bytes: 2 * slab as u64,
+        slab_bytes: slab as u64,
+        block_bytes: L0_BLOCK as u64,
+        memory_kind: MemoryKind::Dedicated,
+    };
+    let l1 = L1PinnedTier::new(cfg, Arc::new(HostPinned::new(u64::MAX)), clock());
+    let per_slab = slab / L0_BLOCK; // 9
+    let l0_block = vec![1u8; L0_BLOCK];
+    for i in 0..(2 * per_slab) as u8 {
+        l1.put(key(i), TierBlockRef::Host(&l0_block)).unwrap();
+    }
+    // The second slab (keys per_slab..) holds one copy fewer: the cheaper drain.
+    l1.evict(&key(per_slab as u8)).unwrap();
+    assert_eq!(l1.free_slots("tq4", TQ4_BLOCK as u64), 0, "no rung slot");
+    assert_eq!(l1.drain_status(), SlabDrainStatus::default());
+    assert!(l1.begin_drain(TQ4_BLOCK as u64));
+    let mut keys = l1.draining_keys();
+    keys.sort_by_key(|k| k.0[0]);
+    let want: Vec<KvKey> = (per_slab + 1..2 * per_slab).map(|i| key(i as u8)).collect();
+    assert_eq!(keys, want, "the slab with the fewest copies drains");
+    assert_eq!(
+        l1.drain_status(),
+        SlabDrainStatus {
+            draining: 1,
+            reformatted: 0
+        }
+    );
+    // Its free slot takes no new l0 copy, and its free slots are not offered.
+    assert_eq!(
+        l1.put(key(100), TierBlockRef::Host(&l0_block)),
+        Err(TierError::Full)
+    );
+    assert_eq!(l1.free_slots("l0", L0_BLOCK as u64), 0);
+    for k in &want {
+        l1.evict(k).unwrap();
+    }
+    assert_eq!(
+        l1.drain_status(),
+        SlabDrainStatus {
+            draining: 0,
+            reformatted: 1
+        }
+    );
+    assert!(l1.draining_keys().is_empty());
+    let per_tq4 = (slab / TQ4_BLOCK) as u64;
+    assert_eq!(l1.free_slots("tq4", TQ4_BLOCK as u64), per_tq4);
+    let tq4_block = vec![7u8; TQ4_BLOCK];
+    for i in 0..per_tq4 as u8 {
+        l1.put(key(150 + i), TierBlockRef::Host(&tq4_block))
+            .expect("the reformatted slab stores rung-format copies");
+    }
+    let mut out = vec![0u8; L0_BLOCK];
+    l1.get(&key(0), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, l0_block, "the other slab's l0 copies survive");
+    // A tier without slabs never drains.
+    let mem = MemTier::new(TierId::L1, 4 * BLOCK, clock());
+    assert!(!mem.begin_drain(BLOCK / 2));
+    assert!(mem.draining_keys().is_empty());
+}
+
+/// P5p S-18 under tensor parallelism: a sharded L1 drains every shard toward its share of the
+/// rung's slot size, names the copies of every draining slab, and counts a reformat only once
+/// every shard reformatted. Breaks if a shard is left out of the drain.
+#[test]
+fn sharded_l1_drains_every_shard() {
+    let shard = |_| {
+        Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                max_bytes: 2 * BLOCK,
+                slab_bytes: BLOCK,
+                block_bytes: BLOCK / 2,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            clock(),
+        ))
+    };
+    let shards: Vec<_> = (0..2).map(shard).collect();
+    let t = ShardedL1Tier::new(shards.clone(), BLOCK / 2);
+    for i in 0..4 {
+        t.put(key(i), TierBlockRef::Host(&bytes(i))).unwrap();
+    }
+    assert_eq!(t.free_slots("tq4", BLOCK / 4), 0);
+    assert!(t.begin_drain(BLOCK / 4));
+    let keys = t.draining_keys();
+    assert_eq!(keys.len(), 2, "one 2-slot slab per shard: {keys:?}");
+    assert_eq!(t.drain_status().draining, 1);
+    for k in &keys {
+        t.evict(k).unwrap();
+    }
+    assert_eq!(
+        t.drain_status(),
+        SlabDrainStatus {
+            draining: 0,
+            reformatted: 1
+        }
+    );
+    // Each shard's reformatted slab holds 6000 / 750 = 8 slots of its share.
+    assert_eq!(t.free_slots("tq4", BLOCK / 4), 8);
+    for s in &shards {
+        assert_eq!(s.drain_status().reformatted, 1);
+    }
+}
+
 #[test]
 fn l1_passes_the_contract_suite() {
     let alloc = Arc::new(HostPinned::new(u64::MAX));
