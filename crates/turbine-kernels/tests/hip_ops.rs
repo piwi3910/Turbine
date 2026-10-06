@@ -23,9 +23,9 @@ use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, GemmConfig, GemmContext, ImplChoice, ImplInfo, KV_FMT_BF16, KV_FMT_FP8_E4M3,
-    KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns, KvCopyConfig, KvCopyContext,
-    KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat, KvTranscodeTables,
+    EmbeddingContext, FusedRope, GemmConfig, GemmContext, ImplChoice, ImplInfo, KV_FMT_BF16,
+    KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns, KvCopyConfig,
+    KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat, KvTranscodeTables,
     LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
     MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
     PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
@@ -1249,6 +1249,7 @@ fn paged_case_pages(
             block_formats: None,
             classes: None,
             tq: None,
+            rope: None,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
@@ -1721,6 +1722,194 @@ fn paged_b1_decode_matches_cpu() {
     }
 }
 
+/// P5p b1 attention II (kernel ABI v2.12): RoPE fused into a paged decode call gives the bits
+/// of the rope op followed by the unfused call — the output rows and the pool after the append,
+/// compared exactly — on the b1 kernel (1–3 sequences, rotating in its append and q staging),
+/// the library's CK hand-off above 3 sequences and CK split-KV bound alone (both rotate in place
+/// first), and the OLMoE heads (CK pagedkv); full and partial rotary widths, a YaRN attention
+/// factor, both page sizes. Breaks if the fused rotation differs from the rope kernel in any
+/// rounding, uses the wrong position or head, misses the appended K row, or a path ignores the
+/// fields.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn paged_decode_fused_rope_matches_separate() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(61);
+    let ragged16: Vec<usize> = (0..16).map(|s| 740 + (37 * s) % 90).collect();
+    let batches: [&[usize]; 4] = [&[830], &[1, 129, 3000], &[1, 2, 127, 128, 129], &ragged16];
+    let splitkv_spec = |heads: (usize, usize)| {
+        OpConfig::Attention(AttentionConfig {
+            kind: AttentionKind::DecodePaged,
+            num_q_heads: heads.0 as u32,
+            num_kv_heads: heads.1 as u32,
+            head_dim: HEAD_DIM as u32,
+            dtype: DType::BF16,
+            block_tokens: Some(128),
+            causal: true,
+        })
+    };
+    let splitkv = p
+        .hip
+        .implementations(OpKind::AttentionDecodePaged)
+        .into_iter()
+        .find(|i| i.name == "ck_tile_fmha_splitkv")
+        .expect("ck_tile_fmha_splitkv is listed");
+    let ck = bound(&p, &splitkv_spec((Q_HEADS, KV_HEADS)), splitkv.index);
+    let cases = [
+        (&p, (Q_HEADS, KV_HEADS), 128, HEAD_DIM, 1.0),
+        (&p, (Q_HEADS, KV_HEADS), 16, HEAD_DIM, YARN16_ATTN_FACTOR),
+        (&p, (32, 8), 128, 64, 1.0),
+        (&p, (16, 16), 128, HEAD_DIM, 1.0),
+        (&ck, (Q_HEADS, KV_HEADS), 128, HEAD_DIM, 1.0),
+        (&ck, (Q_HEADS, KV_HEADS), 128, 64, YARN16_ATTN_FACTOR),
+    ];
+    for (pair, heads, block_tokens, rotary, factor) in cases {
+        for kv_lens in batches {
+            let what = format!(
+                "heads={heads:?} block_tokens={block_tokens} rotary={rotary} factor={factor} \
+                 kv_lens={kv_lens:?}"
+            );
+            fused_rope_case(
+                pair,
+                &mut rng,
+                heads,
+                block_tokens,
+                rotary,
+                factor,
+                kv_lens,
+                &what,
+            );
+        }
+    }
+}
+
+/// One [`paged_decode_fused_rope_matches_separate`] case on `pair`'s HIP provider.
+#[allow(clippy::too_many_arguments)]
+fn fused_rope_case(
+    p: &Pair,
+    rng: &mut Rng,
+    heads: (usize, usize),
+    block_tokens: usize,
+    rotary: usize,
+    attn_factor: f32,
+    kv_lens: &[usize],
+    what: &str,
+) {
+    let (q_heads, kv_heads) = heads;
+    let cfg = AttentionConfig {
+        kind: AttentionKind::DecodePaged,
+        num_q_heads: q_heads as u32,
+        num_kv_heads: kv_heads as u32,
+        head_dim: HEAD_DIM as u32,
+        dtype: DType::BF16,
+        block_tokens: Some(block_tokens as u32),
+        causal: true,
+    };
+    let rope_cfg = RopeConfig {
+        num_q_heads: q_heads as u32,
+        num_kv_heads: kv_heads as u32,
+        head_dim: HEAD_DIM as u32,
+        rotary_dim: rotary as u32,
+        dtype: DType::BF16,
+    };
+    let attn = p.hip.attention().expect("hip attention");
+    assert!(
+        attn.fuses_decode_rope(&cfg, &rope_cfg),
+        "{what}: the library must fuse RoPE"
+    );
+    let impl_name = attn.implementation(&cfg);
+    let seqs = kv_lens.len();
+    let max_blocks = kv_lens
+        .iter()
+        .map(|k| k.div_ceil(block_tokens))
+        .max()
+        .expect("a sequence");
+    let num_blocks = seqs * max_blocks + 1;
+    let order = shuffled(rng, num_blocks);
+    let table: Vec<f32> = (0..seqs * max_blocks).map(|i| order[i] as f32).collect();
+    let indptr: Vec<f32> = (0..=seqs).map(|i| i as f32).collect();
+    let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+    // The new token's position: the sequence's last key.
+    let positions: Vec<f32> = kv_lens.iter().map(|&k| (k - 1) as f32).collect();
+    let inv_freq: Vec<f32> = (0..rotary / 2)
+        .map(|i| (1.0 / ROPE_THETA.powf(2.0 * i as f64 / rotary as f64)) as f32)
+        .collect();
+    let pool_shape = [num_blocks, 2, block_tokens, kv_heads, HEAD_DIM];
+    let pool = rng.normal(num_blocks * 2 * block_tokens * kv_heads * HEAD_DIM, 1.0);
+    let q = rng.normal(seqs * q_heads * HEAD_DIM, 1.0);
+    let k = rng.normal(seqs * kv_heads * HEAD_DIM, 1.0);
+    let v = rng.normal(seqs * kv_heads * HEAD_DIM, 1.0);
+    let bt = on_hip(p, &[seqs, max_blocks], DType::I32, &table);
+    let ip = on_hip(p, &[seqs + 1], DType::I32, &indptr);
+    let kl = on_hip(p, &[seqs], DType::I32, &lens);
+    let pos = on_hip(p, &[seqs], DType::I32, &positions);
+    let freq = on_hip(p, &[rotary / 2], DType::F32, &inv_freq);
+    // (out, pool) of one run: fused, or the rope op then the plain call.
+    let run = |fused: bool| -> (Vec<f32>, Vec<f32>) {
+        let q_t = on_hip(p, &[seqs, q_heads, HEAD_DIM], DType::BF16, &q);
+        let k_t = on_hip(p, &[seqs, kv_heads, HEAD_DIM], DType::BF16, &k);
+        let v_t = on_hip(p, &[seqs, kv_heads, HEAD_DIM], DType::BF16, &v);
+        let o_t = on_hip(
+            p,
+            &[seqs, q_heads, HEAD_DIM],
+            DType::BF16,
+            &vec![0.0; q.len()],
+        );
+        let pool_t = on_hip(p, &pool_shape, DType::BF16, &pool);
+        if !fused {
+            p.hip
+                .rope()
+                .expect("hip rope")
+                .execute(&mut RopeContext {
+                    cfg: rope_cfg,
+                    q: q_t.view(),
+                    k: k_t.view(),
+                    positions: pos.view(),
+                    inv_freq: freq.view(),
+                    attn_factor,
+                })
+                .expect("rope");
+        }
+        attn.execute_paged(&mut PagedAttentionContext {
+            cfg,
+            q: q_t.view(),
+            k_new: k_t.view(),
+            v_new: v_t.view(),
+            out: o_t.view(),
+            kv_layer: pool_t.view(),
+            block_table: bt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kl.view(),
+            max_q_len: 1,
+            max_kv_len: kv_lens.iter().copied().max().unwrap_or(0) as u32,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            k_scale: 1.0,
+            v_scale: 1.0,
+            block_formats: None,
+            classes: None,
+            tq: None,
+            rope: fused.then(|| FusedRope {
+                cfg: rope_cfg,
+                positions: pos.view(),
+                inv_freq: freq.view(),
+                attn_factor,
+            }),
+        })
+        .expect("paged decode attention");
+        (read(&o_t), read(&pool_t))
+    };
+    let (out_sep, pool_sep) = run(false);
+    let (out_fused, pool_fused) = run(true);
+    assert_exact(&format!("{what} out"), &impl_name, &out_fused, &out_sep);
+    assert_exact(&format!("{what} pool"), &impl_name, &pool_fused, &pool_sep);
+    println!("fused rope {what}: impl={impl_name} out and pool exact ok");
+}
+
 /// Phase 6a S-13 (plan Task 23): paged attention over FP8 e4m3 pages matches the CPU reference
 /// (pages written as `e4m3(x / scale)`, read as `bf16(e4m3 · scale)`) for every registered FP8
 /// implementation, each run alone as the registry binds it: prefill batches (ragged chunks after
@@ -2035,6 +2224,7 @@ fn decode_attention_timings_fp8() {
                             block_formats: None,
                             classes: None,
                             tq: None,
+                            rope: None,
                         })
                         .expect("paged decode attention");
                     });
@@ -2143,6 +2333,7 @@ fn prefill_op_timings_fp8() {
                             block_formats: None,
                             classes: None,
                             tq: None,
+                            rope: None,
                         })
                         .expect("paged prefill attention");
                     });
@@ -3341,6 +3532,7 @@ fn decode_op_timings() {
                         block_formats: None,
                         classes: None,
                         tq: None,
+                        rope: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -3891,6 +4083,7 @@ fn decode_forward_timing() {
                             block_formats: None,
                             classes: None,
                             tq: None,
+                            rope: None,
                         })
                         .expect("paged decode attention")
                     });
@@ -4194,6 +4387,7 @@ fn decode_attention_timings() {
                         block_formats: None,
                         classes: None,
                         tq: None,
+                        rope: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -4515,6 +4709,7 @@ fn fused_projection_timings() {
                 block_formats: None,
                 classes: None,
                 tq: None,
+                rope: None,
             })
             .expect("paged decode attention");
         };
@@ -7024,6 +7219,7 @@ fn paged_mixed_case(
                 seed: SEED,
                 device,
             }),
+            rope: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -7139,6 +7335,7 @@ fn paged_mixed_case(
                     block_formats: None,
                     classes: None,
                     tq: None,
+                    rope: None,
                 })
                 .expect("BF16 reference");
             // Decode rows riding along in a staged prefill run turbine_hip_mixed after the
@@ -7556,6 +7753,7 @@ fn paged_mixed_classed_matches_cpu() {
                 seed: SEED,
                 device,
             }),
+            rope: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -7665,6 +7863,7 @@ fn paged_mixed_classed_matches_cpu() {
                 seed: SEED,
                 device,
             }),
+            rope: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -7889,6 +8088,7 @@ fn mixed_time_us(
                 seed: SEED,
                 device: Some(tables.view()),
             }),
+            rope: None,
         })
         .expect("timed mixed attention");
     };

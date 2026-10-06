@@ -11,6 +11,11 @@
 // - the k_new/v_new append is fused: the workgroup whose key range holds the
 //   sequence's new token (position kv_lens[s] - 1) writes it before scoring,
 //   for its own KV head only, so no other workgroup depends on it;
+// - RoPE is fused too (ABI v2.12, when the descriptor carries the rope_*
+//   fields): every workgroup rotates its query heads while staging them and
+//   the appending one rotates the K row on its way into the pool, with the
+//   rope kernel's exact operations -- the standalone rope launch and its
+//   boundary disappear and the bits do not change;
 // - each workgroup writes its partial (per head: the P.V accumulator, the row
 //   maximum and the sum) into a context workspace, fences, and counts itself
 //   in a per-(sequence, KV head) arrival counter; the last-arriving workgroup
@@ -46,6 +51,7 @@ using turbine_hip::bf16_to_f32;
 using turbine_hip::check_hip;
 using turbine_hip::f32_to_bf16;
 using turbine_hip::fail;
+using turbine_hip::round_bf16;
 
 namespace {
 
@@ -107,7 +113,32 @@ template <int G> struct B1Lds {
   };
   float max[kDecodeWaves][G];
   float sum[kDecodeWaves][G];
+  // The combining workgroup's split maxima and sums.
+  float split_max[kSplits][G];
+  float split_sum[kSplits][G];
+  // The fused RoPE's cos and sin of the sequence's new position (v2.12).
+  float rope_cos[kHeadDim / 2];
+  float rope_sin[kHeadDim / 2];
 };
+
+// Element d of the row x rotated by the fused RoPE: the operations of
+// elementwise.hip's rope_kernel<Bf16> (half-split, cos and sin rounded to
+// BF16, each product rounded to BF16, the sum rounded to BF16), so the bits
+// are those of a separate turbine_rope call. Elements at and past rotary_dim
+// are copied.
+__device__ inline Bf16 rope_element(const Bf16 *x, int d, int32_t rotary_dim,
+                                    const float *cos_s, const float *sin_s) {
+  const int32_t half = rotary_dim / 2;
+  if (d >= rotary_dim)
+    return x[d];
+  const int i = d < half ? d : d - half;
+  const float x1 = bf16_to_f32(x[i]);
+  const float x2 = bf16_to_f32(x[i + half]);
+  const float c = cos_s[i];
+  const float s = sin_s[i];
+  return d < half ? f32_to_bf16(round_bf16(x1 * c) + round_bf16(-x2 * s))
+                  : f32_to_bf16(round_bf16(x2 * c) + round_bf16(x1 * s));
+}
 
 // Paged decode over BF16 pages: grid (sequences, KV heads, kSplits). Every
 // sequence has one query (row q_indptr[s]) that sees all kv_lens[s] keys.
@@ -115,15 +146,14 @@ template <int G> struct B1Lds {
 // chunk = ceil(kv_len / kSplits), appending k_new/v_new when its range holds
 // key kv_len - 1.
 template <int G>
-__global__ void __launch_bounds__(kThreads)
-    paged_b1_decode_kernel(const Bf16 *q, Bf16 *kv_layer, const Bf16 *k_new,
-                           const Bf16 *v_new, Bf16 *out, float *partials,
-                           int32_t *counters, const int32_t *block_table,
-                           const int32_t *q_indptr, const int32_t *kv_lens,
-                           int32_t max_blocks, int32_t num_blocks,
-                           int32_t block_tokens, int32_t kv_heads,
-                           int64_t q_stride, int64_t new_stride,
-                           int64_t out_stride, float scale) {
+__global__ void __launch_bounds__(kThreads) paged_b1_decode_kernel(
+    const Bf16 *q, Bf16 *kv_layer, const Bf16 *k_new, const Bf16 *v_new,
+    Bf16 *out, float *partials, int32_t *counters, const int32_t *block_table,
+    const int32_t *q_indptr, const int32_t *kv_lens, int32_t max_blocks,
+    int32_t num_blocks, int32_t block_tokens, int32_t kv_heads,
+    int64_t q_stride, int64_t new_stride, int64_t out_stride, float scale,
+    const int32_t *rope_positions, const float *rope_inv_freq,
+    int32_t rope_rotary_dim, float rope_attn_factor) {
   __shared__ B1Lds<G> lds;
   __shared__ int32_t is_last;
 
@@ -142,9 +172,31 @@ __global__ void __launch_bounds__(kThreads)
   const int64_t v_half = static_cast<int64_t>(block_tokens) * token_elems;
   const int32_t *table = block_table + static_cast<int64_t>(seq) * max_blocks;
 
+  // The fused RoPE (v2.12): cos and sin of the row's position, evaluated as
+  // rope_kernel does (one f64 cos or sin per thread), for the q staging and
+  // the append below.
+  const bool rope = rope_inv_freq != nullptr;
+  if (rope) {
+    const int32_t half = rope_rotary_dim / 2;
+    const float pos = static_cast<float>(rope_positions[row]);
+    for (int w = tid; w < 2 * half; w += kThreads) {
+      const int i = w < half ? w : w - half;
+      const float f = pos * rope_inv_freq[i];
+      if (w < half) {
+        lds.rope_cos[i] = round_bf16(
+            static_cast<float>(cos(static_cast<double>(f))) * rope_attn_factor);
+      } else {
+        lds.rope_sin[i] = round_bf16(
+            static_cast<float>(sin(static_cast<double>(f))) * rope_attn_factor);
+      }
+    }
+    __syncthreads();
+  }
+
   // The append, fused: this workgroup's KV head's new row, when its key range
   // holds the sequence's new token (position kv_len - 1) -- exactly one split
-  // of the (sequence, KV head) does. No other workgroup reads that key.
+  // of the (sequence, KV head) does. No other workgroup reads that key. With
+  // the fused RoPE the K row is rotated on its way into the pool.
   if (k0 <= kv_len - 1 && kv_len - 1 < k1) {
     const int32_t last = kv_len - 1;
     const int32_t page = last / block_tokens;
@@ -162,7 +214,9 @@ __global__ void __launch_bounds__(kThreads)
         const Bf16 *v_src = v_new + static_cast<int64_t>(row) * new_stride +
                             static_cast<int64_t>(kv_head) * kHeadDim;
         for (int d = tid; d < kHeadDim; d += kThreads) {
-          k_dst[d] = k_src[d];
+          k_dst[d] = rope ? rope_element(k_src, d, rope_rotary_dim,
+                                         lds.rope_cos, lds.rope_sin)
+                          : k_src[d];
           v_dst[d] = v_src[d];
         }
       }
@@ -175,8 +229,11 @@ __global__ void __launch_bounds__(kThreads)
     const int d = e % kHeadDim;
     // The launcher instantiates G == group, so every g is a real head.
     const int32_t h = kv_head * G + g;
-    lds.loop.q[g][d] = bf16_to_f32(q[static_cast<int64_t>(row) * q_stride +
-                                     static_cast<int64_t>(h) * kHeadDim + d]);
+    const Bf16 *qh = q + static_cast<int64_t>(row) * q_stride +
+                     static_cast<int64_t>(h) * kHeadDim;
+    lds.loop.q[g][d] = bf16_to_f32(
+        rope ? rope_element(qh, d, rope_rotary_dim, lds.rope_cos, lds.rope_sin)
+             : qh[d]);
   }
   __syncthreads();
 
@@ -256,15 +313,26 @@ __global__ void __launch_bounds__(kThreads)
     lds.loop.voff[wave][lane] = off < 0 ? -1 : off + v_half;
     wave_sync();
     const int32_t keys = min(kDecodeLanes, k1 - c0);
-    for (int j = 0; j < keys; ++j) {
+    // The round's V words are all loaded before the first is used: a load
+    // per key, waited on in turn, was a serial chain of 32 memory latencies
+    // (~9 us of the ~18 us kernel, the phase timing of "b1 attention II").
+    // A key the round does not attend (past the range, a missing page) reads
+    // the pool's first word and is skipped below; the sum runs in key order
+    // as before, so the bits are those of the one-load-per-key loop.
+    uint2 vw[kDecodeLanes];
+#pragma unroll
+    for (int j = 0; j < kDecodeLanes; ++j) {
       const int64_t voff = lds.loop.voff[wave][j];
-      if (voff < 0)
+      vw[j] = *reinterpret_cast<const uint2 *>(
+          kv_layer + (voff < 0 ? 0 : voff) + lane * kDimsPerLane);
+    }
+#pragma unroll
+    for (int j = 0; j < kDecodeLanes; ++j) {
+      if (j >= keys || lds.loop.voff[wave][j] < 0)
         continue;
-      const uint2 w4 = *reinterpret_cast<const uint2 *>(kv_layer + voff +
-                                                        lane * kDimsPerLane);
       float v[kDimsPerLane];
-      bf16_pair(w4.x, v[0], v[1]);
-      bf16_pair(w4.y, v[2], v[3]);
+      bf16_pair(vw[j].x, v[0], v[1]);
+      bf16_pair(vw[j].y, v[2], v[3]);
 #pragma unroll
       for (int g = 0; g < G; ++g) {
         const float pg = lds.loop.p[wave][g][j];
@@ -339,29 +407,46 @@ __global__ void __launch_bounds__(kThreads)
 
   // The last-arriving workgroup combines the splits in ascending split order
   // (deterministic whatever the arrival order) and resets the counter for the
-  // next call.
+  // next call. The splits' maxima and sums are staged in LDS first (one load
+  // each), then every thread loads its kSplits accumulators together: the
+  // per-element loop of dependent loads cost ~0.8 us more ("b1 attention
+  // II"). Same operations in the same order, so the same bits.
   __threadfence();
+  const float *base =
+      partials + (static_cast<int64_t>(seq) * kv_heads + kv_head) * kSplits *
+                     G * (kHeadDim + 2);
+  static_assert(kSplits * G <= kThreads, "one thread per (split, head)");
+  if (tid < kSplits * G) {
+    const int sp = tid / G;
+    const int g = tid % G;
+    const float *sb = base + static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
+                      g * (kHeadDim + 2);
+    lds.split_max[sp][g] = sb[kHeadDim];
+    lds.split_sum[sp][g] = sb[kHeadDim + 1];
+  }
+  __syncthreads();
   for (int e = tid; e < G * kHeadDim; e += kThreads) {
     const int g = e / kHeadDim;
     const int d = e % kHeadDim;
-    const float *base =
-        partials + (static_cast<int64_t>(seq) * kv_heads + kv_head) * kSplits *
-                       G * (kHeadDim + 2);
-    float mx = kNegInf;
+    float od[kSplits];
+#pragma unroll
     for (int sp = 0; sp < kSplits; ++sp)
-      mx = fmaxf(mx, base[static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
-                          g * (kHeadDim + 2) + kHeadDim]);
+      od[sp] = base[static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
+                    g * (kHeadDim + 2) + d];
+    float mx = kNegInf;
+#pragma unroll
+    for (int sp = 0; sp < kSplits; ++sp)
+      mx = fmaxf(mx, lds.split_max[sp][g]);
     float o = 0.0f;
     float total = 0.0f;
+#pragma unroll
     for (int sp = 0; sp < kSplits; ++sp) {
-      const float *sb = base + static_cast<int64_t>(sp) * G * (kHeadDim + 2) +
-                        g * (kHeadDim + 2);
       // A split with no keys has max -inf and adds nothing.
-      if (sb[kHeadDim] == kNegInf)
+      if (lds.split_max[sp][g] == kNegInf)
         continue;
-      const float f = expf(sb[kHeadDim] - mx);
-      o += sb[d] * f;
-      total += sb[kHeadDim + 1] * f;
+      const float f = expf(lds.split_max[sp][g] - mx);
+      o += od[sp] * f;
+      total += lds.split_sum[sp][g] * f;
     }
     const int32_t h = kv_head * G + g;
     out[static_cast<int64_t>(row) * out_stride +
@@ -389,7 +474,8 @@ int32_t launch_b1_decode(turbine_ctx *ctx,
       static_cast<Bf16 *>(d->out), partials, counters, d->block_table,
       d->q_indptr, d->kv_lens, d->max_blocks_per_seq, d->num_blocks,
       d->block_tokens, d->num_kv_heads, d->q_stride_token, d->new_stride_token,
-      d->out_stride_token, d->scale);
+      d->out_stride_token, d->scale, d->rope_positions, d->rope_inv_freq,
+      d->rope_rotary_dim, d->rope_attn_factor);
   return check_hip(ctx, hipGetLastError(), "b1 decode kernel launch");
 }
 } // namespace

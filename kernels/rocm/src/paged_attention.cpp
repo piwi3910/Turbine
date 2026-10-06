@@ -145,6 +145,12 @@ bool supported(const turbine_attention_paged_desc *d) {
       d->max_q_len < 0 || d->max_kv_len < 0) {
     return false;
   }
+  // v2.12 fused RoPE: half-split over an even rotary width within the head.
+  if (d->rope_inv_freq != nullptr &&
+      (d->rope_rotary_dim < 2 || d->rope_rotary_dim % 2 != 0 ||
+       d->rope_rotary_dim > kHeadDim)) {
+    return false;
+  }
   return d->q_stride_token >= static_cast<int64_t>(d->num_q_heads) * kHeadDim &&
          d->out_stride_token >=
              static_cast<int64_t>(d->num_q_heads) * kHeadDim &&
@@ -572,6 +578,32 @@ int32_t run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
       d->num_seqs >= turbine_hip::kTurbineB1CkSeqs && ck_serves(d) &&
       turbine_hip::ck_splitkv_serves(d)) {
     path = turbine_hip::PagedPath::CkSplitkv;
+  }
+  // v2.12 fused RoPE: the b1 kernel rotates q and the appended k row itself;
+  // every other path rotates q and k_new in place first, with the rope
+  // kernels (the same operations as a separate turbine_rope call).
+  if (d->rope_inv_freq != nullptr && d->rope_positions == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, entry + ": NULL rope_positions");
+  }
+  if (d->rope_inv_freq != nullptr &&
+      path != turbine_hip::PagedPath::TurbineB1) {
+    turbine_rope_desc rd{};
+    rd.q = const_cast<void *>(d->q);
+    rd.k = const_cast<void *>(d->k_new);
+    rd.positions = d->rope_positions;
+    rd.inv_freq = d->rope_inv_freq;
+    rd.num_tokens = d->total_q;
+    rd.num_q_heads = d->num_q_heads;
+    rd.num_kv_heads = d->num_kv_heads;
+    rd.head_dim = d->head_dim;
+    rd.rotary_dim = d->rope_rotary_dim;
+    rd.q_stride_token = d->q_stride_token;
+    rd.k_stride_token = d->new_stride_token;
+    rd.style = 0;
+    rd.dtype = TURBINE_DTYPE_BF16;
+    rd.attn_factor = d->rope_attn_factor;
+    if (int32_t rc = turbine_rope(ctx, &rd); rc != TURBINE_OK)
+      return rc;
   }
   // The b1 decode kernel appends inside the kernel; every other path takes
   // the common append first.

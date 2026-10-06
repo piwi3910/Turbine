@@ -870,6 +870,26 @@ pub struct PagedAttentionContext<'a> {
     /// [`KvPageClasses::page_offset`] instead, and `kv_layer` is then this layer's region
     /// ([`KvPoolView::layer_stride_bytes`] bytes of U8) rather than a dense page view.
     pub classes: Option<KvPageClasses<'a>>,
+    /// RoPE fused into a decode call (P5p b1 attention II, kernel ABI v2.12): `Some` asks the
+    /// kernel to rotate `q` and `k_new` exactly as [`RopeKernel::execute`] with these operands
+    /// would before it appends and attends (the appended rows and the scores are those of the
+    /// rotated values, bit for bit); `q` and `k_new` may be left rotated or not. Passed only
+    /// to a kernel whose [`AttentionKernel::fuses_decode_rope`] holds; `None` = `q` and `k_new`
+    /// are already rotated.
+    pub rope: Option<FusedRope<'a>>,
+}
+
+/// The RoPE operands of a fused decode call ([`PagedAttentionContext::rope`]): those of the
+/// [`RopeContext`] the separate op would run with (the q and k operands are the call's own).
+#[derive(Clone, Debug)]
+pub struct FusedRope<'a> {
+    pub cfg: RopeConfig,
+    /// `[total_q]` I32: each q row's position.
+    pub positions: TensorView<'a>,
+    /// `[rotary_dim / 2]` F32.
+    pub inv_freq: TensorView<'a>,
+    /// YaRN's attention factor, as [`RopeContext::attn_factor`].
+    pub attn_factor: f32,
 }
 
 /// Block format code of a BF16 page (the v2.11 `block_formats` byte).
@@ -1139,6 +1159,13 @@ pub trait AttentionKernel: Send + Sync {
     fn implementation(&self, cfg: &AttentionConfig) -> String;
     fn execute(&self, ctx: &mut AttentionContext<'_>) -> Result<(), KernelError>;
     fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError>;
+    /// True when [`Self::execute_paged`] takes a [`PagedAttentionContext::rope`] for
+    /// [`AttentionKind::DecodePaged`] calls of `cfg` with `rope` (the executor then skips the
+    /// separate rope op on decode steps). False by default.
+    fn fuses_decode_rope(&self, cfg: &AttentionConfig, rope: &RopeConfig) -> bool {
+        let _ = (cfg, rope);
+        false
+    }
 }
 
 /// RMSNorm.

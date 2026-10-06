@@ -91,6 +91,8 @@ SLOW_TESTS=(
 	decode_op_timings
 	fused_projection_timings
 	prefill_op_timings
+	# crates/turbine-kernels/tests/hip_qgemm_mxfp4.rs (P5p Task 15)
+	qgemm_mxfp4_prefill_within_hipblaslt_bound
 	every_implementation_matches_cpu
 	implementations_enumerated
 	# renamed from gemm_matches_cpu, whose substring also skipped every qgemm_matches_cpu

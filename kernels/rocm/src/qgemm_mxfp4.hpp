@@ -30,17 +30,22 @@ bool quantize_act_mxfp4_supports(const turbine_quantize_act_desc *d);
 int32_t quantize_act_mxfp4_run(turbine_ctx *ctx,
                                const turbine_quantize_act_desc *d);
 
-// The kernel tiles of turbine_hip_mxfp4. Auto, what the run uses, takes Large
-// for every prefill call (d->prefill) and picks by m otherwise:
-//   Small  -- m <= 16: one 16-row fragment, one column fragment per wave, k
-//             split over 8 waves (decode);
-//   Medium -- m <= 64: 2 (m <= 32) or 4 row fragments, 2 column waves, k
-//             split over 4;
-//   Large  -- 128 x 128 block tiles, activations staged in LDS.
-// Each tile sums a row in its own order (the k split), so a row's bits depend
-// on the tile; within Large they depend on nothing but the row, so prefill
-// calls are batch invariant (prefix reuse needs it) and decode calls are not.
-enum class Mxfp4Tile { Auto, Small, Medium, Large };
+// The kernel tiles of turbine_hip_mxfp4. Auto, what the run uses, takes Prefill
+// from 1,024 rows, Large for every smaller prefill call (d->prefill), and picks
+// by m otherwise:
+//   Small   -- m <= 16: one 16-row fragment, one column fragment per wave, k
+//              split over 8 waves (decode);
+//   Medium  -- m <= 64: 2 (m <= 32) or 4 row fragments, 2 column waves, k
+//              split over 4;
+//   Large   -- 128 x 128 block tiles, activations staged in LDS, each wave
+//              decoding its own 16 columns;
+//   Prefill -- 256 x 128 block tiles, activations and decoded weights staged
+//              in LDS (one decode per 256 rows), 16-byte output stores.
+// Small and Medium sum a row in their own order (the k split), so a row's bits
+// depend on the tile; Large and Prefill sum it in one order (natural k, one
+// accumulator) and give it the same bits, so prefill calls are batch invariant
+// (prefix reuse needs it) and decode calls below 1,024 rows are not.
+enum class Mxfp4Tile { Auto, Small, Medium, Large, Prefill };
 
 // Enqueues the product of d (already validated: qgemm_mxfp4_supports and
 // non-NULL operands) on stream with the given tile.

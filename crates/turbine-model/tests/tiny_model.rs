@@ -2273,6 +2273,9 @@ impl AttentionKernel for Attention {
     fn execute_paged(&self, ctx: &mut PagedAttentionContext<'_>) -> Result<(), KernelError> {
         in_kernel(|| self.inner().execute_paged(ctx))
     }
+    fn fuses_decode_rope(&self, cfg: &AttentionConfig, rope: &RopeConfig) -> bool {
+        self.inner().fuses_decode_rope(cfg, rope)
+    }
 }
 
 /// Routed rows up to which [`DeviceOffsetsProvider`] reads the expert offsets on the device,
@@ -4091,6 +4094,78 @@ fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
     }
 }
 
+/// P5p b1 attention II: for both tiny checkpoints on the CPU provider (whose paged decode
+/// attention fuses RoPE, as the GPU library's ABI v2.12), a decode step of 3 sequences with the
+/// RoPE fused into the attention call gives the logits, bit for bit, of the same step with the
+/// separate rope op (tracing on, which keeps the op so it can record the rotated q and k), and
+/// the K/V the fused step appends is the one the separate step appends (the repeated step reads
+/// it back). Breaks if the executor hands the fused call the wrong positions, frequencies,
+/// rotary width or attention factor, or skips the rope op without fusing it.
+#[test]
+fn decode_fused_rope_matches_separate_rope() {
+    const PROMPT: u32 = 20;
+    let tmp = TempDir::new("tiny-model-fused-rope");
+    for spec in both_checkpoints(&tmp) {
+        let arch = spec.config.family;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let (mut exec, _registry) = cpu_profiled(&spec, &mem);
+        let layout = *exec.kv_layout();
+        let per_seq = (PROMPT + 2).div_ceil(BLOCK_TOKENS);
+        let storage = pool(&mem, &layout, 3 * per_seq);
+        let kv = pool_view(&storage, &layout, 3 * per_seq);
+        let tables: Vec<Vec<BlockId>> = (0..3)
+            .map(|s| (0..per_seq).map(|b| BlockId(s * per_seq + b)).collect())
+            .collect();
+        for (s, table) in tables.iter().enumerate() {
+            let tokens: Vec<u32> = (0..PROMPT)
+                .map(|i| (i * 13 + 5 * s as u32 + 1) % spec.vocab)
+                .collect();
+            run_seq(&mut exec, &kv, table, &tokens, 0);
+        }
+        // Two decode steps (positions PROMPT, then PROMPT + 1, which attends the first step's
+        // appended row); `traced` keeps the separate rope op.
+        let step = |exec: &mut DecoderExecutor, traced: bool, pos: u32, tokens: [u32; 3]| {
+            exec.set_trace(traced);
+            let positions = [pos; 3];
+            let seqs: Vec<SeqSlice<'_>> = tables
+                .iter()
+                .enumerate()
+                .map(|(s, table)| SeqSlice {
+                    seq: SeqId(s as u64 + 1),
+                    q_start: s as u32,
+                    q_len: 1,
+                    kv_len: pos + 1,
+                    block_table: table,
+                    block_formats: &[],
+                    reduce: None,
+                    logits_rows: 1,
+                })
+                .collect();
+            let logits = exec
+                .forward(&BatchInput {
+                    tokens: &tokens,
+                    positions: &positions,
+                    seqs: &seqs,
+                    kv: &kv,
+                })
+                .expect("decode");
+            exec.set_trace(false);
+            let _ = exec.take_trace();
+            logits
+        };
+        let separate = (
+            step(&mut exec, true, PROMPT, [3, 7, 11]),
+            step(&mut exec, true, PROMPT + 1, [5, 2, 9]),
+        );
+        let fused = (
+            step(&mut exec, false, PROMPT, [3, 7, 11]),
+            step(&mut exec, false, PROMPT + 1, [5, 2, 9]),
+        );
+        assert_eq!(fused.0, separate.0, "{arch:?}: first decode step");
+        assert_eq!(fused.1, separate.1, "{arch:?}: second decode step");
+    }
+}
+
 /// For both tiny checkpoints on the CPU provider, a decode forward of 3 sequences with profile
 /// mode on yields one entry per op kind the forward runs (each at its selected implementation)
 /// with the per-layer call pattern × layers, plus the batch upload and the logits read (and
@@ -4169,7 +4244,8 @@ fn op_profile_accounts_forward() {
         let mut want: Vec<(&str, &str, u32)> = vec![
             ("batch_upload", "host", 1),
             ("embedding", cpu("embedding"), 1),
-            ("rope", cpu("rope"), layers),
+            // No rope op: on decode steps RoPE rides in the attention call (P5p, the CPU
+            // provider's fuses_decode_rope, as the GPU's ABI v2.12).
             (
                 "attention_decode_paged",
                 cpu("attention_decode_paged"),

@@ -3566,3 +3566,75 @@ faster at 16,384 (2859 vs 3345). All tiers stay bitwise equal.
 
 **Decision (user, 2026-10-06): O1.** Route 513 rows up to the measured crossover to the `wmma` tier, the prefill tier
 above it; no numerics change. O2 is not tasked now.
+
+## P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss (Task 15, 2026-10-06)
+
+Date: 2026-10-06 (Phase 5p Task 15, branch `p5p-t15`). Card: R9700 (gfx1201), GPU 0 under `bench.lock`, ROCm 7.14.1, hipBLASLt 1.4.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`, llama.cpp at `680a0362` (6a's build). Harness: `kernels/rocm/tools/qgemm_mxfp4_eval.cpp` (gains `--cands` and the `mxfp4_prefill` candidate); lab test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`, whose BF16 side is `gemm` with `prefill` — what a BF16 checkpoint runs: the tuned table's invariant rows for the 3B shapes, the heuristic for 8B. Shapes and method as in "P6: MXFP4 GEMM — provider evaluation (kernel reuse rule)".
+
+### Candidates (m = 2,048)
+
+| Candidate                                                                                                                                                                                                                                       | Builds on gfx1201 | Correct                                                                                                                                                     | Notes                                                                                                                                                                                    |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CK `ck_tile` `gemm_microscale` (`MicroscaleGemmPipelineAgBgCrCompV3`, BF16 × `pk_fp4_t`, E8M0 group 32), 6a's WMMA config (128×128×128, 1×4 warps)                                                                                              | yes               | yes (6a)                                                                                                                                                    | 11.1–12.8 TFLOPS on every shape (3b.gate_up 16.96 ms vs 1.44 ms BF16): ~10× slower, as in 6a                                                                                             |
+| The same pipeline with larger WMMA block tiles (256×128×64 2×2 warps; 128×128×64 2×2; 128×256×32 2×4)                                                                                                                                           | yes               | not checked (no faster)                                                                                                                                     | 7.7–12.6 TFLOPS: no config within 10× of BF16. CK's other MX GEMMs (`67_gemm_microscaling`, `42_mx_gemm`) target gfx950 / gfx1250 scaled MFMA/WMMA, not gfx1201                          |
+| llama.cpp HIP `GGML_TYPE_MXFP4` `mmq`                                                                                                                                                                                                           | yes               | W4A8 (`q8_1` activations), not the checkpoint's W4A16                                                                                                       | 6a: prefill equal to the 6a tile (3b.gate_up 2,213 vs 2,223 µs). Its arithmetic rules it out whatever its speed; the same-day run kept its BF16 `MUL_MAT` rows only (3b.gate_up 1.82 ms) |
+| hipBLASLt                                                                                                                                                                                                                                       | —                 | —                                                                                                                                                           | no MX scaling or mixed BF16 × FP4 on gfx1201 (6a)                                                                                                                                        |
+| Dequantize to BF16 + hipBLASLt                                                                                                                                                                                                                  | yes               | yes                                                                                                                                                         | same day 1.18–1.32× BF16 on the 3B shapes (582 / 387 / 1,917 / 1,192 µs) with a full-size BF16 scratch: slower than the own Prefill tile                                                 |
+| Own `turbine_hip_mxfp4` Large tile (6a)                                                                                                                                                                                                         | yes               | yes                                                                                                                                                         | 85–92 TFLOPS; 1.18–1.6× BF16                                                                                                                                                             |
+| Own `turbine_hip_mxfp4` **Prefill tile** (new: 256×128 blocks, 8 waves of 64×64, activations and _decoded_ weights staged in LDS so one decoded weight feeds 256 rows, 32 k per step double buffered, output through LDS as 16-byte row chunks) | yes               | yes (`qgemm_mxfp4_matches_cpu` now checks prefill calls; rows bitwise the Large tile's — `qgemm_mxfp4_prefill_rows_are_batch_invariant` crosses both tiles) | **picked**: 97–104 TFLOPS, 10–16 % below the Large tile at 2,048 rows                                                                                                                    |
+
+No provider wins by ≥ 10 %, so nothing is registered; the own tile is improved instead.
+
+### µs per call at m = 2,048 (lab test, GPU 0; Large from the same-day harness)
+
+| shape      | BF16 prefill `gemm` | Large (6a tile) | Prefill tile | Prefill / BF16 (bound 1.10) |
+| ---------- | ------------------- | --------------- | ------------ | --------------------------- |
+| 3b.qkv     | 474.5               | 741             | 675.6        | 1.42                        |
+| 3b.o       | 287.9               | 435             | 405.2        | 1.41                        |
+| 3b.gate_up | 1,550.6             | 2,303           | 2,034.9      | 1.31                        |
+| 3b.down    | 881.2               | 1,235           | 1,052.1      | 1.19                        |
+| 8b.qkv     | 846.1               | 1,214           | 1,054.6      | 1.25                        |
+| 8b.o       | 586.7               | 805             | 714.8        | 1.22                        |
+| 8b.gate_up | 3,632.5             | 5,219           | 4,702.3      | 1.29                        |
+| 8b.down    | 2,364.8             | 2,705           | 2,311.0      | 0.98                        |
+
+Where the time goes (3b.gate_up, ablations of the Prefill tile): the WMMA + LDS-operand core alone (no decode, loads, stores, barrier or epilogue) runs 1,620–1,640 µs, about 1.05–1.10× BF16; the per-step LDS stores and barrier add ~250 µs, the decode and global loads ~250 µs, and the 6a-style scattered 2-byte epilogue ~400 µs (cut by the LDS-staged 16-byte epilogue now in the tile). One 62 KB block per CU (4 waves per SIMD) leaves nothing to overlap the barrier and the epilogue with. Smaller-LDS variants (16 k per step, 128-row tiles, 4-wave blocks) and moving the decode between the WMMAs were all slower (perf log 5p "MXFP4 prefill tile"). Between 512 and 1,024 rows the Prefill tile wins only at multiples of 256, so it runs from 1,024 rows; below, prefill calls keep the Large tile (same bits).
+
+Tuning-table note (the external engine Strata ships `gfx1201-hipblaslt-100500.txt`, solution indices per shape for one arch and hipBLASLt version, with fallback): Turbine already pins tuned hipBLASLt solutions per arch (`kernels/rocm/tuning/gfx1201/gemm.tsv`, keyed by solution name and checked by index, hipBLASLt 1.4.1). The 3B BF16 reference above is therefore tuned (its invariant prefill class, ~2 % slower than the heuristic at m = 2,048); the 8B shapes have no rows and run the heuristic. Strata's table targets hipBLASLt 1.5.0 indices and is not usable here as is. Nothing was added; option C below.
+
+### Served (lab-bench on GPU 0, 2026-10-06, labbook set `phase-5p`; the Prefill tile then ran from 512 rows)
+
+| run                                | c1 TTFT p50 | c1 tok/s | c16 TTFT p50 | c16 tok/s | golden c1                              |
+| ---------------------------------- | ----------- | -------- | ------------ | --------- | -------------------------------------- |
+| llama8b (BF16)                     | 123 ms      | 35.6     | 481 ms       | 402.2     | FAIL (the provisional 8B bounds)       |
+| llama8b-mxfp4, Large only (before) | 149 ms      | 87.9     | 559 ms       | 673.2     | 15/16, p05 tail 1.20 (6a's known miss) |
+| llama8b-mxfp4, Prefill tile        | 154 ms      | 88.1     | 552 ms       | 675.5     | identical to before                    |
+
+The served TTFT target (≤ 1.05× BF16) misses: 1.21–1.25× at c1 and 1.15× at c16. The bench prompts (~700 tokens) prefill below the Prefill tile's useful range, and at that m the per-layer GEMMs stay 1.3–1.6× BF16, so the kernel gain does not reach the served number on this workload. Golden c1 is unchanged line for line, since prefill rows keep the Large tile's bits. The p05 tail miss is 6a's known one (decision "MXFP4-A16 8B: `mxfp4` status for 6a").
+
+### Open — the S-16 targets miss (user decision needed)
+
+- A) Keep the Prefill tile (from 1,024 rows: 10–16 % faster at 2,048 rows, served neutral) and re-bound S-16 to what it measures. The kernel bound becomes ≤ 1.45× BF16 per shape at 2,048 rows, a no-regression bound the timing test asserts. Served TTFT is recorded but not gated, and `mxfp4` stays `experimental` anyway. Recommended: the remaining gap needs a different kernel structure (several blocks per CU, or a persistent software-pipelined tile). That is multi-day work with an uncertain payoff, on an experimental format whose prefill is a minority of served time.
+- B) Keep iterating the own tile toward 1.10×: a persistent kernel with a smaller LDS footprint (swizzled, unpadded tiles so 2–3 blocks share a CU) and an overlapped epilogue. This is multi-day with no guarantee. The k = 3,072 shapes have the least room, since the bare WMMA core is already ~1.05–1.10× BF16.
+- C) Tune the BF16 side as well, by adding the 8B shapes to `gemm.tsv` (what Strata's per-version table does). This would make the 8B BF16 reference faster and the ratios worse. It is useful for BF16 serving, not for S-16.
+- D) Revert the Prefill tile and keep the evaluation record only.
+
+**Decision (user, 2026-10-06): A.** The Prefill tile stays (from 1,024 rows). S-16 is re-bound: the MXFP4 prefill GEMM at m = 2,048 ≤ 1.45× the BF16 prefill GEMM per shape, a no-regression bound asserted by `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`; served TTFT is recorded, not gated; `mxfp4` stays `experimental`. Spec S-16 (its AC names `hip_qgemm_mxfp4`) and plan Task 15 amended.
+
+## 5p b1 attention II: 8.96 µs/layer, 0.81× reached — c1 ≥ 90 tok/s is not reachable from attention (open, 2026-10-06)
+
+From `p5p-b1attn2` (e90631a4, merged): served Llama b1 attention 16.88 → 8.96 µs/layer (V loads issued together, a
+faster split combine), and 10.64 µs with RoPE fused into the attention call (ABI v2.12, rope kernel and one boundary
+per layer removed); decode step 12.85 → 12.44 ms, effective bandwidth 501 → 517 GB/s (0.78× → 0.81×), c1 81.2 → 82.9
+tok/s, c16 1.002×, golden c1/c16 PASS at every step; b1's math unchanged (P F32, same order). Attention + RoPE is now
+0.30 ms of the 12.44 ms step; ≥ 90 tok/s needs ~11.1 ms, and the rest is GEMMs at 86–99 % of peak plus ~1.0 ms of
+inter-kernel gaps. Not landed: split count 4/16, one wave per split (no gain, different bits), K/V L2 prefetch
+(slower), joint K+V loads (spill).
+
+- A) Close the b1 attention work; next decode-BW effort goes to the ~1.0 ms of inter-kernel gaps (fusion of the
+  remaining boundaries, graph/launch overhead) — the only remaining lever toward ~0.9× (recommended)
+- B) Shave the fused RoPE's ~1.7 µs (≤ ~0.03 ms/step)
+- C) A long-context prefetch that does not stall at the barrier (helps 8k contexts, not the served ~800 tokens)
+
+Separately: b1 is now ~2× faster, so the 4-sequence hand-off to CK splitkv may belong at 2–8 sequences; moving the
+edge moves the bitwise-invariance edge with it.

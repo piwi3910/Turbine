@@ -326,6 +326,20 @@ typedef struct turbine_attention_paged_desc {
    * the call only. */
   const struct turbine_kv_page_class *page_classes;
   int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks;
+  /* v2.12 (Phase 5p), decode only, read only by a library reporting
+   * minor >= 12: RoPE fused into the call. rope_inv_freq non-NULL asks the
+   * implementation to rotate q and k_new exactly as turbine_rope with
+   * positions = rope_positions (one per q row), inv_freq = rope_inv_freq,
+   * rotary_dim = rope_rotary_dim, style 0 (half-split) and attn_factor =
+   * rope_attn_factor would, before it appends and attends: the rows appended
+   * to the pool and the scores are those of the rotated values, bit for bit.
+   * The q and k_new buffers may be left rotated or not. NULL (the default of
+   * a zeroed descriptor) = q and k_new are already rotated. Device pointers,
+   * captured with the call by a decode graph. */
+  const int32_t *rope_positions;
+  const float *rope_inv_freq;
+  int32_t rope_rotary_dim;
+  float rope_attn_factor;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -470,8 +484,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * and FP8 KV scales (all below); v2.10 turbine_rope_desc.attn_factor (above,
  * no new symbol); v2.11 the KV transcode and the host-to-device copy kernel
  * (below) and the mixed-format paged attention fields (block_formats,
- * tq_params; no new symbol). */
-#define TURBINE_ABI_MINOR 11u
+ * tq_params; no new symbol); v2.12 RoPE fused into paged decode attention
+ * (the rope_* fields of turbine_attention_paged_desc; no new symbol). */
+#define TURBINE_ABI_MINOR 12u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

@@ -1343,6 +1343,70 @@ target is missed**; Llama c1 +1.5 % (80.0 → 81.2), bandwidth 0.77× → 0.79×
 (21.7 vs 42.5 µs cold); the measurable win is the two removed boundaries per layer (gaps −0.20 ms)
 plus ~5 µs/layer of attention. c16 unchanged.
 
+### b1 attention II: iterating the own kernel toward ~10 µs (branch `p5p-b1attn2`, commits 37c24412 … e90631a4, 2026-10-06)
+
+User decision 2026-10-06 **B** ("5p b1 attention: result"): iterate `turbine_hip_b1_decode`. Profile
+first, then one change at a time. All numbers are from novanas GPU 0 under the bench lock, the same
+day and the same card. The baseline is `p6b-stack` 97050b3c.
+
+**Where the 16.8 µs went.** A standalone harness (`target/b1attn2/h/`, not in the tree) runs the
+kernel on 28 layer pools, with an L2/MALL-evicting read kernel before each call so the KV is cold
+as in a served step. Wave 0 of each workgroup writes `wall_clock64` stamps at each phase, and the
+loads are waited on at each stamp. Kernel span at 830 keys was 18.3 µs: append 0.4, q staging 0.6,
+block table 0.2, K loads + scores 3.2, softmax 0.6, **P·V 9.3**, partial write 0.7, atomic 0.3,
+**combine 1.9**. The P·V loop loaded one V word per key and waited on it before loading the next,
+so each round ran 32 memory latencies back to back. The combine had the same problem: one
+dependent chain per output element over the 8 splits.
+
+| Step                                           | commit   | served attention µs/layer               | decode step / gaps (ms) | eff. BW          | c1 tok/s / ITL p50 | c16 tok/s | golden c1 / c16 |
+| ---------------------------------------------- | -------- | --------------------------------------- | ----------------------- | ---------------- | ------------------ | --------- | --------------- |
+| base (landed b1, separate rope)                | 97050b3c | 16.88 + 2.76 rope                       | 12.85 / 1.24            | 501 GB/s (0.78×) | 81.2 / 12.10       | 851.2     | PASS / PASS     |
+| 1: a round's 32 V loads issued together        | 37c24412 | **9.84** + 2.96 rope                    | 12.60 / 1.13            | 510 GB/s (0.80×) | 82.0 / 11.96       | 851.9     | PASS / PASS     |
+| 2: split maxima/sums staged before the combine | c47250af | **8.96** + 2.96 rope                    | 12.56 / 1.12            | 512 GB/s (0.80×) | 82.4 / 11.92       | 851.8     | PASS / PASS     |
+| 3: RoPE fused into the call (ABI v2.12)        | e90631a4 | **10.64** (rope inside, no rope launch) | 12.44 / 1.04            | 517 GB/s (0.81×) | 82.9 / 11.85       | 852.9     | PASS / PASS     |
+
+(The c1 figures are `lab-bench --c1`: 10 requests of 128 tokens. Step, gaps and bandwidth come from
+`lab-decode-profile.sh` and `decode-profile-report.py` over a 3 s trace of about 235 steps. The
+c16 ratio of step 3 to base is 1.002.)
+
+- Steps 1 and 2 keep the arithmetic and its order, so the output bits are unchanged. They pass
+  `paged_b1_decode_matches_cpu`, `paged_decode_splitkv_matches_cpu`,
+  `paged_prefill_ck_128_matches_cpu`, `b1_decode_rows_are_batch_invariant` (bitwise on each side
+  of the 4-sequence CK edge; the 7.8125e-3 cross-edge bound holds) and
+  `paged_attention_rows_are_batch_invariant`. Golden runs on every step.
+- Step 3 adds RoPE operands to the paged attention descriptor (`rope_positions`, `rope_inv_freq`,
+  `rope_rotary_dim`, `rope_attn_factor`; minor 12). The b1 kernel rotates its query heads while
+  staging them, and rotates the appended K row on its way into the pool. It uses the rope kernel's
+  exact operations: f64 cos/sin rounded to BF16, then each product and the sum rounded to BF16.
+  Every other decode path runs the rope kernels in place first. The decoder drops its rope op on
+  decode steps when the bound kernel fuses it (`AttentionKernel::fuses_decode_rope`), except while
+  tracing. The CPU reference fuses too, as rope followed by attention.
+  `paged_decode_fused_rope_matches_separate` (lab) compares the output and the pool after the
+  append exactly against rope followed by the plain call. It covers b1 at 1–3 sequences, the CK
+  hand-off at 5 and 16, CK split-KV bound alone, OLMoE heads on CK pagedkv, full and partial
+  rotary widths, a YaRN factor and 16- and 128-token pages. `tiny_model
+decode_fused_rope_matches_separate_rope` (host) runs two decode steps fused and unfused on both
+  tiny models and requires bitwise-equal logits. The mutant that appends an unrotated K row fails
+  the lab test. The fused rotation adds ~1.7 µs inside the kernel (the f64 trig and one more
+  barrier) and removes the 2.96 µs rope launch and its ~3.6 µs boundary. Net: −0.12 ms/step.
+- **Evaluated and not landed** (harness, cold KV, 830 keys, kernel span):
+  - Split count and wave shape: W16 S8 10.4 µs, W8 S4 10.4, W8 S16 11.2, W4 S16 11.8, W2/W1
+    much worse. None beats W8 S8 by more than noise once steps 1–2 are in, and any change alters
+    the bits.
+  - One barrier for the append and q staging: no gain.
+  - L2 prefetch of the K/V lines before the staging barrier: +2.5 µs, because the barrier waits
+    for the prefetch loads. At 8k keys it removes 26 µs of round time but the barrier gives the
+    gain back.
+  - K and V loads issued together at the top of a round, as a lambda-held array: 256 VGPRs plus
+    scratch spills, 2–3× slower.
+
+Verdict: served attention is ≤ ~10 µs/layer (8.96 µs without RoPE; 10.64 µs with RoPE fused in,
+which replaces 2.96 µs of rope kernel plus a boundary). The effective bandwidth target of ~0.81× is
+reached (517 GB/s). Llama c1 is 81.2 → 82.9 tok/s (+2.1 %); the **≥ 90 tok/s mark is not reachable
+from attention**. The whole attention plus RoPE is now 0.30 ms of a 12.44 ms step. 90 tok/s needs
+a ~11.1 ms step, and the rest is GEMMs already at 86–99 % of the 640 GB/s card peak plus ~1.0 ms of
+inter-kernel gaps. c16 is unchanged (the CK path from 4 sequences on).
+
 ### S-9 plumbing: multi-token append and multi-row logits (plan Task 10, commit a03f42ac, 2026-10-05)
 
 Enabler landing; nothing uses extensions yet (the verified jump-forward wires them in Task 12), so only the no-regression bound applies. `scripts/lab-bench.sh --quick` on GPU 0 (64 requests), golden c1 PASS and `failed=0` on both:
@@ -1414,3 +1478,41 @@ novanas GPU 0, three `scripts/lab-bench.sh --model olmoe --golden16` runs (stand
 Verdict: median **609.5 ≥ 608** (0.99 × 613.9). That is 0.993× the 6a exit and 1.012× the 602.5 watch value, with golden c1 and c16 PASS on every run and 0 failed requests. **S-17 is met and the 6a watch item closes.** The profile names no stage to fix: ITL and the decode forward match the 6a exit (24.3 ms), and the host share matches S-2 (0.013 vs 0.012). The 602.5 reading does not reproduce on the current stack, and the GREEN admission cap is not involved. The same tree measured 614.9–617.7 earlier the same day (the GPU 1 vs GPU 0 section), and the MoE invariance branch measured 624.4 with `--quick`. The margin is thin: the median clears the bound by 1.5 tok/s, and r3 read 608.8. Run-to-run spread is about 1 %, so a single run can land below 608.
 
 Observation, not acted on: TTFT p50 reads 132–133 ms here, against 118 at the 6a exit and S-2 and 121–122 that morning, while the decode numbers are unchanged. TTFT is outside this task's criterion; it is noted for the phase-exit bench.
+
+### MXFP4 prefill tile (plan Task 15, S-16; branch `p5p-t15`, commits 648dcebe test + 45506bfb tile + the 1,024-row threshold, 2026-10-06)
+
+Provider re-evaluation, kernel tables, ablations and options: decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss". All runs GPU 0 under `bench.lock`.
+
+Tile sweep at m = 2,048 (eval harness, µs; 3b.qkv / 3b.o / 3b.gate_up / 3b.down / 8b.qkv / 8b.o / 8b.gate_up / 8b.down):
+
+| variant                                                                         | µs                                                          |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| hipBLASLt BF16 best of 8                                                        | 441 / 276 / 1,439 / 1,015 / 845 / 588 / 4,260 / 2,062       |
+| 6a Large tile (128×128, per-wave decode)                                        | 725 / 440 / 2,258 / 1,157 / 1,129 / 760 / 5,243 / 2,574     |
+| Large with 2 or 4 column fragments per wave                                     | 3.4–7× slower (register spills)                             |
+| shared decode 256×128, 32 k/step, scattered epilogue                            | 685 / 402 / 2,124 / 1,110 / 1,065 / 719 / 4,990 / 2,391     |
+| same, decode moved between the WMMAs (branch-free F32 decode)                   | 771 / 449 / 2,361 / 1,245 / 1,189 / 806 / 5,584 / 2,657     |
+| same, 16 k/step (2–3 blocks per CU)                                             | 788 / 462 / 2,220 / 2,942 / 1,548 / 1,295 / 5,498 / 3,482   |
+| 128×128 / 128×256 / 256×64 blocks                                               | 7–40 % slower than 256×128                                  |
+| **Prefill tile**: shared decode 256×128, 32 k/step, LDS-staged 16-byte epilogue | **637 / 380 / 2,002 / 1,033 / 1,020 / 695 / 4,694 / 2,336** |
+
+Ablations of the shared-decode tile (3b.gate_up / 8b.down µs): full 2,123 / 2,401; no decode 1,976 / 2,051; no global loads 2,118 / 2,213; no barrier 1,914 / 2,122; no WMMA 1,557 / 1,621; no decode/loads/stores/barrier (WMMA + LDS operand reads only) 1,638 / 1,708; no epilogue 1,725 / 1,982.
+
+Between 512 and 1,024 rows the Prefill tile wins only at multiples of 256 (e.g. 3b.gate_up 704 rows 776 vs 829 µs, 896 rows 1,026 vs 972), so it runs from 1,024 rows; prefill calls below use the Large tile, which gives the same bits.
+
+Lab test `qgemm_mxfp4_prefill_within_hipblaslt_bound` (MXFP4 / BF16 prefill `gemm` at 2,048 rows; bound 1.10): 1.44 / 1.42 / 1.26 / 1.14 / 1.23 / 1.13 / 1.27 / 0.99 — **FAIL** on 7 of 8 shapes (6a tile: 1.60 / 1.56 / 1.47 / 1.18 / 1.34 / 1.28 / 1.18 / 1.22, decision "P6"). `qgemm_mxfp4_matches_cpu` (now prefill calls too, up to 1,031 rows) and `qgemm_mxfp4_prefill_rows_are_batch_invariant` (1,031-row call vs 1 / 7 / 128 rows, crossing both tiles) pass.
+
+Served (`lab-bench.sh`; Prefill tile from 512 rows at the time, labels `t15-before` = kernel files at 648dcebe, `t15-after`, `t15-bf16`; not uploaded to labbook — lab-bench uploads only on exit 0 and golden c1 fails on both 8B slugs, see below):
+
+```
+BENCH t15-bf16   llama8b       quick=1 conc=1  tok/s=35.6  itl_p50=27.7 ttft_p50=123 golden1=FAIL (provisional 8B bounds)
+BENCH t15-before llama8b-mxfp4 quick=1 conc=1  tok/s=87.9  itl_p50=10.8 ttft_p50=149 golden1=FAIL (15/16, p05 tail 1.20)
+BENCH t15-after  llama8b-mxfp4 quick=1 conc=1  tok/s=88.1  itl_p50=10.8 ttft_p50=154 golden1=FAIL (identical lines)
+BENCH t15-bf16   llama8b       conc=16 tok/s=402.2 itl_p50=32.0 ttft_p50=481
+BENCH t15-before llama8b-mxfp4 conc=16 tok/s=673.2 itl_p50=15.1 ttft_p50=559
+BENCH t15-after  llama8b-mxfp4 conc=16 tok/s=675.5 itl_p50=15.1 ttft_p50=552
+```
+
+S-16 served target (TTFT p50 ≤ 1.05× same-day BF16 8B): **miss**, 1.25× at c1 and 1.15× at c16; the tile is served-neutral on this workload (~700-token prompts prefill below its range). With the 1,024-row threshold, prompts under 1,024 tokens run exactly the 6a kernel. Golden c1 output is line-for-line identical before and after.
+
+User decision 2026-10-06 A: S-16 re-bound to ≤ 1.45× the BF16 prefill GEMM per shape (no-regression), served TTFT recorded, not gated. The timing test under the new bound (`scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4 -- qgemm_mxfp4_prefill`): **PASS**, ratios 1.44 / 1.41 / 1.31 / 1.17 / 1.26 / 1.18 / 1.31 / 0.96; `qgemm_mxfp4_prefill_rows_are_batch_invariant` passes. 3b.qkv sits within ~1 % of the bound (1.424–1.438 over three runs): a host-timed test that may flake on a loaded host.
