@@ -137,16 +137,45 @@ struct Outcome {
     max_abs: f32,
     differing: usize,
     numel: usize,
+    /// When set, the comparison judges against this |Delta| bound instead of bit equality: a
+    /// recorded numerics-class change (the b1 decode attention's dispatch to CK splitkv from 4
+    /// sequences, decision 2026-10-06), while the same-row-same-bits property holds within the
+    /// implementation that serves the batch.
+    max_allowed: Option<f32>,
 }
 
 impl Outcome {
     fn of(what: String, alone: &[f32], batched: &[f32], impl_name: &str) -> Outcome {
+        Self::bounded_inner(what, alone, batched, impl_name, None)
+    }
+
+    /// A comparison against a recorded tolerance instead of bit equality. `max_allowed` is the
+    /// measured cross-tier |Delta| on heavy-tailed activations plus headroom; the run still
+    /// prints the actual max_abs and the differing count, so a growing spread stays visible.
+    fn bounded(
+        what: String,
+        alone: &[f32],
+        batched: &[f32],
+        impl_name: &str,
+        max_allowed: f32,
+    ) -> Outcome {
+        Self::bounded_inner(what, alone, batched, impl_name, Some(max_allowed))
+    }
+
+    fn bounded_inner(
+        what: String,
+        alone: &[f32],
+        batched: &[f32],
+        impl_name: &str,
+        max_allowed: Option<f32>,
+    ) -> Outcome {
         assert_eq!(alone.len(), batched.len(), "{what}: length");
         let mut o = Outcome {
             what: format!("{what} impl={impl_name}"),
             max_abs: 0.0,
             differing: 0,
             numel: alone.len(),
+            max_allowed,
         };
         for (a, b) in alone.iter().zip(batched) {
             if a.to_bits() != b.to_bits() {
@@ -154,9 +183,13 @@ impl Outcome {
                 o.max_abs = o.max_abs.max((a - b).abs());
             }
         }
+        let bound = o
+            .max_allowed
+            .map(|b| format!(" allowed={b:.3e}"))
+            .unwrap_or_default();
         println!(
-            "invariance: {} max_abs={:.3e} differing={}/{}",
-            o.what, o.max_abs, o.differing, o.numel
+            "invariance: {} max_abs={:.3e} differing={}/{}{}",
+            o.what, o.max_abs, o.differing, o.numel, bound
         );
         o
     }
@@ -165,7 +198,7 @@ impl Outcome {
 fn assert_invariant(outcomes: &[Outcome]) {
     let bad: Vec<&str> = outcomes
         .iter()
-        .filter(|o| o.differing > 0)
+        .filter(|o| o.differing > 0 && o.max_allowed.is_none())
         .map(|o| o.what.as_str())
         .collect();
     assert!(
@@ -173,6 +206,24 @@ fn assert_invariant(outcomes: &[Outcome]) {
         "{} batch shapes change the target's bits:\n{}",
         bad.len(),
         bad.join("\n")
+    );
+    let over: Vec<String> = outcomes
+        .iter()
+        .filter(|o| o.max_allowed.is_some_and(|lim| o.max_abs > lim))
+        .map(|o| {
+            format!(
+                "{} max_abs={:.3e} > allowed {:.3e}",
+                o.what,
+                o.max_abs,
+                o.max_allowed.unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{} batch shapes exceed the recorded tolerance:\n{}",
+        over.len(),
+        over.join("\n")
     );
 }
 
