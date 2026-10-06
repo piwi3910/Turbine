@@ -3759,3 +3759,7 @@ Open items for the lead (measured, not landed — each would be its own landing)
    pass, but p14 likely |Δ| 1.48 > 1.36 and p16 tail 5.54 > 2.99); 6a recorded PASS at its exit. With
    the new kernel it passes (summation order only). Not investigated further (the 5p changes between
    6a and the base — b1 attention among them — are the candidates).
+
+**Decision (user, 2026-10-06): 1 A, 2 yes.** The FP8 activation quantize is fused into the W8A8 GEMM (ABI semantics
+addition, decoder skips `quantize_act` when the bound qgemm takes BF16 activations), and FP8-block's `down` moves to
+16 waves as its own landing. Item 3 (the per-tensor golden c1 regression on the base) is bisected as a bug.
