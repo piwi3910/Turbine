@@ -92,6 +92,12 @@ pub struct DevicePoolLabels {
     pub pool: &'static str,
 }
 
+/// `reason` of `turbine_request_failures_total` (`RequestFailureReason::as_str`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ReasonLabel {
+    pub reason: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct OutcomeLabel {
     pub outcome: &'static str,
@@ -128,6 +134,8 @@ pub struct ReliabilityMetrics {
     pub recovery_retries: Counter,
     pub circuit_state: Family<StateLabel, Gauge>,
     pub circuit_transitions: Family<CircuitTransitionLabels, Counter>,
+    /// Iterations whose requests failed without a device fault, by reason (user decision C).
+    pub request_failures: Family<ReasonLabel, Counter>,
     /// P5: per-device budget by component.
     pub device_budget_bytes: Family<DeviceComponentLabels, Gauge>,
     /// P5: TP group state per replica, 0 GREEN … 4 SURVIVAL.
@@ -238,6 +246,11 @@ impl ReliabilityMetrics {
             m.circuit_transitions.clone(),
         );
         reg.register(
+            "turbine_request_failures",
+            "Iterations whose requests failed without a device fault, by reason",
+            m.request_failures.clone(),
+        );
+        reg.register(
             "turbine_device_budget_bytes",
             "Per-device memory budget by component",
             m.device_budget_bytes.clone(),
@@ -315,6 +328,7 @@ impl ReliabilityMetrics {
             recovery_retries: Counter::default(),
             circuit_state: Family::default(),
             circuit_transitions: Family::default(),
+            request_failures: Family::default(),
             device_budget_bytes: Family::default(),
             group_pressure_state: Family::default(),
             group_limiting_device: Family::default(),

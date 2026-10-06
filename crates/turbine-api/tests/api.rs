@@ -373,7 +373,9 @@ mod p3 {
         Admission, AdmissionParams, Calibration, PressureReason, RejectionReason,
     };
     use turbine_reliability::budget::{DeviceBudget, PoolKind};
-    use turbine_reliability::circuit::{CircuitBreaker, CircuitEvent, CircuitReason};
+    use turbine_reliability::circuit::{
+        CircuitBreaker, CircuitEvent, CircuitReason, RequestFailureReason,
+    };
     use turbine_reliability::controller::{
         ControllerHandle, EngineStats, NoReclaim, PressureController,
     };
@@ -1218,6 +1220,7 @@ mod p3 {
             .map(|r| r.as_str())
             .chain(RejectionReason::ALL.iter().map(|r| r.as_str()))
             .chain(CircuitReason::ALL.iter().map(|r| r.as_str()))
+            .chain(RequestFailureReason::ALL.iter().map(|r| r.as_str()))
             .chain(["none", "thermal", "power", "other"])
             .collect();
         let mut allowed: BTreeMap<&str, Vec<&str>> = BTreeMap::new();

@@ -3872,3 +3872,12 @@ a bug that hits every warm request keeps re-opening the circuit after each probe
 
 **Decision (user, 2026-10-06): C.** A pre-launch argument error fails only that iteration's requests (metric and
 reason code, no circuit event); a per-reason rate limit still opens the circuit when argument errors repeat.
+
+As built (`p5p-circuit`, builder's defaults, no new config key): `KernelError::InvalidArgument` (the library's
+`TURBINE_E_ARGUMENT` or the host-side validation; HIP runtime errors map only to OOM / device, so the call enqueued
+nothing) ends the iteration's requests with `internal_error`, logs `event="iteration_failed"
+reason="kernel_argument_rejected"` and counts `turbine_request_failures_total{reason="kernel_argument_rejected"}`; the
+breaker makes no transition until `REQUEST_FAILURES_TO_OPEN` = 3 of one reason fall within
+`reliability.circuit.window` (60 s default, the same count as `oom_recoveries_to_open`), then opens with
+`repeated_kernel_argument`. A key (`reliability.circuit.request_failures_to_open`) only if a deployment needs another
+count.

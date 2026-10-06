@@ -1007,7 +1007,14 @@ pub fn plan_with(state: PressureState, cfg: &SchedulerLimits, survival: Survival
 
 // circuit (P3 S-12)
 pub enum CircuitReason { LatencyDrift, ThermalThrottle, OomRecovered, TelemetryStale, RepeatedOom, RecoveryFailed, DeviceError,
-                         ProbeFailed, DeviceFatal, ControllerFailed, CollectiveFailed /* P5, contract-chosen */, NoTrigger /* DEGRADED→HEALTHY after window */ }
+                         ProbeFailed, DeviceFatal, ControllerFailed, CollectiveFailed /* P5, contract-chosen */,
+                         RepeatedKernelArgument /* P5p, user decision C 2026-10-06: `repeated_kernel_argument` */, NoTrigger /* DEGRADED→HEALTHY after window */ }
+// P5p (user decision C, 2026-10-06): an iteration whose requests failed without a device fault. One makes no transition (requests
+// end `internal_error`); REQUEST_FAILURES_TO_OPEN (= 3) of one reason within reliability.circuit.window open the circuit with
+// reason.repeated(). The engine maps ModelError::Kernel(KernelError::InvalidArgument) (pre-launch validation) to it.
+pub enum RequestFailureReason { KernelArgumentRejected /* `kernel_argument_rejected` */ }
+pub const REQUEST_FAILURES_TO_OPEN: u32 = 3;
+// CircuitEvent gains RequestFailure { reason: RequestFailureReason }
 pub struct CircuitBreaker { /* transition table P3 */ }
 impl CircuitBreaker { pub fn on_event(&mut self, ev: CircuitEvent, now: Duration) -> Option<(CircuitState, CircuitState, CircuitReason)>; pub fn state(&self) -> CircuitState; pub fn retry_after_secs(&self) -> u64; }
 
@@ -2187,6 +2194,7 @@ pub mod client {
 | `turbine_recovery_retries_total`                                                                                       | counter                       | —                                                                                                                                                                               | P3                                                                     | reliability   |
 | `turbine_circuit_state`                                                                                                | gauge                         | `state` ∈ HEALTHY…PROBING                                                                                                                                                       | P3                                                                     | reliability   |
 | `turbine_circuit_transitions_total`                                                                                    | counter                       | `from`, `to`, `reason` (CircuitReason snake_case)                                                                                                                               | P3                                                                     | reliability   |
+| `turbine_request_failures_total`                                                                                       | counter                       | `reason` (RequestFailureReason snake_case: `kernel_argument_rejected`)                                                                                                          | P5p (user decision C)                                                  | reliability   |
 | `turbine_gpu_temperature_celsius`, `turbine_gpu_clock_mhz`, `turbine_gpu_power_watts`, `turbine_gpu_utilization_ratio` | gauge                         | `device`                                                                                                                                                                        | P3                                                                     | device        |
 | `turbine_gpu_memory_bytes`                                                                                             | gauge                         | `device`, `kind` ∈ used, free (dedicated only)                                                                                                                                  | P3                                                                     | device        |
 | `turbine_gpu_throttle_active`                                                                                          | gauge                         | `device`, `reason` ∈ thermal, power, other                                                                                                                                      | P3                                                                     | device        |

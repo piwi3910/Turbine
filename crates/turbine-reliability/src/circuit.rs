@@ -8,10 +8,49 @@ use serde::Serialize;
 use turbine_core::config::CircuitConfig;
 use turbine_core::types::CircuitState;
 
-use crate::metrics::{CircuitTransitionLabels, ReliabilityMetrics, StateLabel};
+use crate::metrics::{CircuitTransitionLabels, ReasonLabel, ReliabilityMetrics, StateLabel};
 
 /// A probe succeeds only within this multiple of the latency baseline (P3 transition table).
 pub const PROBE_LATENCY_LIMIT: f64 = 2.0;
+
+/// Request failures of one reason within `reliability.circuit.window` that open the circuit
+/// (user decision C, 2026-10-06): one rejected argument fails only its iteration's requests,
+/// repeats (a bug every request hits) still open it. The same count as the
+/// `oom_recoveries_to_open` default; no config key until a deployment needs another value.
+pub const REQUEST_FAILURES_TO_OPEN: u32 = 3;
+
+/// Why an iteration's requests failed without a device fault (metric label `reason` of
+/// `turbine_request_failures_total`): the device is healthy, so one such failure makes no
+/// circuit transition; repeats are rate limited per reason ([`REQUEST_FAILURES_TO_OPEN`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RequestFailureReason {
+    /// A kernel call rejected its arguments before enqueueing device work
+    /// (`KernelError::InvalidArgument`: `TURBINE_E_ARGUMENT` or the host-side validation).
+    KernelArgumentRejected,
+}
+
+impl RequestFailureReason {
+    pub const ALL: [RequestFailureReason; 1] = [RequestFailureReason::KernelArgumentRejected];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestFailureReason::KernelArgumentRejected => "kernel_argument_rejected",
+        }
+    }
+
+    /// The reason the circuit opens with when this failure repeats.
+    pub fn repeated(self) -> CircuitReason {
+        match self {
+            RequestFailureReason::KernelArgumentRejected => CircuitReason::RepeatedKernelArgument,
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
 
 /// Closed set of circuit transition reasons (metric label `reason`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -31,6 +70,8 @@ pub enum CircuitReason {
     /// A tensor-parallel group's collective failed (P5: a timeout, a rank's abort or a backend
     /// error); the replica's requests end with `replica_failed`.
     CollectiveFailed,
+    /// `REQUEST_FAILURES_TO_OPEN` kernel argument rejections within `window` (user decision C).
+    RepeatedKernelArgument,
     NoTrigger,
     DrainStarted,
     DrainComplete,
@@ -38,7 +79,7 @@ pub enum CircuitReason {
 }
 
 impl CircuitReason {
-    pub const ALL: [CircuitReason; 15] = [
+    pub const ALL: [CircuitReason; 16] = [
         CircuitReason::LatencyDrift,
         CircuitReason::ThermalThrottle,
         CircuitReason::OomRecovered,
@@ -50,6 +91,7 @@ impl CircuitReason {
         CircuitReason::DeviceFatal,
         CircuitReason::ControllerFailed,
         CircuitReason::CollectiveFailed,
+        CircuitReason::RepeatedKernelArgument,
         CircuitReason::NoTrigger,
         CircuitReason::DrainStarted,
         CircuitReason::DrainComplete,
@@ -69,6 +111,7 @@ impl CircuitReason {
             CircuitReason::DeviceFatal => "device_fatal",
             CircuitReason::ControllerFailed => "controller_failed",
             CircuitReason::CollectiveFailed => "collective_failed",
+            CircuitReason::RepeatedKernelArgument => "repeated_kernel_argument",
             CircuitReason::NoTrigger => "no_trigger",
             CircuitReason::DrainStarted => "drain_started",
             CircuitReason::DrainComplete => "drain_complete",
@@ -99,6 +142,12 @@ pub enum CircuitEvent {
     /// A tensor-parallel group's collective failed mid-step (P5): opens like a non-sticky
     /// device error, with its own reason.
     CollectiveFailed,
+    /// An iteration's requests failed without a device fault (user decision C): counted by
+    /// reason, no transition until `REQUEST_FAILURES_TO_OPEN` of one reason fall within
+    /// `window`.
+    RequestFailure {
+        reason: RequestFailureReason,
+    },
     /// Probe latency / baseline.
     ProbeSucceeded {
         latency_ratio: f64,
@@ -124,6 +173,9 @@ pub struct CircuitBreaker {
     last_iteration: Option<Duration>,
     /// OOM recoveries within `window` (sliding).
     ooms: VecDeque<Duration>,
+    /// Request failures within `window` per `RequestFailureReason` (sliding, at most
+    /// `REQUEST_FAILURES_TO_OPEN` each).
+    failures: [VecDeque<Duration>; RequestFailureReason::ALL.len()],
     opened_at: Duration,
     probes_ok: u32,
     fatal: bool,
@@ -152,6 +204,7 @@ impl CircuitBreaker {
             last_trigger: now,
             last_iteration: None,
             ooms: VecDeque::new(),
+            failures: Default::default(),
             opened_at: now,
             probes_ok: 0,
             fatal: false,
@@ -249,6 +302,31 @@ impl CircuitBreaker {
                     self.degrade(CircuitReason::OomRecovered, now)
                 }
             }
+            CircuitEvent::RequestFailure { reason } => {
+                self.metrics
+                    .request_failures
+                    .get_or_create(&ReasonLabel {
+                        reason: reason.as_str(),
+                    })
+                    .inc();
+                let window = &mut self.failures[reason.index()];
+                window.push_back(now);
+                while window
+                    .front()
+                    .is_some_and(|t| now.saturating_sub(*t) > self.cfg.window.0)
+                {
+                    window.pop_front();
+                }
+                if window.len() < REQUEST_FAILURES_TO_OPEN as usize {
+                    return None;
+                }
+                window.clear();
+                if can_open {
+                    self.open(reason.repeated(), now)
+                } else {
+                    None
+                }
+            }
             CircuitEvent::RecoveryFailed if can_open => {
                 self.open(CircuitReason::RecoveryFailed, now)
             }
@@ -292,6 +370,7 @@ impl CircuitBreaker {
                     return None;
                 }
                 self.ooms.clear();
+                self.failures.iter_mut().for_each(VecDeque::clear);
                 self.last_trigger = now;
                 self.go(CircuitState::Healthy, CircuitReason::ProbesSucceeded, now)
             }
@@ -568,5 +647,56 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len(), "reason codes are distinct");
+    }
+
+    /// User decision C (2026-10-06): a request failure (a pre-launch kernel argument error)
+    /// makes no transition and is counted by reason; `REQUEST_FAILURES_TO_OPEN` of them within
+    /// `window` open the circuit with `repeated_kernel_argument`; older ones age out. Breaks if
+    /// one argument error opens (or degrades) the circuit, or repeats never do.
+    #[test]
+    fn request_failures_are_rate_limited() {
+        let arg = E::RequestFailure {
+            reason: RequestFailureReason::KernelArgumentRejected,
+        };
+        let metrics = ReliabilityMetrics::unregistered();
+        let mut b = CircuitBreaker::new(&CircuitConfig::default(), metrics.clone(), s(0));
+        for t in 1..u64::from(REQUEST_FAILURES_TO_OPEN) {
+            assert_eq!(b.on_event(arg, s(t)), None, "failure {t} stays closed");
+        }
+        assert_eq!(b.state(), Healthy);
+        assert_eq!(
+            b.on_event(arg, s(10)),
+            Some((Healthy, CircuitOpen, R::RepeatedKernelArgument))
+        );
+        let counted = metrics
+            .request_failures
+            .get_or_create(&ReasonLabel {
+                reason: "kernel_argument_rejected",
+            })
+            .get();
+        assert_eq!(counted, u64::from(REQUEST_FAILURES_TO_OPEN));
+        // Spread wider than the window: never opens, and the window stays bounded.
+        let mut b = breaker();
+        for i in 0..20 {
+            assert_eq!(b.on_event(arg, s(1 + i * 31)), None, "failure {i}");
+        }
+        assert!(
+            b.failures
+                .iter()
+                .all(|w| w.len() < REQUEST_FAILURES_TO_OPEN as usize)
+        );
+        // A device error still opens at once.
+        assert_eq!(
+            breaker().on_event(E::DeviceError { sticky: false }, s(1)),
+            Some((Healthy, CircuitOpen, R::DeviceError))
+        );
+        assert_eq!(
+            RequestFailureReason::KernelArgumentRejected.as_str(),
+            "kernel_argument_rejected"
+        );
+        assert_eq!(
+            R::RepeatedKernelArgument.as_str(),
+            "repeated_kernel_argument"
+        );
     }
 }

@@ -90,6 +90,7 @@ use turbine_core::request::{
     StopConditions,
 };
 use turbine_core::types::{BlockId, CircuitState, PressureState, Priority, RequestId, SeqId};
+use turbine_kernels::KernelError;
 use turbine_kv::BlockPool;
 use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
@@ -98,7 +99,7 @@ use turbine_model::executor::{
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_reliability::budget::PoolKind;
-use turbine_reliability::circuit::{CircuitEvent, CircuitReason};
+use turbine_reliability::circuit::{CircuitEvent, CircuitReason, RequestFailureReason};
 use turbine_reliability::controller::{EngineStats, Snapshot};
 use turbine_reliability::recovery::RecoveryStep;
 use turbine_reliability::step_window::{DecodeStepWindow, StepSample};
@@ -3154,13 +3155,19 @@ fn device_choice(reduced: &ReducedRow, reduce: Option<RowReduce>) -> Option<u32>
 /// (`KernelError::is_oom`, `KernelError::is_sticky`): out of memory is recovered from, a sticky
 /// device error is fatal, anything else opens the circuit. A tensor-parallel group's failed
 /// collective (P5: a timeout, a rank's abort or a backend error) opens it with reason
-/// `collective_failed`, and the iteration's requests end with `replica_failed`.
+/// `collective_failed`, and the iteration's requests end with `replica_failed`. A kernel
+/// argument rejection (`KernelError::InvalidArgument`: the library's `TURBINE_E_ARGUMENT` or
+/// the host-side validation, raised before the call enqueues device work; HIP runtime errors
+/// map only to out-of-memory or device) leaves the device healthy: the requests end with
+/// `internal_error` and the circuit only counts it (`kernel_argument_rejected`), opening once
+/// they repeat (user decision C, 2026-10-06).
 #[derive(Debug)]
 struct IterationError {
     message: String,
     oom: bool,
     sticky: bool,
     collective: bool,
+    argument: bool,
 }
 
 impl IterationError {
@@ -3170,11 +3177,13 @@ impl IterationError {
             ModelError::Collective(_) => (false, false, true),
             _ => (false, false, false),
         };
+        let argument = matches!(e, ModelError::Kernel(KernelError::InvalidArgument { .. }));
         IterationError {
             message: format!("{context}: {e}"),
             oom,
             sticky,
             collective,
+            argument,
         }
     }
 
@@ -3184,6 +3193,7 @@ impl IterationError {
             oom: false,
             sticky: false,
             collective: false,
+            argument: false,
         }
     }
 
@@ -3191,6 +3201,13 @@ impl IterationError {
     fn failure(&self) -> (ErrorCode, CircuitEvent) {
         if self.collective {
             (ErrorCode::ReplicaFailed, CircuitEvent::CollectiveFailed)
+        } else if self.argument {
+            let reason = RequestFailureReason::KernelArgumentRejected;
+            tracing::warn!(event = "iteration_failed", reason = reason.as_str(), error = %self.message, "a kernel rejected its arguments; the iteration's requests fail");
+            (
+                ErrorCode::InternalError,
+                CircuitEvent::RequestFailure { reason },
+            )
         } else {
             (
                 ErrorCode::InternalError,
@@ -4984,6 +5001,8 @@ mod tests {
         kv: KvLayout,
         panic: bool,
         collective: bool,
+        /// Reject the arguments before any device work (`KernelError::InvalidArgument`).
+        argument: bool,
     }
 
     impl ModelExecutor for BrokenExecutor {
@@ -4999,6 +5018,11 @@ mod tests {
                 return Err(ModelError::Collective(
                     turbine_distributed::collective::CollectiveError::RemoteAbort { rank: 1 },
                 ));
+            }
+            if self.argument {
+                return Err(ModelError::Kernel(KernelError::InvalidArgument {
+                    message: "injected argument rejection".into(),
+                }));
             }
             Err(ModelError::Kernel(plain_device_error("injected")))
         }
@@ -5018,6 +5042,7 @@ mod tests {
             kv: spec.config.kv_layout(BLOCK_TOKENS),
             panic,
             collective: false,
+            argument: false,
         })
     }
 
@@ -5085,6 +5110,88 @@ mod tests {
         }
     }
 
+    fn argument_rejecting(spec: &TinySpec) -> Box<dyn ModelExecutor> {
+        Box::new(BrokenExecutor {
+            shape: spec.config.shape(),
+            kv: spec.config.kv_layout(BLOCK_TOKENS),
+            panic: false,
+            collective: false,
+            argument: true,
+        })
+    }
+
+    /// User decision C (2026-10-06): a kernel argument rejection (no device work enqueued)
+    /// fails only its iteration's request with `internal_error`, counted under
+    /// `turbine_request_failures_total{reason="kernel_argument_rejected"}`, and the circuit
+    /// stays closed (no transition at all). Breaks if it is mapped to a device error again.
+    #[test]
+    fn kernel_argument_error_fails_requests_without_opening_the_circuit() {
+        let (_dir, spec, tokenizer) = tiny();
+        let t = engine(argument_rejecting(&spec), tokenizer, params(1, 64));
+        let (mut rx, admitted) = submit(&t.tx, request(&[256, 1, 2], 4));
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(
+            error_code(&read_to_end(&mut rx)),
+            Some(ErrorCode::InternalError)
+        );
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        assert!(!t.controller.circuit().blocks_readiness());
+        assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
+        let text = t.reg.render().unwrap();
+        let line = r#"turbine_request_failures_total{reason="kernel_argument_rejected"} 1"#;
+        assert!(text.contains(line), "missing {line:?} in\n{text}");
+        assert!(
+            !text.contains(r#"to="CIRCUIT_OPEN""#),
+            "no circuit transition in\n{text}"
+        );
+    }
+
+    /// User decision C: argument rejections that repeat (`REQUEST_FAILURES_TO_OPEN` within
+    /// `reliability.circuit.window`) still open the circuit, reason `repeated_kernel_argument`:
+    /// the first requests fail `internal_error`, the ones still queued are rejected
+    /// `circuit_open`. Breaks if the rate limit never trips.
+    #[test]
+    fn repeated_kernel_argument_errors_open_the_circuit() {
+        use turbine_reliability::circuit::REQUEST_FAILURES_TO_OPEN;
+        let (_dir, spec, tokenizer) = tiny();
+        let t = engine(argument_rejecting(&spec), tokenizer, params(1, 64));
+        let n = REQUEST_FAILURES_TO_OPEN as usize;
+        let streams: Vec<_> = (0..n + 1)
+            .map(|_| submit(&t.tx, request(&[256, 1, 2], 4)))
+            .collect();
+        let engine = t.engine;
+        let handle = std::thread::spawn(move || engine.run());
+        for (i, (mut rx, admitted)) in streams.into_iter().enumerate() {
+            assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+            let expected = if i < n {
+                ErrorCode::InternalError
+            } else {
+                ErrorCode::CircuitOpen
+            };
+            assert_eq!(
+                error_code(&read_to_end(&mut rx)),
+                Some(expected),
+                "request {i}"
+            );
+        }
+        assert!(t.controller.circuit().blocks_readiness());
+        drop(t.tx);
+        assert_eq!(handle.join().unwrap(), Ok(()));
+        assert_eq!(held_blocks(&t.shared.docs().unwrap()), 0);
+        let text = t.reg.render().unwrap();
+        let failures =
+            format!(r#"turbine_request_failures_total{{reason="kernel_argument_rejected"}} {n}"#);
+        for line in [
+            r#"turbine_circuit_transitions_total{from="HEALTHY",to="CIRCUIT_OPEN",reason="repeated_kernel_argument"} 1"#,
+            failures.as_str(),
+        ] {
+            assert!(text.contains(line), "missing {line:?} in\n{text}");
+        }
+    }
+
     /// A failed iteration opens the circuit before its requests hear of the failure: the
     /// moment a client reads its `replica_failed` (collective) or `internal_error` (device) event,
     /// the circuit already blocks readiness (`/ready` 503 `circuit_open`). Breaks if the engine
@@ -5098,6 +5205,7 @@ mod tests {
                 kv: spec.config.kv_layout(BLOCK_TOKENS),
                 panic: false,
                 collective,
+                argument: false,
             });
             let t = engine(exec, tokenizer, params(1, 64));
             let (mut rx, admitted) = submit(&t.tx, request(&[256, 1, 2], 4));
@@ -5171,6 +5279,7 @@ mod tests {
             kv: spec.config.kv_layout(BLOCK_TOKENS),
             panic: false,
             collective: true,
+            argument: false,
         });
         let t = engine(exec, tokenizer, params(1, 64));
         let streams: Vec<_> = (0..3)
