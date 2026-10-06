@@ -21,8 +21,9 @@
 //! while the listener stays open; running requests continue until none is left or
 //! `server.shutdown_grace` has passed; then `EngineCommand::Shutdown` cancels the rest with
 //! reason `shutdown` (their streams end with `shutting_down`), the engine delivers what it holds
-//! and stops, the listener closes, open connections finish (bounded by [`CLOSE_LIMIT`]), the
-//! engine threads are joined once they have released their device resources, then the local
+//! and stops (bounded by [`CLOSE_LIMIT`]), the listener closes, open connections finish
+//! (bounded by [`CONNECTIONS_CLOSE_LIMIT`]), the engine threads are joined once they have
+//! released their device resources, then the local
 //! tensor-parallel worker-rank threads (`replica.worker`), both bounded by [`ENGINE_STOP_LIMIT`]
 //! in total (`join_engines_and_workers`; a worker still running past it is named in one WARN,
 //! `event="tp_worker_join_timeout"`), and the process exits 0.
@@ -74,9 +75,16 @@ use crate::{support_matrix, support_startup};
 const FAILURE_GRACE: Duration = Duration::from_millis(500);
 /// How often the shutdown sequence looks at the engine.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
-/// After the grace: how long the engine may take to deliver the cancellations and stop, and
-/// then how long open connections may take to finish, before the process exits 0 regardless.
+/// After the grace: how long the engine may take to deliver the cancellations and stop.
 const CLOSE_LIMIT: Duration = Duration::from_millis(500);
+/// Then how long open connections may take to finish before the process exits 0 regardless.
+/// A cancelled stream that was paused still holds its buffered events (the output channel's
+/// 256, hyper's queue) ahead of its `shutting_down` error: a client that resumes reading at the
+/// grace needs to get all of them before the exit cuts the connection mid-body. 500 ms was too
+/// short on a loaded host (`sigterm_drains_then_cancels` read EOF there, 2026-10-06); with
+/// [`CLOSE_LIMIT`] this keeps the exit within 3 s of the grace (P2 S-13), and an idle server
+/// still exits as soon as its last connection closes.
+const CONNECTIONS_CLOSE_LIMIT: Duration = Duration::from_secs(2);
 /// On a clean exit: how long the engine threads may take, after the engine loop ends, to drop
 /// the executor, the KV tiers, the telemetry sampler and the kernel provider before the process
 /// exits regardless (`engine_stop_timeout`). Returning from `main` runs the device runtime's
@@ -790,7 +798,7 @@ async fn serve(
     let server = axum::serve(listener, turbine_api::router(state)).with_graceful_shutdown(shutdown);
     let connections_closed = async {
         match drained_rx.await {
-            Ok(()) => tokio::time::sleep(CLOSE_LIMIT).await,
+            Ok(()) => tokio::time::sleep(CONNECTIONS_CLOSE_LIMIT).await,
             Err(_) => std::future::pending().await,
         }
     };
