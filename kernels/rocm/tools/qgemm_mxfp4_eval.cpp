@@ -8,7 +8,7 @@
 //   dequant+bf16    a dequantize-to-BF16 kernel over the whole weight, then
 //                   the same hipBLASLt GEMM (the "reuse hipBLASLt" candidate
 //                   for prefill; needs an n x k BF16 scratch)
-//   mxfp4_small / _medium / _large
+//   mxfp4_small / _medium / _large / _prefill
 //                   turbine_hip_mxfp4 (src/qgemm_mxfp4.hip) with each tile
 //
 // checks every MXFP4 candidate against a host reference of the CPU provider's
@@ -21,7 +21,7 @@
 // cpu::quant's rules and times it.
 //
 //   turbine_qgemm_mxfp4_eval [--ms 1,4,16,128,2048] [--iters 20] [--rounds 5]
-//                            [--shapes 3b.qkv,...]
+//                            [--shapes 3b.qkv,...] [--cands bf16_best8,...]
 //
 // A lab tool (run it on GPU 0 under scripts/bench-lock.sh); not loaded by the
 // server. Exit 0 when every MXFP4 candidate matched the reference and the
@@ -260,7 +260,15 @@ void free_shape(ShapeData &d) {
   (void)hipFree(d.c);
 }
 
-enum class Cand { Bf16First, Bf16Best, DequantBf16, Small, Medium, Large };
+enum class Cand {
+  Bf16First,
+  Bf16Best,
+  DequantBf16,
+  Small,
+  Medium,
+  Large,
+  Prefill
+};
 
 const char *cand_name(Cand c) {
   switch (c) {
@@ -274,8 +282,10 @@ const char *cand_name(Cand c) {
     return "mxfp4_small";
   case Cand::Medium:
     return "mxfp4_medium";
-  default:
+  case Cand::Large:
     return "mxfp4_large";
+  default:
+    return "mxfp4_prefill";
   }
 }
 
@@ -360,7 +370,8 @@ bool run(const Env &env, Cand cand, ShapeData &d, Blas &blas, int64_t m,
     const turbine_qgemm_desc q = mx_desc(d, m, i % d.w.size());
     const Mxfp4Tile tile = cand == Cand::Small    ? Mxfp4Tile::Small
                            : cand == Cand::Medium ? Mxfp4Tile::Medium
-                                                  : Mxfp4Tile::Large;
+                           : cand == Cand::Large  ? Mxfp4Tile::Large
+                                                  : Mxfp4Tile::Prefill;
     return turbine_hip::launch_qgemm_mxfp4(env.stream, &q, tile) == hipSuccess;
   }
   }
@@ -554,6 +565,7 @@ int main(int argc, char **argv) {
   env.iters = 20;
   env.rounds = 5;
   bool check_all = true;
+  std::vector<std::string> cand_filter;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     const char *val = i + 1 < argc ? argv[i + 1] : "";
@@ -571,12 +583,15 @@ int main(int argc, char **argv) {
     } else if (arg == "--shapes") {
       shapes = split(val);
       ++i;
+    } else if (arg == "--cands") {
+      cand_filter = split(val);
+      ++i;
     } else if (arg == "--no-check") {
       check_all = false;
     } else {
       std::fprintf(stderr, "usage: turbine_qgemm_mxfp4_eval [--ms a,b] "
                            "[--iters n] [--rounds n] [--shapes a,b] "
-                           "[--no-check]\n");
+                           "[--cands a,b] [--no-check]\n");
       return 2;
     }
   }
@@ -597,7 +612,8 @@ int main(int argc, char **argv) {
   Rng rng{97};
   const int64_t m_max = *std::max_element(ms.begin(), ms.end());
   const Cand cands[] = {Cand::Bf16First, Cand::Bf16Best, Cand::DequantBf16,
-                        Cand::Small,     Cand::Medium,   Cand::Large};
+                        Cand::Small,     Cand::Medium,   Cand::Large,
+                        Cand::Prefill};
   for (const LinearShape &sh : kShapes) {
     if (!shapes.empty() &&
         std::find(shapes.begin(), shapes.end(), sh.name) == shapes.end()) {
@@ -608,6 +624,11 @@ int main(int argc, char **argv) {
       Blas blas;
       prepare_blas(env, d, m, blas);
       for (Cand cand : cands) {
+        if (!cand_filter.empty() &&
+            std::find(cand_filter.begin(), cand_filter.end(),
+                      cand_name(cand)) == cand_filter.end()) {
+          continue;
+        }
         double us = std::nan("");
         const hipblasLtMatmulAlgo_t *algo = nullptr;
         if (cand == Cand::Bf16First || cand == Cand::DequantBf16) {
