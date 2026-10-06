@@ -321,11 +321,11 @@ Interfaces:
   Covers: S-15 AC (manual measurement)
   Depends on: Task 2, Task 3
 
-- [ ] Profile (GPU 0): `scripts/lab-bench.sh --model llama-fp8 --concurrency 1 --quick` and `--model llama-fp8-block --concurrency 1 --quick`, plus the same-day BF16 c1 run, with the stage-share; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` for the decode GEMM timings m = 1–16; paste the tables into `.procoder/perf-log.md`
-- [ ] Fix per the profile, test first: a host-side fix gets a failing host test first; a kernel-side change is gated by the lab timing comparison and golden c1 strict bounds; the perf log holds the before/after tables
-- [ ] Landing (GPU 0): `scripts/lab-bench.sh --model llama-fp8 --concurrency 1 --quick` and `--model llama-fp8-block --concurrency 1 --quick` — ITL p50 ≤ 0.75 × the same-day BF16 c1 ITL, golden c1 PASS, the standard bench within the no-regression bound; a miss needs a user re-bound on the profile's evidence (decisions entry)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `perf(kernels): FP8 c1 decode — the profiled fix`
+- [x] Profile (GPU 0): `scripts/lab-bench.sh --model llama-fp8 --concurrency 1 --quick` and `--model llama-fp8-block --concurrency 1 --quick`, plus the same-day BF16 c1 run, with the stage-share; `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops` for the decode GEMM timings m = 1–16; paste the tables into `.procoder/perf-log.md`
+- [x] Fix per the profile, test first: a host-side fix gets a failing host test first; a kernel-side change is gated by the lab timing comparison and golden c1 strict bounds; the perf log holds the before/after tables
+- [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama-fp8 --concurrency 1 --quick` and `--model llama-fp8-block --concurrency 1 --quick` — ITL p50 ≤ 0.75 × the same-day BF16 c1 ITL, golden c1 PASS, the standard bench within the no-regression bound; a miss needs a user re-bound on the profile's evidence (decisions entry)
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `perf(kernels): FP8 c1 decode — the profiled fix`
 
 ## Task 15: MXFP4 prefill GEMM at hipBLASLt speed (S-16)
 

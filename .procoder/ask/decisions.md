@@ -3512,3 +3512,46 @@ merged meanwhile (c1 +1.5 %, c16 neutral, golden PASS).
 ## GPU 1 vs GPU 0 on the new PSU: GPU 1 joins perf work (recorded result, 2026-10-06)
 
 This applies the user's rule from "New PSU validation sequence, then the GPU 1 benchmark" (within ~3 %: GPU 1 joins perf work). The measurement is from branch `p5p-gpu1`, same tree fa70043d, run back to back as GPU 0, then GPU 1, then GPU 0 again. GPU 1 / GPU 0 tok/s: Llama c16 855.9 vs 850.7 (1.006), OLMoE c16 614.9 vs 617.2 (0.996), Llama c1 78.1 vs 78.0 (1.001), OLMoE c1 150.3 vs 150.1 (1.002). ITL and TTFT p50 match within 1 ms (2 ms TTFT). Golden c1 passed on every run. Both cards link Gen5 x8 at the root port, then Gen5 x16 inside the card, and have the same 300 W cap, clocks and temperatures under load. The perf-log entry "GPU 1 vs GPU 0 on the new PSU" has the table and the labbook ids. Outcome: the GPU-0-only perf rule is lifted. `scripts/lab-bench.sh` accepts `--gpu 0|1` with no caveat, and AGENTS.md says perf numbers are comparable on either card. The earlier lift in the same branch also stands: the one-GPU-job rule (decision "New PSU validated"); lab-test and lab-serve hold bench.lock shared again, and `--gpus 2` and `lab-cluster.sh` are allowed. `TURBINE_LAB_ONE_GPU_JOB=1` restores that rule if the host needs it again.
+
+## 5p Task 14: FP8 c1 decode — provider evaluation (kernel reuse rule) and result (2026-10-06)
+
+Branch `p5p-t14` (from `p6b-stack` 97050b3c). The served profile (perf log 5p "S-15") puts the W8A8 c1
+miss (0.851× / 0.860× of BF16's 12.1 ms against ≤ 0.75×) on hipBLASLt's FP8 GEMMs at batch 1 (pinned
+SABV rows, 237 µs per layer, 363–459 GB/s) and then the 112 activation-quantize launches per step.
+
+Reuse evaluation for a faster batch-1 FP8 W8A8 GEMM on gfx1201:
+
+- hipBLASLt (the current provider): every FP8 solution is already tuned per m (`qgemm_tuned.hpp`,
+  791 solutions timed in 6a); the best m = 1 rows are the ones served. No faster provider solution.
+- CK `ck_tile` `gemm_quant` (RowCol / Tensor): wrong results on gfx1201 at the pinned CK (decision
+  "P6: FP8 GEMM — provider evaluation"); m = 1 refused (kPadM). Not usable.
+- llama.cpp: no FP8 e4m3 tensor type or kernel (its HIP decode kernels serve GGUF quant types).
+- vLLM / aiter: the ROCm FP8 linear runs `torch._scaled_mm` (hipBLASLt) or aiter / the skinny
+  `wvSplitKQ` kernels, which target MI300-class (gfx94x/gfx950) instructions; no gfx12 provider.
+- Own kernel: `turbine_hip_fp8_block`'s fused WMMA structure (6a, own by user decision) with the
+  gfx12 `v_wmma_f32_16x16x16_fp8_fp8` on e4m3 activations — measured 26.7 / 17.1 / 83.6 / 41.4 µs per
+  layer served (−29 %, ~597 GB/s), exact e4m3 products, F32 sums, scales applied after the sum.
+
+**Landed (one change): `turbine_hip_fp8_wmma`**, first in a new ≤ 16-row decode tier of gfx1201's
+QGemm order; prefill steps and larger calls run `hipblaslt_fp8` inside the entry. FP8-dynamic c1
+96.0 → 118.0 tok/s, ITL 10.3 → 8.3 ms (0.686×); per-tensor 10.4 → 8.2 ms (0.678×); golden c1 PASS on
+both; c16 FP8-dynamic 1127.6 tok/s. S-15 met; no re-bound needed.
+
+Open items for the lead (measured, not landed — each would be its own landing):
+
+1. The W8A8 activation quantization: 112 `quantize_fp8_rows` per step (0.86 ms dynamic, plus ~112
+   boundaries). Fusing it into the GEMV removes them (bit-exact codes are possible: the same
+   `fp8_e4m3_round`), but the qgemm op would take BF16 activations with an FP8 `act_quant` and the
+   decoder would skip `quantize_act` when the bound qgemm takes them — an ABI v2.9 semantics addition
+   and a decoder change. Options: A) task it (estimated −0.9 to −1.2 ms per W8A8 step, ~0.60×),
+   B) leave it (S-15 is met), C) fuse into the preceding norm instead (CK `add_rmsnorm2d_rdquant` is not
+   bit-exact with the reference rule; an own norm+quant kernel also needs an ABI op).
+2. `turbine_hip_fp8_block` reads `down` (k = 8192) at 8 waves: 72.5 µs served (345 GB/s); the same
+   wave sweep on the W8A8 kernel measured 89 µs at 8 waves vs 43 µs at 16. Switching its k ≥ 64-group
+   rule to 16 waves is a one-line change (≈ −0.85 ms per FP8-block step, 0.68× → ~0.61×); it changes
+   only the wave split of k, so its numerics move by F32 summation order (golden re-check). Recommended
+   as a follow-up landing.
+3. Found on the unchanged base: the per-tensor FP8 checkpoint fails golden c1 (14/16 identical-prefix
+   pass, but p14 likely |Δ| 1.48 > 1.36 and p16 tail 5.54 > 2.99); 6a recorded PASS at its exit. With
+   the new kernel it passes (summation order only). Not investigated further (the 5p changes between
+   6a and the base — b1 attention among them — are the candidates).

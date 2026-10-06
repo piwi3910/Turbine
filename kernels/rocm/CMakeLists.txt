@@ -192,6 +192,7 @@ set(TURBINE_SOURCES
   src/qgemm_int4.hip
   src/qgemm_mxfp4.hip
   src/qgemm_fp8_block.hip
+  src/qgemm_fp8_wmma.hip
   src/quantize_act_mxfp4.hip
   src/kv_transcode.hip
   src/kv_transcode_tq.hip

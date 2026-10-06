@@ -20,8 +20,9 @@ use turbine_kernels::cpu::quant::{fp8_e4m3_round, fp8_e4m3_value};
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
-    GemmContext, KernelProvider, OpKind, QGemmConfig, QGemmContext, QuantizeActConfig,
-    QuantizeActContext, ShimLibrary, cpu_reference_provider, shim_provider,
+    GemmConfig, GemmContext, ImplChoice, KernelProvider, OpConfig, OpKind, QGemmConfig,
+    QGemmContext, QuantizeActConfig, QuantizeActContext, ShimLibrary, cpu_reference_provider,
+    shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
@@ -48,6 +49,21 @@ struct Pair {
     hip_mem: Arc<dyn DeviceMemory>,
     cpu_mem: Arc<dyn DeviceMemory>,
 }
+
+impl Pair {
+    /// The same pair with `hip` in place of the HIP provider (a bound implementation).
+    fn with_hip(&self, hip: Arc<dyn KernelProvider>) -> Pair {
+        Pair {
+            hip,
+            cpu: Arc::clone(&self.cpu),
+            hip_mem: Arc::clone(&self.hip_mem),
+            cpu_mem: Arc::clone(&self.cpu_mem),
+        }
+    }
+}
+
+/// The FP8 W8A8 (FP8_TENSOR / FP8_CHANNEL × FP8_TENSOR / FP8_TOKEN) implementations.
+const FP8_W8A8_IMPLS: [&str; 2] = ["hipblaslt_fp8", "turbine_hip_fp8_wmma"];
 
 /// One test at a time per process: device discovery (amd-smi) and the per-thread context.
 static GPU: Mutex<()> = Mutex::new(());
@@ -438,7 +454,8 @@ fn assert_implementations(p: &Pair) {
             "turbine_hip_int4_wmma",
             "turbine_hip_int4_dequant",
             "turbine_hip_mxfp4",
-            "turbine_hip_fp8_block"
+            "turbine_hip_fp8_block",
+            "turbine_hip_fp8_wmma"
         ]
     );
     assert_eq!(
@@ -447,7 +464,8 @@ fn assert_implementations(p: &Pair) {
     );
 }
 
-/// Phase 6a S-7: `hipblaslt_fp8` matches the CPU reference for FP8_TENSOR and FP8_CHANNEL
+/// Phase 6a S-7 (and 5p Task 14): `hipblaslt_fp8` and `turbine_hip_fp8_wmma`, each bound alone,
+/// match the CPU reference for FP8_TENSOR and FP8_CHANNEL
 /// weights × FP8_TENSOR (static) and FP8_TOKEN (dynamic) activations, M ∈ {1, 7, 16, 128, 513},
 /// every Llama-3.2-3B and Llama-3.1-8B linear shape, BF16 out (F32 out is refused by
 /// `supports`).
@@ -469,22 +487,51 @@ fn qgemm_matches_cpu() {
         (QuantSchemeDesc::Fp8Channel, ActQuantDesc::Fp8Tensor),
         (QuantSchemeDesc::Fp8Tensor, ActQuantDesc::Fp8Token),
     ];
+    // Each FP8 W8A8 implementation bound alone (hipblaslt_fp8 at every m; turbine_hip_fp8_wmma
+    // on its kernel up to 16 decode rows, on hipblaslt_fp8 above).
+    let providers: Vec<(String, Pair)> = FP8_W8A8_IMPLS
+        .iter()
+        .map(|&wanted| {
+            let info = p
+                .hip
+                .implementations(OpKind::QGemm)
+                .into_iter()
+                .find(|i| i.name == wanted)
+                .unwrap_or_else(|| panic!("{wanted} is not in the library"));
+            let spec = OpConfig::QGemm(QGemmConfig {
+                n: 3072,
+                k: 3072,
+                scheme: QuantSchemeDesc::Fp8Channel,
+                act_quant: ActQuantDesc::Fp8Token,
+                a_dtype: DType::F8E4M3,
+                c_dtype: DType::BF16,
+            });
+            let hip = p
+                .hip
+                .bind(&spec, &ImplChoice::Single(info.index))
+                .unwrap_or_else(|| panic!("bind {wanted}"));
+            (wanted.to_string(), p.with_hip(hip))
+        })
+        .collect();
     for (name, n, k) in SHAPES_3B.into_iter().chain(SHAPES_8B) {
         for (scheme, act) in combos {
             let weights = fp8_weights(&mut rng, scheme, n, k);
             for m in MS {
-                qgemm_case(
-                    &p,
-                    &mut rng,
-                    name,
-                    m,
-                    n,
-                    k,
-                    scheme,
-                    act,
-                    DType::BF16,
-                    &weights,
-                );
+                for (bound, pair) in &providers {
+                    println!("qgemm_matches_cpu: {bound}");
+                    qgemm_case(
+                        pair,
+                        &mut rng,
+                        name,
+                        m,
+                        n,
+                        k,
+                        scheme,
+                        act,
+                        DType::BF16,
+                        &weights,
+                    );
+                }
             }
         }
     }
@@ -961,6 +1008,248 @@ fn qgemm_fp8_block_rows_do_not_depend_on_m() {
                 );
             }
             println!("qgemm fp8 block {name} prefill={prefill}: rows independent of m ok");
+        }
+    }
+}
+
+/// Host-timed µs per call of `op` over `iters` back-to-back calls, after `warm` (at least two)
+/// warm-up calls: a pass over every cycled weight copy, so no timing pays first-touch costs.
+fn time_us(p: &Pair, warm: u32, iters: u32, mut op: impl FnMut()) -> f64 {
+    for _ in 0..warm.max(2) {
+        op();
+    }
+    p.hip_mem.synchronize().expect("synchronize");
+    let start = std::time::Instant::now();
+    for _ in 0..iters {
+        op();
+    }
+    p.hip_mem.synchronize().expect("synchronize");
+    start.elapsed().as_secs_f64() * 1e6 / f64::from(iters)
+}
+
+/// Lab microbenchmark (Phase 5p Task 14, S-15; no assertion on speed): the decode-step linear
+/// layers of Llama-3.2-3B at m ∈ {1, 2, 4, 8, 16} rows, per weight format the FP8 checkpoints
+/// serve — the BF16 GEMM (the tuned table), `qgemm` FP8_TENSOR × FP8_TENSOR (per-tensor
+/// checkpoint), FP8_CHANNEL × FP8_TOKEN (FP8-dynamic) and FP8_BLOCK × BF16 (FP8-block) — and the
+/// `quantize_act` before them, each timed alone over back-to-back calls with the weights cycled
+/// through ≥ 512 MiB of copies (never cache-resident, as in a forward). Prints one `qgemm_timing`
+/// line per (shape, format, m) with the weight-read bandwidth. Run with
+/// `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_qgemm -- qgemm_decode_timings --nocapture`.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_decode_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(83);
+    const ITERS: u32 = 100;
+    const TIMING_MS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+    let max_m = TIMING_MS[TIMING_MS.len() - 1];
+    let gemm = p.hip.gemm().expect("hip gemm");
+    let quantize = p.hip.quantize_act().expect("hip quantize_act (ABI v2.9)");
+    let report = |shape: &str, format: &str, impl_name: &str, m: usize, us: f64, bytes: usize| {
+        println!(
+            "qgemm_timing {shape:<11} {format:<22} m={m:<2} impl={impl_name:<24} {us:>8.1} us \
+             {:>5.0} GB/s",
+            bytes as f64 / (us * 1e3)
+        );
+    };
+    for (name, n, k) in SHAPES_3B {
+        let a_bf16 = tensor(
+            &p.hip_mem,
+            &[max_m, k],
+            DType::BF16,
+            &encode(DType::BF16, &rng.normal(max_m * k, 1.0)),
+        );
+        let a_fp8 = tensor(
+            &p.hip_mem,
+            &[max_m, k],
+            DType::F8E4M3,
+            &vec![0x38u8; max_m * k],
+        );
+        let a_scales = tensor(
+            &p.hip_mem,
+            &[max_m],
+            DType::F32,
+            &encode(DType::F32, &vec![0.01f32; max_m]),
+        );
+        let c = tensor(
+            &p.hip_mem,
+            &[max_m, n],
+            DType::BF16,
+            &vec![0u8; max_m * n * 2],
+        );
+
+        // BF16 GEMM on the tuned table (the BF16 checkpoint's decode layer).
+        {
+            let bytes = n * k * 2;
+            let raw = encode(DType::BF16, &rng.normal(n * k, 1.0 / (k as f32).sqrt()));
+            let copies = (512usize << 20).div_ceil(bytes).max(2);
+            let ws: Vec<Tensor> = (0..copies)
+                .map(|_| tensor(&p.hip_mem, &[n, k], DType::BF16, &raw))
+                .collect();
+            let cfg = GemmConfig {
+                n: n as u64,
+                k: k as u64,
+                trans_b: true,
+                a_dtype: DType::BF16,
+                b_dtype: DType::BF16,
+                c_dtype: DType::BF16,
+            };
+            for m in TIMING_MS {
+                let mut next = 0usize;
+                let us = time_us(&p, copies as u32, ITERS, || {
+                    next = (next + 1) % copies;
+                    gemm.execute(&mut GemmContext {
+                        a: row_range(&a_bf16, 0, m),
+                        b: ws[next].view(),
+                        c: row_range(&c, 0, m),
+                        trans_b: true,
+                        alpha: 1.0,
+                        beta: 0.0,
+                        prefill: false,
+                    })
+                    .expect("gemm");
+                });
+                report(name, "bf16", &gemm.implementation(&cfg), m, us, bytes);
+            }
+        }
+
+        // The FP8 formats: e4m3 weights, n·k bytes (the scales are negligible).
+        let formats = [
+            (
+                "fp8 tensor x tensor",
+                QuantSchemeDesc::Fp8Tensor,
+                ActQuantDesc::Fp8Tensor,
+            ),
+            (
+                "fp8 channel x token",
+                QuantSchemeDesc::Fp8Channel,
+                ActQuantDesc::Fp8Token,
+            ),
+            ("fp8 block x bf16", FP8_BLOCK, ActQuantDesc::None),
+        ];
+        for (format, scheme, act) in formats {
+            let block = matches!(scheme, QuantSchemeDesc::Fp8Block { .. });
+            let (codes, scales) = if block {
+                fp8_block_weights(&mut rng, n, k)
+            } else {
+                fp8_weights(&mut rng, scheme, n, k)
+            };
+            let bytes = n * k;
+            let copies = (512usize << 20).div_ceil(bytes).max(2);
+            let ws: Vec<(Tensor, Tensor)> = (0..copies)
+                .map(|_| {
+                    (
+                        tensor(&p.hip_mem, &[n, k], DType::F8E4M3, &codes),
+                        tensor(
+                            &p.hip_mem,
+                            &[scales.len()],
+                            DType::F32,
+                            &encode(DType::F32, &scales),
+                        ),
+                    )
+                })
+                .collect();
+            let cfg = QGemmConfig {
+                n: n as u32,
+                k: k as u32,
+                scheme,
+                act_quant: act,
+                a_dtype: if block { DType::BF16 } else { DType::F8E4M3 },
+                c_dtype: DType::BF16,
+            };
+            // Every implementation that takes the format, each bound alone.
+            let spec = OpConfig::QGemm(cfg);
+            let runs: Vec<(String, Arc<dyn KernelProvider>)> = p
+                .hip
+                .implementations(OpKind::QGemm)
+                .into_iter()
+                .filter(|info| p.hip.implementation_supports(&spec, info.index, None))
+                .map(|info| {
+                    let bound = p
+                        .hip
+                        .bind(&spec, &ImplChoice::Single(info.index))
+                        .expect("bind a qgemm implementation");
+                    (info.name, bound)
+                })
+                .collect();
+            for (impl_name, provider) in &runs {
+                let kernel = provider.qgemm().expect("qgemm");
+                for m in TIMING_MS {
+                    let mut next = 0usize;
+                    let us = time_us(&p, copies as u32, ITERS, || {
+                        next = (next + 1) % copies;
+                        let (a, a_s) = if block {
+                            (row_range(&a_bf16, 0, m), None)
+                        } else {
+                            (row_range(&a_fp8, 0, m), Some(row_range(&a_scales, 0, m)))
+                        };
+                        kernel
+                            .execute(&mut QGemmContext {
+                                cfg,
+                                a,
+                                a_scales: a_s,
+                                b: ws[next].0.view(),
+                                b_scales: ws[next].1.view(),
+                                b_zeros: None,
+                                c: row_range(&c, 0, m),
+                                alpha: 1.0,
+                                prefill: false,
+                            })
+                            .expect("qgemm");
+                    });
+                    report(name, format, impl_name, m, us, bytes);
+                }
+            }
+        }
+    }
+
+    // The activation quantization before each W8A8 layer.
+    for k in [3072usize, 8192] {
+        let x = tensor(
+            &p.hip_mem,
+            &[max_m, k],
+            DType::BF16,
+            &encode(DType::BF16, &rng.normal(max_m * k, 1.0)),
+        );
+        let out = tensor(
+            &p.hip_mem,
+            &[max_m, k],
+            DType::F8E4M3,
+            &vec![0u8; max_m * k],
+        );
+        let scales = tensor(&p.hip_mem, &[max_m], DType::F32, &vec![0u8; 4 * max_m]);
+        for mode in [ActQuantDesc::Fp8Tensor, ActQuantDesc::Fp8Token] {
+            let cfg = QuantizeActConfig {
+                cols: k as u32,
+                mode,
+                x_dtype: DType::BF16,
+                out_dtype: DType::F8E4M3,
+            };
+            for m in TIMING_MS {
+                let us = time_us(&p, 2, ITERS, || {
+                    quantize
+                        .execute(&mut QuantizeActContext {
+                            cfg,
+                            x: row_range(&x, 0, m),
+                            out: row_range(&out, 0, m),
+                            scales: row_range(&scales, 0, mode.scale_count(m, k).max(1)),
+                            static_scale: 0.01,
+                        })
+                        .expect("quantize_act");
+                });
+                report(
+                    &format!("k={k}"),
+                    &format!("quantize {}", mode.as_str()),
+                    &quantize.implementation(&cfg),
+                    m,
+                    us,
+                    m * k * 2,
+                );
+            }
         }
     }
 }

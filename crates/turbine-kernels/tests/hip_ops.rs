@@ -5309,6 +5309,8 @@ fn implementations_enumerated() {
                 ("turbine_hip_int4_dequant", "turbine_hip", false),
                 ("turbine_hip_mxfp4", "turbine_hip", false),
                 ("turbine_hip_fp8_block", "turbine_hip", false),
+                // Phase 5p Task 14: the FP8 W8A8 small-m decode kernel.
+                ("turbine_hip_fp8_wmma", "turbine_hip", false),
             ],
         ),
         (
