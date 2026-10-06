@@ -386,6 +386,10 @@ pub(crate) struct QGemmDesc {
     pub block_k: i32,
     pub alpha: f32,
     pub prefill: i32,
+    /// v2.13: the static FP8 tensor scale of unquantized (BF16) activations, read only by a
+    /// library of minor ≥ 13 and only with `a_dtype` BF16 and an FP8 tensor / token
+    /// `act_quant`.
+    pub act_static_scale: f32,
 }
 
 /// `turbine_quantize_act_desc` (v2.9).

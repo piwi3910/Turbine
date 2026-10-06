@@ -320,6 +320,7 @@ fn run(
         c: c.view(),
         alpha: 1.0,
         prefill,
+        act_static_scale: 1.0,
     };
     provider
         .qgemm()

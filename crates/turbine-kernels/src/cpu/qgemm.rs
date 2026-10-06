@@ -18,9 +18,35 @@ fn weight_bytes_per_row(scheme: QuantSchemeDesc, k: usize) -> usize {
     scheme.data_bytes(1, k)
 }
 
-/// The activation matrix as F32: BF16 / F32 as stored, FP8 decoded with its scales.
+/// True for the unquantized-activation form (kernel ABI v2.13): float `a` with an FP8 tensor or
+/// token act mode.
+fn unquantized_fp8(cfg: &QGemmConfig) -> bool {
+    matches!(
+        cfg.act_quant,
+        ActQuantDesc::Fp8Tensor | ActQuantDesc::Fp8Token
+    ) && is_float(cfg.a_dtype)
+}
+
+/// The activation matrix as F32: BF16 / F32 as stored, FP8 decoded with its scales; in the
+/// unquantized-activation form, quantized first exactly as `quantize_act` does and decoded.
 fn activations(ctx: &QGemmContext<'_>, m: usize, k: usize) -> Result<Vec<f32>, KernelError> {
     let mode = ctx.cfg.act_quant;
+    if unquantized_fp8(&ctx.cfg) {
+        let x = load(&ctx.a)?;
+        let (codes, scales) = quant::quantize_activations_fp8(&x, m, k, mode, ctx.act_static_scale);
+        return Ok(codes
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| {
+                let s = if mode == ActQuantDesc::Fp8Token {
+                    scales[i / k]
+                } else {
+                    scales[0]
+                };
+                quant::fp8_e4m3_value(q) * s
+            })
+            .collect());
+    }
     if !mode.is_fp8() {
         return load(&ctx.a);
     }
@@ -57,7 +83,7 @@ fn activations(ctx: &QGemmContext<'_>, m: usize, k: usize) -> Result<Vec<f32>, K
 impl QGemmKernel for CpuReference {
     fn supports(&self, cfg: &QGemmConfig) -> bool {
         let a_ok = if cfg.act_quant.is_fp8() {
-            cfg.a_dtype == DType::F8E4M3
+            cfg.a_dtype == DType::F8E4M3 || unquantized_fp8(cfg)
         } else {
             is_float(cfg.a_dtype)
         };
@@ -66,6 +92,17 @@ impl QGemmKernel for CpuReference {
 
     fn implementation(&self, _cfg: &QGemmConfig) -> String {
         "cpu_qgemm_ref".into()
+    }
+
+    /// The reference takes unquantized activations on decode calls (any row count), so host
+    /// runs cover both executor paths: decode steps without `quantize_act`, prefill steps with it.
+    fn quantizes_activations(&self, cfg: &QGemmConfig, _rows: usize, prefill: bool) -> bool {
+        !prefill
+            && cfg.a_dtype == DType::F8E4M3
+            && matches!(
+                cfg.act_quant,
+                ActQuantDesc::Fp8Tensor | ActQuantDesc::Fp8Token
+            )
     }
 
     fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError> {
@@ -356,12 +393,119 @@ mod tests {
                         c: c.view(),
                         alpha: 1.0,
                         prefill: false,
+                        act_static_scale: 1.0,
                     })
                     .unwrap();
                 let got = load(&c.view()).unwrap();
                 assert_eq!(got, want, "{} / {}", scheme.as_str(), mode.as_str());
             }
         }
+    }
+
+    /// Kernel ABI v2.13 on the reference: an FP8 W8A8 `qgemm` handed the BF16 activations
+    /// (`a_dtype` BF16, the act mode and static scale kept) equals `quantize_act` then `qgemm`
+    /// on its codes bit for bit, for tensor / channel weights × static tensor / dynamic token
+    /// activations, and the reference offers that form on decode calls only. Breaks if the
+    /// in-call quantization uses another scale (the static one for token mode, or 1.0), a
+    /// per-row scale of the wrong row, or if the executor would skip `quantize_act` on prefill.
+    #[test]
+    fn unquantized_fp8_activations_match_quantize_then_qgemm() {
+        let mem = mem();
+        let cpu = CpuReference;
+        let (m, n, k) = (3, 16, 256);
+        let static_scale = 0.02;
+        let mut rng = Rng(11);
+        for scheme in [QuantSchemeDesc::Fp8Tensor, QuantSchemeDesc::Fp8Channel] {
+            for mode in [ActQuantDesc::Fp8Tensor, ActQuantDesc::Fp8Token] {
+                let (data, scales, _) = quantized_weight(&mut rng, scheme, n, k);
+                // Rows of different magnitudes, so per-row (token) scales differ.
+                let x: Vec<f32> = (0..m * k)
+                    .map(|i| half::bf16::from_f32(rng.next() * (1 + i / k) as f32).to_f32())
+                    .collect();
+                let x_t = f32_tensor(&mem, &[m, k], DType::BF16, &x);
+                let b = bytes_tensor(&mem, &[n, k], DType::F8E4M3, &data);
+                let b_scales = f32_tensor(&mem, &[scales.len()], DType::F32, &scales);
+                let cfg = QGemmConfig {
+                    n: n as u32,
+                    k: k as u32,
+                    scheme,
+                    act_quant: mode,
+                    a_dtype: DType::F8E4M3,
+                    c_dtype: DType::BF16,
+                };
+                let run = |cfg: QGemmConfig, a: &Tensor, a_scales: Option<&Tensor>| {
+                    let c = Tensor::empty(&mem, &[m, n], DType::BF16).unwrap();
+                    cpu.qgemm()
+                        .unwrap()
+                        .execute(&mut QGemmContext {
+                            cfg,
+                            a: a.view(),
+                            a_scales: a_scales.map(Tensor::view),
+                            b: b.view(),
+                            b_scales: b_scales.view(),
+                            b_zeros: None,
+                            c: c.view(),
+                            alpha: 1.0,
+                            prefill: false,
+                            act_static_scale: static_scale,
+                        })
+                        .unwrap();
+                    let v: Vec<u32> = load(&c.view())
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    v
+                };
+                // Two launches: quantize_act, then qgemm on its codes.
+                let qcfg = QuantizeActConfig {
+                    cols: k as u32,
+                    mode,
+                    x_dtype: DType::BF16,
+                    out_dtype: DType::F8E4M3,
+                };
+                let codes = Tensor::empty(&mem, &[m, k], DType::F8E4M3).unwrap();
+                let s = Tensor::empty(&mem, &[mode.scale_count(m, k)], DType::F32).unwrap();
+                cpu.quantize_act()
+                    .unwrap()
+                    .execute(&mut QuantizeActContext {
+                        cfg: qcfg,
+                        x: x_t.view(),
+                        out: codes.view(),
+                        scales: s.view(),
+                        static_scale,
+                    })
+                    .unwrap();
+                let two = run(cfg, &codes, Some(&s));
+                // One launch on the BF16 activations.
+                let fused = QGemmConfig {
+                    a_dtype: DType::BF16,
+                    ..cfg
+                };
+                assert!(QGemmKernel::supports(&cpu, &fused), "{fused}");
+                assert!(cpu.quantizes_activations(&cfg, m, false), "{cfg}");
+                assert!(!cpu.quantizes_activations(&cfg, m, true), "{cfg} prefill");
+                let one = run(fused, &x_t, None);
+                assert_eq!(one, two, "{} / {}", scheme.as_str(), mode.as_str());
+            }
+        }
+        // Group-scaled activations keep the two launches.
+        let group = QGemmConfig {
+            n: n as u32,
+            k: k as u32,
+            scheme: QuantSchemeDesc::Fp8Channel,
+            act_quant: ActQuantDesc::Fp8Group { group: 128 },
+            a_dtype: DType::F8E4M3,
+            c_dtype: DType::BF16,
+        };
+        assert!(!cpu.quantizes_activations(&group, 1, false));
+        assert!(!QGemmKernel::supports(
+            &cpu,
+            &QGemmConfig {
+                a_dtype: DType::BF16,
+                ..group
+            }
+        ));
     }
 
     /// A mismatched weight size is refused, not read out of bounds.
@@ -394,6 +538,7 @@ mod tests {
                 c: c.view(),
                 alpha: 1.0,
                 prefill: true,
+                act_static_scale: 1.0,
             })
             .unwrap_err();
         assert!(err.to_string().contains("weight bytes"), "{err}");
