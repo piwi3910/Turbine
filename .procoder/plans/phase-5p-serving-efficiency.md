@@ -337,10 +337,10 @@ Interfaces:
   Covers: S-16 ACs (lab timing test + served TTFT)
   Depends on: Task 3
 
-- [ ] Provider evaluation (GPU 0, under the bench lock): CK `gemm_microscale_*` and llama.cpp mmq against the own tile on the 6a shapes; record in decisions.md; a provider that wins by ≥ 10 % is registered (one file per provider, the registry entry, the conformance suite) instead of tile work
-- [ ] Write failing lab timing test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound` (per layer shape ≤ 1.10 × the hipBLASLt BF16 time measured in the same run). Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4` — expect FAIL (tile unchanged)
-- [ ] Implement (provider or tile); `qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green
-- [ ] Landing (GPU 0): `scripts/lab-bench.sh --model llama8b-mxfp4 --concurrency 1 --quick` and the standard bench: TTFT p50 ≤ 1.05 × the same-day BF16 8B TTFT, golden c1 PASS; perf-log rows
+- [x] Provider evaluation (GPU 0, under the bench lock): CK `gemm_microscale_*` and llama.cpp mmq against the own tile on the 6a shapes; record in decisions.md; a provider that wins by ≥ 10 % is registered (one file per provider, the registry entry, the conformance suite) instead of tile work
+- [x] Write failing lab timing test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound` (per layer shape ≤ 1.10 × the hipBLASLt BF16 time measured in the same run). Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4` — expect FAIL (tile unchanged)
+- [x] Implement (provider or tile); `qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green — own Prefill tile (no provider within 10 %); the timing test still FAILS (1.0–1.44×, 7 of 8 shapes over 1.10); open re-bound in decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss"
+- [ ] Landing (GPU 0): `scripts/lab-bench.sh --model llama8b-mxfp4 --concurrency 1 --quick` and the standard bench: TTFT p50 ≤ 1.05 × the same-day BF16 8B TTFT, golden c1 PASS; perf-log rows — measured, MISS (1.25× c1, 1.15× c16; golden c1 15/16 as in 6a, unchanged); perf-log rows written; awaits the user's re-bound
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `perf(kernels): MXFP4 prefill at hipBLASLt speed`
 

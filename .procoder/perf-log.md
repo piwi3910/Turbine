@@ -1399,3 +1399,39 @@ labbook (in the table's order, g0a / g0b / g1): Llama c16 dc08b52f / ae7010ce / 
 Card state, from `amd-smi metric` sampled every 10 s during each run (the samples taken under load, > 100 W). Both cards have a 300 W socket power cap. Under load each card peaks at 280–300 W, with GFX clocks up to ~3.4 GHz, memory at 1258 MHz, hotspot 77–92 °C and memory 76–86 °C. The two cards behave the same: GPU 1 peaked at 300 W, 3.41 GHz and 91 °C hotspot. `THROTTLE_STATUS` reads `THROTTLED` on both cards under load, idle included for GPU 0, so it does not separate them. During the GPU 1 runs, GPU 0 carried other builders' jobs. That is allowed now that the one-GPU-job rule is lifted, and those jobs did not touch GPU 1. The PCIe chain in sysfs is the same on both cards: root port 00:01.0 or 00:01.1 → the card's switch at **Gen5 x8**, then Gen5 x16 inside the card to the GPU function (03:00.0 or 06:00.0). amd-smi's own PCIe field (GPU 0 "2.5 GT/s x8", GPU 1 "16 GT/s x8") contradicts sysfs and is not used. The old "GPU 1 is Gen4 x8" note no longer describes the hardware.
 
 Verdict: GPU 1 lands within 0.6 % of GPU 0 on both models at c16 and c1, inside the decision's ~3 % bound. **GPU 1 joins perf work**: `lab-bench.sh --gpu 1` is a peer of `--gpu 0`, and numbers from the two cards are comparable.
+
+### MXFP4 prefill tile (plan Task 15, S-16; branch `p5p-t15`, commits 648dcebe test + 45506bfb tile + the 1,024-row threshold, 2026-10-06)
+
+Provider re-evaluation, kernel tables, ablations and options: decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss". All runs GPU 0 under `bench.lock`.
+
+Tile sweep at m = 2,048 (eval harness, µs; 3b.qkv / 3b.o / 3b.gate_up / 3b.down / 8b.qkv / 8b.o / 8b.gate_up / 8b.down):
+
+| variant                                                                         | µs                                                          |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| hipBLASLt BF16 best of 8                                                        | 441 / 276 / 1,439 / 1,015 / 845 / 588 / 4,260 / 2,062       |
+| 6a Large tile (128×128, per-wave decode)                                        | 725 / 440 / 2,258 / 1,157 / 1,129 / 760 / 5,243 / 2,574     |
+| Large with 2 or 4 column fragments per wave                                     | 3.4–7× slower (register spills)                             |
+| shared decode 256×128, 32 k/step, scattered epilogue                            | 685 / 402 / 2,124 / 1,110 / 1,065 / 719 / 4,990 / 2,391     |
+| same, decode moved between the WMMAs (branch-free F32 decode)                   | 771 / 449 / 2,361 / 1,245 / 1,189 / 806 / 5,584 / 2,657     |
+| same, 16 k/step (2–3 blocks per CU)                                             | 788 / 462 / 2,220 / 2,942 / 1,548 / 1,295 / 5,498 / 3,482   |
+| 128×128 / 128×256 / 256×64 blocks                                               | 7–40 % slower than 256×128                                  |
+| **Prefill tile**: shared decode 256×128, 32 k/step, LDS-staged 16-byte epilogue | **637 / 380 / 2,002 / 1,033 / 1,020 / 695 / 4,694 / 2,336** |
+
+Ablations of the shared-decode tile (3b.gate_up / 8b.down µs): full 2,123 / 2,401; no decode 1,976 / 2,051; no global loads 2,118 / 2,213; no barrier 1,914 / 2,122; no WMMA 1,557 / 1,621; no decode/loads/stores/barrier (WMMA + LDS operand reads only) 1,638 / 1,708; no epilogue 1,725 / 1,982.
+
+Between 512 and 1,024 rows the Prefill tile wins only at multiples of 256 (e.g. 3b.gate_up 704 rows 776 vs 829 µs, 896 rows 1,026 vs 972), so it runs from 1,024 rows; prefill calls below use the Large tile, which gives the same bits.
+
+Lab test `qgemm_mxfp4_prefill_within_hipblaslt_bound` (MXFP4 / BF16 prefill `gemm` at 2,048 rows; bound 1.10): 1.44 / 1.42 / 1.26 / 1.14 / 1.23 / 1.13 / 1.27 / 0.99 — **FAIL** on 7 of 8 shapes (6a tile: 1.60 / 1.56 / 1.47 / 1.18 / 1.34 / 1.28 / 1.18 / 1.22, decision "P6"). `qgemm_mxfp4_matches_cpu` (now prefill calls too, up to 1,031 rows) and `qgemm_mxfp4_prefill_rows_are_batch_invariant` (1,031-row call vs 1 / 7 / 128 rows, crossing both tiles) pass.
+
+Served (`lab-bench.sh`; Prefill tile from 512 rows at the time, labels `t15-before` = kernel files at 648dcebe, `t15-after`, `t15-bf16`; not uploaded to labbook — lab-bench uploads only on exit 0 and golden c1 fails on both 8B slugs, see below):
+
+```
+BENCH t15-bf16   llama8b       quick=1 conc=1  tok/s=35.6  itl_p50=27.7 ttft_p50=123 golden1=FAIL (provisional 8B bounds)
+BENCH t15-before llama8b-mxfp4 quick=1 conc=1  tok/s=87.9  itl_p50=10.8 ttft_p50=149 golden1=FAIL (15/16, p05 tail 1.20)
+BENCH t15-after  llama8b-mxfp4 quick=1 conc=1  tok/s=88.1  itl_p50=10.8 ttft_p50=154 golden1=FAIL (identical lines)
+BENCH t15-bf16   llama8b       conc=16 tok/s=402.2 itl_p50=32.0 ttft_p50=481
+BENCH t15-before llama8b-mxfp4 conc=16 tok/s=673.2 itl_p50=15.1 ttft_p50=559
+BENCH t15-after  llama8b-mxfp4 conc=16 tok/s=675.5 itl_p50=15.1 ttft_p50=552
+```
+
+S-16 served target (TTFT p50 ≤ 1.05× same-day BF16 8B): **miss**, 1.25× at c1 and 1.15× at c16; the tile is served-neutral on this workload (~700-token prompts prefill below its range). With the 1,024-row threshold, prompts under 1,024 tokens run exactly the 6a kernel. Golden c1 output is line-for-line identical before and after.
