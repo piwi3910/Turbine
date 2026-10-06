@@ -1557,3 +1557,42 @@ Same recipe as Task 13's on-arm (`kv.ladder.l0=true`, `kv.partial_prefix_reuse=f
 - S-18 AC met: every run ends with **100 % rung-format L1 copies** (287–409 blocks against 141–161 without the drain), 16–22 reformats per run at **6–8 evictions + re-stores per reformat**, `rung_no_slot`/`no_room` actions down from ~1,600–1,900 to 159–383. Standard bench **849.2 tok/s** (S-2 baseline 852.2: 0.996×, inside the 0.97× bound), ITL p50 15.6 ms, TTFT p50 207 ms, golden c1 PASS (ladder off by default, so the drain is inert there).
 - On the ladder workload the drain trades throughput for capacity: median tok/s 291.1 against 310.2 for the same arm without the drain (0.94×; 0.85× the ladder-off arm) and ORANGE samples 63 against 44, with one run (r3) where L1's larger compressed capacity paid off (recomputed tokens −36 % against the off-arm median, cached ratio 0.865) at 911 s of L1/L2 rewrite time. The median recompute reduction stays −6 %.
 - labbook set `phase-5p-serving-efficiency`: `lab-bench:t17b-drain-r{1,2,3}-llama:c7718a96`, `lab-bench:t17-std-llama:c7718a96`, `lab-bench:t13b-l1l2-r{1,2,3}-llama:a5f4b4a3`.
+
+### b1 → CK split-KV edge re-timed (branch `p5p-gaps`, 2026-10-06)
+
+User decision 2026-10-06 ("5p b1 attention II", A: "re-time the edge"). `kTurbineB1CkSeqs` was 4, set
+from the pre-iteration b1 kernel. New harness `hip_ops b1_ck_edge_timings`: Llama heads, 128-token
+pages, RoPE fused as served, each call inside a captured graph of ≥ 28 calls on their own pools
+(≥ 512 MB of pools, cold KV, no host launch cost), the b1 entry and CK split-KV bound alone; the b1
+side above the old edge from a library built with the edge raised (not committed). novanas GPU 0,
+bench lock. µs per layer, b1 / CK:
+
+| b \ ctx | ~768          | ~2,048         | ~4,096          | ~8,192        |
+| ------- | ------------- | -------------- | --------------- | ------------- |
+| 1       | 13.1 / 41.6   | 22.6 / 85.3    | 36.4 / 153.0    | —             |
+| 4       | 32.7 / 44.9   | 65.6 / 91.2    | 118.8 / 165.4   | —             |
+| 8       | 55.4 / 63.1   | 121.1 / 129.6  | 233.6 / 239.0   | 450.8 / 451.2 |
+| 9       | —             | —              | 261.2 / 266.9   | 502.5 / 507.9 |
+| 10      | —             | —              | 290.5 / 292.1   | 569.2 / 563.7 |
+| 12      | 78.8 / 85.2   | 182.1 / 184.6  | 351.8 / 343.8   | 677.8 / 670.3 |
+| 16      | 100.6 / 106.8 | 240.5 / 239.6  | 455.9 / 451.4   | —             |
+| 32      | 213.2 / 209.3 | 504.3 / 492.0  | 935.3 / 933.4   | —             |
+| 64      | 535.1 / 402.6 | 1349.8 / 952.5 | 2394.4 / 1814.9 | —             |
+
+b1 is not slower than CK through 9 sequences at every context; at 10 it loses 1 % at ~8k, from 12 at
+~4k. **The edge moves to 10** (b1 for 1–9 sequences). The invariance test moves with it
+(`b1_decode_rows_are_batch_invariant`: b1 side batches 2, 3, 9 bitwise against alone; CK side 10,
+16, 64 bitwise against each other; cross-edge bound re-measured in lab run 1006094933: max |Δ|
+3.906e-3 on up to 1,317 / 3,072 elements over 216 cross-edge rows — unchanged, the 7.8125e-3 bound
+stays). Green in the same run: `paged_attention_rows_are_batch_invariant`,
+`paged_b1_decode_matches_cpu`, `paged_decode_splitkv_matches_cpu`,
+`paged_decode_fused_rope_matches_separate`.
+
+| Run (`lab-bench --c1 --golden16`, GPU 0, same session) | c16 tok/s | ITL p50 | c1 tok/s | ITL c1 p50 | golden c1 / c16 |
+| ------------------------------------------------------ | --------- | ------- | -------- | ---------- | --------------- |
+| base `p6b-stack` 8b6f27c4 (`gaps-base`)                | 852.1     | 15.5    | 82.8     | 11.86      | PASS / PASS     |
+| edge 10 (`gaps-edge10`)                                | 848.8     | 15.6    | 82.6     | 11.89      | PASS / PASS     |
+
+c16 0.996× (inside the 0.5 % GPU-0 drift bracket; the c16 bench decodes 16-sequence batches, CK on
+both sides of the change), c1 unchanged (batch 1 runs b1 on both). The win is for decode batches of
+4–9 sequences: 3–27 % less attention time per layer at those sizes.

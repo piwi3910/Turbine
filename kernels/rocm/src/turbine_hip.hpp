@@ -390,8 +390,10 @@ enum class PagedPath {
 // The b1 decode kernel's largest GQA group (its instantiated templates).
 constexpr int32_t kTurbineB1MaxGroup = 8;
 // The decode batch size from which the b1 entry runs CK fmha_fwd_splitkv
-// instead (when CK serves the page size; paged_attention.cpp).
-constexpr int32_t kTurbineB1CkSeqs = 4;
+// instead (when CK serves the page size; paged_attention.cpp). Re-timed after
+// the b1 kernel's second iteration (hip_ops b1_ck_edge_timings, 2026-10-06):
+// b1 is not slower than CK through 9 sequences at ~768 to ~8,192 tokens.
+constexpr int32_t kTurbineB1CkSeqs = 10;
 bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);
