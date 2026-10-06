@@ -40,6 +40,20 @@ const SHARDED_NORM_ORDER: &[&str] = &["turbine_hip"];
 /// vs 711 dequant, 512 rows 2,387 vs 1,402; decision "P6: INT4 group GEMM — provider
 /// evaluation (kernel reuse rule)").
 const INT4_WMMA_MAX_ROWS: u32 = 128;
+/// Decode rows up to which FP8 W8A8 weights (FP8_TENSOR / FP8_CHANNEL) run Turbine's own WMMA
+/// kernel (`turbine_hip_fp8_wmma`, `kMaxRows` in `qgemm_fp8_wmma.hip`): at batch 1 hipBLASLt's
+/// best FP8 solutions read the weights at 350-460 GB/s (decision "5p Task 14: FP8 c1 decode —
+/// provider evaluation (kernel reuse rule)"). The entry runs hipBLASLt itself for prefill steps
+/// and larger calls, so the tier only moves decode steps of up to this many rows.
+const FP8_WMMA_MAX_ROWS: u32 = 16;
+const QGEMM_DECODE_ORDER: &[&str] = &[
+    "turbine_hip_fp8_wmma",
+    "hipblaslt_fp8",
+    "turbine_hip_int4_wmma",
+    "turbine_hip_int4_dequant",
+    "turbine_hip_mxfp4",
+    "turbine_hip_fp8_block",
+];
 const QGEMM_SMALL_ORDER: &[&str] = &[
     "hipblaslt_fp8",
     "turbine_hip_int4_wmma",
@@ -107,7 +121,12 @@ pub static GFX1201: CardProfile = CardProfile {
             order: QGEMM_SMALL_ORDER,
             // INT4 (decision "P6: INT4 group GEMM — provider evaluation (kernel reuse rule)"):
             // the fused kernel up to INT4_WMMA_MAX_ROWS rows, dequantize + hipBLASLt above.
+            // FP8 W8A8: the own small-m kernel up to FP8_WMMA_MAX_ROWS rows (5p Task 14).
             row_tiers: &[
+                RowTierSpec {
+                    max_rows: Some(FP8_WMMA_MAX_ROWS),
+                    order: QGEMM_DECODE_ORDER,
+                },
                 RowTierSpec {
                     max_rows: Some(INT4_WMMA_MAX_ROWS),
                     order: QGEMM_SMALL_ORDER,

@@ -48,6 +48,10 @@
 //                                  (INT4_GROUP_ZP / _SYM, BF16 activations)
 //                                n turbine_hip_fp8_block [turbine_hip]
 //                                  (FP8_BLOCK 128 x 128, BF16 activations)
+//                                n+1 turbine_hip_fp8_wmma [turbine_hip]
+//                                  (hipblaslt_fp8's schemes; decode steps
+//                                  of <= 16 rows on an own kernel, every
+//                                  other call on hipblaslt_fp8)
 //   quantize_act (v2.9)          0 turbine_hip [turbine_hip] (FP8 modes)
 //   qgemm 3, quantize_act 1      turbine_hip_mxfp4 [turbine_hip] (MXFP4
 //                                  weights x BF16 activations; the
@@ -293,6 +297,9 @@ const ImplEntry kQGemm[] = {
         "turbine_hip_mxfp4", kTurbine),
     entry<Impl<turbine_qgemm_desc, qgemm_fp8_block_supports,
                qgemm_fp8_block_run>>("turbine_hip_fp8_block", kTurbine),
+    entry<
+        Impl<turbine_qgemm_desc, qgemm_fp8_wmma_supports, qgemm_fp8_wmma_run>>(
+        "turbine_hip_fp8_wmma", kTurbine),
 };
 const ImplEntry kQuantizeAct[] = {
     entry<Impl<turbine_quantize_act_desc, quantize_act_fp8_supports,

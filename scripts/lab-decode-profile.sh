@@ -2,7 +2,7 @@
 # lab-decode-profile.sh — per-kernel profile of a batch-1 decode step on novanas GPU 0
 # (phase-5p Task 18 / S-19).
 #
-#   scripts/lab-decode-profile.sh [--model llama|olmoe] [--label L] [--attach-ms <ms>]
+#   scripts/lab-decode-profile.sh [--model llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block] [--label L] [--attach-ms <ms>]
 #                                 [--requests <n>] [--max-tokens <n>] [--dry-run]
 #
 # 1. Builds the release server and the HIP kernel library (cached, like lab-bench.sh).
@@ -26,7 +26,7 @@ requests=24
 max_tokens=256
 dry=0
 usage() {
-	echo "usage: scripts/lab-decode-profile.sh [--model llama|olmoe] [--label L] [--attach-ms <ms>] [--requests <n>] [--max-tokens <n>] [--dry-run]" >&2
+	echo "usage: scripts/lab-decode-profile.sh [--model llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block] [--label L] [--attach-ms <ms>] [--requests <n>] [--max-tokens <n>] [--dry-run]" >&2
 	exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -70,6 +70,10 @@ llama)
 olmoe)
 	slug=olmoe-1b-7b-0125-instruct
 	cfg=scripts/lab/phase2c-novanas-olmoe.yaml
+	;;
+# The FP8 Llama checkpoints (5p Task 14), on their Phase 6a configs (lab-bench.sh's mapping).
+llama-fp8 | llama-fp8-tensor | llama-fp8-block)
+	read -r slug _ cfg < <("$(dirname "${BASH_SOURCE[0]}")/lab-bench.sh" --print-model "$model")
 	;;
 *)
 	echo "lab-decode-profile: unknown model $model" >&2
