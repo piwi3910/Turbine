@@ -3847,24 +3847,25 @@ reference's tokens. Triangle = today's bound + the slug's largest noise (the mos
 proposed = max(today, observed), capped at the triangle. Token-identity rule unchanged. Method, table and notes in
 each slug README, data in `tests/golden/<slug>/engine_spread.json`.
 
-| slug | bound (likely / tail / likely b / tail b) today | proposed | triangle cap | noise max (likely / tail) |
-|---|---|---|---|---|
-| llama-3.2-3b-instruct (BF16) | 0.15 / 0.55 / 0.25 / 0.75 | 0.15 / **0.56** / 0.25 / 0.75 | 0.34 / 1.44 / 0.44 / 1.64 | 0.18 / 0.89 |
-| olmoe-1b-7b-0125-instruct | 1.01 / 1.66 / 1.01 / 1.66 | 1.01 / **1.72** / 1.01 / **1.72** | 1.58 / 3.17 | 0.56 / 1.51 |
-| llama-3.2-3b-instruct-fp8 (per-tensor) | 1.36 / 2.99 / 1.36 / 2.99 | 1.36 / 2.99 / **1.42** / **5.34** | 2.65 / 5.84 | 1.28 / 2.85 |
-| llama-3.2-3b-instruct-fp8-dynamic | 0.78 / 5.08 / 0.78 / 5.08 | unchanged | 1.50 / 7.16 | 0.72 / 2.08 |
-| llama-3.2-3b-instruct-fp8-block | 0.19 / 0.55 / 0.25 / 0.75 | unchanged | 0.38 / 1.11 / 0.44 / 1.31 | 0.19 / 0.56 |
-| llama-3.2-3b-instruct-awq | 0.15 / 0.55 / 0.25 / 0.75 | unchanged | 0.29 / 1.31 / 0.39 / 1.51 | 0.13 / 0.75 |
-| llama-3.2-3b-instruct-gptq | 0.15 / 0.91 / 0.25 / 0.91 | unchanged | 0.35 / 1.44 / 0.45 / 1.44 | 0.20 / 0.52 |
-| llama-3.2-3b-instruct-gptq-own | 0.15 / 1.06 / 0.25 / 1.06 | unchanged | 0.28 / 1.99 / 0.38 / 1.99 | 0.13 / 0.93 |
-| llama-3.2-3b-instruct-autoround-gptq | 0.15 / 0.55 / 0.25 / 0.75 | unchanged | 0.30 / 1.05 / 0.40 / 1.25 | 0.14 / 0.50 |
-| llama-3.2-3b-instruct-fp8kv | 0.40 / 2.44 / 0.40 / 2.44 | unchanged | 0.82 / 3.65 | 0.42 / 1.20 |
-| llama-3.2-3b-instruct-yarn16 | 0.19 / 0.84 / 0.25 / 0.84 | unchanged | 0.34 / 1.59 / 0.41 / 1.59 | 0.15 / 0.74 |
-| llama-3.1-8b-instruct (BF16, provisional bounds) | 0.15 / 0.55 / 0.25 / 0.75 | **0.28** / 0.55 / **0.28** / **0.89** | 0.56 / 1.14 / 0.66 / 1.34 | 0.40 / 0.58 |
-| llama-3.1-8b-instruct-mxfp4a16 (experimental) | 0.15 / 0.90 / 0.15 / 0.90 | 0.15 / **1.20** / **0.31** / **6.02** | 0.46 / 6.23 | 0.31 / 5.33 (p05 pos 5 alone) |
-| olmoe-1b-7b-0125-instruct-fp8kv (experimental) | 1.10 / 2.01 / 1.10 / 2.01 | **1.14** / **3.42 cap** / **1.14** / **3.42 cap** | 2.06 / 3.42 | 0.96 / 1.40 |
+| slug                                             | bound (likely / tail / likely b / tail b) today | proposed                                          | triangle cap              | noise max (likely / tail)     |
+| ------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------- | ------------------------- | ----------------------------- |
+| llama-3.2-3b-instruct (BF16)                     | 0.15 / 0.55 / 0.25 / 0.75                       | 0.15 / **0.56** / 0.25 / 0.75                     | 0.34 / 1.44 / 0.44 / 1.64 | 0.18 / 0.89                   |
+| olmoe-1b-7b-0125-instruct                        | 1.01 / 1.66 / 1.01 / 1.66                       | 1.01 / **1.72** / 1.01 / **1.72**                 | 1.58 / 3.17               | 0.56 / 1.51                   |
+| llama-3.2-3b-instruct-fp8 (per-tensor)           | 1.36 / 2.99 / 1.36 / 2.99                       | 1.36 / 2.99 / **1.42** / **5.34**                 | 2.65 / 5.84               | 1.28 / 2.85                   |
+| llama-3.2-3b-instruct-fp8-dynamic                | 0.78 / 5.08 / 0.78 / 5.08                       | unchanged                                         | 1.50 / 7.16               | 0.72 / 2.08                   |
+| llama-3.2-3b-instruct-fp8-block                  | 0.19 / 0.55 / 0.25 / 0.75                       | unchanged                                         | 0.38 / 1.11 / 0.44 / 1.31 | 0.19 / 0.56                   |
+| llama-3.2-3b-instruct-awq                        | 0.15 / 0.55 / 0.25 / 0.75                       | unchanged                                         | 0.29 / 1.31 / 0.39 / 1.51 | 0.13 / 0.75                   |
+| llama-3.2-3b-instruct-gptq                       | 0.15 / 0.91 / 0.25 / 0.91                       | unchanged                                         | 0.35 / 1.44 / 0.45 / 1.44 | 0.20 / 0.52                   |
+| llama-3.2-3b-instruct-gptq-own                   | 0.15 / 1.06 / 0.25 / 1.06                       | unchanged                                         | 0.28 / 1.99 / 0.38 / 1.99 | 0.13 / 0.93                   |
+| llama-3.2-3b-instruct-autoround-gptq             | 0.15 / 0.55 / 0.25 / 0.75                       | unchanged                                         | 0.30 / 1.05 / 0.40 / 1.25 | 0.14 / 0.50                   |
+| llama-3.2-3b-instruct-fp8kv                      | 0.40 / 2.44 / 0.40 / 2.44                       | unchanged                                         | 0.82 / 3.65               | 0.42 / 1.20                   |
+| llama-3.2-3b-instruct-yarn16                     | 0.19 / 0.84 / 0.25 / 0.84                       | unchanged                                         | 0.34 / 1.59 / 0.41 / 1.59 | 0.15 / 0.74                   |
+| llama-3.1-8b-instruct (BF16, provisional bounds) | 0.15 / 0.55 / 0.25 / 0.75                       | **0.28** / 0.55 / **0.28** / **0.89**             | 0.56 / 1.14 / 0.66 / 1.34 | 0.40 / 0.58                   |
+| llama-3.1-8b-instruct-mxfp4a16 (experimental)    | 0.15 / 0.90 / 0.15 / 0.90                       | 0.15 / **1.20** / **0.31** / **6.02**             | 0.46 / 6.23               | 0.31 / 5.33 (p05 pos 5 alone) |
+| olmoe-1b-7b-0125-instruct-fp8kv (experimental)   | 1.10 / 2.01 / 1.10 / 2.01                       | **1.14** / **3.42 cap** / **1.14** / **3.42 cap** | 2.06 / 3.42               | 0.96 / 1.40                   |
 
 The current failures:
+
 - FP8 per-tensor c16 p14 (likely 1.40 > 1.36): passes the proposed 1.42; it is order noise (p14 position 18 alone
   ranges 1.28 over the captures).
 - FP8 per-tensor c16 p16 (tail 5.27 > 2.99): passes the proposed 5.34, but not because the value itself is order
@@ -3881,6 +3882,7 @@ The current failures:
   the two non-default switches (1.71 / 1.55; default 1.46); OLMoE's batched captures are bitwise equal to c1.
 
 Options:
+
 - A) Apply the proposed column to every slug (observed, capped at the triangle). FP8 per-tensor c16 goes green,
   including p16 under the uniform-bound reading; mxfp4a16's batched tail becomes 6.02 and OLMoE FP8 KV stays red.
 - B) Apply partially — recommended: the noise-justified moves on the supported rows (Llama BF16 tail 0.56, OLMoE
@@ -3890,7 +3892,11 @@ Options:
   offset made visible by order noise; B records that in its README.
 - C) Keep every bound; FP8 per-tensor c16 stays red under the A record (the b1 shift).
 
-## 5p FP8 follow-ups: the per-tensor golden bisect (2026-10-06, open)
+**Decision (user, 2026-10-06): A.** The proposed bounds apply to every slug (observed, capped at today's bound plus
+the slug's largest measured noise); the per-tensor p16 caveat is recorded in its README; OLMoE FP8 KV stays red (its
+offset exceeds the cap). The spread is re-measured after the fused-GEMV stages land.
+
+## 5p FP8 follow-ups: the per-tensor golden bisect (2026-10-06; decided in "5p golden tolerance vs engine summation order")
 
 Branch `p5p-fp8b` (perf log 5p "S-15 follow-ups"). The FP8 per-tensor checkpoint's golden c1 FAIL on the
 `p6b-stack` base (14/16: p14 likely |Δ| 1.48 > 1.36, p16 tail 5.54 > 2.99) bisects to **`b1c072ce` "the b1 decode
