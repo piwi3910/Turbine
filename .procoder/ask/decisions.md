@@ -3763,3 +3763,24 @@ Open items for the lead (measured, not landed — each would be its own landing)
 **Decision (user, 2026-10-06): 1 A, 2 yes.** The FP8 activation quantize is fused into the W8A8 GEMM (ABI semantics
 addition, decoder skips `quantize_act` when the bound qgemm takes BF16 activations), and FP8-block's `down` moves to
 16 waves as its own landing. Item 3 (the per-tensor golden c1 regression on the base) is bisected as a bug.
+
+## 5p FP8 follow-ups: the per-tensor golden bisect (2026-10-06, open)
+
+Branch `p5p-fp8b` (perf log 5p "S-15 follow-ups"). The FP8 per-tensor checkpoint's golden c1 FAIL on the
+`p6b-stack` base (14/16: p14 likely |Δ| 1.48 > 1.36, p16 tail 5.54 > 2.99) bisects to **`b1c072ce` "the b1 decode
+attention kernel"** (merged in `2951123f`): every point before it gives the 6a-exit numbers byte for byte (only
+p09 moves, from token-granular reuse, and passes), `b1c072ce` gives the base's FAIL byte for byte, and turning partial
+prefix reuse off on the base changes only p09. Mechanism: the b1 kernel's split and combine order moves every decode
+attention sum (the numerics class chosen 2026-10-04 B); this checkpoint has sat at its bounds since 6a (p16 tail
+2.889 of 2.99, p14 likely 1.108 of 1.36), so the shift crosses them. No kernel is wrong: BF16, FP8-dynamic and
+FP8-block keep PASS on the same kernel, and on the current tip (Task 14's W8A8 kernel, and this branch's fused
+quantize, byte-identical to it) per-tensor golden c1 passes 15/16 (p13 on its margin). Golden c16 per-tensor fails
+the same way on the base and the tip (p14 1.40, p16 tail 5.27; byte-identical runs). Fixing it inside a kernel would
+change the b1 numerics class the user chose, so it is not done here.
+
+- A) Accept: record the base FAIL as the b1 numerics shift on an edge-tight checkpoint; c1 passes at the tip; the
+  c16 per-tensor gate stays red until B or a later numerics change — recommended together with B as a follow-up
+- B) Re-derive the per-tensor tolerance with engine-order perturbation in the spread (the 1.36 / 2.99 bounds come from
+  the HF self-spread alone, which does not cover a decode-attention summation change; a fixture job under
+  `fixture.lock`)
+- C) Make b1's split/combine reproduce CK splitkv's summation order (gives back b1's own numerics class; kernel work)
