@@ -3512,3 +3512,21 @@ merged meanwhile (c1 +1.5 %, c16 neutral, golden PASS).
 ## GPU 1 vs GPU 0 on the new PSU: GPU 1 joins perf work (recorded result, 2026-10-06)
 
 This applies the user's rule from "New PSU validation sequence, then the GPU 1 benchmark" (within ~3 %: GPU 1 joins perf work). The measurement is from branch `p5p-gpu1`, same tree fa70043d, run back to back as GPU 0, then GPU 1, then GPU 0 again. GPU 1 / GPU 0 tok/s: Llama c16 855.9 vs 850.7 (1.006), OLMoE c16 614.9 vs 617.2 (0.996), Llama c1 78.1 vs 78.0 (1.001), OLMoE c1 150.3 vs 150.1 (1.002). ITL and TTFT p50 match within 1 ms (2 ms TTFT). Golden c1 passed on every run. Both cards link Gen5 x8 at the root port, then Gen5 x16 inside the card, and have the same 300 W cap, clocks and temperatures under load. The perf-log entry "GPU 1 vs GPU 0 on the new PSU" has the table and the labbook ids. Outcome: the GPU-0-only perf rule is lifted. `scripts/lab-bench.sh` accepts `--gpu 0|1` with no caveat, and AGENTS.md says perf numbers are comparable on either card. The earlier lift in the same branch also stands: the one-GPU-job rule (decision "New PSU validated"); lab-test and lab-serve hold bench.lock shared again, and `--gpus 2` and `lab-cluster.sh` are allowed. `TURBINE_LAB_ONE_GPU_JOB=1` restores that rule if the host needs it again.
+
+## 5p b1 attention breaks `tiny_model hip_matches_cpu` (2026-10-06)
+
+The merged-stack quick tier (97050b3c): `turbine-model --test tiny_model` `hip_matches_cpu` and
+`hip_v23_library_matches_cpu` fail at step 1 (the first decode step) with max |Δ logit| 0.1028 against the 1e-4
+bound. The tiny GPU model (4 query heads on 2 KV heads) runs the b1 decode attention at batch 1; b1 keeps the
+attention probabilities P in F32, while the test's CPU reference mirrors CK's order with BF16 P (its comment records
+that exact mismatch at 0.097). The b1 branch ran only kernel-level lab tests, so the merge exposed it.
+
+- A) The CPU reference models the b1 numerics (F32 P) when the HIP side runs b1 (grouped heads, < 4 sequences); the
+  1e-4 bound stays and the test keeps checking the real numerics (recommended)
+- B) Re-bound `HIP_MAX_ABS_LOGIT_DIFF` for the b1 class (~0.15); less work, but a same-size numerics mismatch elsewhere
+  would no longer be caught
+- C) Make b1 round P to BF16 like CK, so it rejoins CK's numerics class; a kernel change, re-running its invariance
+  and cross-edge bound tests
+
+**Decision (user, 2026-10-06): A.** The CPU reference models the b1 numerics (F32 P) where the HIP side runs b1; the
+1e-4 bound stays.
