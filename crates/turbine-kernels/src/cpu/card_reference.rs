@@ -262,6 +262,7 @@ mod tests {
                 block_formats: None,
                 classes: None,
                 tq: None,
+                rope: None,
             })
             .expect("decode");
         crate::cpu::load(&out.view()).expect("load out")
