@@ -141,6 +141,7 @@ mod tests {
             a_dtype: DType::BF16,
             b_dtype: DType::BF16,
             c_dtype: DType::F32,
+            gemv: false,
         };
         let gemm = cpu.gemm().expect("gemm family");
         assert!(gemm.supports(&gemm_cfg));

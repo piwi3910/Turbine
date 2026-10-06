@@ -2,7 +2,10 @@
 // turbine_impl_count / _info / _supports / _run enumerate and run
 // (impl_exports.cpp). Index order is the library order.
 //
-//   gemm                         0 hipblaslt [hipblaslt]
+//   gemm                         0 hipblaslt [hipblaslt], 1 vllm_wvsplitk
+//                                  [vllm] (BF16 x BF16, single-row decode
+//                                  calls on vLLM's wvSplitK GEMV, every
+//                                  other call on hipblaslt)
 //   attention_prefill / _decode  0 ck_tile_fmha_fwd [ck]
 //   rmsnorm, add_rmsnorm         0 ck_tile_rmsnorm2d [ck] (the instantiated
 //                                  BF16 buckets), 1 turbine_hip [turbine_hip]
@@ -75,6 +78,7 @@ namespace {
 constexpr const char *kHipblaslt = "hipblaslt";
 constexpr const char *kCk = "ck";
 constexpr const char *kTurbine = "turbine_hip";
+constexpr const char *kVllm = "vllm";
 
 // An implementation that is the whole op: its entry point trio.
 template <typename D, int32_t (*Supported)(const D *),
@@ -167,9 +171,24 @@ entry(const char *name, const char *provider, uint32_t flags = 0,
   return {name, provider, flags, profile_allows, &S::supports, &S::run};
 }
 
+// An implementation given by its supports / run pair (qgemm_impls.hpp,
+// gemm_wvsplitk.hip).
+template <typename D, bool (*Supports)(const D *),
+          int32_t (*Run)(turbine_ctx *, const D *)>
+struct Impl {
+  static bool supports(const void *d) {
+    return Supports(static_cast<const D *>(d));
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return Run(ctx, static_cast<const D *>(d));
+  }
+};
+
 const ImplEntry kGemm[] = {
     whole<turbine_gemm_desc, turbine_gemm_supported, turbine_gemm>("hipblaslt",
                                                                    kHipblaslt),
+    entry<Impl<turbine_gemm_desc, gemm_wvsplitk_supports, gemm_wvsplitk_run>>(
+        "vllm_wvsplitk", kVllm),
 };
 const ImplEntry kAttentionPrefill[] = {
     whole<turbine_attention_prefill_desc, turbine_attention_prefill_supported,
@@ -263,18 +282,6 @@ const ImplEntry kRowSumsq[] = {
 const ImplEntry kRmsnormSharded[] = {
     whole<turbine_rmsnorm_sharded_desc, turbine_rmsnorm_sharded_supported,
           turbine_rmsnorm_sharded>("turbine_hip", kTurbine),
-};
-
-// An implementation given by its supports / run pair (qgemm_impls.hpp).
-template <typename D, bool (*Supports)(const D *),
-          int32_t (*Run)(turbine_ctx *, const D *)>
-struct Impl {
-  static bool supports(const void *d) {
-    return Supports(static_cast<const D *>(d));
-  }
-  static int32_t run(turbine_ctx *ctx, const void *d) {
-    return Run(ctx, static_cast<const D *>(d));
-  }
 };
 
 template <Int4Path Path> struct Int4 {

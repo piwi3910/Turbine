@@ -220,6 +220,12 @@ pub struct GemmConfig {
     pub a_dtype: DType,
     pub b_dtype: DType,
     pub c_dtype: DType,
+    /// The caller's single-row calls may run a card's single-row GEMV (a `gemm` row tier of
+    /// one row, decision "5p fused batch-1 GEMV"): set by dense BF16 decoders on one device;
+    /// `false` keeps every call on the tiers above it, as before the GEMV landed. Not rendered:
+    /// every GEMM of one model carries the same value (`DecoderDims::gemv`), so a model's
+    /// configs stay distinct, and the selection's implementation and row tiers show it.
+    pub gemv: bool,
 }
 
 impl fmt::Display for GemmConfig {
@@ -1487,10 +1493,15 @@ mod tests {
             a_dtype: DType::BF16,
             b_dtype: DType::BF16,
             c_dtype: DType::F32,
+            gemv: false,
         };
         assert_eq!(
             gemm.to_string(),
             "n=3072 k=8192 trans_b=1 a_dtype=bf16 b_dtype=bf16 c_dtype=f32"
+        );
+        assert_eq!(
+            GemmConfig { gemv: true, ..gemm }.to_string(),
+            gemm.to_string()
         );
         assert_eq!(
             NormConfig {

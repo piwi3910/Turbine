@@ -242,7 +242,16 @@ impl DecoderDims {
             a_dtype: self.act,
             b_dtype: self.act,
             c_dtype,
+            gemv: self.gemv(),
         }
+    }
+
+    /// Whether this decoder's single-row GEMMs may run a card's single-row GEMV
+    /// ([`GemmConfig::gemv`]): dense, unquantized checkpoints on one device (user decision
+    /// "5p fused batch-1 GEMV", B staged: mixture-of-experts models, tensor parallelism and
+    /// quantized checkpoints keep their GEMM paths unchanged).
+    pub fn gemv(&self) -> bool {
+        self.moe.is_none() && self.tp.is_none() && self.quant.is_none()
     }
 
     /// RMSNorm over rows of `dim` elements.
@@ -2475,6 +2484,36 @@ mod tests {
         assert_eq!(d.attn_scale, p.attn_scale);
         assert_eq!(d.rope_attn_factor, (0.1 * 16f64.ln() + 1.0) as f32);
         assert_eq!(p.rope_attn_factor, 1.0);
+    }
+
+    /// User decision "5p fused batch-1 GEMV" (B staged, stage A): only a dense, unquantized
+    /// decoder on one device marks its GEMMs `gemv` (the card's single-row GEMV tier) —
+    /// Llama-3.2-3B yes; OLMoE, a tensor-parallel rank and a quantized checkpoint no. Breaks if
+    /// the GEMV reaches a path the decision keeps unchanged.
+    #[test]
+    fn gemv_only_for_dense_unquantized_one_device() {
+        let fixture = |name: &str| {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name);
+            crate::config::load_model_config_with(&dir, None).expect("fixture config")
+        };
+        let llama = fixture("llama-3.2-3b-instruct");
+        let d = DecoderDims::of(&llama);
+        assert!(d.gemv());
+        assert!(d.gemm(d.hidden, d.hidden, DType::BF16).gemv);
+        let olmoe = DecoderDims::of(&fixture("olmoe-1b-7b-0125-instruct"));
+        assert!(!olmoe.gemv());
+        assert!(!olmoe.gemm(olmoe.hidden, olmoe.hidden, DType::BF16).gemv);
+        let rank = DecoderDims::for_shard(&llama, Some(ShardSpec { rank: 0, world: 2 }))
+            .expect("tp 2 rank");
+        assert!(!rank.gemv());
+        let mut quant = DecoderDims::of(&llama);
+        quant.quant = Some(LinearQuant {
+            scheme: crate::weights::QuantScheme::Fp8Channel,
+            act: crate::weights::ActivationQuant::Fp8PerTokenDynamic,
+        });
+        assert!(!quant.gemv());
     }
 
     /// Review r13 P5: the activation-quantization scratch of an FP8-activation model is sized

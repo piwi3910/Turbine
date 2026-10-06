@@ -171,6 +171,7 @@ set(TURBINE_SOURCES
   src/graph.cpp
   src/gemm.cpp
   src/gemm_table.cpp
+  src/gemm_wvsplitk.hip
   src/attention.cpp
   src/rmsnorm.cpp
   src/elementwise.hip

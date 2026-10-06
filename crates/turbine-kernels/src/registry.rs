@@ -1383,6 +1383,7 @@ mod tests {
             a_dtype: DType::BF16,
             b_dtype: DType::BF16,
             c_dtype: DType::BF16,
+            gemv: false,
         })
         .into();
         let err = match build(&PREFER_B, &[gemm]) {

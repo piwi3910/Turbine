@@ -235,6 +235,7 @@ fn gemm_case(p: &Pair, rng: &mut Rng, m: usize, n: usize, k: usize, c_dtype: DTy
         a_dtype: DType::BF16,
         b_dtype: DType::BF16,
         c_dtype,
+        gemv: false,
     };
     let hip = p.hip.gemm().expect("hip gemm");
     assert!(hip.supports(&cfg), "hip must support gemm {cfg}");
@@ -288,6 +289,212 @@ fn bf16_gemm_matches_cpu() {
         }
         gemm_case(&p, &mut rng, m, VOCAB, HIDDEN, DType::F32);
     }
+}
+
+/// Llama-3.2-3B's decode GEMMs `(name, n, k, c_dtype)`: the fused q/k/v projection, o_proj,
+/// the fused gate/up projection, down and the LM head (F32 logits).
+const LLAMA_DECODE_GEMMS: [(&str, usize, usize, DType); 5] = [
+    ("qkv", 5120, HIDDEN, DType::BF16),
+    ("o_proj", HIDDEN, HIDDEN, DType::BF16),
+    ("gate_up", 2 * INTERMEDIATE, HIDDEN, DType::BF16),
+    ("down", HIDDEN, INTERMEDIATE, DType::BF16),
+    ("lm_head", VOCAB, HIDDEN, DType::F32),
+];
+
+/// The single-row GEMV implementation of `gemm` (decision "5p fused batch-1 GEMV", stage A).
+const GEMV_IMPL: &str = "vllm_wvsplitk";
+
+/// A dense decoder's `gemm` config (`gemv` set): the one the card's single-row tier serves.
+fn gemv_config(n: usize, k: usize, c_dtype: DType) -> OpConfig {
+    OpConfig::Gemm(GemmConfig {
+        gemv: true,
+        ..gemm_config(n, k, c_dtype)
+    })
+}
+
+/// `p` bound to the `gemm` implementation called `name`.
+fn bound_gemm(p: &Pair, name: &str) -> Pair {
+    let info = p
+        .hip
+        .implementations(OpKind::Gemm)
+        .into_iter()
+        .find(|i| i.name == name)
+        .unwrap_or_else(|| panic!("the library has no gemm implementation {name}"));
+    bound(p, &gemv_config(HIDDEN, HIDDEN, DType::BF16), info.index)
+}
+
+/// `c = a · bᵀ` of one row on `p`'s HIP gemm, as a step that prefills (`prefill`) or decodes;
+/// the output's bits.
+fn gemm_row_bits(p: &Pair, a: &Tensor, b: &Tensor, c_dtype: DType, prefill: bool) -> Vec<u32> {
+    let c = zeros_on_hip(p, &[1, b.shape[0]], c_dtype);
+    p.hip
+        .gemm()
+        .expect("hip gemm")
+        .execute(&mut GemmContext {
+            a: a.view(),
+            b: b.view(),
+            c: c.view(),
+            trans_b: true,
+            alpha: 1.0,
+            beta: 0.0,
+            prefill,
+        })
+        .expect("gemm");
+    read(&c).iter().map(|v| v.to_bits()).collect()
+}
+
+/// The single-row GEMV (`vllm_wvsplitk`, vLLM's wvSplitK) on every Llama-3.2-3B decode shape:
+/// matches the CPU reference under the GEMM tolerance, returns the same bits on three runs,
+/// and in a prefill step runs hipBLASLt (bit-equal to the bound `hipblaslt` implementation,
+/// so prefill keeps its invariant class and prefix reuse stays bit-exact). The card profile
+/// binds it for a dense decoder's single-row calls only: a config without `gemv`, and more
+/// than one row, never select it. Breaks if the kernel's launch (tile choice, strides, the F32
+/// LM-head store) or its decode-only gating regresses.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(43);
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let blaslt = bound_gemm(&p, "hipblaslt");
+    let index = |name: &str| {
+        p.hip
+            .implementations(OpKind::Gemm)
+            .into_iter()
+            .find(|i| i.name == name)
+            .map(|i| i.index)
+            .expect("enumerated")
+    };
+    let gemv_index = index(GEMV_IMPL);
+    for (name, n, k, c_dtype) in LLAMA_DECODE_GEMMS {
+        // The selection: one row of a `gemv` config only.
+        let dense = gemv_config(n, k, c_dtype);
+        assert!(
+            p.hip.implementation_supports(&dense, gemv_index, Some(1)),
+            "{name}"
+        );
+        assert!(
+            !p.hip.implementation_supports(&dense, gemv_index, Some(2)),
+            "{name}"
+        );
+        let plain = OpConfig::Gemm(gemm_config(n, k, c_dtype));
+        assert!(
+            !p.hip.implementation_supports(&plain, gemv_index, Some(1)),
+            "{name}"
+        );
+
+        gemm_case(&gemv, &mut rng, 1, n, k, c_dtype);
+
+        let a = on_hip(&p, &[1, k], DType::BF16, &rng.normal(k, 1.0));
+        let w = rng.normal(n * k, 1.0 / (k as f32).sqrt());
+        let b = on_hip(&p, &[n, k], DType::BF16, &w);
+        let first = gemm_row_bits(&gemv, &a, &b, c_dtype, false);
+        for run in 1..3 {
+            assert!(
+                gemm_row_bits(&gemv, &a, &b, c_dtype, false) == first,
+                "{name}: run {run} differs from run 0"
+            );
+        }
+        assert!(
+            gemm_row_bits(&gemv, &a, &b, c_dtype, true)
+                == gemm_row_bits(&blaslt, &a, &b, c_dtype, true),
+            "{name}: a prefill step's row is not hipBLASLt's"
+        );
+        println!("gemv_matches_cpu {name} n={n} k={k}: ok");
+    }
+}
+
+/// Lab microbenchmark: the single-row GEMV against hipBLASLt (the bound implementations, a
+/// decode step) on every Llama-3.2-3B decode shape, each call one node of a captured graph of
+/// ≥ 112 calls (as the served decode graph runs them), weights cycled over ≥ 512 MB so they never
+/// stay in the 64 MB MALL; prints µs and GB/s per shape and the per-layer sum, and asserts the
+/// GEMV's layer sum (qkv + o_proj + gate_up + down) is not slower than hipBLASLt's by more than
+/// 2 % (its reason to be preferred, decision "5p fused batch-1 GEMV": 327.7 vs 341.0 µs). Run
+/// with `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test hip_ops -- gemv_timings --nocapture`
+/// (GPU 0 for comparable numbers).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(47);
+    const ITERS: u32 = 15;
+    const GRAPH_CALLS: usize = 112;
+    let impls = [GEMV_IMPL, "hipblaslt"];
+    let pairs: Vec<Pair> = impls.iter().map(|name| bound_gemm(&p, name)).collect();
+    let mut layer = [0.0f64; 2];
+    for (name, n, k, c_dtype) in LLAMA_DECODE_GEMMS {
+        let bytes = n * k * 2;
+        let raw = encode(
+            DType::BF16,
+            &pattern(&mut rng, n * k, 1.0 / (k as f32).sqrt()),
+        );
+        let copies = (512usize << 20).div_ceil(bytes).max(2);
+        let ws: Vec<Tensor> = (0..copies)
+            .map(|_| raw_on_hip(&p, &[n, k], DType::BF16, &raw))
+            .collect();
+        let a = on_hip(&p, &[1, k], DType::BF16, &pattern(&mut rng, k, 1.0));
+        let c = zeros_on_hip(&p, &[1, n], c_dtype);
+        let mut line = format!("gemv_timings {name:<8} n={n:<6} k={k:<5}");
+        // One graph node per call, as in the served decode graph: `calls` calls cycling the
+        // weight copies (device time plus the in-graph boundary, no host launch).
+        let calls = copies.max(GRAPH_CALLS);
+        for (i, pair) in pairs.iter().enumerate() {
+            let gemm = pair.hip.gemm().expect("hip gemm");
+            let call = |w: &Tensor| {
+                gemm.execute(&mut GemmContext {
+                    a: a.view(),
+                    b: w.view(),
+                    c: c.view(),
+                    trans_b: true,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    prefill: false,
+                })
+                .expect("gemm");
+            };
+            // Warm-up outside the graph (hipBLASLt's first call picks its algorithm).
+            call(&ws[0]);
+            p.hip_mem.synchronize().expect("synchronize");
+            p.ctx.graph_begin().expect("graph begin");
+            for j in 0..calls {
+                call(&ws[j % copies]);
+            }
+            let graph = p.ctx.graph_end().expect("graph end");
+            let us = time_us(&p, ITERS, || {
+                p.ctx.graph_launch(&graph).expect("graph launch");
+            }) / calls as f64;
+            if name != "lm_head" {
+                layer[i] += us;
+            }
+            line += &format!(
+                "  {}={us:8.1} us ({:4.0} GB/s)",
+                impls[i],
+                bytes as f64 / (us * 1e3)
+            );
+        }
+        println!("{line}");
+    }
+    println!(
+        "gemv_timings layer (qkv+o+gate_up+down): {}={:.1} us  hipblaslt={:.1} us  ratio={:.3}",
+        GEMV_IMPL,
+        layer[0],
+        layer[1],
+        layer[0] / layer[1]
+    );
+    assert!(
+        layer[0] <= layer[1] * 1.02,
+        "the single-row GEMV's layer ({:.1} us) is slower than hipBLASLt's ({:.1} us)",
+        layer[0],
+        layer[1]
+    );
 }
 
 /// One attention call on HIP over the whole query, compared with the CPU reference on row
@@ -3316,6 +3523,7 @@ fn gemm_config(n: usize, k: usize, c_dtype: DType) -> GemmConfig {
         a_dtype: DType::BF16,
         b_dtype: DType::BF16,
         c_dtype,
+        gemv: false,
     }
 }
 
@@ -5581,6 +5789,7 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
             a_dtype: dtype("a_dtype"),
             b_dtype: dtype("b_dtype"),
             c_dtype: dtype("c_dtype"),
+            gemv: false,
         }),
         "attention_prefill" => attention(AttentionKind::Prefill),
         "attention_decode" => attention(AttentionKind::Decode),
@@ -5659,7 +5868,11 @@ fn recorded_choices() -> Vec<(&'static str, OpConfig, String)> {
         let entries: serde_json::Value = serde_json::from_str(&text).expect("kernel choices JSON");
         for e in entries.as_array().expect("an array of choices") {
             let field = |k: &str| e[k].as_str().unwrap_or_else(|| panic!("{k} in {e}"));
-            let spec = parse_choice(field("op"), field("config"));
+            let mut spec = parse_choice(field("op"), field("config"));
+            // The served dense model's GEMMs carry `gemv` (`DecoderDims::gemv`; not rendered).
+            if let OpConfig::Gemm(g) = &mut spec {
+                g.gemv = model == "llama";
+            }
             out.push((model, spec, field("implementation").to_string()));
         }
     }
@@ -5712,7 +5925,14 @@ fn implementations_enumerated() {
     // (name, provider, needs host offsets) in library order.
     type Impls = Vec<(&'static str, &'static str, bool)>;
     let table: Vec<(OpKind, Impls)> = vec![
-        (OpKind::Gemm, one("hipblaslt", "hipblaslt")),
+        (
+            OpKind::Gemm,
+            vec![
+                ("hipblaslt", "hipblaslt", false),
+                // The single-row GEMV (decision "5p fused batch-1 GEMV", stage A).
+                ("vllm_wvsplitk", "vllm", false),
+            ],
+        ),
         (OpKind::AttentionPrefill, one("ck_tile_fmha_fwd", "ck")),
         (OpKind::AttentionDecode, one("ck_tile_fmha_fwd", "ck")),
         (OpKind::Rmsnorm, norm.clone()),
@@ -5787,6 +6007,23 @@ fn implementations_enumerated() {
     let first_tier = GFX1201.thresholds.moe_small_max_rows;
     for (model, spec, recorded) in recorded_choices() {
         let what = format!("{model} {} {}", spec.op(), spec.render());
+        // A dense decoder's GEMM serves its single-row calls from the profile's one-row tier
+        // (the GEMV, not the library's first implementation); recorded is that tier's choice.
+        if let OpConfig::Gemm(GemmConfig { gemv: true, .. }) = spec {
+            let gemv = p
+                .hip
+                .implementations(OpKind::Gemm)
+                .into_iter()
+                .find(|i| i.name == recorded)
+                .unwrap_or_else(|| panic!("{what}: no implementation {recorded}"));
+            assert_eq!(recorded, GEMV_IMPL, "{what}");
+            assert!(
+                p.hip.implementation_supports(&spec, gemv.index, Some(1)),
+                "{what}: {recorded} refuses one row"
+            );
+            println!("{what}: {recorded} ok");
+            continue;
+        }
         let legacy = spec
             .probe(p.hip.as_ref())
             .unwrap_or_else(|| panic!("{what}: unsupported"));
@@ -5863,6 +6100,7 @@ fn every_implementation_matches_cpu() {
             a_dtype: bf16,
             b_dtype: bf16,
             c_dtype,
+            gemv: false,
         })
     };
     let attention = |kind, block_tokens: Option<usize>, (q, kv): (usize, usize)| {
@@ -5909,6 +6147,17 @@ fn every_implementation_matches_cpu() {
                 gemm_case(p, rng, 17, 1024, HIDDEN, DType::F32);
             }),
         ),
+        // A dense decoder's single-row calls (the `gemm` one-row tier: `vllm_wvsplitk`) on
+        // every Llama-3.2-3B decode shape.
+        ImplCase {
+            spec: gemv_config(HIDDEN, HIDDEN, bf16),
+            rows: Some(1),
+            run: Box::new(|p, _name, rng| {
+                for (_, n, k, c_dtype) in LLAMA_DECODE_GEMMS {
+                    gemm_case(p, rng, 1, n, k, c_dtype);
+                }
+            }),
+        },
         case(
             attention(AttentionKind::Prefill, None, (Q_HEADS, KV_HEADS)),
             Box::new(|p, _name, rng| {
