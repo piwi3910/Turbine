@@ -1445,13 +1445,17 @@ impl ShimProvider {
 // Probe descriptors for `supports`/`implementation`: the config's shapes and dtypes with null
 // pointers and dense strides; the per-call dimension (tokens, rows) is 1.
 
-fn gemm_probe(cfg: &GemmConfig) -> GemmDesc {
+/// `rows` is the probed call's row count (a `gemm` row tier's bound; 1 when absent). A config
+/// without [`GemmConfig::gemv`] is probed with at least 2 rows, so an implementation that serves
+/// single-row calls only (the card's GEMV) never binds to it.
+fn gemm_probe(cfg: &GemmConfig, rows: Option<u32>) -> GemmDesc {
     let (n, k) = (cfg.n as i64, cfg.k as i64);
+    let rows = i64::from(rows.unwrap_or(1).max(1));
     GemmDesc {
         a: null(),
         b: null(),
         c: null(),
-        m: 1,
+        m: if cfg.gemv { rows } else { rows.max(2) },
         n,
         k,
         lda: k,
@@ -2514,11 +2518,11 @@ impl LogitsReduceKernel for ShimProvider {
 
 impl GemmKernel for ShimProvider {
     fn supports(&self, cfg: &GemmConfig) -> bool {
-        Self::supported(&self.syms().gemm, &gemm_probe(cfg))
+        Self::supported(&self.syms().gemm, &gemm_probe(cfg, None))
     }
 
     fn implementation(&self, cfg: &GemmConfig) -> String {
-        self.implementation_of(OpKind::Gemm, &self.syms().gemm, &gemm_probe(cfg))
+        self.implementation_of(OpKind::Gemm, &self.syms().gemm, &gemm_probe(cfg, None))
     }
 
     fn execute(&self, ctx: &mut GemmContext<'_>) -> Result<(), KernelError> {
@@ -2540,7 +2544,9 @@ impl GemmKernel for ShimProvider {
             beta: ctx.beta,
         };
         self.ctx.gemm_step(ctx.prefill)?;
-        self.run(OpKind::Gemm, &self.syms().gemm, &d, 0)
+        // The row count picks the bound row tier (the card's single-row GEMV tier).
+        let rows = ctx.a.shape.first().copied().unwrap_or(0);
+        self.run(OpKind::Gemm, &self.syms().gemm, &d, rows)
     }
 }
 
@@ -3344,11 +3350,11 @@ impl KernelProvider for ShimProvider {
     }
 
     /// `turbine_impl_supports` on the probe descriptor of `spec` (a `moe_experts` probe covers
-    /// `rows` routed rows), after the same config checks as the family's `supports`.
+    /// `rows` routed rows, a `gemm` probe `rows` rows), after the same config checks as the family's `supports`.
     fn implementation_supports(&self, spec: &OpConfig, index: u32, rows: Option<u32>) -> bool {
         let lib = &self.ctx.lib;
         match spec {
-            OpConfig::Gemm(cfg) => lib.impl_supports(OpKind::Gemm, index, &gemm_probe(cfg)),
+            OpConfig::Gemm(cfg) => lib.impl_supports(OpKind::Gemm, index, &gemm_probe(cfg, rows)),
             OpConfig::Attention(cfg) if cfg.kind.is_paged() => {
                 cfg.block_tokens.is_some_and(|b| b > 0)
                     && lib.impl_supports(cfg.op(), index, &paged_probe(cfg))

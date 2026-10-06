@@ -180,6 +180,22 @@ mod tests {
         );
         let order = |op| p.preference(op).map(|pref| pref.order);
         assert_eq!(order(OpKind::Gemm), Some(&["hipblaslt"][..]));
+        let gemm_tiers = p.preference(OpKind::Gemm).map(|pref| pref.row_tiers);
+        assert_eq!(
+            gemm_tiers,
+            Some(
+                &[
+                    RowTierSpec {
+                        max_rows: Some(1),
+                        order: &["vllm_wvsplitk", "hipblaslt"],
+                    },
+                    RowTierSpec {
+                        max_rows: None,
+                        order: &["hipblaslt"],
+                    },
+                ][..]
+            )
+        );
         for op in [OpKind::AttentionPrefill, OpKind::AttentionDecode] {
             assert_eq!(order(op), Some(&["ck_tile_fmha_fwd"][..]), "{op}");
         }

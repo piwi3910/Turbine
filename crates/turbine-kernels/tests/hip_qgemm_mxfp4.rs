@@ -753,6 +753,7 @@ fn qgemm_mxfp4_prefill_within_hipblaslt_bound() {
             a_dtype: DType::BF16,
             b_dtype: DType::BF16,
             c_dtype: DType::BF16,
+            gemv: false,
         };
         let c = tensor(
             &p.hip_mem,

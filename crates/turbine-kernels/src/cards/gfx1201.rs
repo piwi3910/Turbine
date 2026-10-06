@@ -39,6 +39,11 @@ const MOE_PREFILL_ORDER: &[&str] = &[
     "hipblaslt_per_expert",
 ];
 
+const GEMM_ORDER: &[&str] = &["hipblaslt"];
+/// Rows up to which `gemm` prefers the single-row GEMV `vllm_wvsplitk` (it computes one row;
+/// the library entry runs hipBLASLt for prefill steps, so only decode rows change class).
+const GEMV_MAX_ROWS: u32 = 1;
+
 const RMSNORM_ORDER: &[&str] = &["ck_tile_rmsnorm2d", "turbine_hip"];
 const PAGED_ORDER: &[&str] = &["ck_tile_fmha_pagedkv", "turbine_hip"];
 const PAGED_DECODE_ORDER: &[&str] = &[
@@ -94,10 +99,22 @@ pub static GFX1201: CardProfile = CardProfile {
         paged_page_multiple: 128,
     },
     preferences: &[
+        // Single-row calls of dense BF16 decoders (`GemmConfig::gemv`) on vLLM's wvSplitK GEMV
+        // (user decision "5p fused batch-1 GEMV", B staged, stage A: the fastest correct m = 1
+        // GEMV on every Llama-3.2-3B decode shape); every other call on hipBLASLt.
         OpPreference {
             op: OpKind::Gemm,
-            order: &["hipblaslt"],
-            row_tiers: &[],
+            order: GEMM_ORDER,
+            row_tiers: &[
+                RowTierSpec {
+                    max_rows: Some(GEMV_MAX_ROWS),
+                    order: &["vllm_wvsplitk", "hipblaslt"],
+                },
+                RowTierSpec {
+                    max_rows: None,
+                    order: GEMM_ORDER,
+                },
+            ],
         },
         OpPreference {
             op: OpKind::AttentionPrefill,

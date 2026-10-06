@@ -1792,3 +1792,31 @@ golden c1 PASS and 192/192 on every run. "L0 rewrites" = `turbine_kv_ladder_acti
   — token-granular reuse on the classed L0 pool serves (before 418b742d it was HTTP 500 + `circuit_open`).
 - labbook set `phase-5p-serving-efficiency`: `lab-bench:t13b-std-llama:cc85653a`, `lab-bench:t13c-l0{on,off}-r{1,2,3}-llama:cc85653a`,
   `lab-bench:t13b-l0{on,off}-r1-llama:cc85653a`.
+
+## 5p GEMV stage A: vLLM wvSplitK as the m = 1 BF16 GEMV (2026-10-06, branch `p5p-gemv-a`)
+
+User decision "5p fused batch-1 GEMV" (B, staged), stage A: `vllm_wvsplitk` (`kernels/rocm/src/gemm_wvsplitk.hip`,
+vLLM `skinny_gemms.cu` @ b267fe4, Apache-2.0) bound in a one-row `gemm` tier of the gfx1201 profile for dense,
+unquantized, one-device decoders (`GemmConfig::gemv`); prefill steps, m > 1, TP, OLMoE and quantized checkpoints keep
+hipBLASLt. No ABI change (a second `gemm` implementation).
+
+Kernel (`hip_ops gemv_timings`, release, one graph node per call, ≥ 112 calls, weights cycled over ≥ 512 MB; µs):
+
+| Shape          | qkv  | o_proj | gate_up | down | layer sum | lm_head F32 |
+| -------------- | ---- | ------ | ------- | ---- | --------- | ----------- |
+| vllm_wvsplitk  | 51.9 | 32.3   | 160.0   | 83.7 | **327.9** | 1241.7      |
+| hipblaslt      | 54.7 | 33.0   | 161.3   | 82.7 | 331.8     | 1247.6      |
+
+(Timed eagerly the order flips — 349.7 vs 336.4 — so the test times inside a graph, as the served decode runs.)
+
+Served (`lab-bench.sh --gpu 0`, one session, commit 485c5e88, client on novanas):
+
+| Run                                   | tok/s     | ITL p50 (ms) | TTFT p50 (ms) | golden c1 / c16 | baseline                                   |
+| ------------------------------------- | --------- | ------------ | ------------- | --------------- | ------------------------------------------ |
+| Llama c1 `--quick` (`p5p-gemv-a-c1`)  | **87.0**  | **11.3**     | 54            | PASS / —        | 83.2 / 11.81 (`gaps-lr`); 77.8 / 12.7 (S-1) |
+| Llama c16 200 req (`p5p-gemv-a`)      | 853.2     | 15.5         | 207           | PASS / PASS     | 852.2 / 15.5 / 207 (S-1 median of 3)       |
+| OLMoE c16 `--quick` (`p5p-gemv-a`)    | 622.2     | 24.4         | 141           | PASS / —        | 615.4 / 24.4 / 118 (S-1)                   |
+
+Llama c1 decode step 11.81 → 11.3 ms (0.957×, eff. BW 545 → ~569 GB/s, ~0.89×); c16 and OLMoE unchanged (OLMoE never
+binds the GEMV; its gemm selections are as recorded). `tests/lab/kernel-choices-llama.json`: the five Llama GEMMs now
+select `vllm_wvsplitk` (status `tiers`: ≤ 1 rows vllm_wvsplitk, above hipblaslt).

@@ -1289,6 +1289,7 @@ fn qgemm_decode_timings() {
                 a_dtype: DType::BF16,
                 b_dtype: DType::BF16,
                 c_dtype: DType::BF16,
+                gemv: false,
             };
             for m in TIMING_MS {
                 let mut next = 0usize;

@@ -154,6 +154,9 @@ struct turbine_ctx {
   // hipDeviceAttributeWallClockRate of the device (kHz), read at the first
   // host-mapped collective step (hostmem.hip); 0 until then.
   int64_t wall_clock_khz = 0;
+  // Compute units of the device (hipDeviceAttributeMultiprocessorCount), read
+  // at the first single-row GEMV (gemm_wvsplitk.hip); 0 until then.
+  int cu_count = 0;
   // True between turbine_graph_begin and turbine_graph_end (graph.cpp): the
   // stream is being captured, so copies, syncs and allocations are refused.
   bool capturing = false;
@@ -309,6 +312,13 @@ int32_t launch_moe_wmma_prefill(turbine_ctx *ctx,
                                 void *act, void *down);
 // hidden and inter are multiples of the prefill kernels' loop step (256).
 bool moe_prefill_shape(const turbine_moe_experts_desc *d);
+
+// The single-row BF16 GEMV gemm implementation vllm_wvsplitk
+// (gemm_wvsplitk.hip): supports = hipblaslt's supports, m = 1 and the
+// kernel's shapes; run launches the kernel in decode steps and runs hipblaslt
+// (turbine_gemm) for every other call it supports.
+bool gemm_wvsplitk_supports(const turbine_gemm_desc *d);
+int32_t gemm_wvsplitk_run(turbine_ctx *ctx, const turbine_gemm_desc *d);
 
 // Asks hipBLASLt for a grouped BF16 GEMM solution on ctx's device (moe.cpp);
 // false when there is none (ROCm 7.14.1 on RDNA4) or the query fails.

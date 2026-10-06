@@ -4573,7 +4573,18 @@ fn hip_v23_library_matches_cpu() {
                 .map(|s| (s.op, s.config.clone(), s.implementation.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(chosen(&old_sel), chosen(&new_sel), "{name}");
+        // The one-row `gemm` tier (`vllm_wvsplitk`, user decision "5p fused batch-1 GEMV") is
+        // a card-profile choice a v2.3 library cannot make: its GEMMs run hipBLASLt at every row
+        // count, which is the v2.4 selection's open tier.
+        let open_tier = |mut v: Vec<(OpKind, String, String)>| {
+            for (op, _, implementation) in &mut v {
+                if *op == OpKind::Gemm && implementation == "vllm_wvsplitk" {
+                    *implementation = "hipblaslt".into();
+                }
+            }
+            v
+        };
+        assert_eq!(chosen(&old_sel), open_tier(chosen(&new_sel)), "{name}");
 
         let prompt = prompt(spec.vocab);
         let n = prompt.len();

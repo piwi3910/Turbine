@@ -280,6 +280,7 @@ fn gemm_case(
         a_dtype: DType::BF16,
         b_dtype: DType::BF16,
         c_dtype,
+        gemv: false,
     };
     let registry = h.registry(&[OpConfig::Gemm(cfg)]);
     let kernel = registry.gemm(&cfg);
