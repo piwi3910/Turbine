@@ -1343,6 +1343,70 @@ target is missed**; Llama c1 +1.5 % (80.0 → 81.2), bandwidth 0.77× → 0.79×
 (21.7 vs 42.5 µs cold); the measurable win is the two removed boundaries per layer (gaps −0.20 ms)
 plus ~5 µs/layer of attention. c16 unchanged.
 
+### b1 attention II: iterating the own kernel toward ~10 µs (branch `p5p-b1attn2`, commits 37c24412 … e90631a4, 2026-10-06)
+
+User decision 2026-10-06 **B** ("5p b1 attention: result"): iterate `turbine_hip_b1_decode`. Profile
+first, then one change at a time. All numbers are from novanas GPU 0 under the bench lock, the same
+day and the same card. The baseline is `p6b-stack` 97050b3c.
+
+**Where the 16.8 µs went.** A standalone harness (`target/b1attn2/h/`, not in the tree) runs the
+kernel on 28 layer pools, with an L2/MALL-evicting read kernel before each call so the KV is cold
+as in a served step. Wave 0 of each workgroup writes `wall_clock64` stamps at each phase, and the
+loads are waited on at each stamp. Kernel span at 830 keys was 18.3 µs: append 0.4, q staging 0.6,
+block table 0.2, K loads + scores 3.2, softmax 0.6, **P·V 9.3**, partial write 0.7, atomic 0.3,
+**combine 1.9**. The P·V loop loaded one V word per key and waited on it before loading the next,
+so each round ran 32 memory latencies back to back. The combine had the same problem: one
+dependent chain per output element over the 8 splits.
+
+| Step                                           | commit   | served attention µs/layer               | decode step / gaps (ms) | eff. BW          | c1 tok/s / ITL p50 | c16 tok/s | golden c1 / c16 |
+| ---------------------------------------------- | -------- | --------------------------------------- | ----------------------- | ---------------- | ------------------ | --------- | --------------- |
+| base (landed b1, separate rope)                | 97050b3c | 16.88 + 2.76 rope                       | 12.85 / 1.24            | 501 GB/s (0.78×) | 81.2 / 12.10       | 851.2     | PASS / PASS     |
+| 1: a round's 32 V loads issued together        | 37c24412 | **9.84** + 2.96 rope                    | 12.60 / 1.13            | 510 GB/s (0.80×) | 82.0 / 11.96       | 851.9     | PASS / PASS     |
+| 2: split maxima/sums staged before the combine | c47250af | **8.96** + 2.96 rope                    | 12.56 / 1.12            | 512 GB/s (0.80×) | 82.4 / 11.92       | 851.8     | PASS / PASS     |
+| 3: RoPE fused into the call (ABI v2.12)        | e90631a4 | **10.64** (rope inside, no rope launch) | 12.44 / 1.04            | 517 GB/s (0.81×) | 82.9 / 11.85       | 852.9     | PASS / PASS     |
+
+(The c1 figures are `lab-bench --c1`: 10 requests of 128 tokens. Step, gaps and bandwidth come from
+`lab-decode-profile.sh` and `decode-profile-report.py` over a 3 s trace of about 235 steps. The
+c16 ratio of step 3 to base is 1.002.)
+
+- Steps 1 and 2 keep the arithmetic and its order, so the output bits are unchanged. They pass
+  `paged_b1_decode_matches_cpu`, `paged_decode_splitkv_matches_cpu`,
+  `paged_prefill_ck_128_matches_cpu`, `b1_decode_rows_are_batch_invariant` (bitwise on each side
+  of the 4-sequence CK edge; the 7.8125e-3 cross-edge bound holds) and
+  `paged_attention_rows_are_batch_invariant`. Golden runs on every step.
+- Step 3 adds RoPE operands to the paged attention descriptor (`rope_positions`, `rope_inv_freq`,
+  `rope_rotary_dim`, `rope_attn_factor`; minor 12). The b1 kernel rotates its query heads while
+  staging them, and rotates the appended K row on its way into the pool. It uses the rope kernel's
+  exact operations: f64 cos/sin rounded to BF16, then each product and the sum rounded to BF16.
+  Every other decode path runs the rope kernels in place first. The decoder drops its rope op on
+  decode steps when the bound kernel fuses it (`AttentionKernel::fuses_decode_rope`), except while
+  tracing. The CPU reference fuses too, as rope followed by attention.
+  `paged_decode_fused_rope_matches_separate` (lab) compares the output and the pool after the
+  append exactly against rope followed by the plain call. It covers b1 at 1–3 sequences, the CK
+  hand-off at 5 and 16, CK split-KV bound alone, OLMoE heads on CK pagedkv, full and partial
+  rotary widths, a YaRN factor and 16- and 128-token pages. `tiny_model
+decode_fused_rope_matches_separate_rope` (host) runs two decode steps fused and unfused on both
+  tiny models and requires bitwise-equal logits. The mutant that appends an unrotated K row fails
+  the lab test. The fused rotation adds ~1.7 µs inside the kernel (the f64 trig and one more
+  barrier) and removes the 2.96 µs rope launch and its ~3.6 µs boundary. Net: −0.12 ms/step.
+- **Evaluated and not landed** (harness, cold KV, 830 keys, kernel span):
+  - Split count and wave shape: W16 S8 10.4 µs, W8 S4 10.4, W8 S16 11.2, W4 S16 11.8, W2/W1
+    much worse. None beats W8 S8 by more than noise once steps 1–2 are in, and any change alters
+    the bits.
+  - One barrier for the append and q staging: no gain.
+  - L2 prefetch of the K/V lines before the staging barrier: +2.5 µs, because the barrier waits
+    for the prefetch loads. At 8k keys it removes 26 µs of round time but the barrier gives the
+    gain back.
+  - K and V loads issued together at the top of a round, as a lambda-held array: 256 VGPRs plus
+    scratch spills, 2–3× slower.
+
+Verdict: served attention is ≤ ~10 µs/layer (8.96 µs without RoPE; 10.64 µs with RoPE fused in,
+which replaces 2.96 µs of rope kernel plus a boundary). The effective bandwidth target of ~0.81× is
+reached (517 GB/s). Llama c1 is 81.2 → 82.9 tok/s (+2.1 %); the **≥ 90 tok/s mark is not reachable
+from attention**. The whole attention plus RoPE is now 0.30 ms of a 12.44 ms step. 90 tok/s needs
+a ~11.1 ms step, and the rest is GEMMs already at 86–99 % of the 640 GB/s card peak plus ~1.0 ms of
+inter-kernel gaps. c16 is unchanged (the CK path from 4 sequences on).
+
 ### S-9 plumbing: multi-token append and multi-row logits (plan Task 10, commit a03f42ac, 2026-10-05)
 
 Enabler landing; nothing uses extensions yet (the verified jump-forward wires them in Task 12), so only the no-regression bound applies. `scripts/lab-bench.sh --quick` on GPU 0 (64 requests), golden c1 PASS and `failed=0` on both:
