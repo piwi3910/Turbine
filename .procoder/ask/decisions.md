@@ -3490,7 +3490,7 @@ but the S-10 speed targets miss: forward steps 0.899× (target ≤ 0.8×), wall 
 **Decision (user, 2026-10-06): A.** Jump-forward stays on by default; the S-10 speed targets are re-bound to the
 measured Llama workload (steps 0.899×, wall 0.989×; correctness unchanged) and Tasks 11–12 close.
 
-## 5p b1 attention: result — landed, the ~10 µs target missed (builder record, 2026-10-06; open for the lead)
+## 5p b1 attention: result — landed, the ~10 µs target missed (2026-10-06)
 
 From `p5p-b1attn` (7d3c8cad; perf log 5p "b1 attention"). The own kernel serves Llama b1 attention at
 16.8 µs/layer served (CK 21.7 + 2.9 separate append), c1 80.0 → 81.2 tok/s, effective bandwidth 0.77× →
@@ -3504,3 +3504,7 @@ edge (measured 3.906e-3). The decision-B targets (≤ ~10 µs/layer, ~0.81×, �
   attention math (served 16.8 µs on ~3 MB of warm KV is still launch/latency-bound)
 - B) Iterate the kernel (split count 4/16, one wave per split, rope fused in) toward ~10 µs before merge
 - C) Revert to CK splitkv (keep the evaluation record only)
+
+**Decision (user, 2026-10-06): B.** Iterate the b1 attention kernel (split count 4/16, one wave per split, rope fused
+into the append) toward ~10 µs/layer served before moving to the other kernel boundaries; the landed kernel stays
+merged meanwhile (c1 +1.5 %, c16 neutral, golden PASS).
