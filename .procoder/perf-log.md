@@ -1520,3 +1520,19 @@ User decision 2026-10-06 A: S-16 re-bound to ≤ 1.45× the BF16 prefill GEMM pe
 ### tiny_model after b1: CK-pinned strict leg and a b1 leg (branch `p5p-t16c`, user decision 2026-10-06 A1)
 
 Correctness only, no served change. `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model` on the tree with p6b-stack merged (ABI v2.12 fused-RoPE b1 decode): 42/42 pass. Max |Δ logit| over 32 greedy steps: `hip_matches_cpu` (decode attention bound to CK split-KV via a test card profile, plain cpu-reference) 3.8e-6, bound 1e-4; `hip_b1_matches_cpu` (default b1 decode, card-class reference with F32 P) 0.0927 (steps 0–6 ~1e-6, the single BF16 flip at step 7), bound 0.15, greedy identical; `hip_v23_library_matches_cpu` Llama 0.0927 on both libraries (now under the b1 bound; it failed at step 7 under 1e-4), OLMoE 3.7e-3. Mutations: default b1 decode against the plain BF16-P reference reads 0.103 at step 1 and 0.1548 max (greedy identical) — fails the b1 leg's 0.15 by a thin margin, and fails the strict leg's 1e-4.
+
+### OLMoE MoE row tier: `wmma` from 513 rows to 11,264, `wmma_prefill` above (branch `p5p-t16c`, user decision 2026-10-06 O1)
+
+Kernel crossover (`perf moe_prefill_timings` with the new `TURBINE_MOE_TOKENS` sweep, real routing, GPU 0 natively under the bench lock; µs per call summed over layers 0/5/10/15, `wmma_prefill` ÷ `wmma`; every output bitwise equal to `wmma`): 512 rows 1.17, 1,024 1.17, 2,048 1.13, 4,096 1.12, 6,144 1.11, 8,192 1.05–1.06, 9,216 1.04, 10,240 1.02, 10,752 1.016, 11,264 1.006, 12,288 0.97, 16,384 0.88. New gfx1201 tier `MOE_WMMA_MAX_ROWS = 11_264` (1,408 prefill tokens). `moe_rows_are_batch_invariant` and `olmoe_rows_are_batch_invariant`: 0 differing (quick tier, 2026-10-06, PASS).
+
+Served (`lab-bench.sh --model olmoe`, GPU 0, one session; `commit=a5bacce3` on the lines is the base, the tier change was the uncommitted tree):
+
+| Run              | conc | requests | tok/s | ITL p50 (ms) | TTFT p50 (ms) | TTFT p95 (ms) | golden c1 / c16 | labbook  |
+| ---------------- | ---- | -------- | ----- | ------------ | ------------- | ------------- | --------------- | -------- |
+| `t16c-before`    | 16   | 64       | 624.1 | 24.2         | 134           | 426           | PASS / –        | 53d36ec2 |
+| `t16c-after`     | 16   | 64       | 621.6 | 24.5         | 141           | 432           | PASS / –        | 4cba5a75 |
+| `t16c-after-g16` | 16   | 200      | 607.9 | 24.3         | 134           | –             | PASS / PASS     | 0ec41df9 |
+| `t16c-before-c1` | 1    | 64       | 149.8 | 6.5          | 44.5          | 48.3          | PASS / –        |          |
+| `t16c-after-c1`  | 1    | 64       | 149.9 | 6.5          | 43.6          | 46.1          | PASS / –        |          |
+
+Verdict: no c16 TTFT recovery. The c16 workload's prefill steps are full 2,048-token chunks plus up to 16 decode rows (≥ 16,384 routed rows: the prefill tier before and after; the step-token histogram shows ~30 prefill steps in (1,024, 2,048] and 1–2 in (512, 1,024]), so the new tier serves almost none of them; 134 vs 141 is run-to-run noise on 64 requests (the 200-request run reads 134). The +10–14 ms against 200d074d comes from the prefill tier itself at 16,384 rows (2,830–2,945 µs per layer now vs 2,500–2,560 at f49149f), which only O2 (k step 128 without spill) addresses. The tier does help prompts of 65–1,408 tokens: c1 TTFT p50 −2 % (44.5 → 43.6 ms), p95 −4.5 %; the kernel is 5–17 % faster per MoE call in that range.

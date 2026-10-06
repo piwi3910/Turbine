@@ -1,9 +1,9 @@
 //! `gfx1201`: AMD RDNA4 (Radeon AI PRO R9700). Wave32 with WMMA matrix instructions and native
 //! BF16; 64 KiB LDS per workgroup. The thresholds are the ones the HIP library tuned on the R9700:
-//! the small-m MoE kernel wins up to 512 routed rows, the prefill WMMA kernels (expert weights
-//! streamed into the WMMA registers, the same per-element chain) above them, 8-16 % faster than
-//! the grouped WMMA kernels with OLMoE's real routing (`perf moe_prefill_timings`), and
-//! Composable Kernel paged attention
+//! the small-m MoE kernel wins up to 512 routed rows, the grouped WMMA kernel up to 11,264 rows
+//! and the prefill WMMA kernels (expert weights streamed into the WMMA registers, the same
+//! per-element chain) above them, with OLMoE's real routing (`perf moe_prefill_timings`; see
+//! `MOE_WMMA_MAX_ROWS`), and Composable Kernel paged attention
 //! serves pages of a multiple of 128 tokens. Paged decode prefers the own b1 kernel (decision
 //! "5p decode-BW floor", user decision B): grouped query heads only, grid (sequences, KV heads,
 //! splits) with the append and the split combine fused into the launch; from 4 sequences that
@@ -21,6 +21,23 @@ use crate::OpKind;
 /// with the WMMA decode kernels the small tier stays faster than the grouped tier up to at least
 /// 96 tokens (`hip_batch_invariance moe_decode_tier_timings`), so 512 rows (64 decodes) stays.
 const MOE_SMALL_MAX_ROWS: u32 = 512;
+
+/// Routed rows up to which, above [`MOE_SMALL_MAX_ROWS`], the grouped `turbine_hip_moe_wmma`
+/// kernel is preferred over `turbine_hip_moe_wmma_prefill` (user decision 2026-10-06 O1: the
+/// prefill kernel's k step dropped 128 → 64 for the K-split slice order, 200d074d, so it now
+/// wins only on large calls). Both run the same WMMA chain, so this bound never changes a row's
+/// bits. Measured with OLMoE's real routing (`perf moe_prefill_timings`, GPU 0, layers 0/5/10/15
+/// summed, prefill ÷ wmma): 1.17 at 512 rows, 1.13 at 2,048, 1.11 at 6,144, 1.05 at 8,192, 1.02
+/// at 10,240, 1.006 at 11,264, 0.97 at 12,288, 0.88 at 16,384 — the crossover lies between
+/// 11,264 and 12,288 rows (1,408 and 1,536 prefill tokens).
+const MOE_WMMA_MAX_ROWS: u32 = 11_264;
+
+const MOE_PREFILL_ORDER: &[&str] = &[
+    "turbine_hip_moe_wmma_prefill",
+    "turbine_hip_moe_wmma",
+    "hipblaslt_grouped",
+    "hipblaslt_per_expert",
+];
 
 const RMSNORM_ORDER: &[&str] = &["ck_tile_rmsnorm2d", "turbine_hip"];
 const PAGED_ORDER: &[&str] = &["ck_tile_fmha_pagedkv", "turbine_hip"];
@@ -141,12 +158,7 @@ pub static GFX1201: CardProfile = CardProfile {
         },
         OpPreference {
             op: OpKind::MoeExperts,
-            order: &[
-                "turbine_hip_moe_wmma_prefill",
-                "turbine_hip_moe_wmma",
-                "hipblaslt_grouped",
-                "hipblaslt_per_expert",
-            ],
+            order: MOE_PREFILL_ORDER,
             row_tiers: &[
                 RowTierSpec {
                     max_rows: Some(MOE_SMALL_MAX_ROWS),
@@ -159,13 +171,17 @@ pub static GFX1201: CardProfile = CardProfile {
                     ],
                 },
                 RowTierSpec {
-                    max_rows: None,
+                    max_rows: Some(MOE_WMMA_MAX_ROWS),
                     order: &[
-                        "turbine_hip_moe_wmma_prefill",
                         "turbine_hip_moe_wmma",
+                        "turbine_hip_moe_wmma_prefill",
                         "hipblaslt_grouped",
                         "hipblaslt_per_expert",
                     ],
+                },
+                RowTierSpec {
+                    max_rows: None,
+                    order: MOE_PREFILL_ORDER,
                 },
             ],
         },

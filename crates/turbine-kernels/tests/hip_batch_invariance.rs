@@ -559,7 +559,8 @@ fn heavy(mut x: Vec<f32>) -> Vec<f32> {
 }
 
 /// `moe_route` then `moe_experts` (through the registry the card profile builds, whose routed-row
-/// tiers switch from small-m to prefill WMMA above 512 rows, as the executor calls them) for one
+/// tiers switch from small-m to grouped WMMA above 512 rows and to prefill WMMA above 11,264, as
+/// the executor calls them; the batches below reach 16,384 rows, so every tier runs) for one
 /// target token alone and at the first and last position of `tokens`-token batches; the target's
 /// routing and its output row must not change. Breaks if the tiers (or the prefill kernels' two
 /// down-projection tiles) stop computing a row with the same WMMA chain.
