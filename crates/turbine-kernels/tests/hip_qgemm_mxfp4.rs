@@ -22,8 +22,8 @@ use turbine_kernels::cpu::quant::{e2m1_value, mxfp4_quantize_group};
 use turbine_kernels::quant::{ActQuantDesc, MX_BLOCK, QuantSchemeDesc};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
-    KernelProvider, OpKind, QGemmConfig, QGemmContext, QuantizeActConfig, QuantizeActContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    GemmConfig, GemmContext, KernelProvider, OpKind, QGemmConfig, QGemmContext, QuantizeActConfig,
+    QuantizeActContext, ShimLibrary, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
@@ -305,10 +305,10 @@ fn sample_rows(m: usize) -> Vec<usize> {
 
 /// One MXFP4 GEMM case: BF16 activations (quantize-dequantized to MXFP4 on the GPU first when
 /// `act` is MXFP4_EMULATED, as the decoder runs Quark W4A4 layers), then `qgemm` on the GPU at
-/// `m` rows vs the CPU reference on the sampled rows fed the same activations. The call is a
-/// decode-step call (`prefill: false`), so the tile follows m; prefill calls always run the
-/// Large tile, which m > 64 covers here and `qgemm_mxfp4_prefill_rows_are_batch_invariant`
-/// checks at every m.
+/// `m` rows vs the CPU reference on the sampled rows fed the same activations. From 512 rows
+/// every call runs the Prefill tile; below, a decode-step call (`prefill: false`) picks its
+/// tile by m and a prefill-step call (`prefill: true`) runs the Large tile, which gives a row
+/// the Prefill tile's bits (`qgemm_mxfp4_prefill_rows_are_batch_invariant` checks it).
 #[allow(clippy::too_many_arguments)]
 fn qgemm_case(
     p: &Pair,
@@ -320,6 +320,7 @@ fn qgemm_case(
     act: ActQuantDesc,
     c_dtype: DType,
     weights: &(Vec<u8>, Vec<u8>),
+    prefill: bool,
 ) {
     let cfg = QGemmConfig {
         n: n as u32,
@@ -329,7 +330,7 @@ fn qgemm_case(
         a_dtype: DType::BF16,
         c_dtype,
     };
-    let what = format!("qgemm {name} m={m} {cfg}");
+    let what = format!("qgemm {name} m={m} prefill={prefill} {cfg}");
     let hip = p.hip.qgemm().expect("hip qgemm (ABI v2.9)");
     assert!(hip.supports(&cfg), "hip must support {what}");
     assert_eq!(hip.implementation(&cfg), IMPL, "{what}");
@@ -367,7 +368,7 @@ fn qgemm_case(
         b_zeros: None,
         c: c_hip.view(),
         alpha: 1.0,
-        prefill: false,
+        prefill,
     };
     hip.execute(&mut ctx).expect("hip qgemm");
     let got_all = decode(c_dtype, &bytes(c_hip.view()));
@@ -455,25 +456,41 @@ fn qgemm_mxfp4_matches_cpu() {
         let weights = mxfp4_weights(&mut rng, n, k);
         for m in MS {
             for act in [ActQuantDesc::None, ActQuantDesc::Mxfp4Emulated] {
-                qgemm_case(&p, &mut rng, name, m, n, k, act, DType::BF16, &weights);
+                for prefill in [false, true] {
+                    qgemm_case(
+                        &p,
+                        &mut rng,
+                        name,
+                        m,
+                        n,
+                        k,
+                        act,
+                        DType::BF16,
+                        &weights,
+                        prefill,
+                    );
+                }
             }
         }
     }
     // F32 out, a non-multiple-of-16 n and odd m.
     let (n, k) = (1000, 1024);
     let weights = mxfp4_weights(&mut rng, n, k);
-    for m in [3, 33, 200] {
-        qgemm_case(
-            &p,
-            &mut rng,
-            "odd",
-            m,
-            n,
-            k,
-            ActQuantDesc::None,
-            DType::F32,
-            &weights,
-        );
+    for m in [3, 33, 200, 300] {
+        for prefill in [false, true] {
+            qgemm_case(
+                &p,
+                &mut rng,
+                "odd",
+                m,
+                n,
+                k,
+                ActQuantDesc::None,
+                DType::F32,
+                &weights,
+                prefill,
+            );
+        }
     }
 }
 
@@ -604,8 +621,10 @@ fn row_range(t: &Tensor, first: usize, rows: usize) -> TensorView<'_> {
 /// Phase 4 prefix reuse under MXFP4 weights: a prefill-step `qgemm` gives every row the same
 /// bits whatever the call's row count and the row's position in it — rows of a 513-row call
 /// equal the same rows computed in calls of 1, 7 and 128 rows, and in a 128-row call starting at
-/// row 200 — on a 3B and an 8B shape. Breaks if a prefill call picks its tile (and so its
-/// summation order) by m, e.g. the k-split decode tiles for a short prefill chunk.
+/// row 200 — on a 3B and an 8B shape; the 513-row call runs the Prefill tile, the shorter ones
+/// the Large tile. Breaks if a prefill call picks a tile with another summation order by m
+/// (e.g. the k-split decode tiles for a short prefill chunk), or if the Prefill and Large tiles
+/// sum a row differently.
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
 fn qgemm_mxfp4_prefill_rows_are_batch_invariant() {
@@ -652,4 +671,138 @@ fn qgemm_mxfp4_prefill_rows_are_batch_invariant() {
         }
         println!("{name}: prefill rows bitwise equal at 1, 7, 128 (at 0 and 200) and 513 rows");
     }
+}
+
+/// Microseconds per call of `op`: two warm-up calls, then the median of `rounds` rounds of
+/// `iters` calls each, timed on the host around stream synchronizations.
+fn time_us(p: &Pair, rounds: usize, iters: u32, mut op: impl FnMut()) -> f64 {
+    op();
+    op();
+    let mut per_round = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        p.hip_mem.synchronize().expect("synchronize");
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            op();
+        }
+        p.hip_mem.synchronize().expect("synchronize");
+        per_round.push(start.elapsed().as_secs_f64() * 1e6 / f64::from(iters));
+    }
+    per_round.sort_by(f64::total_cmp);
+    per_round[rounds / 2]
+}
+
+/// Phase 5p S-16: a prefill-step MXFP4 `qgemm` (W4A16, BF16 out) at m = 2,048 takes at most
+/// 1.10 × the BF16 GEMM a BF16 checkpoint runs for the same layer in a prefill step (`gemm`
+/// with `prefill`: hipBLASLt through the tuned table's invariant rows where the shape has some,
+/// the heuristic otherwise), both measured in this run, on every Llama-3.2-3B and Llama-3.1-8B
+/// linear shape; m = 512 is printed for information. Breaks if prefill calls lose the
+/// shared-decode tile (e.g. run a decode tile or the per-wave-decode LDS tile).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_mxfp4_prefill_within_hipblaslt_bound() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(83);
+    const BOUND: f64 = 1.10;
+    const GATED_M: usize = 2048;
+    let max_k = 14336;
+    let x = rng.normal(GATED_M * max_k, 1.0);
+    let a = tensor(
+        &p.hip_mem,
+        &[GATED_M, max_k],
+        DType::BF16,
+        &encode(DType::BF16, &x),
+    );
+    let gemm = p.hip.gemm().expect("hip gemm");
+    let qgemm = p.hip.qgemm().expect("hip qgemm (ABI v2.9)");
+    let mut misses = Vec::new();
+    for (name, n, k) in SHAPES_3B.into_iter().chain(SHAPES_8B) {
+        let cfg = QGemmConfig {
+            n: n as u32,
+            k: k as u32,
+            scheme: QuantSchemeDesc::Mxfp4,
+            act_quant: ActQuantDesc::None,
+            a_dtype: DType::BF16,
+            c_dtype: DType::BF16,
+        };
+        let (codes, exps) = mxfp4_weights(&mut rng, n, k);
+        let b = tensor(&p.hip_mem, &[n, k / 2], DType::U8, &codes);
+        let bs = tensor(&p.hip_mem, &[exps.len()], DType::U8, &exps);
+        let w = tensor(
+            &p.hip_mem,
+            &[n, k],
+            DType::BF16,
+            &encode(DType::BF16, &rng.normal(n * k, 1.0 / (k as f32).sqrt())),
+        );
+        let gemm_cfg = GemmConfig {
+            n: n as u64,
+            k: k as u64,
+            trans_b: true,
+            a_dtype: DType::BF16,
+            b_dtype: DType::BF16,
+            c_dtype: DType::BF16,
+        };
+        let c = tensor(
+            &p.hip_mem,
+            &[GATED_M, n],
+            DType::BF16,
+            &vec![0u8; GATED_M * n * 2],
+        );
+        for m in [512, GATED_M] {
+            let a_m = TensorView {
+                slice: a.storage.whole().sub(0, ((m - 1) * max_k + k) * 2),
+                shape: (&[m, k][..]).into(),
+                strides: (&[max_k, 1][..]).into(),
+                dtype: DType::BF16,
+            };
+            let c_m = row_range(&c, 0, m);
+            let bf16_us = time_us(&p, 5, 10, || {
+                gemm.execute(&mut GemmContext {
+                    a: a_m.clone(),
+                    b: w.view(),
+                    c: c_m.clone(),
+                    trans_b: true,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    prefill: true,
+                })
+                .expect("gemm");
+            });
+            let mx_us = time_us(&p, 5, 10, || {
+                qgemm
+                    .execute(&mut QGemmContext {
+                        cfg,
+                        a: a_m.clone(),
+                        a_scales: None,
+                        b: b.view(),
+                        b_scales: bs.view(),
+                        b_zeros: None,
+                        c: c_m.clone(),
+                        alpha: 1.0,
+                        prefill: true,
+                    })
+                    .expect("qgemm");
+            });
+            let ratio = mx_us / bf16_us;
+            let gated = m == GATED_M;
+            println!(
+                "mxfp4_prefill_timing {name:<10} m={m:<5} bf16 {bf16_us:>8.1} us ({}) mxfp4 \
+                 {mx_us:>8.1} us ({}) ratio {ratio:.3} {}",
+                gemm.implementation(&gemm_cfg),
+                qgemm.implementation(&cfg),
+                if gated { "(gated)" } else { "(info)" }
+            );
+            if gated && ratio > BOUND {
+                misses.push(format!("{name}: {ratio:.3}"));
+            }
+        }
+    }
+    assert!(
+        misses.is_empty(),
+        "MXFP4 prefill above {BOUND} x the BF16 prefill GEMM: {misses:?}"
+    );
 }
