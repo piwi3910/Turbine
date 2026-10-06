@@ -1063,6 +1063,12 @@ impl EngineLoop {
             }
             self.stages = StageClock::start();
         }
+        self.take_commands();
+        true
+    }
+
+    /// Takes every command already in the channel, without waiting.
+    fn take_commands(&mut self) {
         loop {
             match self.commands.try_recv() {
                 Ok(cmd) => self.command(cmd),
@@ -1076,7 +1082,6 @@ impl EngineLoop {
                 }
             }
         }
-        true
     }
 
     fn command(&mut self, cmd: EngineCommand) {
@@ -2247,6 +2252,11 @@ impl EngineLoop {
                 //   (no dropped extra rows beside it, their slots and blocks already free),
                 //   and its first token is not held behind a launch-ahead.
                 self.finish_serial(prev)?;
+                // Requests that reached the channel while the turn waited for the device start
+                // in the plan below, as on the serial loop, whose plan follows its device wait
+                // (decision "5p Task 4" B: left for the next turn, each waited a whole further
+                // iteration — c16 TTFT p50 1.70×).
+                self.take_commands();
                 // Fall through: the plan below launches with nothing in flight.
             } else {
                 self.complete_overlap_ahead(prev)?;
@@ -4723,6 +4733,131 @@ mod tests {
             "b's first chunk is in the next plan, without a's dropped row"
         );
         assert_eq!(vec![vec![stream_a], vec![stream_b]], serial);
+    }
+
+    /// An executor that submits the commands armed in `arrivals` from inside its `collect`: a
+    /// request reaching the engine's channel while the engine waits for the device.
+    struct ArriveOnCollect {
+        inner: Box<dyn ModelExecutor>,
+        tx: Arc<std::sync::Mutex<Option<mpsc::Sender<EngineCommand>>>>,
+        arrivals: Arc<std::sync::Mutex<Vec<EngineCommand>>>,
+    }
+
+    impl ModelExecutor for ArriveOnCollect {
+        fn shape(&self) -> &ModelShape {
+            self.inner.shape()
+        }
+        fn kv_layout(&self) -> &KvLayout {
+            self.inner.kv_layout()
+        }
+        fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError> {
+            self.inner.forward(batch)
+        }
+        fn reduces_logits(&self) -> bool {
+            self.inner.reduces_logits()
+        }
+        fn overlaps(&self) -> bool {
+            self.inner.overlaps()
+        }
+        fn launch(
+            &mut self,
+            batch: &BatchInput<'_>,
+            feeds: &[TokenFeed],
+        ) -> Result<(), ModelError> {
+            self.inner.launch(batch, feeds)
+        }
+        fn collect(&mut self) -> Result<Logits, ModelError> {
+            let logits = self.inner.collect();
+            let tx = self.tx.lock().unwrap();
+            for cmd in self.arrivals.lock().unwrap().drain(..) {
+                if tx.as_ref().unwrap().try_send(cmd).is_err() {
+                    panic!("command channel full");
+                }
+            }
+            logits
+        }
+        fn copy_blocks(
+            &mut self,
+            kv: &KvPoolView<'_>,
+            src: &[BlockId],
+            dst: &[BlockId],
+        ) -> Result<(), ModelError> {
+            self.inner.copy_blocks(kv, src, dst)
+        }
+    }
+
+    /// P5p S-3 follow-up (decision "5p Task 4", B): under overlap scheduling, request `c` that
+    /// reaches the channel while a turn waits for the iteration in flight (`b` waited for its
+    /// first chunk, so the turn completes that iteration serially) starts in the same plan as
+    /// `b`, as it does on the serial loop, whose plan follows the device wait. Breaks if the
+    /// turn plans from the commands it took before that wait: `c` then waits in the queue for
+    /// the whole next iteration (the c16 TTFT of the 2026-10-06 A/B). Every stream equals the
+    /// serial run's.
+    #[test]
+    fn overlap_admits_arrivals_during_the_device_wait() {
+        let (_dir, spec, tokenizer) = tiny();
+        let a = request(&[256, 72, 101, 108, 108, 111], 10);
+        let b = request(&[256, 79], 4);
+        let c = request(&[256, 80, 81], 4);
+        let (serial, _) = run_streams(&spec, &tokenizer, &[a.clone(), b.clone(), c.clone()], false);
+
+        let tx_slot = Arc::new(std::sync::Mutex::new(None));
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = ArriveOnCollect {
+            inner: tiny_reducing_executor(&spec, 8),
+            tx: Arc::clone(&tx_slot),
+            arrivals: Arc::clone(&arrivals),
+        };
+        let t = engine_with(Box::new(exec), Arc::clone(&tokenizer), params(4, 8), true);
+        assert!(t.engine.overlap);
+        *tx_slot.lock().unwrap() = Some(t.tx.clone());
+        let mut engine = t.engine;
+        let (rx_a, ack_a) = submit(&t.tx, a.clone());
+        let mut acks = vec![ack_a];
+        let mut streams = vec![(rx_a, ChoiceStream::default(), false)];
+        let mut first_turn: HashMap<RequestId, usize> = HashMap::new();
+        for turn in 0..200 {
+            if turn == 3 {
+                // `a` decodes with an iteration launched ahead: `b` arrives between turns, and
+                // `c` while the next turn waits for the device.
+                assert!(engine.in_flight.as_ref().is_some_and(|f| f.launched));
+                let (rx_b, ack_b) = submit(&t.tx, b.clone());
+                acks.push(ack_b);
+                streams.push((rx_b, ChoiceStream::default(), false));
+                let (events, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+                let (ack, admitted) = oneshot::channel();
+                acks.push(admitted);
+                arrivals.lock().unwrap().push(EngineCommand::Submit(
+                    Box::new(c.clone().into()),
+                    events,
+                    ack,
+                ));
+                streams.push((rx, ChoiceStream::default(), false));
+            }
+            assert!(matches!(engine.turn_overlap(), Ok(Turn::Continue)));
+            for id in &engine.iteration_requests {
+                first_turn.entry(*id).or_insert(turn);
+            }
+            for (rx, stream, done) in &mut streams {
+                *done |= fold_events(stream, drain(rx));
+            }
+            if streams.len() == 3 && streams.iter().all(|s| s.2) {
+                break;
+            }
+        }
+        assert!(streams.iter().all(|s| s.2), "every stream finished");
+        assert_eq!(
+            first_turn.get(&b.id),
+            Some(&3),
+            "b starts in the turn that takes it"
+        );
+        assert_eq!(
+            first_turn.get(&c.id),
+            first_turn.get(&b.id),
+            "c, arrived during that turn's device wait, starts beside b"
+        );
+        let got: Vec<Vec<ChoiceStream>> = streams.into_iter().map(|s| vec![s.1]).collect();
+        assert_eq!(got, serial);
     }
 
     /// Continuous batching with chunked prefill gives every request exactly the greedy tokens
