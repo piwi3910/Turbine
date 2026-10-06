@@ -3051,9 +3051,11 @@ const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
 /// steps 0-6 match at ~1e-6, then one b1 attention output rounds to the other BF16 neighbour
 /// (b1's own F32 split/wave order and GPU `expf`, which a CPU reference cannot copy bit for
 /// bit), the changed value enters the KV cache and steps 7-31 sit at 0.017-0.093; greedy tokens
-/// are identical for all 32 steps. 0.15 is ~1.6× the measured 0.093 (user decision 2026-10-06
-/// A1); the identical greedy tokens are the sharp check.
-const HIP_B1_MAX_ABS_LOGIT_DIFF: f32 = 0.15;
+/// are identical for all 32 steps. 0.12 is ~1.3× the measured 0.0927 (user decision 2026-10-06
+/// "5p tiny_model A1 landed", 1 A: tightened from 0.15, which the b1 kernel against the BF16-P
+/// cpu-reference missed only at 0.1548); the mutant now fails clearly. The identical greedy
+/// tokens remain the sharp check. The v2.3 library's Llama leg uses the same bound.
+const HIP_B1_MAX_ABS_LOGIT_DIFF: f32 = 0.12;
 
 /// `card` with paged decode attention ordered CK split-KV first (then CK pagedkv and the
 /// Turbine kernel), every other preference unchanged: the test's way to bind decode attention
