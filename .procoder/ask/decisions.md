@@ -3869,3 +3869,93 @@ a bug that hits every warm request keeps re-opening the circuit after each probe
   circuit event, a metric and reason code
 - C) B plus a per-reason rate limit that still opens the circuit when argument errors repeat (builder's
   recommendation)
+
+## 5p fused batch-1 GEMV: provider evaluation and proposal (2026-10-06, open)
+
+Owed by decision "5p decode-step gaps" (B + C, the AGENTS.md kernel-reuse rule). Branch `p5p-gemv-eval`, no kernel
+landed. Harness `gemv_eval` (scratch, novanas `remote/agent-aba0d49ec7d5d3f14/gemv-eval/`): every candidate at m = 1
+on the Llama-3.2-3B shapes, BF16 weights `[n, k]`, a HIP graph of 112 launches cycling weight copies over ≥ 512 MB (the
+64 MB MALL never serves the weights), median µs per graph node (the in-graph boundary included), checked against an
+F64 reference. GPU 0, bench lock, three back-to-back passes agree to ±0.3 µs (a first cold-clock pass was discarded).
+Sources: vLLM `csrc/rocm/skinny_gemms.cu` at b267fe4 (kernel templates extracted, no torch), llama.cpp
+`ggml-cuda/mmvf.cu` at da263e7 (with a stub device-info), hipBLASLt 1.4 / ROCm 7.14 (heuristic top 16, best timed), and
+an own throwaway prototype (one wave per 2–8 rows, x in LDS as F32, optional norm / silu·mul prologue and residual /
+GLU epilogue; not for landing).
+
+| µs per call (GB/s)                     | qkv 5120×3072  | o_proj 3072×3072 | gate_up 16384×3072 | down 3072×8192 | lm_head 128256×3072 F32 |
+| -------------------------------------- | -------------- | ---------------- | ------------------ | -------------- | ----------------------- |
+| served hipBLASLt table (traced kernel) | 58.9 (534)     | 36.5 (517)       | 159.8 (630)        | 85.8 (587)     | 1244.6 (633)            |
+| hipBLASLt heuristic #0                 | 54.2           | 38.3             | 167.6              | 109.9          | 1247.6                  |
+| hipBLASLt best of 16                   | 52.9 (595)     | 38.3 (493)       | 161.6 (623)        | 95.3 (528)     | 1247.2 (632)            |
+| **vLLM `wvSplitK`**                    | **51.8 (607)** | **32.2 (586)**   | **160.0 (629)**    | **83.7 (601)** | **1242.5 (634)**        |
+| vLLM `LLMM1` (4 rows/block)            | 52.0           | 32.3             | 159.9              | 88.1 — wrong†  | 1240.8                  |
+| llama.cpp `mul_mat_vec_f` (F32 x)      | 56.9           | 46.6             | 166.9 / 164.6 +GLU | 86.8           | 1260.4                  |
+| own prototype, best plain              | 54.5           | 34.0             | 162.3              | 93.3           | 1251.8                  |
+| own prototype, fused                   | 60.0 +norm     | 35.8 +res        | 175.2 +norm+GLU    | 99.9 +silu+res | 1255.4 +norm            |
+
+† `LLMM1` returns wrong results at k = 8192 (max rel. error 0.69; it is built for small k). All other candidates agree
+with the reference to BF16 output rounding (llama.cpp: F32 activations and output, 1e-7).
+
+Findings:
+
+- **Providers.** vLLM's `wvSplitK` (Apache-2.0, plain HIP, builds for gfx1201 with no torch) is the fastest correct
+  m = 1 GEMV on every shape: per layer 327.7 µs against hipBLASLt-best 348.1 (served table: 341.0 traced), most of it
+  on o_proj (−6.1) and down (−11.6 vs heuristic, ~−2 vs the tuned row). It persists one block per CU (32 blocks),
+  stages x in LDS once per block and loops over rows — the structure a fused prologue needs. llama.cpp's
+  `mul_mat_vec_f` is the only provider with a gated fusion (its fused SwiGLU is 2 µs faster than its plain gate_up)
+  but is slower everywhere (o_proj 46.6) and pulls in ggml headers. CK has no GEMV: its WMMA GEMMs (gfx12) tile
+  m ≥ 16, offer an elementwise D-tensor epilogue (residual add) and a GEMM + LayerNorm-of-output variant
+  (`device_gemm_multiple_d_layernorm_wmma_cshuffle_v3`: LayerNorm, not RMSNorm, two kernels), and no norm prologue or
+  gated epilogue — not built (no fusion it offers removes a kernel here; the earlier CK GEMM evaluations stand).
+  hipBLASLt has only pointwise epilogues (ReLU, GELU, Swish, sigmoid, clamp, bias, AUX outputs), scale vectors and
+  `beta·C` (a residual add with one rounding instead of today's two), no prologue and no gated epilogue: it cannot
+  fuse the norm or silu·mul at all.
+- **Fusion cost depends on the grid.** In the prototype's one-wave-per-rows grid (512–2048 blocks), a norm prologue
+  costs 5–7 µs (every block re-reduces x before its first weight load: qkv 54.5 → 60.0, gate_up 162.3 → 170.3),
+  more than the kernel plus boundary it removes (~3.4 µs); with 32 rows per block it costs ~1 µs (gate_up w8r4
+  174.1 → 175.4, lm_head 0). Epilogue fusions are free: residual add (o_proj 35.8 = plain, down 93.9 vs 93.3), GLU
+  +4 µs for a 4.5 µs kernel + boundary. So fusions pay only in a persistent grid like `wvSplitK`'s, where the
+  prologue runs once per block and can overlap the first weight loads (not measured: the remaining risk).
+- **Removable per layer** (served, unprofiled boundary ~1.6 µs): input `rmsnorm` / `add_rmsnorm` before qkv (1.8),
+  `add_rmsnorm` before gate_up (1.7), `silu_mul` (2.9) → 6.4 µs of kernels + 3 boundaries = ~11 µs, 0.31 ms per step;
+  the residual adds move into the o_proj / down epilogues (rounded exactly as `add_rmsnorm` rounds today), the norms
+  into the next GEMV's prologue, silu·mul into the gate_up epilogue (GLU, `[gate; up]` rows paired) or the down
+  prologue. The final norm can go into the LM head prologue (0.003 ms).
+
+Estimated step (11.81 ms today, 0.851×): `wvSplitK`-class GEMVs −0.25…−0.35 ms (vs the served rows; the tuned down
+row is closer than the heuristic), fusions −0.31 ms, fused prologue overhead +0.03…+0.08 → **~11.2–11.3 ms
+(0.89–0.90×)**; with C (overlap scheduling, −0.07…−0.1) ~11.1–11.2 (≥ 0.9×).
+
+Numerics (what stops being bitwise; m = 1 decode rows only, tp = 1, BF16 Llama-family weights only):
+
+- The m = 1 projections sum in the GEMV's order, not hipBLASLt's: decode logits and the KV appended by c1 decode
+  steps change bits. Llama's decode rows are already hipBLASLt speed rows that may depend on the batch (tuned table
+  `speed` buckets), so no invariance held today is lost; prefill keeps the invariant `prefix` class, so prefix reuse
+  stays bit-exact. A c1 sequence and the same sequence batched at m > 1 differ by summation order (as today
+  between buckets).
+- Fused norm: the sum of squares is reduced in the GEMV's order, not CK rmsnorm's → the normalised activation can
+  differ in the last BF16 bit (it is still rounded to BF16 before the dot products). Residual add in the epilogue and
+  silu·mul (`round(silu)·up`, `elementwise.hip`'s formula) can be made bitwise equal to today's kernels given the
+  same GEMV output.
+- Tensor parallel keeps today's path (the o_proj / down partials must be all-reduced before the add), so
+  `rmsnorm_sharded`'s bitwise constraint (the Q/K-norm path) is untouched; OLMoE, quantized weights (`qgemm`) and
+  prefill are unchanged.
+- Golden: the re-derived tolerances (decision "5p golden tolerance vs engine summation order", B) must include this
+  class; golden c1 and c16 re-checked on the fused build.
+
+Tests a landing needs: per-shape GEMV vs the CPU reference (tolerance) and three-run determinism; residual-epilogue
+and silu prologue/GLU bitwise against `add` / `silu_mul` on the same GEMV output; fused norm vs `rmsnorm` within one
+BF16 ulp; graph capture; `tiny_model` HIP vs CPU (`card_reference` dispatch for the m = 1 class); `kv_gpu` prefix reuse
+still bit-exact; the tp 2 path unchanged (its gates); registry conformance for the new implementation and a kernel ABI
+minor (the fused ops); `lab-bench --golden16` and the ITL c1 measure per landing.
+
+- A) Vendor `wvSplitK` (Apache-2.0, `third_party/LICENSES`) as a registered m = 1 BF16 GEMV implementation, unfused:
+  speed only, −0.25…−0.35 ms (~11.5 ms, 0.87×), the GEMV-order numerics shift alone
+- B) A + the fusions as one own kernel family on `wvSplitK`'s persistent structure (residual-add epilogue on o_proj /
+  down, norm prologue on qkv / gate_up / LM head, GLU epilogue on gate_up), landed one fusion at a time, each measured
+  (~11.2–11.3 ms, 0.89–0.90×; ≥ 0.9× with C)
+- C) A + only the bit-exact-capable fusions (residual epilogues + GLU; the CK norms stay, so the add_rmsnorm kernels
+  become plain rmsnorm and only silu·mul and its boundary go): ~11.4 ms (0.88×), no norm numerics change
+
+Builder recommendation: B, staged as A first (the provider, measured served), then GLU, then the residual + norm pair;
+stop after any stage that does not measure faster. Not decided here.
