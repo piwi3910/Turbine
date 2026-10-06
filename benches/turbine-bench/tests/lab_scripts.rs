@@ -128,6 +128,16 @@ fn assert_in_order(hay: &str, needles: &[&str]) {
 /// Runs `scripts/<script> <args>` with stubs for every host-contacting tool first on PATH.
 /// Returns the output and whether any stub was called.
 fn lab_script(script: &str, tag: &str, args: &[&str]) -> (Output, Option<String>) {
+    lab_script_env(script, tag, args, &[])
+}
+
+/// `lab_script` with environment changes: `(name, Some(value))` sets, `(name, None)` removes.
+fn lab_script_env(
+    script: &str,
+    tag: &str,
+    args: &[&str],
+    envs: &[(&str, Option<&str>)],
+) -> (Output, Option<String>) {
     let stubs =
         std::env::temp_dir().join(format!("turbine-lab-scripts-{}-{tag}", std::process::id()));
     let _ = fs::remove_dir_all(&stubs);
@@ -154,13 +164,21 @@ fn lab_script(script: &str, tag: &str, args: &[&str]) -> (Output, Option<String>
         stubs.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new("bash")
-        .arg(repo_root().join("scripts").join(script))
+    let mut cmd = Command::new("bash");
+    cmd.arg(repo_root().join("scripts").join(script))
         .args(args)
         .current_dir(repo_root())
         .env("PATH", path)
-        .output()
-        .expect("run bash");
+        .env_remove("TURBINE_LAB_ONE_GPU_JOB")
+        .env_remove("TURBINE_BENCH_LOCK_HELD")
+        .stdin(std::process::Stdio::null());
+    for (name, value) in envs {
+        match value {
+            Some(v) => cmd.env(name, v),
+            None => cmd.env_remove(name),
+        };
+    }
+    let out = cmd.output().expect("run bash");
     let called = fs::read_to_string(&calls).ok();
     let _ = fs::remove_dir_all(&stubs);
     (out, called)
@@ -1510,14 +1528,12 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
 }
 
 /// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the
-/// --with-tests / --skip-tests / --golden16 / --quick flags and the GPU-0-only guard (GPU 1's
-/// PCIe link is not throughput-comparable). These usage cases cover what must be rejected
-/// before any host contact (the well-formed invocations are covered by the --dry-run tests
-/// below, P5p S-1).
+/// --with-tests / --skip-tests / --golden16 / --quick flags and the card guard (novanas has GPUs 0
+/// and 1). These usage cases cover what must be rejected before any host contact (the
+/// well-formed invocations are covered by the --dry-run tests below, P5p S-1).
 #[test]
 fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     for (tag, args) in [
-        ("bench-gpu1", &["--gpu", "1"][..]),
         ("bench-gpu2", &["--gpu", "2"][..]),
         ("bench-model", &["--model", "qwen"][..]),
         ("bench-unknown", &["--fast"][..]),
@@ -1526,12 +1542,29 @@ fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
         assert_eq!(called, None, "{tag}: contacted a host");
         assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
     }
-    let (out, _) = lab_script("lab-bench.sh", "bench-gpu1-message", &["--gpu", "1"]);
+    let (out, _) = lab_script("lab-bench.sh", "bench-gpu2-message", &["--gpu", "2"]);
     assert!(
-        stderr(&out).contains("GPU 0"),
-        "refusing GPU 1 should explain why: {}",
+        stderr(&out).contains("--gpu is 0 or 1"),
+        "refusing GPU 2 should name the valid cards: {}",
         stderr(&out)
     );
+}
+
+/// GPU 1 vs GPU 0 on the new PSU (decision 2026-10-06): `lab-bench.sh --gpu 1` serves on GPU 1 —
+/// the server is pinned with `ROCR_VISIBLE_DEVICES=1` — as a peer of GPU 0, with no
+/// comparability warning. Breaks if GPU 1 is refused or warned about again, or the pin stays on
+/// GPU 0.
+#[test]
+fn lab_bench_gpu_1_serves_on_gpu_1() {
+    let text = dry_run("lab-bench.sh", "bench-gpu1", &["--dry-run", "--gpu", "1"]);
+    assert!(text.contains("ROCR_VISIBLE_DEVICES=1 "), "{text}");
+    assert!(!text.contains("ROCR_VISIBLE_DEVICES=0 "), "{text}");
+    let (out, _) = lab_script(
+        "lab-bench.sh",
+        "bench-gpu1-warn",
+        &["--dry-run", "--gpu", "1"],
+    );
+    assert!(!stderr(&out).contains("WARN"), "{}", stderr(&out));
 }
 
 /// The flags parse (they are not rejected the way an unknown flag or a bad --gpu/--model is
@@ -2289,26 +2322,87 @@ fn lab_serve_gpus_2_renders_a_two_gpu_serve_job() {
     );
 }
 
-/// PSU rule (coordinator 2026-09-29): a real `lab-serve --gpus 2` is refused while one GPU job at
-/// a time holds, but its dry run still renders the Job and names the refusal. Breaks if the dry
-/// run starts failing (as e06afc9 did) or stops saying a real run would be refused.
+/// New PSU (decision 2026-10-05, the one-GPU-job rule lifted): a `lab-serve --gpus 2` dry run
+/// names no refusal and its holder takes bench.lock shared (one serve per card side by side, a
+/// benchmark still waits); `TURBINE_LAB_ONE_GPU_JOB=1` restores the exclusive hold and the
+/// refusal. Breaks if the default goes back to one GPU job at a time, or the opt-in stops working.
 #[test]
-fn lab_serve_gpus_2_dry_run_names_the_one_gpu_refusal() {
-    let text = dry_run(
-        "lab-serve.sh",
-        "serve-gpus-2-psu",
-        &[
-            "--dry-run",
-            "novanas",
-            "scripts/lab/phase5-novanas-olmoe.yaml",
-            "--gpus",
-            "2",
-        ],
+fn lab_serve_holds_bench_lock_shared_unless_one_gpu_job() {
+    let args = [
+        "--dry-run",
+        "novanas",
+        "scripts/lab/phase5-novanas-olmoe.yaml",
+        "--gpus",
+        "2",
+    ];
+    let text = dry_run("lab-serve.sh", "serve-gpus-2-shared", &args);
+    assert!(!text.contains("refuses --gpus 2"), "{text}");
+    assert!(
+        text.contains("bench.lock shared on novanas (holder"),
+        "the default holder must take bench.lock shared:\n{text}"
     );
+    let (out, called) = lab_script_env(
+        "lab-serve.sh",
+        "serve-gpus-2-one-job",
+        &args,
+        &[("TURBINE_LAB_ONE_GPU_JOB", Some("1"))],
+    );
+    assert_eq!(called, None);
+    let text = stdout(&out);
     assert!(
         text.contains("a real run refuses --gpus 2 while one GPU job at a time holds"),
         "{text}"
     );
+}
+
+/// The one-GPU-job rule lifted (decision 2026-10-05): a real `lab-test.sh novanas --gpus 2` is
+/// not refused and takes bench.lock shared (writer preference through the gate), and
+/// `lab-cluster.sh <scenario>` is not refused; `TURBINE_LAB_ONE_GPU_JOB=1` brings both refusals
+/// back. Every host tool is a failing stub, so the runs stop at their first host contact.
+#[test]
+fn two_gpu_lab_runs_are_not_refused_by_default() {
+    let (out, called) = lab_script_env(
+        "lab-test.sh",
+        "test-gpus-2-real",
+        &["novanas", "--gpus", "2"],
+        &[],
+    );
+    let err = stderr(&out);
+    assert!(!err.contains("refused"), "{err}");
+    let calls = called.unwrap_or_default();
+    assert!(
+        calls.contains("flock -x /home/piwi/turbine-ci/bench.gate true && flock -s /home/piwi/turbine-ci/bench.lock"),
+        "lab-test must take bench.lock shared:\n{calls}"
+    );
+    let (out, _) = lab_script_env(
+        "lab-test.sh",
+        "test-gpus-2-one-job",
+        &["novanas", "--gpus", "2"],
+        &[("TURBINE_LAB_ONE_GPU_JOB", Some("1"))],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--gpus 2 refused"),
+        "{}",
+        stderr(&out)
+    );
+
+    let (out, called) = lab_script_env("lab-cluster.sh", "cluster-real", &["tp2-novanas"], &[]);
+    let err = stderr(&out);
+    assert!(!err.contains("refused"), "{err}");
+    assert!(
+        called.is_some(),
+        "lab-cluster never reached the host: {err}"
+    );
+    let (out, called) = lab_script_env(
+        "lab-cluster.sh",
+        "cluster-one-job",
+        &["tp2-novanas"],
+        &[("TURBINE_LAB_ONE_GPU_JOB", Some("1"))],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("refused"), "{}", stderr(&out));
+    assert_eq!(called, None);
 }
 
 /// A real (not dry-run) `lab-serve.sh` start whose ssh always succeeds, curl sees no server and
@@ -2368,7 +2462,7 @@ fn lab_serve_failed_upload_releases_the_bench_lock_holder() {
     assert!(!out.status.success(), "the start must fail: {err}");
     assert!(err.contains("rsync to"), "{err}");
     let start = log
-        .find("setsid nohup flock -x")
+        .find("setsid nohup sh -c")
         .unwrap_or_else(|| panic!("the holder was never started:\n{log}"));
     let after = &log[start..];
     assert!(

@@ -1382,3 +1382,20 @@ On the real tokenizer the forced runs are short: Llama writes keys as one or two
 - `lab-bench.sh --quick` on GPU 0 (a004fd93, golden c1 PASS, failed=0): Llama **875.3** tok/s (Task 10 landing 879.1), OLMoE **630.2** (636.4) — within the no-regression band; plain benches never jump.
 
 User decision 2026-10-06 A: jump-forward stays on by default and the S-10 targets are re-bound to this workload — forward steps ≤ 0.90 × (measured 0.899 ×), summed wall ≤ 1.00 × (measured 0.989 ×, never slower); correctness criteria unchanged. Tasks 11–12 close.
+
+### GPU 1 vs GPU 0 on the new PSU (branch `p5p-gpu1`, commit fa70043d, 2026-10-05/06)
+
+The decision "New PSU validation sequence, then the GPU 1 benchmark" asked whether GPU 1 can join perf work. Method: the same tree (fa70043d), one `lab-bench.sh --gpu <n>` run per cell, run back to back in three rounds: GPU 0 (g0a), GPU 1 (g1), GPU 0 again (g0b) to bracket drift. Each round ran Llama and OLMoE at the standard c16 workload (200 requests, golden c1) and at `--concurrency 1 --quick`. Every run held the bench lock exclusively, used the `phase2c` configs and ran the release client on novanas; every run passed golden c1 with 0 failed requests. The ratio is GPU 1 / mean(g0a, g0b).
+
+| Model | conc | GPU 0 (g0a / g0b) tok/s | GPU 1 tok/s | ratio | ITL p50 ms GPU 0 / GPU 1 | TTFT p50 ms GPU 0 / GPU 1 |
+| ----- | ---- | ----------------------- | ----------- | ----- | ------------------------ | ------------------------- |
+| Llama | 16   | 852.8 / 848.5           | 855.9       | 1.006 | 15.5–15.6 / 15.5         | 207–208 / 205             |
+| OLMoE | 16   | 616.7 / 617.7           | 614.9       | 0.996 | 24.1–24.3 / 24.3         | 121–122 / 122             |
+| Llama | 1    | 78.0 / 78.0             | 78.1        | 1.001 | 12.7 / 12.6              | 54 / 52                   |
+| OLMoE | 1    | 150.0 / 150.1           | 150.3       | 1.002 | 6.5 / 6.5                | 44 / 43                   |
+
+labbook (in the table's order, g0a / g0b / g1): Llama c16 dc08b52f / ae7010ce / 8201a6f5, OLMoE c16 2771302b / 11538868 / 51d06af6, Llama c1 086a2429 / aad7f387 / 1eb901c4, OLMoE c1 5e185a7f / c5db348f / 25bb3414. GPU 0 reproduces the S-2 baselines (Llama c16 852.2, OLMoE 615.4). The drift bracket is small: g0a and g0b differ by at most 0.5 %. OLMoE c1 reads 150 tok/s here against S-2's 126.0; the K-split MoE GEMV landed between the two.
+
+Card state, from `amd-smi metric` sampled every 10 s during each run (the samples taken under load, > 100 W). Both cards have a 300 W socket power cap. Under load each card peaks at 280–300 W, with GFX clocks up to ~3.4 GHz, memory at 1258 MHz, hotspot 77–92 °C and memory 76–86 °C. The two cards behave the same: GPU 1 peaked at 300 W, 3.41 GHz and 91 °C hotspot. `THROTTLE_STATUS` reads `THROTTLED` on both cards under load, idle included for GPU 0, so it does not separate them. During the GPU 1 runs, GPU 0 carried other builders' jobs. That is allowed now that the one-GPU-job rule is lifted, and those jobs did not touch GPU 1. The PCIe chain in sysfs is the same on both cards: root port 00:01.0 or 00:01.1 → the card's switch at **Gen5 x8**, then Gen5 x16 inside the card to the GPU function (03:00.0 or 06:00.0). amd-smi's own PCIe field (GPU 0 "2.5 GT/s x8", GPU 1 "16 GT/s x8") contradicts sysfs and is not used. The old "GPU 1 is Gen4 x8" note no longer describes the hardware.
+
+Verdict: GPU 1 lands within 0.6 % of GPU 0 on both models at c16 and c1, inside the decision's ~3 % bound. **GPU 1 joins perf work**: `lab-bench.sh --gpu 1` is a peer of `--gpu 0`, and numbers from the two cards are comparable.
