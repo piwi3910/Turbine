@@ -1557,3 +1557,39 @@ Same recipe as Task 13's on-arm (`kv.ladder.l0=true`, `kv.partial_prefix_reuse=f
 - S-18 AC met: every run ends with **100 % rung-format L1 copies** (287–409 blocks against 141–161 without the drain), 16–22 reformats per run at **6–8 evictions + re-stores per reformat**, `rung_no_slot`/`no_room` actions down from ~1,600–1,900 to 159–383. Standard bench **849.2 tok/s** (S-2 baseline 852.2: 0.996×, inside the 0.97× bound), ITL p50 15.6 ms, TTFT p50 207 ms, golden c1 PASS (ladder off by default, so the drain is inert there).
 - On the ladder workload the drain trades throughput for capacity: median tok/s 291.1 against 310.2 for the same arm without the drain (0.94×; 0.85× the ladder-off arm) and ORANGE samples 63 against 44, with one run (r3) where L1's larger compressed capacity paid off (recomputed tokens −36 % against the off-arm median, cached ratio 0.865) at 911 s of L1/L2 rewrite time. The median recompute reduction stays −6 %.
 - labbook set `phase-5p-serving-efficiency`: `lab-bench:t17b-drain-r{1,2,3}-llama:c7718a96`, `lab-bench:t17-std-llama:c7718a96`, `lab-bench:t13b-l1l2-r{1,2,3}-llama:a5f4b4a3`.
+
+### Task 13b: lazy L0 page classes — landing (branch `p5p-kvfix`, commit cc85653a, 2026-10-06)
+
+Decision "5p Task 13" B: the L0 pool's page classes become active only when a class page is first allocated (the L0
+ladder step's rewrite, the recent window); until then the view is flat and decode runs the plain paged attention. Same
+card (GPU 0), one session, measured from a fixed clone of cc85653a, bench lock per run, arms interleaved; the partial
+reuse fix (418b742d) is in the tree.
+
+Standard bench (`lab-bench.sh --gpu 0 --model llama`, `t13b-std`): **854.0 tok/s** (S-2 baseline 852.2: 1.002×), ITL p50
+15.5 ms, TTFT p50 207 ms, golden c1 PASS, 200/0.
+
+The Task 13 recipe exactly (`--config scripts/lab/phase6-novanas-ladder.yaml --mt-only --multi-turn-sessions 24
+--mt-think-time 1..4 -- --set kv.partial_prefix_reuse=false --set kv.ladder.l0=true|false`, runs `t13c-l0{on,off}-r{1,2,3}`);
+golden c1 PASS and 192/192 on every run. "L0 rewrites" = `turbine_kv_ladder_actions_total{tier="l0"}` at the final scrape.
+
+| Arm | Run | tok/s | ITL p50 (ms) | later TTFT p50 (ms) | cached ratio | recomputed | ORANGE samples | L0 actions (fill_high_water / no_room_backoff) |
+| --- | --- | ----- | ------------ | ------------------- | ------------ | ---------- | -------------- | ---------------------------------------------- |
+| l0=true  | r1 | 353.2 | 24.4 | 173 | 0.8201 | 183,413 | 26 | 0 / 0 |
+| l0=false | r1 | 298.3 | 24.6 | 154 | 0.8503 | 152,309 | 45 | – |
+| l0=true  | r2 | 309.3 | 23.1 | 156 | 0.8418 | 158,532 | 43 | 52 / 27 |
+| l0=false | r2 | 326.5 | 23.6 | 139 | 0.8607 | 139,634 | 36 | – |
+| l0=true  | r3 | 303.4 | 24.6 | 154 | 0.8087 | 194,921 | 37 | 8 / 1 |
+| l0=false | r3 | 346.5 | 24.5 | 163 | 0.8186 | 183,602 | 25 | – |
+
+- **ITL target met**: median ITL p50 24.4 (l0=true) against 24.5 ms (l0=false); the run where the L0 step never fired
+  (r1) is 24.4 against the off-arm's 23.6–24.6. Task 13 measured 26.4 against 24.2 (+9 %) on the always-classed pool.
+  Even the runs where the L0 step fired (r2, r3: it now fires in 2 of 3 runs, never in Task 13 — L1's drain-reformatted
+  rung slabs shift the pressure) stay inside the off-arm's spread, since activation happens late in the run.
+- tok/s medians 309.3 against 326.5 (0.947×) and ORANGE samples 37 against 36: within the wide run-to-run spread of
+  this workload (off-arm 298–347 tok/s); no ITL signal behind it.
+- Side runs with the partial reuse fix live (same recipe without `kv.partial_prefix_reuse=false`, `t13b-l0{on,off}-r1`,
+  one pair, then stopped because the L0 step fired in the on-run): l0=true 311.9 tok/s, ITL 21.7, cached 0.8665, L0
+  actions 52 / 9; l0=false 221.9 tok/s, ITL 20.7, cached 0.9052, ORANGE 124 samples. Both 192/192 with golden c1 PASS
+  — token-granular reuse on the classed L0 pool serves (before 418b742d it was HTTP 500 + `circuit_open`).
+- labbook set `phase-5p-serving-efficiency`: `lab-bench:t13b-std-llama:cc85653a`, `lab-bench:t13c-l0{on,off}-r{1,2,3}-llama:cc85653a`,
+  `lab-bench:t13b-l0{on,off}-r1-llama:cc85653a`.

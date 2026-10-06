@@ -320,12 +320,12 @@ Interfaces:
   Covers: S-14 follow-up ACs (host test + manual measurement)
   Depends on: Task 13
 
-- [ ] Write failing test `turbine-kv pool::tests::page_classes_are_built_lazily` (flat view and no active class before the first class allocation; the classed view from it on, kept after the page frees; base allocations alone never activate). Run: `scripts/remote-cargo.sh test -p turbine-kv pool::tests::page_classes_are_built_lazily` — expect FAIL
-- [ ] Implement the activation flag and the flat view; the decoder's `block_formats` and the engine's per-block codes follow the view; keep `kv_sim ladder_l0_under_pinned_pressure`, `tiny_server status_reports_tier_formats_and_ladder` and the recent-window tests passing unchanged. Run: `scripts/remote-cargo.sh test -p turbine-kv pool::` — expect PASS
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` and `-- -p turbine-server --test kv_gpu l0_ladder_serves_on_gpu partial_reuse_on_classed_l0_pool` — expect PASS
-- [ ] Measure (GPU 0, one session, bench lock): `scripts/lab-bench.sh --gpu 0 --model llama` (standard bench, golden c1) and the Task 13 recipe with `--set kv.ladder.l0=true` against `--set kv.ladder.l0=false`, three runs each — ITL p50 equal when no L0 rewrite fires; the lines go into `.procoder/perf-log.md`
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `perf(kv): build L0's compressed page classes lazily, on the first L0 ladder step`
+- [x] Write failing test `turbine-kv pool::tests::page_classes_are_built_lazily` (flat view and no active class before the first class allocation; the classed view from it on, kept after the page frees; base allocations alone never activate). Run: `scripts/remote-cargo.sh test -p turbine-kv pool::tests::page_classes_are_built_lazily` — expect FAIL
+- [x] Implement the activation flag and the flat view; the decoder's `block_formats` and the engine's per-block codes follow the view; keep `kv_sim ladder_l0_under_pinned_pressure`, `tiny_server status_reports_tier_formats_and_ladder` and the recent-window tests passing unchanged. Run: `scripts/remote-cargo.sh test -p turbine-kv pool::` — expect PASS
+- [x] (quick tier on 418b742d and cc85653a: all pass except the known `tiny_model hip_matches_cpu` / `hip_v23_library_matches_cpu` b1 mismatch, step-1 |Δ| 0.1028, decisions "5p b1 attention breaks tiny_model hip_matches_cpu" — not this task's) Lab: `scripts/lab-test.sh novanas --tier quick` and `-- -p turbine-server --test kv_gpu l0_ladder_serves_on_gpu partial_reuse_on_classed_l0_pool` — expect PASS
+- [x] (perf log 5p "Task 13b": ITL p50 medians 24.4 vs 24.5 ms, standard bench 854.0 tok/s, golden c1 PASS on all; the recipe ran with `kv.partial_prefix_reuse=false` as in Task 13) Measure (GPU 0, one session, bench lock): `scripts/lab-bench.sh --gpu 0 --model llama` (standard bench, golden c1) and the Task 13 recipe with `--set kv.ladder.l0=true` against `--set kv.ladder.l0=false`, three runs each — ITL p50 equal when no L0 rewrite fires; the lines go into `.procoder/perf-log.md`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] (cc85653a; the measurement and docs follow in a docs commit) Commit: `perf(kv): build L0's compressed page classes lazily, on the first L0 ladder step`
 
 ## Task 14: FP8 c1 ITL — profile, then the measured fix (S-15)
 
