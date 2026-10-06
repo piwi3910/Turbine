@@ -65,3 +65,32 @@ strict and batched alike; `min_prompts_passing` stays 14, which the worst varian
 Re-run the spread and re-derive the bounds if the reference, the transformers version, the
 emulation or the prompts change. The spread JSON stays a working artifact on `novanas`
 (`/home/piwi/turbine-ci/golden-work/fp8kv/olmoe-1b-7b-0125-instruct/self_spread.json`), as in the AWQ precedent.
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+0.956 (p13 position 16), tail 1.401
+(p09 position 15). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 1.10 | 1.14 | 2.06 | 1.14 **changed** |
+| tail | 2.01 | 5.25 (over cap) | 3.42 | 3.42 **changed** |
+| likely batched | 1.10 | 1.14 | 2.06 | 1.14 **changed** |
+| tail batched | 2.01 | 5.25 (over cap) | 3.42 | 3.42 **changed** |
+
+Default server c1 against the reference: prefix ok 16/16, likely 0.951 (p13),
+tail 5.162 (p03).
+
+Over the cap: p03 position 20 puts the −12.62 tail candidate at −17.78 in every default capture (−17.07 … −17.86 over all variants), 5.16 from the reference — a systematic offset of the FP8 KV path, not order noise, so the triangle (3.42) does not cover it and no bound is proposed beyond the cap. The `OlmoeForCausalLM/bf16/fp8_e4m3` row is `experimental`; the strict likely moves 1.10 → 1.14.

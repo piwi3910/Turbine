@@ -90,3 +90,30 @@ batched likely 0.25, `min_prompts_passing` 14 and the other keys unchanged, wide
 to 1.06 (+0.51) and batched tail to 1.06 (+0.31). Re-run the spread and re-derive the bounds if
 the reference, the transformers version or the prompts change. `spread.json` remains a local
 working artifact, as in the AWQ precedent.
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+0.125 (p10 position 11), tail 0.928
+(p16 position 28). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 0.15 | 0.14 | 0.28 | 0.15 |
+| tail | 1.06 | 0.62 | 1.99 | 1.06 |
+| likely batched | 0.25 | 0.14 | 0.38 | 0.25 |
+| tail batched | 1.06 | 0.62 | 1.99 | 1.06 |
+
+Default server c1 against the reference: prefix ok 16/16, likely 0.132 (p15),
+tail 0.427 (p16).

@@ -76,3 +76,32 @@ all-reduce), so a mode that includes it (tp > 1, also ep × tp) is gated against
 capture with the batched bounds at concurrency 1 and 16 (`turbine-golden compare
 --batched-bounds`) and against this transformers reference with the batched bounds at c1 and c16 too — for OLMoE only the latter is a gate and the capture comparison is informational, because this tolerance's batched bounds equal its strict ones (follow-up 2026-09-28; the OLMoE TP drift is investigated in a later phase); expert and pipeline parallelism without TP stay strict against the capture
 (user decision 2026-09-28, "P5: tensor-parallel accuracy gate against the one-GPU capture").
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+0.561 (p14 position 0), tail 1.509
+(p03 position 22). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 1.01 | 0.65 | 1.58 | 1.01 |
+| tail | 1.66 | 1.72 | 3.17 | 1.72 **changed** |
+| likely batched | 1.01 | 0.65 | 1.58 | 1.01 |
+| tail batched | 1.66 | 1.72 | 3.17 | 1.72 **changed** |
+
+Default server c1 against the reference: prefix ok 16/16, likely 0.517 (p08),
+tail 1.461 (p03).
+
+The tail moves 1.66 → 1.72 (`fused_ops=false` 1.71, `gemm_autotune=false` 1.55, default 1.46). Batched captures are bitwise equal to c1 here (OLMoE's decode path does not change summation order with the batch).

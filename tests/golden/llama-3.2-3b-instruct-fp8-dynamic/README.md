@@ -78,3 +78,30 @@ reference's near-tie (check with `turbine-golden positions --prompt-id p05`), no
 
 Re-run the spread and re-derive the bounds if the reference, the transformers version or the
 prompts change.
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+0.718 (p12 position 0), tail 2.076
+(p10 position 9). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 0.78 | 0.78 | 1.50 | 0.78 |
+| tail | 5.08 | 2.10 | 7.16 | 5.08 |
+| likely batched | 0.78 | 0.78 | 1.50 | 0.78 |
+| tail batched | 5.08 | 2.34 | 7.16 | 5.08 |
+
+Default server c1 against the reference: prefix ok 16/16, likely 0.771 (p14),
+tail 2.100 (p10).

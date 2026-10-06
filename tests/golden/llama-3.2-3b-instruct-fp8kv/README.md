@@ -64,3 +64,30 @@ keeps `min_prompts_passing` 14 and the other keys of the BF16 file.
 Re-run the spread and re-derive the bounds if the reference, the transformers version, the
 emulation or the prompts change. The spread JSON stays a working artifact on `novanas`
 (`/home/piwi/turbine-ci/golden-work/fp8kv/llama-3.2-3b-instruct/self_spread.json`), as in the AWQ precedent.
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+0.418 (p11 position 0), tail 1.203
+(p16 position 26). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 0.40 | 0.32 | 0.82 | 0.40 |
+| tail | 2.44 | 1.19 | 3.65 | 2.44 |
+| likely batched | 0.40 | 0.32 | 0.82 | 0.40 |
+| tail batched | 2.44 | 1.19 | 3.65 | 2.44 |
+
+Default server c1 against the reference: prefix ok 16/16, likely 0.289 (p08),
+tail 1.110 (p16).
