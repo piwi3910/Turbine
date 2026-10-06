@@ -343,7 +343,7 @@ Interfaces:
 - [x] Implement (provider or tile); `qgemm_mxfp4_prefill_rows_are_batch_invariant` stays green — own Prefill tile (no provider within 10 %); the timing test still FAILS (1.0–1.44×, 7 of 8 shapes over 1.10); open re-bound in decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss"
 - [x] Landing (GPU 0): `scripts/lab-bench.sh --model llama8b-mxfp4 --concurrency 1 --quick` and the standard bench: TTFT p50 recorded against the same-day BF16 8B TTFT (1.25 × c1, 1.15 × c16; not gated, decision A), golden c1 unchanged; perf-log rows; timing test passes under the 1.45 × bound
 - [x] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [x] Commit: `perf(kernels): MXFP4 prefill at hipBLASLt speed` (landed as the Prefill tile commits and `test(kernels): MXFP4 prefill timing bound re-bound to 1.45x`)
+- [x] Commit: `perf(kernels): MXFP4 prefill at hipBLASLt speed` (landed as the Prefill tile commits 45506bfb and 1f6bad3c; the 1.45 × re-bound in fee70bf9)
 
 ## Task 16: OLMoE BF16 back inside the 0.98× bound with margin (S-17)
 
