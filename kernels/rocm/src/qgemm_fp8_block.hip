@@ -38,11 +38,16 @@ constexpr int64_t kFusedMaxRows = 64;
 // larger one is staged and multiplied in column chunks of whole blocks.
 constexpr int64_t kDequantMaxBytes = 256 << 20;
 // The fused kernel's launch shape: one 16-column tile per wave, the waves of a
-// block splitting k into whole 128-deep blocks (about eight per wave).
+// block splitting k into whole 128-deep blocks.
 constexpr int kFragsN = 1;
 
+// Waves per block by the number of 128-deep k blocks. k >= 8192 (Llama's
+// `down`, 64 blocks) runs 16 waves, four blocks each: at 8 it read the weight
+// at 345 GB/s served (72.5 us, decision "5p Task 14: FP8 c1 decode", item 2),
+// where the W8A8 kernel's same sweep measured 89 us at 8 waves against 43 at
+// 16. Changing it moves only the F32 summation order of the wave partials.
 int waves_for(int64_t blocks) {
-  return blocks >= 64 ? 8 : blocks >= 32 ? 4 : 2;
+  return blocks >= 64 ? 16 : blocks >= 32 ? 4 : 2;
 }
 
 bool supported(const turbine_qgemm_desc *d) {
@@ -79,8 +84,8 @@ hipError_t launch_fused(const turbine_qgemm_desc *d, hipStream_t stream) {
   const auto *s = static_cast<const float *>(d->b_scales);
   const bool f32 = d->c_dtype == TURBINE_DTYPE_F32;
   switch (waves_for(d->k / kBlock)) {
-  case 8:
-    return fp8_block::launch_wmma<kFragsN, 8>(d->a, b, s, d->c, d->m, d->n,
+  case 16:
+    return fp8_block::launch_wmma<kFragsN, 16>(d->a, b, s, d->c, d->m, d->n,
                                               d->k, d->lda, d->ldc, f32,
                                               d->alpha, stream);
   case 4:

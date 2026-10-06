@@ -1588,3 +1588,19 @@ Per-layer GEMM µs (served trace medians, qkv / o / gate_up / down): hipBLASLt S
 Per-layer GEMM µs after: **26.7 / 17.1 / 83.6 / 41.4** (589 / 552 / 602 / 608 GB/s; −29 % against SABV). Correctness: `hip_qgemm qgemm_matches_cpu` runs both W8A8 implementations bound alone at m ∈ {1, 7, 16, 128, 513} on every 3B and 8B shape and the four scale pairings (Phase 1 GEMM tolerance), plus the prefill invariance and FP8-block suites — green. c16 FP8-dynamic 1127.6 tok/s against 6a's 960.3–976.4 (no same-day c16 base was taken; the 16-row decode steps now run the own kernel, so c16 is above any no-regression bound). **S-15 met on both W8A8 checkpoints** (0.686× / 0.678× ≤ 0.75×); FP8-block was already at 0.678×.
 
 Open items recorded for the lead (decision "5p Task 14: FP8 c1 decode"): the activation quantization still costs ~0.86 ms + boundaries per W8A8 step (a fused quantize-in-GEMV would need the qgemm op to take BF16 activations with an FP8 act mode — an ABI semantics addition); `turbine_hip_fp8_block` runs `down` at 8 waves (72.5 µs, 345 GB/s) where 16 waves would read it at ~600 GB/s (≈ −0.85 ms per FP8-block step, a one-line change of its own); the per-tensor checkpoint's golden c1 fails on the unchanged base (p14 likely-|Δ| 1.48 > 1.36, p16 tail 5.54 > 2.99) and passes after this change (summation order only).
+
+### S-15 follow-ups: FP8-block `down` at 16 waves, the fused W8A8 activation quantize, the per-tensor golden bisect (branch `p5p-fp8b`, 2026-10-06)
+
+User decision "5p Task 14" (1 A, 2 yes, 3 bisect). novanas GPU 0, one session, every run under the bench and port locks (`lab-bench.sh`, release client on novanas), each commit measured from a git-less export of its tree. Base `299985a9` (p6b-stack tip, Task 14's `turbine_hip_fp8_wmma` in). Same-day BF16 c1 (Llama, phase2c config, `--concurrency 1 --quick`): **82.7 tok/s, ITL p50 11.9 ms**, golden c1 PASS.
+
+**Landing 1 — `turbine_hip_fp8_block` reads k ≥ 8192 at 16 waves** (`cf84d926`; `waves_for`: 64+ k-blocks → 16 waves, 4 blocks each, instead of 8; the evaluation harness `tools/qgemm_eval.cpp` launches the same). Only the F32 summation order of the wave partials moves; rows stay batch-invariant (the split is a rule of k only; `qgemm_fp8_block_rows_do_not_depend_on_m` and `qgemm_fp8_block_matches_cpu` green).
+
+| FP8-block (W8A16)                        | base `299985a9`                       | 16 waves `cf84d926`                |
+| ---------------------------------------- | ------------------------------------- | ---------------------------------- |
+| `down` µs, `qgemm_decode_timings` m 2–16 | 76.5 / 76.3 / 73.6 (t14 run, 8 waves) | **44.7 / 45.2 / 46.1** (~560 GB/s) |
+| c1 tok/s / ITL p50 (quick)               | 122.4 / 7.9 ms                        | **135.2 / 7.1 ms**                 |
+| × BF16 ITL (11.9)                        | 0.66                                  | **0.60**                           |
+| golden c1                                | PASS                                  | PASS (16/16)                       |
+| c16 tok/s (200 req) / golden c16         | 1059.6 / –                            | **1115.1** / PASS                  |
+
+The other three FP8-block shapes are unchanged (qkv / o / gate_up 29.8 / 19.5 / 84.9 µs at m = 2, as at 8 waves: they run 2 waves).
