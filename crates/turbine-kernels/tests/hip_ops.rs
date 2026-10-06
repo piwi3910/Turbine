@@ -2903,10 +2903,18 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
             assert_eq!(sl_h[r].to_bits(), sl_c[r].to_bits(), "{what}: row {r}");
         }
     }
+    // FNV-1a over the bits of every HIP output: equal digests from two kernel libraries mean
+    // bit-identical reductions (a kernel change that claims to keep the bits is checked so).
+    let digest = [&ids_h, &vals_h, &lse_h, &s_h, &sl_h]
+        .iter()
+        .flat_map(|v| v.iter())
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+        });
     println!(
         "{what}: impl={impl_name} top ids exact, max lse rel |Δ| {worst_lse:.3e}, \
          draws identical ({nucleus_rows} from a top_p nucleus) but {boundary} at a CDF \
-         boundary ok"
+         boundary ok, output digest {digest:016x}"
     );
 }
 

@@ -5,6 +5,14 @@ Reads the rocprofv3 kernel-trace CSVs under target/decodebw/<label>-<model>/ and
 per model: traced steps, per-kernel ms/step and per-call us, share of busy, the top
 kernel-pair gaps, step span / busy / gaps, and effective weight-read bandwidth
 (weight bytes / step span). usage: decode-profile-report.py <csv-dir>... [--weights <bytes>]
+[--boundaries]
+
+--boundaries adds the per-boundary table of the modal step (the steps with the most common kernel
+count): each kernel boundary (kernel -> next kernel) with its calls per step, the median kernel time
+and the median gap after it. Caveat (perf log 5p "Decode-step boundaries"): rocprofv3's kernel trace
+adds ~1.9 us to every dispatch inside a graph replay and stretches hipGraphLaunch (5 -> ~140-180 us
+on the host), so the traced gaps (~3.5 us) overstate the served ones (~1.6 us); kernel times are
+the device's own.
 """
 import csv
 import glob
@@ -72,6 +80,38 @@ def summarize(steps):
     return per_kernel, per_pair_gaps, spans, busy_totals
 
 
+def short_name(name):
+    # A hipBLASLt kernel by its macro tile, any other by its function name.
+    n = name.replace("void ", "").replace("(anonymous namespace)::", "")
+    m = re.search(r"MT\d+x\d+x\d+", n)
+    if n.startswith("Cijk"):
+        return ("gemm_f32out_" if "_BSS_" in n else "gemm_") + (m.group(0) if m else "?")
+    return n.split("<")[0].split("(")[0][:40]
+
+
+def boundaries(steps):
+    counts = defaultdict(int)
+    for s in steps:
+        counts[len(s)] += 1
+    modal = max(counts, key=counts.get)
+    good = [s for s in steps if len(s) == modal]
+    names = [short_name(r[3]) for r in good[0]]
+    agg = {}
+    for i in range(modal):
+        dur = sorted(s[i][2] for s in good)[len(good) // 2]
+        gap = sorted(s[i + 1][0] - s[i][1] for s in good)[len(good) // 2] if i + 1 < modal else 0
+        key = (names[i], names[i + 1] if i + 1 < modal else "-")
+        a = agg.setdefault(key, [0, 0.0, 0.0])
+        a[0] += 1
+        a[1] += dur
+        a[2] += gap
+    print(f"-- boundaries of the modal step ({modal} kernels, {len(good)} steps): "
+          "calls/step, median us/call, median gap us after, ms/step kernel, ms/step gap")
+    for (a, b), (n, t, g) in agg.items():
+        print(f"   {a:<26} -> {b:<26} x{n:>3}  {t/n/1e3:8.2f}  {g/n/1e3:6.2f}  "
+              f"{t/1e6:7.3f}  {g/1e6:6.3f}")
+
+
 def top_name(name):
     # rocprofv3 kernel names can carry long template arguments; keep the head.
     return name.split("<")[0][:72]
@@ -84,6 +124,8 @@ def main():
         i = args.index("--weights")
         weight_bytes = int(args[i + 1])
         args = args[:i] + args[i + 2:]
+    show_boundaries = "--boundaries" in args
+    args = [a for a in args if a != "--boundaries"]
     if not args:
         print(__doc__)
         return 2
@@ -110,6 +152,8 @@ def main():
         print("-- top gaps (ms/step)")
         for (a, b), gap in sorted(per_pair_gaps.items(), key=lambda kv: -kv[1])[:12]:
             print(f"   {top_name(a):<40} -> {top_name(b):<40} {gap/n/1e6:.3f} ms")
+        if show_boundaries:
+            boundaries(steps)
 
 
 if __name__ == "__main__":

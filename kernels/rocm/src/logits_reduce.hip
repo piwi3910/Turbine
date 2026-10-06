@@ -172,6 +172,31 @@ __device__ inline int wave_sum_int(int v) {
   return v;
 }
 
+// Visits a wave's ids j = begin + lane, begin + lane + kWave, ... below end,
+// in that order per lane, as `for (j = begin + lane; j < end; j += kWave)
+// f(j, row[j])` does, but issues kSweepLoads of a lane's loads before the
+// first use: a row sweep of the 1024-thread block is otherwise a chain of
+// ~125 dependent memory latencies per lane (128,256 ids). Every lane applies
+// f to the same values in the same order as the plain loop, so the results
+// are bit-identical to it.
+constexpr int kSweepLoads = 8;
+template <typename F>
+__device__ inline void sweep_row(const float *row, int64_t begin, int64_t end,
+                                 int lane, F &&f) {
+  int64_t base = begin;
+  for (; base + kSweepLoads * kWave <= end; base += kSweepLoads * kWave) {
+    float v[kSweepLoads];
+#pragma unroll
+    for (int u = 0; u < kSweepLoads; ++u)
+      v[u] = row[base + u * kWave + lane];
+#pragma unroll
+    for (int u = 0; u < kSweepLoads; ++u)
+      f(base + u * kWave + lane, v[u]);
+  }
+  for (int64_t j = base + lane; j < end; j += kWave)
+    f(j, row[j]);
+}
+
 // The float an order key came from (order_key is a bijection on non-NaN).
 __device__ inline float key_value(uint32_t k) {
   return (k & 0x80000000u) ? __uint_as_float(k & 0x7fffffffu)
@@ -253,15 +278,14 @@ __device__ void mass_histogram(const float *row, int64_t begin, int64_t end,
   if (tid < 256)
     hist[tid] = 0ull;
   __syncthreads();
-  for (int64_t j = begin + lane; j < end; j += kWave) {
-    const float v = row[j];
+  sweep_row(row, begin, end, lane, [&](int64_t, float v) {
     const uint32_t key = order_key(v);
     if ((key & mask) == prefix) {
       const unsigned long long q = qweight(v, inv_t, big_t, scale_bits);
       if (q != 0ull)
         atomicAdd(&hist[(key >> shift) & 0xffu], q);
     }
-  }
+  });
   __syncthreads();
 }
 
@@ -393,8 +417,8 @@ __global__ void __launch_bounds__(kThreads)
 
   // ---- 1. the maximum ----
   float m = -INFINITY;
-  for (int64_t j = begin + lane; j < end; j += kWave)
-    m = fmaxf(m, row[j]);
+  sweep_row(row, begin, end, lane,
+            [&](int64_t, float v) { m = fmaxf(m, v); });
   m = wave_max(m);
   if (lane == 0)
     s_max[wave] = m;
@@ -438,17 +462,14 @@ __global__ void __launch_bounds__(kThreads)
     win[i] = 0u;
   int arg = INT_MAX;
   int last = -1;
-  for (int64_t base = begin; base < end; base += kWave) {
-    const int64_t j = base + lane;
-    const bool in = j < end;
-    const float v = in ? row[j] : 0.0f;
-    if (use_window && in) {
+  sweep_row(row, begin, end, lane, [&](int64_t j, float v) {
+    if (use_window) {
       const uint32_t bin = win_top - (order_key(v) >> 24);
 #pragma unroll
       for (int i = 0; i < kWin; ++i)
         win[i] += bin == static_cast<uint32_t>(i) ? 1u : 0u;
     }
-    if (in && !isnan(v)) {
+    if (!isnan(v)) {
       if (isfinite(big))
         sum += scale_trunc(expf(v - big), qbits);
       if (v == big && big > -INFINITY)
@@ -463,7 +484,7 @@ __global__ void __launch_bounds__(kThreads)
           last = static_cast<int>(j);
       }
     }
-  }
+  });
   sum = wave_sum_u64(sum);
   sum_t = unit_t ? sum : wave_sum_u64(sum_t);
   arg = wave_min(arg);
@@ -614,13 +635,13 @@ __global__ void __launch_bounds__(kThreads)
     if (tid == 0)
       s_count = 0;
     __syncthreads();
-    for (int64_t j = begin + lane; j < end; j += kWave) {
-      const uint32_t key = order_key(row[j]);
+    sweep_row(row, begin, end, lane, [&](int64_t j, float v) {
+      const uint32_t key = order_key(v);
       if (key >= floor_key) {
         const int slot = atomicAdd(&s_count, 1);
         cand[slot] = candidate(key, static_cast<int32_t>(j));
       }
-    }
+    });
     __syncthreads();
     const int n = s_count;
     int size = kMaxTopN;
@@ -662,8 +683,8 @@ __global__ void __launch_bounds__(kThreads)
   int ties = 0;
   const bool selected = s_selected;
   if (k_sel > 0 && !selected) {
-    for (int64_t j = begin + lane; j < end; j += kWave) {
-      const uint32_t key = order_key(row[j]);
+    sweep_row(row, begin, end, lane, [&](int64_t j, float v) {
+      const uint32_t key = order_key(v);
       const uint32_t masked = key & mask;
       if (masked > prefix || (take_all_ties && masked == prefix)) {
         const int slot = atomicAdd(&s_count, 1);
@@ -671,7 +692,7 @@ __global__ void __launch_bounds__(kThreads)
       } else if (masked == prefix) {
         ++ties;
       }
-    }
+    });
   }
   if (!take_all_ties && !selected) {
     // Ties at the threshold (the full key): the rem lowest ids, in id order.
@@ -833,8 +854,9 @@ __global__ void __launch_bounds__(kThreads)
     const int64_t s_begin = min64(d_end, d_begin + wave * slice);
     const int64_t s_end = min64(d_end, s_begin + slice);
     unsigned long long mass = 0ull;
-    for (int64_t j = s_begin + lane; j < s_end; j += kWave)
-      mass += qweight(row[j], inv_t, big_t, qbits);
+    sweep_row(row, s_begin, s_end, lane, [&](int64_t, float v) {
+      mass += qweight(v, inv_t, big_t, qbits);
+    });
     mass = wave_sum_u64(mass);
     if (lane == 0)
       s_slice[wave] = mass;
