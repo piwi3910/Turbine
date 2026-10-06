@@ -1610,3 +1610,28 @@ Served (`lab-bench.sh --model olmoe`, GPU 0, one session; `commit=a5bacce3` on t
 | `t16c-after-c1`  | 1    | 64       | 149.9 | 6.5          | 43.6          | 46.1          | PASS / –        |          |
 
 Verdict: no c16 TTFT recovery. The c16 workload's prefill steps are full 2,048-token chunks plus up to 16 decode rows (≥ 16,384 routed rows: the prefill tier before and after; the step-token histogram shows ~30 prefill steps in (1,024, 2,048] and 1–2 in (512, 1,024]), so the new tier serves almost none of them; 134 vs 141 is run-to-run noise on 64 requests (the 200-request run reads 134). The +10–14 ms against 200d074d comes from the prefill tier itself at 16,384 rows (2,830–2,945 µs per layer now vs 2,500–2,560 at f49149f), which only O2 (k step 128 without spill) addresses. The tier does help prompts of 65–1,408 tokens: c1 TTFT p50 −2 % (44.5 → 43.6 ms), p95 −4.5 %; the kernel is 5–17 % faster per MoE call in that range.
+
+### OLMoE O2: sliced prefill gate-up back at k step 128 (branch `p5p-o2`, user decision 2026-10-06 O2)
+
+`PrefillGateUpSliced` = `Stream<1, 8, 4, 1, 128, BRing>`: one B register stage instead of two, each 16-k fragment reloaded with the next step's right after its WMMAs (same loads, same WMMA chain, same slice-summed order). Compiled ISA (gfx1201, `-Rpass-analysis=kernel-resource-usage`): 255 VGPRs, 0 spilled, occupancy 5 (two stages at k 128: 112 spilled; k 64: occupancy 6). `moe_rows_are_batch_invariant` and `olmoe_rows_are_batch_invariant`: 0 differing; every `moe_prefill_timings` output bitwise equal to `wmma`.
+
+Kernel (`perf moe_prefill_timings`, real routing, GPU 0 natively under the bench lock, one session, µs per call, layers 0/5/10/15, two rounds agree within 1 %):
+
+| Variant                                                            | 12,288 rows (1,536 tok)       | 16,384 rows (2,048 tok)       |
+| ------------------------------------------------------------------ | ----------------------------- | ----------------------------- |
+| base: k 64 (029b8c17)                                              | 2,475 / 2,594 / 2,477 / 2,476 | 2,812 / 2,936 / 2,795 / 2,800 |
+| **BRing, k 128 (landed)**                                          | 2,329 / 2,409 / 2,314 / 2,324 | 2,788 / 2,885 / 2,777 / 2,780 |
+| BRing + A staged in halves + `waves_per_eu(6)` (235 VGPRs, occ. 6) | 2,505 / 2,556 / 2,485 / 2,503 | 2,948 / 2,985 / 2,924 / 2,922 |
+| BRing + A staged in halves (247 VGPRs, occ. 5)                     | 2,465 / 2,558 / 2,446 / 2,468 | 2,905 / 3,017 / 2,898 / 2,897 |
+| split gate / up passes (two kernels, k 128)                        | 2,405 / 2,475 / 2,385 / 2,401 | 2,965 / 3,004 / 2,941 / 2,957 |
+| diag: down unsliced (not bitwise)                                  | –                             | 2,766 / 2,870 / 2,743 / 2,732 |
+| diag: all unsliced, k 128 (not bitwise)                            | 2,254 / 2,316 / 2,234 / 2,255 | 2,658 / 2,703 / 2,645 / 2,649 |
+
+BRing is −6 % at 12,288 rows, −1 % at 16,384. The slice order's remaining cost at 16,384 rows is the gate-up kernel (all-unsliced −130 µs; the sliced down tiles cost nothing measurable), not k step or spill; occupancy 6 by fewer A registers loses more than it gains.
+
+Served (`lab-bench.sh --model olmoe --golden16`, GPU 0, one session, 200 requests; labbook unreachable (DNS), results under `target/lab-bench/o2-*-olmoe/`):
+
+| Run         | tok/s | ITL p50 (ms) | TTFT p50 (ms) | TTFT p95 (ms) | golden c1 / c16 |
+| ----------- | ----- | ------------ | ------------- | ------------- | --------------- |
+| `o2-before` | 610.5 | 24.3         | 132.5         | 262           | PASS / PASS     |
+| `o2-after`  | 608.8 | 24.3         | 128.7         | 216           | PASS / PASS     |
