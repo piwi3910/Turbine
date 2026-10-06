@@ -724,6 +724,7 @@ mod tests {
                         seed: SEED,
                         device: None,
                     }),
+                    rope: None,
                 })
                 .expect("mixed paged attention");
             let got = load(&out.view()).expect("out");
@@ -812,6 +813,7 @@ mod tests {
             block_formats: None,
             classes: None,
             tq: None,
+            rope: None,
         })?;
         Ok((
             load(&out.view()).expect("out"),
@@ -998,6 +1000,7 @@ mod tests {
             block_formats: None,
             classes: None,
             tq: None,
+            rope: None,
         })
         .expect("paged attention");
         let paged_out = load(&out.view()).expect("load");
@@ -1269,6 +1272,7 @@ mod tests {
                     seed: 0,
                     device: None,
                 }),
+                rope: None,
             })
             .expect("mixed paged attention");
         let got = load(&out.view()).expect("out");
@@ -1472,6 +1476,7 @@ mod tests {
                     seed: SEED,
                     device: None,
                 }),
+                rope: None,
             })
             .expect("classed paged attention");
         let bytes = pool.view().slice.read_bytes().expect("pool");

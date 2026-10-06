@@ -208,6 +208,13 @@ pub(crate) struct AttentionPagedDesc {
     pub base_blocks: i32,
     pub slab_stride: i32,
     pub slab_base_blocks: i32,
+    /// v2.12 fused RoPE (decode): device positions (one per q row) and inverse frequencies;
+    /// NULL `rope_inv_freq` = q and k_new are already rotated (read only by a library of minor
+    /// ≥ 12, so set only for one).
+    pub rope_positions: *const i32,
+    pub rope_inv_freq: *const f32,
+    pub rope_rotary_dim: i32,
+    pub rope_attn_factor: f32,
 }
 
 /// `turbine_kv_page_class` (v2.11): one page class besides the base.

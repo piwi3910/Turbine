@@ -872,6 +872,7 @@ fn paged_run_heads(
             block_formats: None,
             classes: None,
             tq: None,
+            rope: None,
         })
         .expect("paged attention");
     let out = read(&o);

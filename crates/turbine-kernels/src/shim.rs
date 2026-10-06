@@ -1596,6 +1596,10 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         base_blocks: 1,
         slab_stride: 1,
         slab_base_blocks: 1,
+        rope_positions: std::ptr::null(),
+        rope_inv_freq: std::ptr::null(),
+        rope_rotary_dim: 0,
+        rope_attn_factor: 1.0,
     }
 }
 
@@ -2652,6 +2656,47 @@ impl AttentionKernel for ShimProvider {
         } else {
             None
         };
+        // P5p fused RoPE (ABI v2.12): the decode call rotates q and k_new itself.
+        let (rope_positions, rope_inv_freq, rope_rotary_dim, rope_attn_factor) = match &ctx.rope {
+            Some(r) => {
+                if !self.fuses_decode_rope(&cfg, &r.cfg) {
+                    return Err(KernelError::Unsupported {
+                        message: format!(
+                            "{} with fused RoPE ({}) needs a decode call and a kernel library \
+                             of ABI minor 12 (this one is {})",
+                            cfg.op(),
+                            r.cfg,
+                            self.ctx.lib.abi_minor()
+                        ),
+                    });
+                }
+                dense(
+                    "rope positions",
+                    &r.positions,
+                    &[ctx.q.shape[0]],
+                    DType::I32,
+                )?;
+                dense(
+                    "rope inv_freq",
+                    &r.inv_freq,
+                    &[r.cfg.rotary_dim as usize / 2],
+                    DType::F32,
+                )?;
+                (
+                    self.ctx
+                        .device_ptr("rope positions", &r.positions)?
+                        .cast_const()
+                        .cast(),
+                    self.ctx
+                        .device_ptr("rope inv_freq", &r.inv_freq)?
+                        .cast_const()
+                        .cast(),
+                    to_i32("rotary_dim", r.cfg.rotary_dim)?,
+                    r.attn_factor,
+                )
+            }
+            None => (std::ptr::null(), std::ptr::null(), 0, 1.0),
+        };
         dense("kv_lens", &ctx.kv_lens, &[num_seqs], DType::I32)?;
         dense("q_indptr", &ctx.q_indptr, &[num_seqs + 1], DType::I32)?;
         dense(
@@ -2694,6 +2739,10 @@ impl AttentionKernel for ShimProvider {
             v_scale: ctx.v_scale,
             block_formats,
             tq_params: tq.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
+            rope_positions,
+            rope_inv_freq,
+            rope_rotary_dim,
+            rope_attn_factor,
         };
         if ctx.block_formats.is_some() && !self.bound_takes(cfg.op(), &d) {
             // A block table that may mix formats, and a bound implementation (chosen for pages
@@ -2706,6 +2755,21 @@ impl AttentionKernel for ShimProvider {
             return self.ctx.check(code);
         }
         self.run(cfg.op(), trio, &d, 0)
+    }
+
+    /// A kernel library of ABI minor ≥ 12 rotates q and k_new inside every paged decode call
+    /// (the b1 kernel in its append, every other path with its rope kernel first): BF16
+    /// activations, half-split RoPE over an even width within the head.
+    fn fuses_decode_rope(&self, cfg: &AttentionConfig, rope: &RopeConfig) -> bool {
+        self.ctx.lib.abi_minor() >= 12
+            && cfg.kind == AttentionKind::DecodePaged
+            && rope.dtype == DType::BF16
+            && rope.head_dim == cfg.head_dim
+            && rope.num_q_heads == cfg.num_q_heads
+            && rope.num_kv_heads == cfg.num_kv_heads
+            && rope.rotary_dim >= 2
+            && rope.rotary_dim.is_multiple_of(2)
+            && rope.rotary_dim <= rope.head_dim
     }
 }
 
