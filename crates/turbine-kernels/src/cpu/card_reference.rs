@@ -40,7 +40,7 @@ pub const B1_DECODE_IMPL: &str = "turbine_hip_b1_decode";
 pub const B1_MAX_GROUP: u32 = 8;
 /// `kTurbineB1CkSeqs` (the library's header): the decode batch from which the b1 entry runs CK
 /// split-KV instead, when CK serves the page size.
-pub const B1_CK_SEQS: usize = 4;
+pub const B1_CK_SEQS: usize = 10;
 /// `kCkPagedkvPage` (paged_attention.cpp): CK serves page sizes that are multiples of this.
 pub const CK_PAGE_MULTIPLE: u32 = 128;
 

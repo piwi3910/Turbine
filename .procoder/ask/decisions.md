@@ -3645,6 +3645,39 @@ moved to the measured crossover, the invariance test's edge moving with it.
 
 ## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06)
 
+## 5p decode-step gaps: what is left — the step is 0.85×, not 0.81×; 0.9× needs a new numerics class (2026-10-06, open)
+
+From `p5p-gaps` (perf log 5p "Decode-step boundaries"). Landed: the b1 → CK split-KV edge at 10 sequences
+(e2d0d8c3; b1 not slower than CK through 9 sequences at ~768–8,192 tokens; c16 0.996×, c1 unchanged) and
+`logits_reduce` loads issued 8 at a time (4fa9622c; bit-identical by output digest; served 117 → 84 µs; Llama ITL
+c1 11.86 → 11.81 ms, c1 82.8 → 83.2 tok/s, c16 852.1 → 855.6, golden c1/c16 PASS; OLMoE c1 unchanged).
+
+What the profile shows, corrected for the profiler: rocprofv3's kernel trace adds ~1.9 µs to every graph-replay
+dispatch and ~170 µs to `hipGraphLaunch` (gap microbenchmark, with and without the profiler). The "~1.0 ms of
+inter-kernel gaps" and the 12.44 ms / 0.81× of the earlier entries are traced numbers; unprofiled, the Llama b1
+decode step is the ITL, **11.81 ms = 545 GB/s = 0.851×**: GEMMs 10.75 ms (91 %; each at 86–99 % of peak), attention
+0.30, `logits_reduce` 0.08, norms + silu·mul + embedding 0.19, and ~0.44 ms between kernels (~230 in-graph boundaries
+at ~1.6 µs, plus ~0.07 ms of host turnaround). 0.9× is 11.16 ms: −0.65 ms. Every bit-exact item left is worth
+~0.1 ms together (`logits_reduce`'s gather/sort ~0.05, a spinning readback wait ~0.02, the final add + norm as one
+`add_rmsnorm` 0.003); ROCm runtime knobs (graph batch size, kernarg placement, doorbell, active wait) measured no
+faster than the defaults. Fewer boundaries need elementwise work inside the GEMMs, and hipBLASLt offers neither a
+normalising prologue nor a gated (silu·up) epilogue.
+
+- A) Accept ~0.85× for Llama b1 decode and close the decode-bandwidth line; record the unprofiled ITL as the
+  bandwidth measure from now on (traced spans overstate the step by ~0.6 ms) (recommended)
+- B) An own m = 1 decode GEMV family for Llama's projections with the neighbours fused in: input rmsnorm /
+  add+rmsnorm as the qkv and gate_up prologue, silu·mul as the down prologue (3 of 8 kernels per layer gone:
+  ~0.18 ms of kernels + ~0.13 ms of boundaries), and possibly faster than hipBLASLt on the small qkv / o_proj /
+  down shapes (served at 84–92 % of peak; ≤ ~0.25 ms more). A new numerics class for decode rows (GEMV summation
+  order instead of hipBLASLt's; prefill keeps its invariant rows, so prefix reuse is unaffected); tensor parallel
+  keeps today's path (`rmsnorm_sharded` bitwise constraint); reuse-first evaluation owed (llama.cpp's mmv kernels,
+  CK); golden re-check. Estimated 11.81 → ~11.3–11.5 ms (0.87–0.89×): reaches ~0.9× only with C as well.
+- C) Overlap scheduling (5p spec item): feed the sampled token to the next step's embedding on the device and
+  launch step N+1 before step N's readback, hiding the ~0.07–0.1 ms host turnaround per step at c1 (~0.7 %) and
+  the host share at c16 (1.9 %). Bit-exact; scheduler/engine design work (stop conditions observed one step late).
+
+## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06, open)
+
 From `p5p-t13t17` (instrumentation a5f4b4a3; perf log 5p "Task 13"). 6b Task 18 recipe on today's tree, 3 + 3
 interleaved runs, GPU 0, `kv.partial_prefix_reuse=false` on both arms (see the next entry). Ladder on (L1/L2 + L0,
 `tq4`) against off, medians: tok/s 310.2 vs 341.4 (**0.909×**, S-14 ≥ 0.90 met at the edge), ORANGE samples 44 vs 26

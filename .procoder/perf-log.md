@@ -1608,3 +1608,119 @@ Served (`lab-bench.sh --model olmoe`, GPU 0, one session; `commit=a5bacce3` on t
 | `t16c-after-c1`  | 1    | 64       | 149.9 | 6.5          | 43.6          | 46.1          | PASS / –        |          |
 
 Verdict: no c16 TTFT recovery. The c16 workload's prefill steps are full 2,048-token chunks plus up to 16 decode rows (≥ 16,384 routed rows: the prefill tier before and after; the step-token histogram shows ~30 prefill steps in (1,024, 2,048] and 1–2 in (512, 1,024]), so the new tier serves almost none of them; 134 vs 141 is run-to-run noise on 64 requests (the 200-request run reads 134). The +10–14 ms against 200d074d comes from the prefill tier itself at 16,384 rows (2,830–2,945 µs per layer now vs 2,500–2,560 at f49149f), which only O2 (k step 128 without spill) addresses. The tier does help prompts of 65–1,408 tokens: c1 TTFT p50 −2 % (44.5 → 43.6 ms), p95 −4.5 %; the kernel is 5–17 % faster per MoE call in that range.
+
+### b1 → CK split-KV edge re-timed (branch `p5p-gaps`, 2026-10-06)
+
+User decision 2026-10-06 ("5p b1 attention II", A: "re-time the edge"). `kTurbineB1CkSeqs` was 4, set
+from the pre-iteration b1 kernel. New harness `hip_ops b1_ck_edge_timings`: Llama heads, 128-token
+pages, RoPE fused as served, each call inside a captured graph of ≥ 28 calls on their own pools
+(≥ 512 MB of pools, cold KV, no host launch cost), the b1 entry and CK split-KV bound alone; the b1
+side above the old edge from a library built with the edge raised (not committed). novanas GPU 0,
+bench lock. µs per layer, b1 / CK:
+
+| b \ ctx | ~768          | ~2,048         | ~4,096          | ~8,192        |
+| ------- | ------------- | -------------- | --------------- | ------------- |
+| 1       | 13.1 / 41.6   | 22.6 / 85.3    | 36.4 / 153.0    | —             |
+| 4       | 32.7 / 44.9   | 65.6 / 91.2    | 118.8 / 165.4   | —             |
+| 8       | 55.4 / 63.1   | 121.1 / 129.6  | 233.6 / 239.0   | 450.8 / 451.2 |
+| 9       | —             | —              | 261.2 / 266.9   | 502.5 / 507.9 |
+| 10      | —             | —              | 290.5 / 292.1   | 569.2 / 563.7 |
+| 12      | 78.8 / 85.2   | 182.1 / 184.6  | 351.8 / 343.8   | 677.8 / 670.3 |
+| 16      | 100.6 / 106.8 | 240.5 / 239.6  | 455.9 / 451.4   | —             |
+| 32      | 213.2 / 209.3 | 504.3 / 492.0  | 935.3 / 933.4   | —             |
+| 64      | 535.1 / 402.6 | 1349.8 / 952.5 | 2394.4 / 1814.9 | —             |
+
+b1 is not slower than CK through 9 sequences at every context; at 10 it loses 1 % at ~8k, from 12 at
+~4k. **The edge moves to 10** (b1 for 1–9 sequences). The invariance test moves with it
+(`b1_decode_rows_are_batch_invariant`: b1 side batches 2, 3, 9 bitwise against alone; CK side 10,
+16, 64 bitwise against each other; cross-edge bound re-measured in lab run 1006094933: max |Δ|
+3.906e-3 on up to 1,317 / 3,072 elements over 216 cross-edge rows — unchanged, the 7.8125e-3 bound
+stays). Green in the same run: `paged_attention_rows_are_batch_invariant`,
+`paged_b1_decode_matches_cpu`, `paged_decode_splitkv_matches_cpu`,
+`paged_decode_fused_rope_matches_separate`.
+
+| Run (`lab-bench --c1 --golden16`, GPU 0, same session) | c16 tok/s | ITL p50 | c1 tok/s | ITL c1 p50 | golden c1 / c16 |
+| ------------------------------------------------------ | --------- | ------- | -------- | ---------- | --------------- |
+| base `p6b-stack` 8b6f27c4 (`gaps-base`)                | 852.1     | 15.5    | 82.8     | 11.86      | PASS / PASS     |
+| edge 10 (`gaps-edge10`)                                | 848.8     | 15.6    | 82.6     | 11.89      | PASS / PASS     |
+
+c16 0.996× (inside the 0.5 % GPU-0 drift bracket; the c16 bench decodes 16-sequence batches, CK on
+both sides of the change), c1 unchanged (batch 1 runs b1 on both). The win is for decode batches of
+4–9 sequences: 3–27 % less attention time per layer at those sizes.
+
+### Decode-step boundaries: the per-boundary profile, the profiler's share, `logits_reduce` (branch `p5p-gaps`, 2026-10-06)
+
+Task: Llama-3.2-3B batch-1 decode toward ~0.9× of the 640 GB/s peak (≈ 11.1 ms/step) by attacking
+the ~1.0 ms of inter-kernel gaps of the profiled step. Tools: `scripts/lab-decode-profile.sh` and
+`scripts/decode-profile-report.py --boundaries` (new: the per-boundary table of the modal step), a
+standalone gap microbenchmark (`gapbench`: a graph of 231 dependent kernels, empty or alternating
+with a 32 MB read, timed with and without rocprofv3; scratch, not in the tree). novanas GPU 0, bench
+lock, same day.
+
+**Per-boundary table** (traced at 4fa9622c, 226 modal steps of 231 kernels, ~800-token context; µs
+are medians; every kernel from the embedding to `logits_reduce` is one graph replay, the two
+`copyBuffer` blits are the eager metadata upload before the launch, the D2H readback follows it):
+
+| Boundary (kernel → next)                               | per step | kernel µs | gap after (traced) µs | graph | ms/step kernel | ms/step gap |
+| ------------------------------------------------------ | -------- | --------- | --------------------- | ----- | -------------- | ----------- |
+| copyBuffer (H2D metadata) → copyBuffer                 | 1        | 2.2       | 151.6                 | no    | 0.002          | 0.152       |
+| copyBuffer → embedding                                 | 1        | 2.7       | 152.9                 | no    | 0.003          | 0.153       |
+| embedding → CK rmsnorm (input norm, layer 0)           | 1        | 4.7       | 3.6                   | yes   | 0.005          | 0.004       |
+| CK rmsnorm / add+rmsnorm → qkv GEMM (MT64x64x64)       | 28       | 1.8       | 3.5                   | yes   | 0.050          | 0.099       |
+| qkv GEMM → b1 attention (RoPE + append fused)          | 28       | 58.9      | 3.6                   | yes   | 1.650          | 0.100       |
+| b1 attention → o_proj GEMM (MT16x16x128)               | 28       | 10.6      | 3.5                   | yes   | 0.298          | 0.099       |
+| o_proj GEMM → CK add+rmsnorm                           | 28       | 36.5      | 3.5                   | yes   | 1.021          | 0.099       |
+| CK add+rmsnorm → gate_up GEMM (MT16x16x128)            | 28       | 1.7       | 3.4                   | yes   | 0.048          | 0.096       |
+| gate_up GEMM → silu·mul                                | 28       | 159.8     | 3.6                   | yes   | 4.475          | 0.100       |
+| silu·mul → down GEMM (MT32x16x256)                     | 28       | 2.9       | 3.6                   | yes   | 0.081          | 0.100       |
+| down GEMM → next layer's CK add+rmsnorm (or add)       | 28       | 85.8      | 3.6                   | yes   | 2.403          | 0.101       |
+| add → CK final rmsnorm → LM head GEMM (f32 out)        | 1 + 1    | 1.2 / 1.7 | 3.5 / 3.5             | yes   | 0.003          | 0.007       |
+| LM head GEMM → `logits_reduce`                         | 1        | 1244.6    | 12.4                  | yes   | 1.245          | 0.012       |
+| `logits_reduce` → (step end; D2H readback, host)       | 1        | 84.4      | —                     | yes   | 0.084          | —           |
+| **step** (traced span 12.50 ms, busy 11.37, gaps 1.13) | 231      |           |                       |       | **11.37**      | **1.13**    |
+
+**The traced gaps are mostly the profiler's.** rocprofv3's kernel trace adds ~1.9 µs to every
+dispatch of a graph replay and blocks `hipGraphLaunch` on the host: gapbench (231 nodes,
+alternating 32 MB reads and empty kernels) runs 30.5 µs/node unprofiled and 33.5 traced, with a
+traced gap of 3.52 µs — the served trace's uniform ~3.5 µs — against ~1.6 µs unprofiled
+(node time minus the traced kernel times); the graph launch call takes 5.5 µs unprofiled and 179 µs
+traced (`DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0` reproduces ~125 µs without the profiler: ROCm 7's
+segment scheduling is what makes it cheap). The served step agrees: ITL c1 p50 11.81–11.89 ms
+unprofiled against the 12.44–12.50 ms traced span. So **the real decode step is ~11.85 ms
+(542 GB/s, 0.85×), not 12.44 (0.81×)**: kernels 11.37 ms (GEMMs 10.75 = 90.7 % of the step, at
+86–99 % of peak each; attention 0.30; `logits_reduce` 0.08; CK norms 0.10; silu·mul 0.08) and
+~0.44 ms between them — ~230 in-graph boundaries at ~1.6 µs plus the host turnaround (readback
+wake-up, metadata upload, launch: ~0.07 ms). Runtime knobs measured on gapbench, none faster than
+the default: `DEBUG_HIP_GRAPH_BATCH_SIZE` 8/32, `DEBUG_CLR_MAX_BATCH_SIZE=8`, `HIP_FORCE_DEV_KERNARG`,
+`ROC_SKIP_KERNEL_ARG_COPY` (slower), `DEBUG_CLR_DOORBELL_SKIP=0`, `DEBUG_HIP_FORCE_GRAPH_QUEUES=0`,
+`ROC_ACTIVE_WAIT_TIMEOUT`; `ROC_SYSTEM_SCOPE_SIGNAL=0` hangs.
+
+**Landed (bit-exact): `logits_reduce` issues 8 loads per lane before using them** (4fa9622c). The
+one-block-per-row kernel swept the 128,256-id row as ~125 dependent loads per lane; the same
+per-id steps now run in the same order on loads issued 8 at a time. `logits_reduce_matches_cpu`
+prints an FNV digest of every HIP output: identical before and after on all six cases (a two-kernel
+prepass that spreads steps 1–2 over 32 blocks per row was also built and digest-identical, but no
+faster than the hoisted loads at the served shapes — not landed). hip_ops, 16 rows: id-order draw
+113 → 78 µs, Llama-default nucleus (T 0.6, top_p 0.9) on peaked rows 102 → 87, broad rows
+490 → 356. Served (traced): 117.4 → 84.4 µs per step.
+
+| Run (`lab-bench --c1`, GPU 0, same session)  | ITL c1 p50 ms | eff. BW (6.43 GB / ITL) | c1 tok/s | c16 tok/s | golden c1 / c16 |
+| -------------------------------------------- | ------------- | ----------------------- | -------- | --------- | --------------- |
+| Llama base 8b6f27c4 (`gaps-base`)            | 11.86         | 542 GB/s (0.847×)       | 82.8     | 852.1     | PASS / PASS     |
+| Llama edge 10 e2d0d8c3 (`gaps-edge10`)       | 11.89         | 541 (0.845×)            | 82.6     | 848.8     | PASS / PASS     |
+| Llama `logits_reduce` 4fa9622c (`gaps-lr`)   | **11.81**     | **545 (0.851×)**        | **83.2** | **855.6** | PASS / PASS     |
+| OLMoE before (`gaps-base-olmoe`, old kernel) | 6.20          | —                       | 154.7    | 611.1     | PASS / —        |
+| OLMoE after (`gaps-lr-olmoe`)                | 6.23          | —                       | 153.9    | 609.7     | PASS / —        |
+
+(The OLMoE "before" run was built with 4fa9622c's tree but e2d0d8c3's `logits_reduce.hip`; its
+BENCH line names 4fa9622c. OLMoE's 50,304-id rows: no measurable change, ±0.5 % is run-to-run.)
+
+**Verdict: ~0.9× is not reachable with bit-exact changes.** 0.9× is 11.16 ms; the step is 11.81 ms,
+of which the GEMMs alone are 10.75 ms. Everything that is neither a GEMM nor attention — norms,
+silu·mul, `logits_reduce`, embedding, every boundary and the host turnaround — is ~0.8 ms, and the
+remaining bit-exact items are worth ~0.1 ms (`logits_reduce`'s gather and sort, ~0.05; a spinning
+readback wait, ~0.02; the final add + norm as one `add_rmsnorm`, 0.003). Removing boundaries means
+fusing elementwise work into the GEMMs, and the GEMMs are hipBLASLt kernels with no prologue and no
+gated epilogue: every fusion candidate (rmsnorm into the qkv / gate_up GEMV prologue, silu·mul into
+the down GEMV prologue) needs an own m = 1 GEMV, a new numerics class for the decode rows. Options
+in decisions ("5p decode-step gaps: what is left").

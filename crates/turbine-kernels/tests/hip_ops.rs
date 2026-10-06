@@ -1724,9 +1724,9 @@ fn paged_b1_decode_matches_cpu() {
 
 /// P5p b1 attention II (kernel ABI v2.12): RoPE fused into a paged decode call gives the bits
 /// of the rope op followed by the unfused call — the output rows and the pool after the append,
-/// compared exactly — on the b1 kernel (1–3 sequences, rotating in its append and q staging),
-/// the library's CK hand-off above 3 sequences and CK split-KV bound alone (both rotate in place
-/// first), and the OLMoE heads (CK pagedkv); full and partial rotary widths, a YaRN attention
+/// compared exactly — on the b1 kernel (1–5 sequences, rotating in its append and q staging),
+/// the library's CK hand-off from 10 sequences (16) and CK split-KV bound alone (both rotate in
+/// place first), and the OLMoE heads (CK pagedkv); full and partial rotary widths, a YaRN attention
 /// factor, both page sizes. Breaks if the fused rotation differs from the rope kernel in any
 /// rounding, uses the wrong position or head, misses the appended K row, or a path ignores the
 /// fields.
@@ -2903,10 +2903,18 @@ fn logits_reduce_case(p: &Pair, rng: &mut Rng, rows: usize, vocab: usize, top_n:
             assert_eq!(sl_h[r].to_bits(), sl_c[r].to_bits(), "{what}: row {r}");
         }
     }
+    // FNV-1a over the bits of every HIP output: equal digests from two kernel libraries mean
+    // bit-identical reductions (a kernel change that claims to keep the bits is checked so).
+    let digest = [&ids_h, &vals_h, &lse_h, &s_h, &sl_h]
+        .iter()
+        .flat_map(|v| v.iter())
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+        });
     println!(
         "{what}: impl={impl_name} top ids exact, max lse rel |Δ| {worst_lse:.3e}, \
          draws identical ({nucleus_rows} from a top_p nucleus) but {boundary} at a CDF \
-         boundary ok"
+         boundary ok, output digest {digest:016x}"
     );
 }
 
@@ -4399,6 +4407,150 @@ fn decode_attention_timings() {
                     model.kv_heads,
                     info.name,
                     kv_bytes as f64 / us / 1e3,
+                );
+            }
+        }
+    }
+}
+
+/// Lab microbenchmark (no assertion on speed): where the b1 decode entry should hand a batch to CK
+/// split-KV (`kTurbineB1CkSeqs`). Llama heads (24/8), 128-token pages, RoPE fused as served
+/// (the b1 kernel rotates in-kernel, every other path runs the rope kernels first), decode
+/// batches of 1 to 64 sequences at ~768 to ~8,192 tokens, the b1 entry and CK split-KV
+/// each bound alone. Each call is timed inside a captured graph of one call per KV
+/// pool copy (≥ 512 MB of pools, so the KV is cold as in a served step where every layer has its
+/// own pool), like the served decode graph: device time plus the inter-kernel boundaries, no host
+/// launch cost. The b1 entry runs CK above the edge, so time b1 there with a library built with
+/// the edge raised. Prints `b1_ck_edge` lines. Run natively on one GPU under the bench lock with
+/// `cargo test --release -p turbine-kernels --test hip_ops -- --ignored b1_ck_edge_timings --nocapture`.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn b1_ck_edge_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(13);
+    const LAUNCHES: u32 = 20;
+    const BLOCK_TOKENS: usize = 128;
+    let model = BENCH_MODELS[0];
+    let cfg = model.attention_cfg(BLOCK_TOKENS);
+    let rope_cfg = model.rope_cfg();
+    let spec = OpConfig::Attention(cfg);
+    let impls: Vec<ImplInfo> = p
+        .hip
+        .implementations(OpKind::AttentionDecodePaged)
+        .into_iter()
+        .filter(|i| p.hip.implementation_supports(&spec, i.index, None))
+        .filter(|i| {
+            matches!(
+                i.name.as_str(),
+                "turbine_hip_b1_decode" | "ck_tile_fmha_splitkv"
+            )
+        })
+        .collect();
+    let batches = [1usize, 2, 4, 8, 9, 10, 12, 16, 32, 64];
+    let max_m = 64usize;
+    let q = on_hip(
+        &p,
+        &[max_m, model.q_heads, HEAD_DIM],
+        DType::BF16,
+        &rng.normal(max_m * model.q_rows(), 1.0),
+    );
+    let kv_new = on_hip(
+        &p,
+        &[max_m, model.kv_heads, HEAD_DIM],
+        DType::BF16,
+        &rng.normal(max_m * model.kv_rows(), 1.0),
+    );
+    let out = zeros_on_hip(&p, &[max_m, model.q_heads, HEAD_DIM], DType::BF16);
+    let freq = on_hip(&p, &[HEAD_DIM / 2], DType::F32, &model.inv_freq());
+    for ctx in [768usize, 2048, 4096, 8192] {
+        for &m in &batches {
+            let kv_lens = bench_kv_lens(m, ctx);
+            let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+            let max_blocks = max_kv.div_ceil(BLOCK_TOKENS);
+            let num_blocks = m * max_blocks;
+            let pool_elems = num_blocks * 2 * BLOCK_TOKENS * model.kv_rows();
+            // At least 28 calls per graph (a served step's layers), at least 2 for pools past
+            // the 64 MB L2/MALL.
+            let pool_bytes = pool_elems * 2;
+            let copies = (512usize << 20)
+                .div_ceil(pool_bytes)
+                .max(if pool_bytes < 64 << 20 { 28 } else { 2 });
+            let raw = encode(DType::BF16, &pattern(&mut rng, pool_elems, 1.0));
+            let pools: Vec<Tensor> = (0..copies)
+                .map(|_| {
+                    raw_on_hip(
+                        &p,
+                        &[num_blocks, 2, BLOCK_TOKENS, model.kv_heads, HEAD_DIM],
+                        DType::BF16,
+                        &raw,
+                    )
+                })
+                .collect();
+            let table: Vec<f32> = shuffled(&mut rng, num_blocks)
+                .iter()
+                .map(|&b| b as f32)
+                .collect();
+            let bt = on_hip(&p, &[m, max_blocks], DType::I32, &table);
+            let indptr: Vec<f32> = (0..=m).map(|i| i as f32).collect();
+            let ip = on_hip(&p, &[m + 1], DType::I32, &indptr);
+            let lens: Vec<f32> = kv_lens.iter().map(|&k| k as f32).collect();
+            let kl = on_hip(&p, &[m], DType::I32, &lens);
+            let positions: Vec<f32> = kv_lens.iter().map(|&k| (k - 1) as f32).collect();
+            let pos = on_hip(&p, &[m], DType::I32, &positions);
+            for info in &impls {
+                let b = bound(&p, &spec, info.index);
+                let attn = b.hip.attention().expect("hip attention");
+                let call = |pool: &Tensor| {
+                    attn.execute_paged(&mut PagedAttentionContext {
+                        cfg,
+                        q: q.view().rows(0, m),
+                        k_new: kv_new.view().rows(0, m),
+                        v_new: kv_new.view().rows(0, m),
+                        out: out.view().rows(0, m),
+                        kv_layer: pool.view(),
+                        block_table: bt.view(),
+                        q_indptr: ip.view(),
+                        kv_lens: kl.view(),
+                        max_q_len: 1,
+                        max_kv_len: max_kv as u32,
+                        max_blocks_per_seq: max_blocks as u32,
+                        scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                        k_scale: 1.0,
+                        v_scale: 1.0,
+                        block_formats: None,
+                        classes: None,
+                        tq: None,
+                        rope: Some(FusedRope {
+                            cfg: rope_cfg,
+                            positions: pos.view(),
+                            inv_freq: freq.view(),
+                            attn_factor: 1.0,
+                        }),
+                    })
+                    .expect("paged decode attention");
+                };
+                // Warm-up outside the graph (CK's first call sets up its arguments).
+                call(&pools[0]);
+                b.hip_mem.synchronize().expect("synchronize");
+                p.ctx.graph_begin().expect("graph begin");
+                for pool in &pools {
+                    call(pool);
+                }
+                let graph = p.ctx.graph_end().expect("graph end");
+                let us = time_us(&b, LAUNCHES, || {
+                    p.ctx.graph_launch(&graph).expect("graph launch");
+                }) / copies as f64;
+                println!(
+                    "b1_ck_edge heads={}/{} impl={} entry_runs={} b={m} kv~{ctx}: {us:.2} us/call \
+                     (graph of {copies})",
+                    model.q_heads,
+                    model.kv_heads,
+                    info.name,
+                    attn.implementation(&cfg),
                 );
             }
         }
