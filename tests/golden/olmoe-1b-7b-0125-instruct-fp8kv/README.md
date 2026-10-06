@@ -81,7 +81,7 @@ range of its logprob over every capture still on the reference's tokens there. M
 within the reference's spread of the reference and within its order noise of any reordering of
 itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
 The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
-`tolerance.json` is unchanged until the decision.
+Decision A (user, 2026-10-06): the proposed column is applied to `tolerance.json` (unchanged where proposed = today).
 
 | bound | today | observed | triangle | proposed |
 |---|---|---|---|---|
@@ -94,3 +94,5 @@ Default server c1 against the reference: prefix ok 16/16, likely 0.951 (p13),
 tail 5.162 (p03).
 
 Over the cap: p03 position 20 puts the −12.62 tail candidate at −17.78 in every default capture (−17.07 … −17.86 over all variants), 5.16 from the reference — a systematic offset of the FP8 KV path, not order noise, so the triangle (3.42) does not cover it and no bound is proposed beyond the cap. The `OlmoeForCausalLM/bf16/fp8_e4m3` row is `experimental`; the strict likely moves 1.10 → 1.14.
+
+Applied bounds (decision A): likely 1.14, tail 3.42 (the cap: 2.01 plus the largest noise 1.40), strict and batched. The slug still fails the gate: c1 tail is 5.16 at p03 position 20, where the -12.62 candidate sits at -17.07 ... -17.86 in every capture, a systematic offset above the cap that no noise-justified bound covers. It stays failing (experimental row) until the Phase 7 investigation.

@@ -20,7 +20,7 @@ range of its logprob over every capture still on the reference's tokens there. M
 within the reference's spread of the reference and within its order noise of any reordering of
 itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
 The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
-`tolerance.json` is unchanged until the decision.
+Decision A (user, 2026-10-06): the proposed column is applied to `tolerance.json` (unchanged where proposed = today).
 
 | bound | today | observed | triangle | proposed |
 |---|---|---|---|---|

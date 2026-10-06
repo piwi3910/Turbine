@@ -65,7 +65,7 @@ range of its logprob over every capture still on the reference's tokens there. M
 within the reference's spread of the reference and within its order noise of any reordering of
 itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
 The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
-`tolerance.json` is unchanged until the decision.
+Decision A (user, 2026-10-06): the proposed column is applied to `tolerance.json` (unchanged where proposed = today).
 
 | bound | today | observed | triangle | proposed |
 |---|---|---|---|---|
@@ -78,3 +78,5 @@ Default server c1 against the reference: prefix ok 15/16, likely 1.062 (p14),
 tail 1.742 (p13).
 
 The two c16 failures (p14 likely 1.40, p16 tail 5.27 in the 2026-10-06 golden c16 run): p14's likely 1.42 is order noise (range 1.28 at p14 position 18 alone). p16 is different: the reference has a 0.10-margin near-tie at position 13; most captures take the other branch there (excused, positions ≥ 13 unjudged), 3 of 16 batched captures take the reference's branch, and on it the −9.09 tail candidate (token 198) at position 28 sits at −13.10, −14.29 and −14.43 in them (range 1.33, all 4.0–5.3 below the reference): a systematic offset on that branch, not order noise. It passes the proposed batched tail only under the uniform reading of the triangle (today's 2.99 plus the slug's largest order noise, 2.85 at p10 position 12).
+
+Caveat on the applied batched tail 5.34 (p16): it is not noise-sized. The -9.09 candidate at p16 position 28 sits 4.0-5.3 nats below the reference on the reference's branch, a systematic offset that order noise only makes visible (it decides whether a capture takes that branch). The bound passes it as a uniform per-slug bound (today's 2.99 plus the slug's largest noise); it does not certify the offset as noise.
