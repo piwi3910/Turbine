@@ -3764,7 +3764,7 @@ Open items for the lead (measured, not landed — each would be its own landing)
 addition, decoder skips `quantize_act` when the bound qgemm takes BF16 activations), and FP8-block's `down` moves to
 16 waves as its own landing. Item 3 (the per-tensor golden c1 regression on the base) is bisected as a bug.
 
-## 5p tiny_model A1 landed; the b1 bound's margin, the v2.3 leg, and the OLMoE c16 TTFT left after O1 (open, 2026-10-06)
+## 5p tiny_model A1 landed; the b1 bound's margin, the v2.3 leg, and the OLMoE c16 TTFT left after O1 (2026-10-06)
 
 `p5p-t16c` (a5bacce3, dc4a32b2): the strict leg runs decode on CK splitkv (a test-only card-profile copy) at 3.8e-6
 against 1e-4; the new `hip_b1_matches_cpu` runs b1 against `card_reference_provider`: 32/32 identical greedy tokens,
@@ -3780,3 +3780,6 @@ prefill chunk is ≥ 16,384 routed rows, still served by the prefill tier, now 2
 2. v2.3 leg on the b1 bound: A) accept (recommended); B) drop the v2.3 Llama leg's logit check, keep tokens only
 3. OLMoE c16 TTFT: A) task O2 — restore the k step 128 in the sliced prefill gate-up without register spill, same
    order so bitwise (recommended); B) accept ~+6 ms c16 TTFT p50 as the price of invariance
+
+**Decision (user, 2026-10-06): 1 A, 2 A, 3 A.** The b1 leg's bound tightens to 0.12; the v2.3 leg keeps the b1 bound
+and the token check; O2 is tasked (the 128 k step in the sliced prefill gate-up without spill, bitwise tiers kept).
