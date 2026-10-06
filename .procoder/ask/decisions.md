@@ -3530,3 +3530,39 @@ that exact mismatch at 0.097). The b1 branch ran only kernel-level lab tests, so
 
 **Decision (user, 2026-10-06): A.** The CPU reference models the b1 numerics (F32 P) where the HIP side runs b1; the
 1e-4 bound stays.
+
+## 5p tiny_model vs b1: the reference models b1's P, but b1's own F32 order still flips a BF16 value (2026-10-06)
+
+Following decision A (`p5p-t16b` 5417357d): `card_reference_provider(card)` keeps P in F32 where the library runs b1.
+Steps 0–6 now match at ~1e-6 (were 0.103), but at step 7 one attention output rounds to a different BF16 value — b1's
+own F32 summation order and GPU `expf`, which a CPU reference cannot copy bit for bit — and the changed value enters
+the KV cache, so steps 7–31 sit at 0.017–0.093; greedy tokens are identical for all 32 steps. CK's class avoided this
+because a BF16 P × BF16 V is exact in F32.
+
+- A1) Keep the strict 1e-4 end-to-end test with decode attention bound to CK splitkv; add a b1 end-to-end leg on the
+  new reference: identical greedy tokens over 32 steps and logits within a calibrated bound (~0.15; 0.093 measured);
+  b1's op-level tests unchanged (recommended)
+- A2) Model b1's full order (8 splits, 32-key waves, FMAs) in the reference; GPU `expf` still differs, flips only
+  rarer
+- A3) Re-bound only the b1 steps of the existing test (hides other mismatches at those steps)
+- A4) b1 rounds P to BF16 like CK (a kernel change on the b1 v2 branch)
+
+**Decision (user, 2026-10-06): A1.** The strict 1e-4 end-to-end test binds decode attention to CK splitkv; a b1 leg
+on the b1-modelling reference checks identical greedy tokens over 32 steps and logits within a calibrated bound.
+
+## 5p OLMoE TTFT +10–14 ms from the MoE invariance fix (2026-10-06)
+
+Bisected (`lab-bench --model olmoe --quick`, GPU 0, one session): TTFT p50 128 ms before 200d074d, 138–142 after; the
+b1 and jump-forward merges add nothing; c16 tok/s within noise. The prefill MoE tier (`wmma_prefill`) is +25 % at 64
+tokens, +19 % at 256, +7 % at 2,048 — its k step dropped 128 → 64 to avoid register spill in the sliced order. Above
+512 rows the prefill tier serves every call; at 2,048 rows it is now slower than the `wmma` tier (1894 vs 1681 µs),
+faster at 16,384 (2859 vs 3345). All tiers stay bitwise equal.
+
+- O1) A row tier preferring `wmma` from 513 rows up to a measured crossover, the prefill tier above; both bitwise
+  equal, invariance untouched; recovers part of the loss (recommended first)
+- O2) Restore the k step 128 in the sliced gate-up without spill (slice totals in LDS, or split gate and up); same
+  order, should stay bitwise; invariance tests and a perf check
+- O3) Accept ~+10 ms TTFT p50 as the price of invariance and record it
+
+**Decision (user, 2026-10-06): O1.** Route 513 rows up to the measured crossover to the `wmma` tier, the prefill tier
+above it; no numerics change. O2 is not tasked now.
