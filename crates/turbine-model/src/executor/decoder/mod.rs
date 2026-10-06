@@ -60,7 +60,8 @@ use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, FusedRope, GemmConfig, GemmContext,
     KernelError, KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement,
-    PagedAttentionContext, QGemmContext, QuantizeActContext, RopeConfig, RopeContext, TqPaged,
+    PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext, RopeConfig, RopeContext,
+    TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -1469,7 +1470,9 @@ impl DecoderExecutor {
     }
 
     /// `c = a · wᵀ` for a `[n, k]` layer `w`: the GEMM for a BF16 weight; for a quantized one
-    /// `quantize_act` into the scratch (when activations are quantized), then `qgemm`.
+    /// `quantize_act` into the scratch (when activations are quantized), then `qgemm` — or
+    /// `qgemm` alone on the unquantized activations when the kernel bound for this call
+    /// quantizes them itself (FP8 W8A8, kernel ABI v2.13: the same codes, one launch fewer).
     fn linear(
         &self,
         a: TensorView<'_>,
@@ -1482,6 +1485,29 @@ impl DecoderExecutor {
         // `k` from the activations: packed 4-bit weights hold two columns per byte.
         let (m, n, k) = (a.shape[0], w.w.shape[0], a.shape[1]);
         let prefill = self.step_prefill.load(Ordering::Relaxed);
+        let cfg = self.dims.qgemm(n, k, q.quant);
+        let kernel = self.registry.qgemm(&cfg);
+        if a.dtype == self.dims.act && kernel.quantizes_activations(&cfg, m, prefill) {
+            let fused = QGemmConfig {
+                a_dtype: a.dtype,
+                ..cfg
+            };
+            // Profiled under the bound config (its implementation name).
+            return self.op(OpConfig::QGemm(cfg), || {
+                kernel.execute(&mut QGemmContext {
+                    cfg: fused,
+                    a,
+                    a_scales: None,
+                    b: w.w,
+                    b_scales: q.scales,
+                    b_zeros: q.zeros,
+                    c,
+                    alpha: 1.0,
+                    prefill,
+                    act_static_scale: q.input_scale,
+                })
+            });
+        }
         let (a, a_scales) = match (self.dims.quantize_act(k, q.quant), &self.act_quant) {
             (None, _) => (a, None),
             (Some(qa), Some((out, scales))) => {
@@ -1508,9 +1534,8 @@ impl DecoderExecutor {
                 ));
             }
         };
-        let cfg = self.dims.qgemm(n, k, q.quant);
         self.op(OpConfig::QGemm(cfg), || {
-            self.registry.qgemm(&cfg).execute(&mut QGemmContext {
+            kernel.execute(&mut QGemmContext {
                 cfg,
                 a,
                 a_scales,
@@ -1520,6 +1545,7 @@ impl DecoderExecutor {
                 c,
                 alpha: 1.0,
                 prefill,
+                act_static_scale: 1.0,
             })
         })
     }

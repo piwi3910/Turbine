@@ -719,7 +719,7 @@ bool eval_block(Env &env, Rng &rng, const std::vector<std::string> &shapes,
         auto fused = [&](int i) {
           const auto *w = static_cast<const uint8_t *>(view.w_fp8[i % copies]);
           if (blocks >= 64)
-            (void)turbine_hip::fp8_block::launch_wmma<1, 8>(
+            (void)turbine_hip::fp8_block::launch_wmma<1, 16>(
                 view.a_bf16, w, view.ws_dev, view.c, m, n, k, k, n, false, 1.0f,
                 env.stream);
           else if (blocks >= 32)

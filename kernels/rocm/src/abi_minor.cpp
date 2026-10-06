@@ -1,6 +1,6 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports TURBINE_ABI_MINOR (12): besides the ABI v2 trios it
+// libturbine_hip.so reports TURBINE_ABI_MINOR (13): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
@@ -17,7 +17,10 @@
 // the KV transcode trio (kv_transcode.hip) and the host-to-device copy kernel
 // (copy_kernel.hip). v2.12 adds no symbol: paged decode attention reads the
 // rope_* fields of its descriptor (RoPE fused into the b1 kernel's append;
-// every other decode path rotates first with the rope kernels).
+// every other decode path rotates first with the rope kernels). v2.13 adds no
+// symbol: turbine_hip_fp8_wmma takes BF16 activations with an FP8 act_quant on
+// small decode calls and quantizes them in the kernel (qgemm_fp8_wmma.hip;
+// turbine_qgemm_desc.act_static_scale).
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)

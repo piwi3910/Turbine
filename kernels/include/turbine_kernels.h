@@ -485,8 +485,10 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * no new symbol); v2.11 the KV transcode and the host-to-device copy kernel
  * (below) and the mixed-format paged attention fields (block_formats,
  * tq_params; no new symbol); v2.12 RoPE fused into paged decode attention
- * (the rope_* fields of turbine_attention_paged_desc; no new symbol). */
-#define TURBINE_ABI_MINOR 12u
+ * (the rope_* fields of turbine_attention_paged_desc; no new symbol); v2.13
+ * unquantized activations into an FP8 W8A8 qgemm (turbine_qgemm_desc's
+ * act_static_scale; no new symbol). */
+#define TURBINE_ABI_MINOR 13u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -1030,6 +1032,18 @@ typedef struct turbine_qgemm_desc {
   float alpha;
   /* 1 when the call belongs to a prefill step (as turbine_gemm's option) */
   int32_t prefill;
+  /* v2.13 (Phase 5p), read only by a library reporting minor >= 13:
+   * activations quantized inside the call. With act_quant FP8_TENSOR or
+   * FP8_TOKEN and a_dtype BF16, a holds the unquantized activations and the
+   * implementation quantizes them exactly as turbine_quantize_act would
+   * (mode = act_quant, static_scale = act_static_scale for FP8_TENSOR) before
+   * the product: c equals turbine_quantize_act followed by this call on its
+   * e4m3 output, bit for bit. a_scales is not read then. Whether an
+   * implementation takes this form may depend on m and prefill
+   * (turbine_impl_supports / turbine_qgemm_supported answer for the
+   * descriptor as given); a library of an earlier minor refuses a BF16 a with
+   * an FP8 act_quant. Ignored for every other act_quant / a_dtype pair. */
+  float act_static_scale;
 } turbine_qgemm_desc;
 
 /* Quantizes x[rows, cols] (BF16) per mode into out and scales:

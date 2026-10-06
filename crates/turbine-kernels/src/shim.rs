@@ -1626,7 +1626,24 @@ fn qgemm_probe(cfg: &QGemmConfig) -> QGemmDesc {
         block_k,
         alpha: 1.0,
         prefill: 0,
+        act_static_scale: 1.0,
     }
+}
+
+/// The library minor from which a qgemm descriptor may carry unquantized activations
+/// (`act_static_scale`, kernel ABI v2.13).
+const QGEMM_BF16_ACTS_MINOR: u32 = 13;
+
+/// `cfg` (FP8 W8A8, e4m3 activations) in its unquantized-activation form: BF16 `a` with the
+/// same FP8 act mode, `rows` rows of a prefill step or not (ABI v2.13).
+fn qgemm_bf16_acts_probe(cfg: &QGemmConfig, rows: usize, prefill: bool) -> QGemmDesc {
+    let mut d = qgemm_probe(&QGemmConfig {
+        a_dtype: DType::BF16,
+        ..*cfg
+    });
+    d.m = i64::try_from(rows).unwrap_or(i64::MAX);
+    d.prefill = i32::from(prefill);
+    d
 }
 
 fn kv_transcode_probe(cfg: &KvTranscodeConfig) -> KvTranscodeDesc {
@@ -1946,9 +1963,52 @@ impl QGemmKernel for ShimProvider {
             block_k,
             alpha: ctx.alpha,
             prefill: i32::from(ctx.prefill),
+            act_static_scale: ctx.act_static_scale,
         };
+        if bf16_acts(&ctx.cfg) && self.ctx.lib.abi_minor() < QGEMM_BF16_ACTS_MINOR {
+            return Err(self
+                .ctx
+                .lib
+                .lacks("unquantized qgemm activations (ABI v2.13)"));
+        }
         self.run(OpKind::QGemm, &fns.qgemm, &d, m)
     }
+
+    fn quantizes_activations(&self, cfg: &QGemmConfig, rows: usize, prefill: bool) -> bool {
+        if self.ctx.lib.abi_minor() < QGEMM_BF16_ACTS_MINOR
+            || cfg.a_dtype != DType::F8E4M3
+            || !matches!(
+                cfg.act_quant,
+                ActQuantDesc::Fp8Tensor | ActQuantDesc::Fp8Token
+            )
+        {
+            return false;
+        }
+        let Ok(fns) = self.quant_fns() else {
+            return false;
+        };
+        let d = qgemm_bf16_acts_probe(cfg, rows, prefill);
+        // The implementation this provider runs at `rows`: the bound one (its tier's), else the
+        // library's own choice for the descriptor.
+        match self.bound.as_ref().filter(|b| b.op == OpKind::QGemm) {
+            Some(bound) => {
+                self.ctx
+                    .lib
+                    .impl_supports(OpKind::QGemm, bound.choice.index_for(rows), &d)
+            }
+            None => Self::supported(&fns.qgemm, &d),
+        }
+    }
+}
+
+/// True for the unquantized-activation form of a qgemm (kernel ABI v2.13): BF16 `a` with an FP8
+/// tensor or token act mode.
+fn bf16_acts(cfg: &QGemmConfig) -> bool {
+    cfg.a_dtype == DType::BF16
+        && matches!(
+            cfg.act_quant,
+            ActQuantDesc::Fp8Tensor | ActQuantDesc::Fp8Token
+        )
 }
 
 impl QuantizeActKernel for ShimProvider {
@@ -2099,6 +2159,19 @@ fn check_qgemm(ctx: &QGemmContext<'_>) -> Result<(i64, i64), KernelError> {
         _ => {}
     }
     let mode = cfg.act_quant;
+    if bf16_acts(&cfg) {
+        // Unquantized activations (v2.13): the kernel derives the scales; a static one must
+        // divide (as `quantize_act` requires).
+        if mode == ActQuantDesc::Fp8Tensor
+            && !(ctx.act_static_scale.is_finite() && ctx.act_static_scale > 0.0)
+        {
+            return Err(invalid(format!(
+                "qgemm: unquantized activations need a finite positive static scale, got {}",
+                ctx.act_static_scale
+            )));
+        }
+        return Ok((lda, ldc));
+    }
     match (mode.is_fp8(), ctx.a_scales.as_ref()) {
         (true, Some(s)) => {
             // The activation scratch may hold more scales than this call's rows use.
@@ -4484,6 +4557,8 @@ pub(crate) mod tests {
         let qgemm = provider.qgemm().expect("the v2.9 qgemm family");
         assert!(!qgemm.supports(&q_cfg));
         assert_eq!(qgemm.implementation(&q_cfg), "stub_qgemm");
+        // A library below minor 13 is never handed unquantized activations (ABI v2.13).
+        assert!(!qgemm.quantizes_activations(&q_cfg, 1, false));
         let quant = provider
             .quantize_act()
             .expect("the v2.9 quantize_act family");
@@ -4498,6 +4573,59 @@ pub(crate) mod tests {
             assert_eq!(impls[0].name, name);
         }
         drop((provider, ctx));
+    }
+
+    /// Kernel ABI v2.13: an FP8 W8A8 call on unquantized activations (BF16 `a`, FP8 tensor or
+    /// token act mode) needs no activation scales, and its static tensor scale must divide (finite
+    /// and positive), as `quantize_act`'s; a group-scaled act mode stays an e4m3-only form.
+    /// Breaks if the unquantized form is refused for lacking `a_scales` or forwarded with a
+    /// zero or infinite static scale.
+    #[test]
+    fn qgemm_unquantized_activations_checked() {
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 16);
+        let t = |shape: &[usize], dtype: DType| Tensor::empty(&host, shape, dtype).unwrap();
+        let (m, n, k) = (2usize, 16usize, 128usize);
+        let a = t(&[m, k], DType::BF16);
+        let b = t(&[n, k], DType::F8E4M3);
+        let scales = t(&[n], DType::F32);
+        let c = t(&[m, n], DType::BF16);
+        let check = |act_quant: ActQuantDesc, act_static_scale: f32| {
+            check_qgemm(&QGemmContext {
+                cfg: QGemmConfig {
+                    n: n as u32,
+                    k: k as u32,
+                    scheme: QuantSchemeDesc::Fp8Channel,
+                    act_quant,
+                    a_dtype: DType::BF16,
+                    c_dtype: DType::BF16,
+                },
+                a: a.view(),
+                a_scales: None,
+                b: b.view(),
+                b_scales: scales.view(),
+                b_zeros: None,
+                c: c.view(),
+                alpha: 1.0,
+                prefill: false,
+                act_static_scale,
+            })
+        };
+        assert!(check(ActQuantDesc::Fp8Token, 0.0).is_ok());
+        assert!(check(ActQuantDesc::Fp8Tensor, 0.5).is_ok());
+        for bad in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            match check(ActQuantDesc::Fp8Tensor, bad) {
+                Err(KernelError::InvalidArgument { message }) => {
+                    assert!(message.contains("static scale"), "{bad}: {message}")
+                }
+                other => panic!("static scale {bad} must be refused, got {other:?}"),
+            }
+        }
+        match check(ActQuantDesc::Fp8Group { group: 128 }, 1.0) {
+            Err(KernelError::InvalidArgument { message }) => {
+                assert!(message.contains("a_scales"), "{message}")
+            }
+            other => panic!("group mode without a_scales must be refused, got {other:?}"),
+        }
     }
 
     /// Review r13 C1: every quantized-GEMM operand is checked against its scheme's layout
@@ -4542,6 +4670,7 @@ pub(crate) mod tests {
                 c: c.view(),
                 alpha: 1.0,
                 prefill: false,
+                act_static_scale: 1.0,
             })
         };
         let refused = |r: Result<(i64, i64), KernelError>, what: &str| match r {
@@ -4696,6 +4825,7 @@ pub(crate) mod tests {
                 c: c.view(),
                 alpha: 1.0,
                 prefill: false,
+                act_static_scale: 1.0,
             })
             .expect_err("group 256 is refused");
         assert!(err.to_string().contains("only groups of 128"), "{err}");

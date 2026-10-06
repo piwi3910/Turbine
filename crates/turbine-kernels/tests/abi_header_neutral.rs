@@ -207,7 +207,7 @@ fn header_declares_the_v24_minor_revision() {
     );
     // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
     // v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -377,7 +377,7 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
         17,
@@ -402,7 +402,7 @@ fn header_declares_the_v29_quantization_group() {
     use turbine_core::types::DType;
     use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
     assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
     assert_eq!(OpKind::QGemm.abi_code(), 17);
@@ -474,7 +474,7 @@ fn header_declares_the_v29_quantization_group() {
 #[test]
 fn header_declares_the_v210_rope_attn_factor() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() == 10).count(),
         0,
@@ -500,7 +500,7 @@ fn header_declares_the_v211_kv_transcode_group() {
         KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KvTranscodeFormat,
     };
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
     assert_eq!(define(&code, "TURBINE_OP_KV_TRANSCODE"), "19");
     assert_eq!(OpKind::KvTranscode.abi_code(), 19);
     assert_eq!(OpKind::KvTranscode.abi_minor(), 11);
@@ -627,13 +627,17 @@ fn header_declares_the_v211_per_class_page_fields() {
 
 /// Kernel ABI v2.12 fused RoPE (P5p b1 attention II): the paged attention descriptor ends with
 /// the decode RoPE's positions, inverse frequencies, rotary width and attention factor, and the
-/// minor is 12. Breaks if a field moves (a library would read the rotary width as the factor)
-/// or the minor is not raised (an older caller's zeroed tail would still mean "already rotated",
-/// but a v2.11 library would silently ignore a set field).
+/// minor is at least 12. Breaks if a field moves (a library would read the rotary width as the
+/// factor) or the minor is not raised (an older caller's zeroed tail would still mean "already
+/// rotated", but a v2.11 library would silently ignore a set field).
 #[test]
 fn header_declares_the_v212_fused_rope_fields() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "12u");
+    let minor: u32 = define(&code, "TURBINE_ABI_MINOR")
+        .trim_end_matches('u')
+        .parse()
+        .expect("TURBINE_ABI_MINOR is a number");
+    assert!(minor >= 12, "TURBINE_ABI_MINOR {minor}");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let attn = "int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
                 const int32_t *rope_positions; const float *rope_inv_freq; \
@@ -643,5 +647,21 @@ fn header_declares_the_v212_fused_rope_fields() {
     assert!(
         flat.contains(&attn),
         "turbine_kernels.h lacks the v2.12 fused RoPE fields {attn}"
+    );
+}
+
+/// Kernel ABI v2.13 (P5p FP8 decode): the quantized GEMM descriptor ends with the static scale
+/// of unquantized activations, after `prefill`, and the minor is 13. Breaks if the field moves
+/// (a library would read `prefill` as the scale) or the minor is not raised (a v2.12 library
+/// must never be handed BF16 activations with an FP8 act mode).
+#[test]
+fn header_declares_the_v213_qgemm_act_static_scale() {
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "13u");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let qgemm = "float alpha; int32_t prefill; float act_static_scale; } turbine_qgemm_desc;";
+    assert!(
+        flat.contains(qgemm),
+        "turbine_kernels.h lacks the v2.13 qgemm field {qgemm}"
     );
 }

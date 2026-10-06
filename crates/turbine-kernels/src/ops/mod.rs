@@ -702,6 +702,12 @@ impl fmt::Display for KvTranscodeConfig {
 /// `[1]`, `[m]` or `[m, k / 128]`), else `None`; `b`: the packed weight bytes `[n, row bytes]`
 /// (U8 or F8E4M3) in the scheme's layout; `b_scales`: F32 scales, or E8M0 bytes (U8) for MXFP4;
 /// `b_zeros`: U8 zero points (INT4 with zero points only); `c`: `[m, n]`.
+///
+/// Unquantized activations (kernel ABI v2.13): with `cfg.act_quant` FP8 tensor or token and
+/// `cfg.a_dtype` BF16, `a` holds the activations before quantization and the kernel quantizes
+/// them itself exactly as `quantize_act` would (`act_static_scale` the tensor mode's static
+/// scale); `a_scales` is then `None`. Only for a call [`QGemmKernel::quantizes_activations`]
+/// accepts.
 pub struct QGemmContext<'a> {
     pub cfg: QGemmConfig,
     pub a: TensorView<'a>,
@@ -713,6 +719,8 @@ pub struct QGemmContext<'a> {
     pub alpha: f32,
     /// As [`GemmContext::prefill`].
     pub prefill: bool,
+    /// The static FP8 tensor scale of unquantized activations (see above); ignored otherwise.
+    pub act_static_scale: f32,
 }
 
 /// `x`: `[rows, cols]`; `out`: `[rows, cols]` (F8E4M3 or BF16); `scales`: F32, dense, as many
@@ -1266,6 +1274,14 @@ pub trait QGemmKernel: Send + Sync {
     fn supports(&self, cfg: &QGemmConfig) -> bool;
     fn implementation(&self, cfg: &QGemmConfig) -> String;
     fn execute(&self, ctx: &mut QGemmContext<'_>) -> Result<(), KernelError>;
+    /// True when a call of `rows` rows (of a prefill step: `prefill`) of the FP8 W8A8 config
+    /// `cfg` (`a_dtype` F8E4M3) also runs with the activations unquantized — `a_dtype` BF16, the
+    /// kernel quantizing them as `quantize_act` would, bit for bit (kernel ABI v2.13): the
+    /// executor then skips its `quantize_act` launch. False by default.
+    fn quantizes_activations(&self, cfg: &QGemmConfig, rows: usize, prefill: bool) -> bool {
+        let _ = (cfg, rows, prefill);
+        false
+    }
 }
 
 /// Activation quantization (ABI v2.9).

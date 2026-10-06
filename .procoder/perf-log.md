@@ -1724,3 +1724,35 @@ fusing elementwise work into the GEMMs, and the GEMMs are hipBLASLt kernels with
 gated epilogue: every fusion candidate (rmsnorm into the qkv / gate_up GEMV prologue, silu·mul into
 the down GEMV prologue) needs an own m = 1 GEMV, a new numerics class for the decode rows. Options
 in decisions ("5p decode-step gaps: what is left").
+
+### S-15 follow-ups: FP8-block `down` at 16 waves, the fused W8A8 activation quantize, the per-tensor golden bisect (branch `p5p-fp8b`, 2026-10-06)
+
+User decision "5p Task 14" (1 A, 2 yes, 3 bisect). novanas GPU 0, one session, every run under the bench and port locks (`lab-bench.sh`, release client on novanas), each commit measured from a git-less export of its tree. Base `299985a9` (p6b-stack tip, Task 14's `turbine_hip_fp8_wmma` in). Same-day BF16 c1 (Llama, phase2c config, `--concurrency 1 --quick`): **82.7 tok/s, ITL p50 11.9 ms**, golden c1 PASS.
+
+**Landing 1 — `turbine_hip_fp8_block` reads k ≥ 8192 at 16 waves** (`489fec4b`; `waves_for`: 64+ k-blocks → 16 waves, 4 blocks each, instead of 8; the evaluation harness `tools/qgemm_eval.cpp` launches the same). Only the F32 summation order of the wave partials moves; rows stay batch-invariant (the split is a rule of k only; `qgemm_fp8_block_rows_do_not_depend_on_m` and `qgemm_fp8_block_matches_cpu` green).
+
+| FP8-block (W8A16)                        | base `299985a9`                       | 16 waves `489fec4b`                |
+| ---------------------------------------- | ------------------------------------- | ---------------------------------- |
+| `down` µs, `qgemm_decode_timings` m 2–16 | 76.5 / 76.3 / 73.6 (t14 run, 8 waves) | **44.7 / 45.2 / 46.1** (~560 GB/s) |
+| c1 tok/s / ITL p50 (quick)               | 122.4 / 7.9 ms                        | **135.2 / 7.1 ms**                 |
+| × BF16 ITL (11.9)                        | 0.66                                  | **0.60**                           |
+| golden c1                                | PASS                                  | PASS (16/16)                       |
+| c16 tok/s (200 req) / golden c16         | 1059.6 / –                            | **1115.1** / PASS                  |
+
+The other three FP8-block shapes are unchanged (qkv / o / gate_up 29.8 / 19.5 / 84.9 µs at m = 2, as at 8 waves: they run 2 waves).
+
+**Landing 2 — the FP8 activation quantize fused into the W8A8 c1 GEMM** (kernel ABI v2.13): `turbine_qgemm_desc.act_static_scale` and the pair `a_dtype` BF16 + `act_quant` FP8_TENSOR / FP8_TOKEN; `turbine_hip_fp8_wmma` takes it on single-row decode calls, quantizing the row in each block (LDS stage, `qgemm_quantize.hpp`'s rule: the same codes and scale) and running its WMMA loop and epilogue unchanged, four / two column tiles per block so the repeated row quantization is shared; the decoder skips `quantize_act` when `QGemmKernel::quantizes_activations` says the bound kernel takes the call (capability, no vendor test). Prefill, m ≥ 2 and hipBLASLt keep the two launches. First version (any m ≤ 16 within a 32 KiB stage, one tile per block) measured and dropped: m = 1 token 35.8 / 25.8 / 96.0 / 50.5 µs (qkv / o / gate_up / down, gate_up slower than GEMM + quantize) and m = 2 already a loss everywhere (qkv 42.9 vs 36.1) — the row's quantization repeats in every block.
+
+`qgemm_decode_timings` at m = 1 (µs; "two launches" = GEMM + `quantize_act` 7.2 / 15.9 token, 6.0 / 11.8 tensor at k = 3072 / 8192): token 31.0 / 20.8 / 89.1 / 48.2 = **189.1 per layer vs 214.6**; tensor 30.5 / 20.5 / 92.3 / 47.4 = **190.7 vs 206.9** — −0.71 / −0.45 ms of kernel time per step over 28 layers, plus 112 launch boundaries.
+
+| c1 quick (BF16 11.9 ms)        | base `299985a9`             | fused (this landing)                                                                                                      |
+| ------------------------------ | --------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| FP8-dynamic tok/s / ITL p50    | 121.6 / 8.1 ms (0.68×)      | **132.8 / 7.4 ms (0.62×)**                                                                                                |
+| FP8 per-tensor tok/s / ITL p50 | 124.4 / 7.9 ms (0.66×)      | **133.6 / 7.3 ms (0.61×)**                                                                                                |
+| golden c1 (strict)             | PASS 16/16 / PASS 15/16     | PASS 16/16 / PASS 15/16, both **byte-identical** to the two-launch runs (`t14-wmma-c1-*` golden1.txt)                     |
+| c16 tok/s (200 req)            | 1119.1 / 1141.9             | **1129.0 / 1140.4** (+0.9 % / −0.1 %)                                                                                     |
+| golden c16 (batched)           | dynamic – / per-tensor FAIL | dynamic PASS / per-tensor FAIL, per-tensor c16 **byte-identical to the base** (the pre-existing b1 attention edge, below) |
+
+Bit-exactness: `hip_qgemm qgemm_fused_act_quant_matches_two_launches` (every 3B / 8B shape, 4 scheme × act pairings, unit-variance, zero, ×10⁴ saturating, subnormal and grid-tie rows) gives byte-identical outputs to `quantize_act` + the same kernel; the CPU reference implements the same form (`unquantized_fp8_activations_match_quantize_then_qgemm`). The estimate in the decision (~0.60×) holds for per-tensor (0.61×); FP8-dynamic lands at 0.62×.
+
+**Bisect — the per-tensor golden c1 FAIL on the base** (S-15 item 3). Per-tensor golden c1 at each point (`--concurrency 1 --quick`): 6a exit `fbddca9` PASS 16/16, numbers identical to the 6a and 6b exit runs; `c7657649` (token-granular reuse) PASS, identical except p09 (partial reuse of the shared chat-template prefix); `0d16d756`, `3963a519` PASS, identical to `c7657649`; `2951123f` (merge `p5p-b1attn`) FAIL; inside it **`b1c072ce` "the b1 decode attention kernel" FAIL**, identical to the base (its parent's code is `1c1c5105`, inside the passing range); `97050b3c` with `kv.partial_prefix_reuse=false` still FAIL (only p09 moves). The b1 kernel moves every decode-attention sum (its own split and combine order, the user-decided numerics class of 2026-10-04 B), and the per-tensor checkpoint sat at its bounds since 6a (p16 tail 2.889 against 2.99, p14 likely 1.108 against 1.36): the shift takes p14 to 1.48 and a p16 tail candidate to 5.54. BF16, FP8-dynamic and FP8-block keep PASS on it; Task 14's W8A8 kernel moved the per-tensor sums again (15/16 PASS, p13 margin). Golden c16 per-tensor fails the same way on the base (p14 1.40, p16 tail 5.27). Not a defect in a kernel; options in decisions "5p FP8 follow-ups: the per-tensor golden bisect".

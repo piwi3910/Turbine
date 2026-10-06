@@ -370,6 +370,7 @@ fn qgemm_case(
         c: c_hip.view(),
         alpha: 1.0,
         prefill,
+        act_static_scale: 1.0,
     };
     hip.execute(&mut ctx).expect("hip qgemm");
     let got_all = decode(c_dtype, &bytes(c_hip.view()));
@@ -400,6 +401,7 @@ fn qgemm_case(
         c: c_cpu.view(),
         alpha: 1.0,
         prefill: false,
+        act_static_scale: 1.0,
     };
     p.cpu
         .qgemm()
@@ -598,6 +600,7 @@ fn prefill_call(p: &Pair, cfg: QGemmConfig, a: TensorView<'_>, b: &Tensor, bs: &
         c: c.view(),
         alpha: 1.0,
         prefill: true,
+        act_static_scale: 1.0,
     };
     p.hip
         .qgemm()
@@ -789,6 +792,7 @@ fn qgemm_mxfp4_prefill_within_hipblaslt_bound() {
                         c: c_m.clone(),
                         alpha: 1.0,
                         prefill: true,
+                        act_static_scale: 1.0,
                     })
                     .expect("qgemm");
             });

@@ -21,8 +21,8 @@ use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     GemmConfig, GemmContext, ImplChoice, KernelProvider, OpConfig, OpKind, QGemmConfig,
-    QGemmContext, QuantizeActConfig, QuantizeActContext, ShimLibrary, cpu_reference_provider,
-    shim_provider,
+    QGemmContext, QuantizeActConfig, QuantizeActContext, RowTier, ShimLibrary,
+    cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
@@ -376,6 +376,7 @@ fn qgemm_case(
         // Decode-sized calls take the pinned FP8 table rows (m <= 64), larger ones the prefill
         // path (the first heuristic answer).
         prefill: m > 64,
+        act_static_scale: 1.0,
     };
     hip.execute(&mut ctx).expect("hip qgemm");
     let got_all = decode(c_dtype, &bytes(c_hip.view()));
@@ -418,6 +419,7 @@ fn qgemm_case(
         c: c_cpu.view(),
         alpha: 1.0,
         prefill: false,
+        act_static_scale: 1.0,
     };
     p.cpu
         .qgemm()
@@ -547,6 +549,192 @@ fn qgemm_matches_cpu() {
         c_dtype: DType::F32,
     };
     assert!(!p.hip.qgemm().expect("hip qgemm").supports(&f32_out));
+}
+
+/// Rows of a BF16 activation matrix that exercise the e4m3 rounding edges, cycled over `m`
+/// rows: unit-variance rows, an all-zero row (the 1 / (448 · 512) token-scale floor), a row
+/// 10⁴ times larger (saturation at ±448 under a static scale), a row in the e4m3 subnormal
+/// range, and a row on the e4m3 grid and its halfway points (ties).
+fn edge_rows(rng: &mut Rng, m: usize, k: usize) -> Vec<f32> {
+    let mut x = Vec::with_capacity(m * k);
+    for r in 0..m {
+        let row: Vec<f32> = match r % 5 {
+            0 => rng.normal(k, 1.0),
+            1 => vec![0.0; k],
+            2 => rng.normal(k, 1e4),
+            3 => rng.normal(k, 1e-4),
+            _ => (0..k)
+                .map(|c| (1.0 + (c % 16) as f32 / 16.0) * if c % 2 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+        };
+        x.extend(row.into_iter().map(|v| bf16::from_f32(v).to_f32()));
+    }
+    x
+}
+
+/// Phase 5p (kernel ABI v2.13, user decision "5p Task 14" 1 A): `turbine_hip_fp8_wmma` handed the
+/// BF16 activations (`a_dtype` BF16, the FP8 act mode and static scale) gives the same bits as
+/// `quantize_act` followed by the same implementation on its e4m3 codes, for FP8_TENSOR /
+/// FP8_CHANNEL weights × FP8_TENSOR (static) / FP8_TOKEN (dynamic) activations, every 3B and 8B
+/// shape, the single-row decode call it takes that form for, on random rows and rounding-edge
+/// rows (zero, saturating, subnormal, ties). Bit-equal outputs over every
+/// column mean bit-equal codes and scales (an e4m3 code off by one moves the sum). Also: the
+/// form is offered exactly for single-row decode calls (not prefill, not 2 or 17 rows), and
+/// through a row-tier binding only in the tier the kernel serves. Breaks if the
+/// in-kernel quantization divides by another scale, reduces the amax differently (a NaN or
+/// signed zero kept), rounds differently from `fp8_e4m3_round`, or sums in another order.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn qgemm_fused_act_quant_matches_two_launches() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let find = |wanted: &str| {
+        p.hip
+            .implementations(OpKind::QGemm)
+            .into_iter()
+            .find(|i| i.name == wanted)
+            .unwrap_or_else(|| panic!("{wanted} is not in the library"))
+    };
+    let wmma = find("turbine_hip_fp8_wmma");
+    let hipblaslt = find("hipblaslt_fp8");
+    let quantize = p.hip.quantize_act().expect("hip quantize_act (ABI v2.9)");
+    let mut rng = Rng(97);
+    let combos = [
+        (QuantSchemeDesc::Fp8Channel, ActQuantDesc::Fp8Token),
+        (QuantSchemeDesc::Fp8Tensor, ActQuantDesc::Fp8Tensor),
+        (QuantSchemeDesc::Fp8Channel, ActQuantDesc::Fp8Tensor),
+        (QuantSchemeDesc::Fp8Tensor, ActQuantDesc::Fp8Token),
+    ];
+    let mut cases = 0usize;
+    for (name, n, k) in SHAPES_3B.into_iter().chain(SHAPES_8B) {
+        for (scheme, act) in combos {
+            let cfg = QGemmConfig {
+                n: n as u32,
+                k: k as u32,
+                scheme,
+                act_quant: act,
+                a_dtype: DType::F8E4M3,
+                c_dtype: DType::BF16,
+            };
+            let spec = OpConfig::QGemm(cfg);
+            let bound = p
+                .hip
+                .bind(&spec, &ImplChoice::Single(wmma.index))
+                .expect("bind turbine_hip_fp8_wmma");
+            let kernel = bound.qgemm().expect("qgemm");
+            // gfx1201's tiers: the kernel up to 16 rows, hipBLASLt above (no BF16 form there).
+            let tiered = p
+                .hip
+                .bind(
+                    &spec,
+                    &ImplChoice::ByRows(vec![
+                        RowTier {
+                            max_rows: Some(16),
+                            index: wmma.index,
+                        },
+                        RowTier {
+                            max_rows: None,
+                            index: hipblaslt.index,
+                        },
+                    ]),
+                )
+                .expect("bind the row tiers");
+            assert!(
+                !kernel.quantizes_activations(&cfg, 1, true),
+                "{name} prefill"
+            );
+            assert!(
+                !kernel.quantizes_activations(&cfg, 17, false),
+                "{name} m=17"
+            );
+            assert!(!kernel.quantizes_activations(&cfg, 2, false), "{name} m=2");
+            let tiered_q = tiered.qgemm().expect("qgemm");
+            assert!(
+                tiered_q.quantizes_activations(&cfg, 1, false),
+                "{name} tier"
+            );
+            assert!(
+                !tiered_q.quantizes_activations(&cfg, 32, false),
+                "{name} open tier"
+            );
+
+            let (wq, ws) = fp8_weights(&mut rng, scheme, n, k);
+            let b = tensor(&p.hip_mem, &[n, k], DType::F8E4M3, &wq);
+            let bs = tensor(
+                &p.hip_mem,
+                &[ws.len()],
+                DType::F32,
+                &encode(DType::F32, &ws),
+            );
+            let m = 1usize;
+            assert!(kernel.quantizes_activations(&cfg, m, false), "{name} m=1");
+            let edges = edge_rows(&mut rng, 5, k);
+            for (kind, x) in edges.chunks_exact(k).enumerate() {
+                let static_scale =
+                    rng.normal(k, 1.0).iter().fold(0f32, |a, v| a.max(v.abs())) / 448.0;
+                let a = tensor(&p.hip_mem, &[m, k], DType::BF16, &encode(DType::BF16, x));
+                let codes = tensor(&p.hip_mem, &[m, k], DType::F8E4M3, &vec![0u8; m * k]);
+                let count = act.scale_count(m, k);
+                let a_scales = tensor(&p.hip_mem, &[count], DType::F32, &vec![0u8; 4 * count]);
+                quantize
+                    .execute(&mut QuantizeActContext {
+                        cfg: QuantizeActConfig {
+                            cols: k as u32,
+                            mode: act,
+                            x_dtype: DType::BF16,
+                            out_dtype: DType::F8E4M3,
+                        },
+                        x: a.view(),
+                        out: codes.view(),
+                        scales: a_scales.view(),
+                        static_scale,
+                    })
+                    .expect("quantize_act");
+                let run = |cfg: QGemmConfig, a: &Tensor, a_scales: Option<&Tensor>| {
+                    let c = tensor(&p.hip_mem, &[m, n], DType::BF16, &vec![0xffu8; m * n * 2]);
+                    kernel
+                        .execute(&mut QGemmContext {
+                            cfg,
+                            a: a.view(),
+                            a_scales: a_scales.map(Tensor::view),
+                            b: b.view(),
+                            b_scales: bs.view(),
+                            b_zeros: None,
+                            c: c.view(),
+                            alpha: 1.0,
+                            prefill: false,
+                            act_static_scale: static_scale,
+                        })
+                        .expect("qgemm");
+                    bytes(c.view())
+                };
+                let two = run(cfg, &codes, Some(&a_scales));
+                let fused = QGemmConfig {
+                    a_dtype: DType::BF16,
+                    ..cfg
+                };
+                let one = run(fused, &a, None);
+                if let Some(i) =
+                    (0..m * n).find(|&i| one[2 * i..2 * i + 2] != two[2 * i..2 * i + 2])
+                {
+                    panic!(
+                        "{name} {cfg} row kind {kind}: element {i} (row {}, col {}): fused {:?} vs \
+                         two launches {:?}",
+                        i / n,
+                        i % n,
+                        &one[2 * i..2 * i + 2],
+                        &two[2 * i..2 * i + 2]
+                    );
+                }
+                cases += 1;
+            }
+            println!("qgemm_fused_act_quant {name} {cfg}: bit-identical on 5 row kinds");
+        }
+    }
+    assert!(cases > 0);
 }
 
 /// Phase 6a S-7: the HIP `quantize_act` is bit-exact with the CPU reference (codes and scales)
@@ -716,6 +904,7 @@ fn qgemm_prefill_rows_do_not_depend_on_m() {
                     c: c.view(),
                     alpha: 1.0,
                     prefill: true,
+                    act_static_scale: 1.0,
                 };
                 hip.execute(&mut ctx).expect("hip qgemm prefill");
                 bytes(c.view())
@@ -846,6 +1035,7 @@ fn fp8_block_case(
         c: c_hip.view(),
         alpha: 1.0,
         prefill,
+        act_static_scale: 1.0,
     };
     hip.execute(&mut ctx).expect("hip qgemm");
     let got_all = decode(DType::BF16, &bytes(c_hip.view()));
@@ -876,6 +1066,7 @@ fn fp8_block_case(
             c: c_cpu.view(),
             alpha: 1.0,
             prefill: false,
+            act_static_scale: 1.0,
         };
         p.cpu
             .qgemm()
@@ -993,6 +1184,7 @@ fn qgemm_fp8_block_rows_do_not_depend_on_m() {
                     c: c.view(),
                     alpha: 1.0,
                     prefill,
+                    act_static_scale: 1.0,
                 };
                 hip.execute(&mut ctx).expect("hip qgemm fp8 block");
                 bytes(c.view())
@@ -1198,10 +1390,37 @@ fn qgemm_decode_timings() {
                                 c: row_range(&c, 0, m),
                                 alpha: 1.0,
                                 prefill: false,
+                                act_static_scale: 1.0,
                             })
                             .expect("qgemm");
                     });
                     report(name, format, impl_name, m, us, bytes);
+                    // The same call on BF16 activations, quantized in the kernel (v2.13).
+                    if !block && kernel.quantizes_activations(&cfg, m, false) {
+                        let fused = QGemmConfig {
+                            a_dtype: DType::BF16,
+                            ..cfg
+                        };
+                        let mut next = 0usize;
+                        let us = time_us(&p, copies as u32, ITERS, || {
+                            next = (next + 1) % copies;
+                            kernel
+                                .execute(&mut QGemmContext {
+                                    cfg: fused,
+                                    a: row_range(&a_bf16, 0, m),
+                                    a_scales: None,
+                                    b: ws[next].0.view(),
+                                    b_scales: ws[next].1.view(),
+                                    b_zeros: None,
+                                    c: row_range(&c, 0, m),
+                                    alpha: 1.0,
+                                    prefill: false,
+                                    act_static_scale: 0.01,
+                                })
+                                .expect("qgemm (BF16 activations)");
+                        });
+                        report(name, &format!("{format} +q"), impl_name, m, us, bytes);
+                    }
                 }
             }
         }
