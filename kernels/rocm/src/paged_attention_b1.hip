@@ -256,15 +256,26 @@ __global__ void __launch_bounds__(kThreads)
     lds.loop.voff[wave][lane] = off < 0 ? -1 : off + v_half;
     wave_sync();
     const int32_t keys = min(kDecodeLanes, k1 - c0);
-    for (int j = 0; j < keys; ++j) {
+    // The round's V words are all loaded before the first is used: a load
+    // per key, waited on in turn, was a serial chain of 32 memory latencies
+    // (~9 us of the ~18 us kernel, the phase timing of "b1 attention II").
+    // A key the round does not attend (past the range, a missing page) reads
+    // the pool's first word and is skipped below; the sum runs in key order
+    // as before, so the bits are those of the one-load-per-key loop.
+    uint2 vw[kDecodeLanes];
+#pragma unroll
+    for (int j = 0; j < kDecodeLanes; ++j) {
       const int64_t voff = lds.loop.voff[wave][j];
-      if (voff < 0)
+      vw[j] = *reinterpret_cast<const uint2 *>(
+          kv_layer + (voff < 0 ? 0 : voff) + lane * kDimsPerLane);
+    }
+#pragma unroll
+    for (int j = 0; j < kDecodeLanes; ++j) {
+      if (j >= keys || lds.loop.voff[wave][j] < 0)
         continue;
-      const uint2 w4 = *reinterpret_cast<const uint2 *>(kv_layer + voff +
-                                                        lane * kDimsPerLane);
       float v[kDimsPerLane];
-      bf16_pair(w4.x, v[0], v[1]);
-      bf16_pair(w4.y, v[2], v[3]);
+      bf16_pair(vw[j].x, v[0], v[1]);
+      bf16_pair(vw[j].y, v[2], v[3]);
 #pragma unroll
       for (int g = 0; g < G; ++g) {
         const float pg = lds.loop.p[wave][g][j];
