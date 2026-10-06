@@ -3620,3 +3620,21 @@ The served TTFT target (≤ 1.05× BF16) misses: 1.21–1.25× at c1 and 1.15× 
 - D) Revert the Prefill tile and keep the evaluation record only.
 
 **Decision (user, 2026-10-06): A.** The Prefill tile stays (from 1,024 rows). S-16 is re-bound: the MXFP4 prefill GEMM at m = 2,048 ≤ 1.45× the BF16 prefill GEMM per shape, a no-regression bound asserted by `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`; served TTFT is recorded, not gated; `mxfp4` stays `experimental`. Spec S-16 (its AC names `hip_qgemm_mxfp4`) and plan Task 15 amended.
+
+## 5p b1 attention II: 8.96 µs/layer, 0.81× reached — c1 ≥ 90 tok/s is not reachable from attention (open, 2026-10-06)
+
+From `p5p-b1attn2` (e90631a4, merged): served Llama b1 attention 16.88 → 8.96 µs/layer (V loads issued together, a
+faster split combine), and 10.64 µs with RoPE fused into the attention call (ABI v2.12, rope kernel and one boundary
+per layer removed); decode step 12.85 → 12.44 ms, effective bandwidth 501 → 517 GB/s (0.78× → 0.81×), c1 81.2 → 82.9
+tok/s, c16 1.002×, golden c1/c16 PASS at every step; b1's math unchanged (P F32, same order). Attention + RoPE is now
+0.30 ms of the 12.44 ms step; ≥ 90 tok/s needs ~11.1 ms, and the rest is GEMMs at 86–99 % of peak plus ~1.0 ms of
+inter-kernel gaps. Not landed: split count 4/16, one wave per split (no gain, different bits), K/V L2 prefetch
+(slower), joint K+V loads (spill).
+
+- A) Close the b1 attention work; next decode-BW effort goes to the ~1.0 ms of inter-kernel gaps (fusion of the
+  remaining boundaries, graph/launch overhead) — the only remaining lever toward ~0.9× (recommended)
+- B) Shave the fused RoPE's ~1.7 µs (≤ ~0.03 ms/step)
+- C) A long-context prefetch that does not stall at the barrier (helps 8k contexts, not the served ~800 tokens)
+
+Separately: b1 is now ~2× faster, so the 4-sequence hand-off to CK splitkv may belong at 2–8 sequences; moving the
+edge moves the bitwise-invariance edge with it.
