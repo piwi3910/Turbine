@@ -3645,7 +3645,7 @@ moved to the measured crossover, the invariance test's edge moving with it.
 
 ## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06)
 
-## 5p decode-step gaps: what is left — the step is 0.85×, not 0.81×; 0.9× needs a new numerics class (2026-10-06, open)
+## 5p decode-step gaps: what is left — the step is 0.85×, not 0.81×; 0.9× needs a new numerics class (2026-10-06)
 
 From `p5p-gaps` (perf log 5p "Decode-step boundaries"). Landed: the b1 → CK split-KV edge at 10 sequences
 (e2d0d8c3; b1 not slower than CK through 9 sequences at ~768–8,192 tokens; c16 0.996×, c1 unchanged) and
@@ -3675,6 +3675,11 @@ normalising prologue nor a gated (silu·up) epilogue.
 - C) Overlap scheduling (5p spec item): feed the sampled token to the next step's embedding on the device and
   launch step N+1 before step N's readback, hiding the ~0.07–0.1 ms host turnaround per step at c1 (~0.7 %) and
   the host share at c16 (1.9 %). Bit-exact; scheduler/engine design work (stop conditions observed one step late).
+
+**Decision (user, 2026-10-06): B + C.** Both are tasked toward ~0.9×: our own batch-1 GEMVs for Llama with the
+norms and silu·mul fused (a new decode numerics class; the kernel-reuse evaluation and a golden re-check come first),
+and overlap scheduling (spec S-3, plan Task 4, bit-exact). Unprofiled time per token is the bandwidth measure from
+now on.
 
 ## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06, open)
 
@@ -3816,3 +3821,18 @@ prefill chunk is ≥ 16,384 routed rows, still served by the prefill tier, now 2
 
 **Decision (user, 2026-10-06): 1 A, 2 A, 3 A.** The b1 leg's bound tightens to 0.12; the v2.3 leg keeps the b1 bound
 and the token check; O2 is tasked (the 128 k step in the sliced prefill gate-up without spill, bitwise tiers kept).
+
+## 5p golden tolerance vs engine summation order (2026-10-06)
+
+The FP8 per-tensor golden c16 FAIL bisects to `b1c072ce` (the first b1 attention kernel): b1's split/combine order
+shifts every decode-attention result, and this checkpoint has sat at its tolerance edge since 6a (p16 tail 2.889 vs
+2.99). No kernel is wrong; BF16, FP8-dynamic and FP8-block pass, per-tensor c1 passes 15/16 at the tip. The fused
+batch-1 GEMVs (decision B + C above) will shift decode numerics again.
+
+- A) Record the per-tensor FAIL as the b1 numerics shift
+- B) Re-derive the golden tolerances with engine summation-order noise included (a fixture job)
+- C) Make b1 sum in CK splitkv's order
+
+**Decision (user, 2026-10-06): A + B.** The FAIL is recorded as the b1 shift; the tolerances are re-derived with
+engine summation-order noise included, which also covers the fused-GEMV class.
+
