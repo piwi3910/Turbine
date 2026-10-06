@@ -696,10 +696,12 @@ fn time_us(p: &Pair, rounds: usize, iters: u32, mut op: impl FnMut()) -> f64 {
 }
 
 /// Phase 5p S-16: a prefill-step MXFP4 `qgemm` (W4A16, BF16 out) at m = 2,048 takes at most
-/// 1.10 × the BF16 GEMM a BF16 checkpoint runs for the same layer in a prefill step (`gemm`
+/// 1.45 × the BF16 GEMM a BF16 checkpoint runs for the same layer in a prefill step (`gemm`
 /// with `prefill`: hipBLASLt through the tuned table's invariant rows where the shape has some,
 /// the heuristic otherwise), both measured in this run, on every Llama-3.2-3B and Llama-3.1-8B
-/// linear shape; m = 512 is printed for information. Breaks if prefill calls lose the
+/// linear shape; m = 512 is printed for information. The bound is a no-regression bound (user
+/// decision 2026-10-06 A: the Prefill tile measured 1.0–1.44 ×, the 6a tile up to 1.60 ×; the
+/// original 1.10 × target was re-bound). Breaks if prefill calls lose the
 /// shared-decode tile (e.g. run a decode tile or the per-wave-decode LDS tile).
 #[test]
 #[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
@@ -710,7 +712,7 @@ fn qgemm_mxfp4_prefill_within_hipblaslt_bound() {
     let _gpu = lock_gpu();
     let p = setup();
     let mut rng = Rng(83);
-    const BOUND: f64 = 1.10;
+    const BOUND: f64 = 1.45;
     const GATED_M: usize = 2048;
     let max_k = 14336;
     let x = rng.normal(GATED_M * max_k, 1.0);

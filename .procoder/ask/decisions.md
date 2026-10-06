@@ -3513,6 +3513,24 @@ merged meanwhile (c1 +1.5 %, c16 neutral, golden PASS).
 
 This applies the user's rule from "New PSU validation sequence, then the GPU 1 benchmark" (within ~3 %: GPU 1 joins perf work). The measurement is from branch `p5p-gpu1`, same tree fa70043d, run back to back as GPU 0, then GPU 1, then GPU 0 again. GPU 1 / GPU 0 tok/s: Llama c16 855.9 vs 850.7 (1.006), OLMoE c16 614.9 vs 617.2 (0.996), Llama c1 78.1 vs 78.0 (1.001), OLMoE c1 150.3 vs 150.1 (1.002). ITL and TTFT p50 match within 1 ms (2 ms TTFT). Golden c1 passed on every run. Both cards link Gen5 x8 at the root port, then Gen5 x16 inside the card, and have the same 300 W cap, clocks and temperatures under load. The perf-log entry "GPU 1 vs GPU 0 on the new PSU" has the table and the labbook ids. Outcome: the GPU-0-only perf rule is lifted. `scripts/lab-bench.sh` accepts `--gpu 0|1` with no caveat, and AGENTS.md says perf numbers are comparable on either card. The earlier lift in the same branch also stands: the one-GPU-job rule (decision "New PSU validated"); lab-test and lab-serve hold bench.lock shared again, and `--gpus 2` and `lab-cluster.sh` are allowed. `TURBINE_LAB_ONE_GPU_JOB=1` restores that rule if the host needs it again.
 
+## 5p b1 attention breaks `tiny_model hip_matches_cpu` (2026-10-06)
+
+The merged-stack quick tier (97050b3c): `turbine-model --test tiny_model` `hip_matches_cpu` and
+`hip_v23_library_matches_cpu` fail at step 1 (the first decode step) with max |Δ logit| 0.1028 against the 1e-4
+bound. The tiny GPU model (4 query heads on 2 KV heads) runs the b1 decode attention at batch 1; b1 keeps the
+attention probabilities P in F32, while the test's CPU reference mirrors CK's order with BF16 P (its comment records
+that exact mismatch at 0.097). The b1 branch ran only kernel-level lab tests, so the merge exposed it.
+
+- A) The CPU reference models the b1 numerics (F32 P) when the HIP side runs b1 (grouped heads, < 4 sequences); the
+  1e-4 bound stays and the test keeps checking the real numerics (recommended)
+- B) Re-bound `HIP_MAX_ABS_LOGIT_DIFF` for the b1 class (~0.15); less work, but a same-size numerics mismatch elsewhere
+  would no longer be caught
+- C) Make b1 round P to BF16 like CK, so it rejoins CK's numerics class; a kernel change, re-running its invariance
+  and cross-edge bound tests
+
+**Decision (user, 2026-10-06): A.** The CPU reference models the b1 numerics (F32 P) where the HIP side runs b1; the
+1e-4 bound stays.
+
 ## P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss (Task 15, 2026-10-06)
 
 Date: 2026-10-06 (Phase 5p Task 15, branch `p5p-t15`). Card: R9700 (gfx1201), GPU 0 under `bench.lock`, ROCm 7.14.1, hipBLASLt 1.4.1, CK at the pinned `cd9574023093742434e8c992d13b89ab9a6c1cf8`, llama.cpp at `680a0362` (6a's build). Harness: `kernels/rocm/tools/qgemm_mxfp4_eval.cpp` (gains `--cands` and the `mxfp4_prefill` candidate); lab test `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`, whose BF16 side is `gemm` with `prefill` — what a BF16 checkpoint runs: the tuned table's invariant rows for the 3B shapes, the heuristic for 8B. Shapes and method as in "P6: MXFP4 GEMM — provider evaluation (kernel reuse rule)".
@@ -3564,3 +3582,5 @@ The served TTFT target (≤ 1.05× BF16) misses: 1.21–1.25× at c1 and 1.15× 
 - B) Keep iterating the own tile toward 1.10×: a persistent kernel with a smaller LDS footprint (swizzled, unpadded tiles so 2–3 blocks share a CU) and an overlapped epilogue. This is multi-day with no guarantee. The k = 3,072 shapes have the least room, since the bare WMMA core is already ~1.05–1.10× BF16.
 - C) Tune the BF16 side as well, by adding the 8B shapes to `gemm.tsv` (what Strata's per-version table does). This would make the 8B BF16 reference faster and the ratios worse. It is useful for BF16 serving, not for S-16.
 - D) Revert the Prefill tile and keep the evaluation record only.
+
+**Decision (user, 2026-10-06): A.** The Prefill tile stays (from 1,024 rows). S-16 is re-bound: the MXFP4 prefill GEMM at m = 2,048 ≤ 1.45× the BF16 prefill GEMM per shape, a no-regression bound asserted by `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`; served TTFT is recorded, not gated; `mxfp4` stays `experimental`. Spec S-16 (its AC names `hip_qgemm_mxfp4`) and plan Task 15 amended.

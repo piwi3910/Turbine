@@ -1400,6 +1400,21 @@ Card state, from `amd-smi metric` sampled every 10 s during each run (the sample
 
 Verdict: GPU 1 lands within 0.6 % of GPU 0 on both models at c16 and c1, inside the decision's ~3 % bound. **GPU 1 joins perf work**: `lab-bench.sh --gpu 1` is a peer of `--gpu 0`, and numbers from the two cards are comparable.
 
+### S-17: OLMoE BF16 margin (plan Task 16, branch `p5p-t16` from `p6b-stack` 97050b3c, 2026-10-06)
+
+novanas GPU 0, three `scripts/lab-bench.sh --model olmoe --golden16` runs (standard c16 workload, 200 requests, `phase2c` config, release client on novanas), each holding the exclusive bench lock. There is no code change on top of the merged stack (the b1 attention kernel, the MoE tier-invariance fix, the jump-forward lab legs, the GPU 1 rule lift). The comparison points are the 6a exit (613.9 tok/s, 24.3 ms ITL, 118 ms TTFT), the 6a watch value (602.5) and the S-2 row (615.4, host share 0.0119). Every run's `host_share` is the c16 `stage-share` over that run's throughput bench.
+
+| Run          | tok/s     | ITL p50 (ms) | TTFT p50 (ms) | decode fwd (ms) | host_share | golden c1 / c16 | labbook  |
+| ------------ | --------- | ------------ | ------------- | --------------- | ---------- | --------------- | -------- |
+| `p5p-t16-r1` | 609.5     | 24.3         | 133           | 23.6            | 0.0141     | PASS / PASS     | 6d16859a |
+| `p5p-t16-r2` | 614.8     | 24.1         | 132           | 23.5            | 0.0126     | PASS / PASS     | cf880e96 |
+| `p5p-t16-r3` | 608.8     | 24.4         | 133           | 23.7            | 0.0128     | PASS / PASS     | 44f7d529 |
+| **median**   | **609.5** | 24.3         | 133           | 23.6            | 0.0128     | PASS / PASS     |          |
+
+Verdict: median **609.5 ≥ 608** (0.99 × 613.9). That is 0.993× the 6a exit and 1.012× the 602.5 watch value, with golden c1 and c16 PASS on every run and 0 failed requests. **S-17 is met and the 6a watch item closes.** The profile names no stage to fix: ITL and the decode forward match the 6a exit (24.3 ms), and the host share matches S-2 (0.013 vs 0.012). The 602.5 reading does not reproduce on the current stack, and the GREEN admission cap is not involved. The same tree measured 614.9–617.7 earlier the same day (the GPU 1 vs GPU 0 section), and the MoE invariance branch measured 624.4 with `--quick`. The margin is thin: the median clears the bound by 1.5 tok/s, and r3 read 608.8. Run-to-run spread is about 1 %, so a single run can land below 608.
+
+Observation, not acted on: TTFT p50 reads 132–133 ms here, against 118 at the 6a exit and S-2 and 121–122 that morning, while the decode numbers are unchanged. TTFT is outside this task's criterion; it is noted for the phase-exit bench.
+
 ### MXFP4 prefill tile (plan Task 15, S-16; branch `p5p-t15`, commits 648dcebe test + 45506bfb tile + the 1,024-row threshold, 2026-10-06)
 
 Provider re-evaluation, kernel tables, ablations and options: decision "P5p: MXFP4 prefill GEMM — provider re-evaluation, the own Prefill tile, and the S-16 miss". All runs GPU 0 under `bench.lock`.
@@ -1435,3 +1450,5 @@ BENCH t15-after  llama8b-mxfp4 conc=16 tok/s=675.5 itl_p50=15.1 ttft_p50=552
 ```
 
 S-16 served target (TTFT p50 ≤ 1.05× same-day BF16 8B): **miss**, 1.25× at c1 and 1.15× at c16; the tile is served-neutral on this workload (~700-token prompts prefill below its range). With the 1,024-row threshold, prompts under 1,024 tokens run exactly the 6a kernel. Golden c1 output is line-for-line identical before and after.
+
+User decision 2026-10-06 A: S-16 re-bound to ≤ 1.45× the BF16 prefill GEMM per shape (no-regression), served TTFT recorded, not gated. The timing test under the new bound (`scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_qgemm_mxfp4 -- qgemm_mxfp4_prefill`): **PASS**, ratios 1.44 / 1.41 / 1.31 / 1.17 / 1.26 / 1.18 / 1.31 / 0.96; `qgemm_mxfp4_prefill_rows_are_batch_invariant` passes. 3b.qkv sits within ~1 % of the bound (1.424–1.438 over three runs): a host-timed test that may flake on a loaded host.
