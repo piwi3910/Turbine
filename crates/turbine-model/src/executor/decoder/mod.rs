@@ -58,9 +58,9 @@ use turbine_distributed::collective::{Collective, ReduceOp};
 use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
-    ElementwiseContext, EmbeddingConfig, EmbeddingContext, GemmConfig, GemmContext, KernelError,
-    KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement, PagedAttentionContext,
-    QGemmContext, QuantizeActContext, RopeConfig, RopeContext, TqPaged,
+    ElementwiseContext, EmbeddingConfig, EmbeddingContext, FusedRope, GemmConfig, GemmContext,
+    KernelError, KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement,
+    PagedAttentionContext, QGemmContext, QuantizeActContext, RopeConfig, RopeContext, TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -1835,24 +1835,35 @@ impl DecoderExecutor {
         let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
         let v_heads = || part(2, &[d.kv_heads, d.head_dim]);
         let rope = d.rope();
-        self.op(OpConfig::Rope(rope), || {
-            self.registry.rope(&rope).execute(&mut RopeContext {
-                cfg: rope,
-                q: q_heads(),
-                k: k_heads(),
-                positions: w.meta.positions_view(p),
-                inv_freq: b.inv_freq.view(),
-                attn_factor: d.rope_attn_factor,
-            })
-        })?;
-        self.record(li, "q_rope", q())?;
-        self.record(li, "k_rope", k())?;
         let kind = if p.is_decode() {
             AttentionKind::DecodePaged
         } else {
             AttentionKind::PrefillPaged
         };
         let attn = d.attention(kind, self.kv_layout.block_tokens, self.kv_layout.dtype);
+        // P5p b1 attention II: on decode steps RoPE rides in the attention call when its kernel
+        // takes it (kernel ABI v2.12: the same operations, one launch and one boundary fewer),
+        // except while tracing, which records the rotated q and k.
+        let fused_rope = p.is_decode()
+            && !self.trace.is_on()
+            && self
+                .registry
+                .attention(&attn)
+                .fuses_decode_rope(&attn, &rope);
+        if !fused_rope {
+            self.op(OpConfig::Rope(rope), || {
+                self.registry.rope(&rope).execute(&mut RopeContext {
+                    cfg: rope,
+                    q: q_heads(),
+                    k: k_heads(),
+                    positions: w.meta.positions_view(p),
+                    inv_freq: b.inv_freq.view(),
+                    attn_factor: d.rope_attn_factor,
+                })
+            })?;
+            self.record(li, "q_rope", q())?;
+            self.record(li, "k_rope", k())?;
+        }
         // The KV scales are the model layer's (a pipeline stage's layer `i` is model layer
         // `layers.start + i`); every tensor-parallel rank has the same ones.
         let model_layer = self.pp.as_ref().map_or(0, |pp| pp.layers.start as usize) + i;
@@ -1896,6 +1907,12 @@ impl DecoderExecutor {
                             .as_ref()
                             .and_then(|dev| dev.layer(model_layer, d.head_dim as u32)),
                         ..t
+                    }),
+                    rope: fused_rope.then(|| FusedRope {
+                        cfg: rope,
+                        positions: w.meta.positions_view(p),
+                        inv_freq: b.inv_freq.view(),
+                        attn_factor: d.rope_attn_factor,
                     }),
                 })
         })?;

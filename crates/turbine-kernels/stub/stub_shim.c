@@ -29,7 +29,7 @@
  * (unsupported like every op; see the v2.9 section at the end); with
  * TURBINE_STUB_V210 as well it reports minor 10, whose only addition is
  * turbine_rope_desc.attn_factor; with TURBINE_STUB_V211 as well it reports
- * minor TURBINE_ABI_MINOR (11) and exports the v2.11 kv_transcode trio
+ * minor 11 and exports the v2.11 kv_transcode trio
  * (unsupported like every op) and the host-to-device copy kernel (memcpy;
  * see the v2.11 section at the end), except that
  * TURBINE_STUB_V211_PARTIAL leaves out turbine_kv_transcode_impl (a library
@@ -293,7 +293,7 @@ STUB_OP(add_rmsnorm, turbine_add_rmsnorm_desc)
 STUB_OP(logits_reduce, turbine_logits_reduce_desc)
 
 #if defined(TURBINE_STUB_V211)
-uint32_t turbine_abi_minor(void) { return TURBINE_ABI_MINOR; }
+uint32_t turbine_abi_minor(void) { return 11u; }
 #elif defined(TURBINE_STUB_V210)
 uint32_t turbine_abi_minor(void) { return 10u; }
 #elif defined(TURBINE_STUB_V29)

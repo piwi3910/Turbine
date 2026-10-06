@@ -6,7 +6,10 @@ use super::{
 use turbine_core::types::DType;
 
 use crate::KernelError;
-use crate::ops::{AttentionConfig, AttentionContext, AttentionKernel, PagedAttentionContext};
+use crate::ops::{
+    AttentionConfig, AttentionContext, AttentionKernel, AttentionKind, PagedAttentionContext,
+    RopeConfig, RopeContext, RopeKernel,
+};
 
 impl AttentionKernel for CpuReference {
     fn supports(&self, cfg: &AttentionConfig) -> bool {
@@ -84,7 +87,35 @@ impl AttentionKernel for CpuReference {
                 message: format!("cpu-reference paged attention {}", ctx.cfg),
             });
         }
+        // Fused RoPE (P5p, the GPU's ABI v2.12): the separate op's rotation of q and k_new in
+        // place, then the call as usual — the same values, so the same bits.
+        if let Some(r) = ctx.rope.clone() {
+            if !self.fuses_decode_rope(&ctx.cfg, &r.cfg) {
+                return Err(KernelError::Unsupported {
+                    message: format!("cpu-reference fused RoPE ({}) on {}", r.cfg, ctx.cfg),
+                });
+            }
+            RopeKernel::execute(
+                self,
+                &mut RopeContext {
+                    cfg: r.cfg,
+                    q: ctx.q.clone(),
+                    k: ctx.k_new.clone(),
+                    positions: r.positions,
+                    inv_freq: r.inv_freq,
+                    attn_factor: r.attn_factor,
+                },
+            )?;
+        }
         paged::attention(ctx)
+    }
+
+    fn fuses_decode_rope(&self, cfg: &AttentionConfig, rope: &RopeConfig) -> bool {
+        cfg.kind == AttentionKind::DecodePaged
+            && RopeKernel::supports(self, rope)
+            && rope.num_q_heads == cfg.num_q_heads
+            && rope.num_kv_heads == cfg.num_kv_heads
+            && rope.head_dim == cfg.head_dim
     }
 }
 
