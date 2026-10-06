@@ -1756,3 +1756,39 @@ The other three FP8-block shapes are unchanged (qkv / o / gate_up 29.8 / 19.5 / 
 Bit-exactness: `hip_qgemm qgemm_fused_act_quant_matches_two_launches` (every 3B / 8B shape, 4 scheme × act pairings, unit-variance, zero, ×10⁴ saturating, subnormal and grid-tie rows) gives byte-identical outputs to `quantize_act` + the same kernel; the CPU reference implements the same form (`unquantized_fp8_activations_match_quantize_then_qgemm`). The estimate in the decision (~0.60×) holds for per-tensor (0.61×); FP8-dynamic lands at 0.62×.
 
 **Bisect — the per-tensor golden c1 FAIL on the base** (S-15 item 3). Per-tensor golden c1 at each point (`--concurrency 1 --quick`): 6a exit `fbddca9` PASS 16/16, numbers identical to the 6a and 6b exit runs; `c7657649` (token-granular reuse) PASS, identical except p09 (partial reuse of the shared chat-template prefix); `0d16d756`, `3963a519` PASS, identical to `c7657649`; `2951123f` (merge `p5p-b1attn`) FAIL; inside it **`b1c072ce` "the b1 decode attention kernel" FAIL**, identical to the base (its parent's code is `1c1c5105`, inside the passing range); `97050b3c` with `kv.partial_prefix_reuse=false` still FAIL (only p09 moves). The b1 kernel moves every decode-attention sum (its own split and combine order, the user-decided numerics class of 2026-10-04 B), and the per-tensor checkpoint sat at its bounds since 6a (p16 tail 2.889 against 2.99, p14 likely 1.108 against 1.36): the shift takes p14 to 1.48 and a p16 tail candidate to 5.54. BF16, FP8-dynamic and FP8-block keep PASS on it; Task 14's W8A8 kernel moved the per-tensor sums again (15/16 PASS, p13 margin). Golden c16 per-tensor fails the same way on the base (p14 1.40, p16 tail 5.27). Not a defect in a kernel; options in decisions "5p FP8 follow-ups: the per-tensor golden bisect".
+
+### Task 13b: lazy L0 page classes — landing (branch `p5p-kvfix`, commit cc85653a, 2026-10-06)
+
+Decision "5p Task 13" B: the L0 pool's page classes become active only when a class page is first allocated (the L0
+ladder step's rewrite, the recent window); until then the view is flat and decode runs the plain paged attention. Same
+card (GPU 0), one session, measured from a fixed clone of cc85653a, bench lock per run, arms interleaved; the partial
+reuse fix (418b742d) is in the tree.
+
+Standard bench (`lab-bench.sh --gpu 0 --model llama`, `t13b-std`): **854.0 tok/s** (S-2 baseline 852.2: 1.002×), ITL p50
+15.5 ms, TTFT p50 207 ms, golden c1 PASS, 200/0.
+
+The Task 13 recipe exactly (`--config scripts/lab/phase6-novanas-ladder.yaml --mt-only --multi-turn-sessions 24
+--mt-think-time 1..4 -- --set kv.partial_prefix_reuse=false --set kv.ladder.l0=true|false`, runs `t13c-l0{on,off}-r{1,2,3}`);
+golden c1 PASS and 192/192 on every run. "L0 rewrites" = `turbine_kv_ladder_actions_total{tier="l0"}` at the final scrape.
+
+| Arm      | Run | tok/s | ITL p50 (ms) | later TTFT p50 (ms) | cached ratio | recomputed | ORANGE samples | L0 actions (fill_high_water / no_room_backoff) |
+| -------- | --- | ----- | ------------ | ------------------- | ------------ | ---------- | -------------- | ---------------------------------------------- |
+| l0=true  | r1  | 353.2 | 24.4         | 173                 | 0.8201       | 183,413    | 26             | 0 / 0                                          |
+| l0=false | r1  | 298.3 | 24.6         | 154                 | 0.8503       | 152,309    | 45             | –                                              |
+| l0=true  | r2  | 309.3 | 23.1         | 156                 | 0.8418       | 158,532    | 43             | 52 / 27                                        |
+| l0=false | r2  | 326.5 | 23.6         | 139                 | 0.8607       | 139,634    | 36             | –                                              |
+| l0=true  | r3  | 303.4 | 24.6         | 154                 | 0.8087       | 194,921    | 37             | 8 / 1                                          |
+| l0=false | r3  | 346.5 | 24.5         | 163                 | 0.8186       | 183,602    | 25             | –                                              |
+
+- **ITL target met**: median ITL p50 24.4 (l0=true) against 24.5 ms (l0=false); the run where the L0 step never fired
+  (r1) is 24.4 against the off-arm's 23.6–24.6. Task 13 measured 26.4 against 24.2 (+9 %) on the always-classed pool.
+  Even the runs where the L0 step fired (r2, r3: it now fires in 2 of 3 runs, never in Task 13 — L1's drain-reformatted
+  rung slabs shift the pressure) stay inside the off-arm's spread, since activation happens late in the run.
+- tok/s medians 309.3 against 326.5 (0.947×) and ORANGE samples 37 against 36: within the wide run-to-run spread of
+  this workload (off-arm 298–347 tok/s); no ITL signal behind it.
+- Side runs with the partial reuse fix live (same recipe without `kv.partial_prefix_reuse=false`, `t13b-l0{on,off}-r1`,
+  one pair, then stopped because the L0 step fired in the on-run): l0=true 311.9 tok/s, ITL 21.7, cached 0.8665, L0
+  actions 52 / 9; l0=false 221.9 tok/s, ITL 20.7, cached 0.9052, ORANGE 124 samples. Both 192/192 with golden c1 PASS
+  — token-granular reuse on the classed L0 pool serves (before 418b742d it was HTTP 500 + `circuit_open`).
+- labbook set `phase-5p-serving-efficiency`: `lab-bench:t13b-std-llama:cc85653a`, `lab-bench:t13c-l0{on,off}-r{1,2,3}-llama:cc85653a`,
+  `lab-bench:t13b-l0{on,off}-r1-llama:cc85653a`.

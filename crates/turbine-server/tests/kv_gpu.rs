@@ -1567,3 +1567,74 @@ fn l0_ladder_serves_on_gpu() {
     assert_eq!(tokens, u64::from(ANSWER_TOKENS));
     assert!(!text.trim().is_empty(), "empty completion: {text:?}");
 }
+
+/// P5p (user decision 2026-10-06, "5p: partial prefix reuse fails on a classed L0 pool", A):
+/// token-granular reuse on the classed L0 pool of `kv.ladder.l0` (BF16 base, the ladder's
+/// rung classes). A primer publishes its partial tail; a target continuing it reuses its full
+/// blocks plus the tail through one copy-on-write tail copy of a base page — which the HIP
+/// `copy_blocks` used to reject (`block id N is outside the pool's id space`, HTTP 500, and the
+/// circuit opened for every following request). Every warm target answers 200 with
+/// `cached_tokens` up to the last written token, within the batched bounds of the same config
+/// without partial reuse, and `/ready` stays 200 (no circuit opened). Breaks if the tail copy
+/// on a classed pool fails again or copies the wrong page.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so and the Llama-3.2-3B weights"]
+fn partial_reuse_on_classed_l0_pool() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    const BLOCK: u32 = 128;
+    const TAILS: [u32; 4] = [1, 17, 100, 127];
+    const EXTRA: u32 = 8;
+    let cases: Vec<(Vec<u32>, Vec<u32>, u32)> = TAILS
+        .iter()
+        .zip(1u32..)
+        .map(|(&tail, i)| {
+            let shared = token_ids(700 + i, 3 * BLOCK);
+            let primer = [shared.as_slice(), &token_ids(800 + i, tail)].concat();
+            let target = [primer.as_slice(), &token_ids(900 + i, EXTRA)].concat();
+            (primer, target, 3 * BLOCK + tail)
+        })
+        .collect();
+    let ladder = |partial: bool| -> Vec<String> {
+        vec![
+            "kv.ladder.enabled=true".to_string(),
+            "kv.ladder.l0=true".to_string(),
+            "kv.ladder.max_format=tq4".to_string(),
+            "kv.cpu.enabled=true".to_string(),
+            "kv.cpu.max_bytes=1GiB".to_string(),
+            format!("kv.partial_prefix_reuse={partial}"),
+        ]
+    };
+    let cold: Vec<IdAnswer> = {
+        let server = LabServer::start(&model_dir, &ladder(false));
+        cases
+            .iter()
+            .map(|(_, t, _)| server.complete_ids(t, ANSWER_TOKENS))
+            .collect()
+    };
+    let server = LabServer::start(&model_dir, &ladder(true));
+    for ((primer, target, want), cold) in cases.iter().zip(&cold) {
+        server.complete_ids(primer, ANSWER_TOKENS);
+        let warm = server.complete_ids(target, ANSWER_TOKENS);
+        let label = format!("prompt {} want {want}", target.len());
+        println!(
+            "{label}: cached {} cold {:?} warm {:?}",
+            warm.cached_tokens, cold.text, warm.text
+        );
+        assert_eq!(
+            warm.cached_tokens,
+            u64::from(*want),
+            "{label}: the tail reuses up to the last written token"
+        );
+        assert_within_batched_bounds(cold, &warm, &label);
+    }
+    assert_eq!(
+        request(server.addr, "GET", "/ready", None).0,
+        200,
+        "the circuit stays closed"
+    );
+    println!("partial_reuse_on_classed_l0_pool ok");
+}

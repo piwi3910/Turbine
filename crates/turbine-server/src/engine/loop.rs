@@ -1933,7 +1933,7 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
-            built.formats.push(if self.pool.has_page_classes() {
+            built.formats.push(if self.pool.page_classes_active() {
                 plan.items[it.index]
                     .block_table
                     .blocks

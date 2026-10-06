@@ -1924,8 +1924,11 @@ impl DecoderExecutor {
                     v_scale,
                     // P6b S-5/S-7: with page classes (the ladder's L0 rungs, the recent
                     // window's BF16 class) the table's bytes say which format each block
-                    // holds; TurboQuant pages take the layer's tables and codec.
-                    block_formats: self.mixed_blocks.then(|| w.meta.block_formats_view(p)),
+                    // holds; TurboQuant pages take the layer's tables and codec. A classed pool
+                    // whose classes are not active yet hands a flat view (P5p S-14
+                    // follow-up): every block is a base page and the plain attention runs.
+                    block_formats: (self.mixed_blocks && kv.classes.is_some())
+                        .then(|| w.meta.block_formats_view(p)),
                     classes: kv.classes,
                     tq: self.cfg.kv_cache.tq_paged(model_layer).map(|t| TqPaged {
                         device: self

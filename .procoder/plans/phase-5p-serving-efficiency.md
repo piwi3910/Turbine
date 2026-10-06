@@ -305,11 +305,27 @@ Interfaces:
 
 - [x] Instrument: add `turbine_kv_ladder_action_seconds_total{tier,action}` and the ORANGE cause breakdown; run: `scripts/remote-cargo.sh test -p turbine-server` — expect PASS (reporting only)
 - [x] (done with the 6b Task 18 recipe as `lab-bench.sh --config scripts/lab/phase6-novanas-ladder.yaml --mt-only --multi-turn-sessions 24 --mt-think-time 1..4`, `kv.partial_prefix_reuse=false` on both arms — perf log 5p "Task 13"; the fix choice is open in decisions "5p Task 13: ladder serving cost") Run the instrumented A/B (GPU 0): `scripts/lab-bench.sh --model llama --multi-turn` with the ladder on and with the ladder off (`--set kv.ladder.enabled=…`), three runs each — the per-action times and the ORANGE breakdown name the dominant cost; the lines go into `.procoder/perf-log.md`
-- [ ] Fix per the profile, test first: write failing test `turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` (at most `max_rewrites_per_tick` rewrites submitted per tick, overflow deferred, no budget = as before). Run: `scripts/remote-cargo.sh test -p turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` — expect FAIL
-- [ ] Implement the fix the profile named (the budget, the hysteresis or the copy-kernel path); keep the 6b ladder tests (`ladder_under_pinned_pressure`, `ladder_l0_under_pinned_pressure`) passing unchanged
-- [ ] Rerun the A/B (GPU 0): meets the S-14 target, or the item closes on the user's read of the numbers (a decisions entry records it either way)
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `perf(kv): ladder serving cost — the instrumented fix for the ORANGE dwell`
+- [x] (not landed: the profile named no cost any candidate targets — user decision 2026-10-06 "5p Task 13: ladder serving cost" A; the budget test and fix (a)–(c) are dropped) Fix per the profile, test first: write failing test `turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` (at most `max_rewrites_per_tick` rewrites submitted per tick, overflow deferred, no budget = as before). Run: `scripts/remote-cargo.sh test -p turbine-kv hierarchy::tests::ladder_rewrite_budget_bounds_actions_per_tick` — expect FAIL
+- [x] (not landed, as above; the 6b ladder tests are unchanged) Implement the fix the profile named (the budget, the hysteresis or the copy-kernel path); keep the 6b ladder tests (`ladder_under_pinned_pressure`, `ladder_l0_under_pinned_pressure`) passing unchanged
+- [x] (closed on the user's read, decision 2026-10-06 A: tok/s 0.909× and ORANGE 1.69× met, the recompute target re-bound to the measured −6.2 % — spec S-14 target; `kv.ladder.l0=false` documented as the cheaper opt-in shape in AGENTS.md and `docs/extending/kv-format.md`; the lazy L0 page classes follow as Task 13b) Rerun the A/B (GPU 0): meets the S-14 target, or the item closes on the user's read of the numbers (a decisions entry records it either way)
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `docs(5p): close S-14 on the instrumented A/B — ladder stays opt-in, kv.ladder.l0=false documented` (the plan's `perf(kv)` message assumed a landed fix)
+
+## Task 13b: Lazy L0 page classes — `kv.ladder.l0=true` costs nothing until the L0 step fires (S-14 follow-up)
+
+Files: `crates/turbine-kv/src/pool.rs` (the activation flag, the flat view until it), `crates/turbine-model/src/executor/decoder/mod.rs` (the `block_formats` table only on a classed view), `crates/turbine-server/src/engine/loop.rs` (per-block format codes only once classes are active), `.procoder/perf-log.md`
+Interfaces:
+
+- `BlockPool::page_classes_active(&self) -> bool`: false until the first `allocate_in` of a non-base class carves a slab, then true for the pool's life (no flapping between graph keys); `BlockPool::view()` reports `classes: None` and `num_blocks` = the base pages until then (every id is a base page, so flat addressing is exact); `has_page_classes()` keeps meaning "configured". The decoder passes `block_formats` only when the view carries classes, so decode on a classed-but-inactive pool runs the plain paged attention; the decode graphs' `PoolId` differs between the two views, so graphs captured flat are dropped at activation. User decision 2026-10-06 ("5p Task 13: ladder serving cost", B)
+  Covers: S-14 follow-up ACs (host test + manual measurement)
+  Depends on: Task 13
+
+- [x] Write failing test `turbine-kv pool::tests::page_classes_are_built_lazily` (flat view and no active class before the first class allocation; the classed view from it on, kept after the page frees; base allocations alone never activate). Run: `scripts/remote-cargo.sh test -p turbine-kv pool::tests::page_classes_are_built_lazily` — expect FAIL
+- [x] Implement the activation flag and the flat view; the decoder's `block_formats` and the engine's per-block codes follow the view; keep `kv_sim ladder_l0_under_pinned_pressure`, `tiny_server status_reports_tier_formats_and_ladder` and the recent-window tests passing unchanged. Run: `scripts/remote-cargo.sh test -p turbine-kv pool::` — expect PASS
+- [x] (quick tier on 418b742d and cc85653a: all pass except the known `tiny_model hip_matches_cpu` / `hip_v23_library_matches_cpu` b1 mismatch, step-1 |Δ| 0.1028, decisions "5p b1 attention breaks tiny_model hip_matches_cpu" — not this task's) Lab: `scripts/lab-test.sh novanas --tier quick` and `-- -p turbine-server --test kv_gpu l0_ladder_serves_on_gpu partial_reuse_on_classed_l0_pool` — expect PASS
+- [x] (perf log 5p "Task 13b": ITL p50 medians 24.4 vs 24.5 ms, standard bench 854.0 tok/s, golden c1 PASS on all; the recipe ran with `kv.partial_prefix_reuse=false` as in Task 13) Measure (GPU 0, one session, bench lock): `scripts/lab-bench.sh --gpu 0 --model llama` (standard bench, golden c1) and the Task 13 recipe with `--set kv.ladder.l0=true` against `--set kv.ladder.l0=false`, three runs each — ITL p50 equal when no L0 rewrite fires; the lines go into `.procoder/perf-log.md`
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] (cc85653a; the measurement and docs follow in a docs commit) Commit: `perf(kv): build L0's compressed page classes lazily, on the first L0 ladder step`
 
 ## Task 14: FP8 c1 ITL — profile, then the measured fix (S-15)
 

@@ -199,6 +199,10 @@ pub struct BlockPool {
     room_epoch: u64,
     /// Page classes other than the base (P6b S-5); `None` = the base class only.
     slabs: Option<Slabs>,
+    /// Whether a class page was ever allocated (P5p S-14 follow-up, lazy classes): until then
+    /// every id is a base page and [`BlockPool::view`] is flat, so decode keeps the plain
+    /// paged attention; once set it stays set for the pool's life.
+    classes_active: bool,
 }
 
 impl BlockPool {
@@ -249,6 +253,7 @@ impl BlockPool {
             class_codes: Vec::new(),
             room_epoch: 0,
             slabs: None,
+            classes_active: false,
         })
     }
 
@@ -346,6 +351,14 @@ impl BlockPool {
     /// window): a block's format tag can then differ from the pool base.
     pub fn has_page_classes(&self) -> bool {
         self.slabs.is_some()
+    }
+
+    /// Whether the configured classes are in use (P5p S-14 follow-up, user decision
+    /// 2026-10-06 "5p Task 13", B): false until the first [`BlockPool::allocate_in`] of a
+    /// non-base class (the L0 ladder step, the recent window), then true for the pool's life —
+    /// the view does not flip back, so decode graphs are dropped once, at activation.
+    pub fn page_classes_active(&self) -> bool {
+        self.classes_active
     }
 
     /// The v2.11 `block_formats` byte of block `b` (`TURBINE_KVFMT_*`): its page class, the
@@ -468,6 +481,7 @@ impl BlockPool {
             s.live[((b.0 - base_blocks) / s.stride) as usize] += 1;
             out.push(b);
         }
+        self.classes_active |= n > 0;
         Ok(out)
     }
 
@@ -806,11 +820,14 @@ impl BlockPool {
 
     /// The device storage and layout for the executor: the base class's addressing plus, with
     /// page classes, the per-class resolution of the ids above the base ([`KvPageClasses`]).
-    /// `num_blocks` is the whole id space.
+    /// `num_blocks` is the whole id space. Until a class page was first allocated
+    /// ([`BlockPool::page_classes_active`]) the view is flat — no classes, `num_blocks` the base
+    /// pages — which addresses every live id exactly, since all of them are base pages.
     pub fn view(&self) -> KvPoolView<'_> {
         let per_layer_block = self.layout.layer_block_bytes();
         let layer_stride_bytes = u64::from(self.base_blocks) * per_layer_block;
-        let classes = self.slabs.as_ref().map(|s| KvPageClasses {
+        let slabs = self.slabs.as_ref().filter(|_| self.classes_active);
+        let classes = slabs.map(|s| KvPageClasses {
             num_blocks: self.total_ids,
             base_blocks: self.base_blocks,
             base_page_bytes: per_layer_block,
@@ -822,7 +839,11 @@ impl BlockPool {
         KvPoolView {
             storage: &self.storage,
             layout: self.layout,
-            num_blocks: self.total_ids,
+            num_blocks: if classes.is_some() {
+                self.total_ids
+            } else {
+                self.base_blocks
+            },
             layer_stride_bytes,
             classes,
         }
@@ -1164,6 +1185,64 @@ mod tests {
         assert_eq!(p.referenced_blocks(), 1, "only the held block");
         p.release(&[base[1]]);
         assert_eq!(p.referenced_blocks(), 0, "idle: nothing referenced");
+    }
+
+    /// P5p S-14 follow-up (user decision 2026-10-06, "5p Task 13", B): page classes are built
+    /// lazily. A pool given classes stays flat — no active class, `view().classes` `None`,
+    /// `num_blocks` the base pages — through base allocations and frees, so decode keeps the
+    /// plain paged attention; the first `allocate_in` of a class (the L0 ladder step, the
+    /// recent window) activates them and the view carries every class and the whole id space
+    /// from then on, also after that page is freed. Breaks if a class is set up before the
+    /// first class allocation or the view goes flat while class pages may exist.
+    #[test]
+    fn page_classes_are_built_lazily() {
+        let layout = KvLayout {
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 128,
+            dtype: DType::BF16,
+            block_tokens: 16,
+        };
+        let classes = [PageClass {
+            format: "tq4",
+            page_bytes: 2 * 2 * 16 * 144,
+        }];
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 23);
+        let mut p = BlockPool::new(
+            BlockPoolConfig {
+                layout,
+                num_blocks: 16,
+            },
+            mem,
+        )
+        .unwrap()
+        .with_page_classes(&classes, 4)
+        .unwrap();
+        let flat = |p: &BlockPool| {
+            let v = p.view();
+            assert!(p.has_page_classes(), "classes stay configured");
+            assert!(!p.page_classes_active());
+            assert!(v.classes.is_none(), "no class before the first class page");
+            assert_eq!(v.num_blocks, 16, "the base pages only");
+        };
+        flat(&p);
+        let base = p.allocate(3).unwrap();
+        flat(&p);
+        p.release(&base);
+        flat(&p);
+        let page = p.allocate_in("tq4", 1).unwrap();
+        assert!(p.page_classes_active());
+        let classed = |p: &BlockPool| {
+            let v = p.view();
+            let c = v.classes.expect("classed view once a class page exists");
+            assert_eq!(c.page_classes.len(), 1);
+            assert!(v.num_blocks > 16, "the whole id space");
+            assert_eq!(c.num_blocks, v.num_blocks);
+        };
+        classed(&p);
+        p.release(&page);
+        assert!(p.page_classes_active(), "activation is kept");
+        classed(&p);
     }
 
     /// P6b S-5: page classes carved from the one allocation. A realistic layout (2 layers,

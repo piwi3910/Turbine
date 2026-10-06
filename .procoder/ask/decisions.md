@@ -3856,3 +3856,16 @@ change the b1 numerics class the user chose, so it is not done here.
   the HF self-spread alone, which does not cover a decode-attention summation change; a fixture job under
   `fixture.lock`)
 - C) Make b1's split/combine reproduce CK splitkv's summation order (gives back b1's own numerics class; kernel work)
+
+## 5p: one request's deterministic kernel argument error opens the circuit (open, 2026-10-06)
+
+Found in the classed-pool partial-reuse bug (`p5p-kvfix`): `IterationError::model` maps every non-OOM,
+non-collective `ModelError` to `CircuitEvent::DeviceError { sticky: false }`. A pre-launch argument rejection
+(`TURBINE_E_ARGUMENT` from the library's own validation, no device work enqueued) is treated like a device fault, so
+a bug that hits every warm request keeps re-opening the circuit after each probe and the server rejects everything.
+
+- A) Keep it (a bug is loud)
+- B) Classify a pre-launch `KernelError::InvalidArgument` as a request failure: fail that iteration's requests, no
+  circuit event, a metric and reason code
+- C) B plus a per-reason rate limit that still opens the circuit when argument errors repeat (builder's
+  recommendation)
