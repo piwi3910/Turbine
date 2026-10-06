@@ -1871,3 +1871,22 @@ Served (`lab-bench.sh --gpu 0`, one session, commit 485c5e88, client on novanas)
 Llama c1 decode step 11.81 → 11.3 ms (0.957×, eff. BW 545 → ~569 GB/s, ~0.89×); c16 and OLMoE unchanged (OLMoE never
 binds the GEMV; its gemm selections are as recorded). `tests/lab/kernel-choices-llama.json`: the five Llama GEMMs now
 select `vllm_wvsplitk` (status `tiers`: ≤ 1 rows vllm_wvsplitk, above hipblaslt).
+
+### OLMoE O2 residual: sliced gate-up tile shapes (branch `p5p-moetile`, user decision 2026-10-06 "5p O2 landed …" B) — none lands
+
+`perf moe_prefill_timings`, real routing, GPU 0 natively under the bench lock, one session, µs per call at layers 0/5/10/15, two rounds (within ~1 %; round 2 shown). 32,768 routed rows cannot be timed: the traced golden prompts hold 2,556 tokens, so the largest size is 2,544 tokens (20,352 rows). Every bitwise variant: 0 outputs differing from `wmma` at every size. VGPRs/scratch/occupancy of the sliced gate-up kernel from `-Rpass-analysis=kernel-resource-usage`.
+
+| Variant (sliced gate-up)                                                            | VGPRs / spill / occ. | 12,288 rows (1,536 tok)       | 16,384 rows (2,048 tok)       | 20,352 rows (2,544 tok)       |
+| ----------------------------------------------------------------------------------- | -------------------- | ----------------------------- | ----------------------------- | ----------------------------- |
+| base: `Stream<1,8,4,1,128,BRing>` (landed O2)                                       | 255 / 0 / 5          | 2,334 / 2,399 / 2,319 / 2,332 | 2,813 / 2,904 / 2,793 / 2,800 | 3,270 / 3,329 / 3,270 / 3,264 |
+| zero-C slice start, per-step branch (4 step bodies)                                 | 256 / 180 B / 5      | not timed (spills)            |                               |                               |
+| zero-C slice start, slice-outer loop (`zcs`, 2 bodies)                              | 244 / 0 / 5          | 2,462 / 2,486 / 2,381 / 2,414 | 2,887 / 2,976 / 2,873 / 2,865 | 3,376 / 3,424 / 3,359 / 3,357 |
+| two waves share the rows, half the accumulators, 2 B stages (`Stream<2,8,2,1,128>`) | 227 / 0 / 6          | 3,085 / 3,145 / 3,069 / 3,066 | 3,713 / 3,704 / 3,655 / 3,659 | 4,276 / 4,270 / 4,275 / 4,253 |
+| the same with BRing (`Stream<2,8,2,1,128,BRing>`)                                   | 168 / 0 / 9          | 2,423 / 2,478 / 2,390 / 2,421 | 2,946 / 3,004 / 2,883 / 2,923 | 3,441 / 3,471 / 3,423 / 3,421 |
+| two waves + zero-C slice-outer loop                                                 | 161 / 0 / 9          | 2,493 / 2,537 / 2,441 / 2,480 | 3,020 / 3,073 / 2,989 / 2,988 | 3,530 / 3,558 / 3,504 / 3,507 |
+| two waves + zero-C per-step branch, 2 B stages / BRing                              | 234, 223 / 0 / 6     | 3,179 … / 2,892 …             | 3,831 … / 3,492 …             | 4,462 … / 4,079 …             |
+| BRing, each slice's reload one / two slices later (WAR distance)                    | 255 / 24 B / 5       | 2,408 / … ; 2,380 / …         | 2,863 / 2,930 / 2,839 / 2,841 | 3,325 / 3,376 / 3,313 / 3,313 |
+| diag: plain chain, 2 B stages (`PrefillGateUp`; not bitwise)                        | 196 / 0 / 6          | 2,272 / 2,342 / 2,249 / 2,271 | 2,700 / 2,735 / 2,673 / 2,702 | 3,128 / 3,171 / 3,140 / 3,105 |
+| diag: plain chain, BRing (not bitwise)                                              | –                    | 2,416 / 2,470 / 2,352 / 2,348 | 2,783 / 2,858 / 2,765 / 2,783 | 3,228 / 3,281 / 3,220 / 3,193 |
+
+Finding: the slice order's accumulator handling costs nothing measurable — the plain chain with the same one-stage B ring (`BRing`) runs as slow as the sliced kernel (2,783 vs 2,800 µs at 16,384 rows). The ~100 µs residual against the unsliced kernel is the single B register stage: the unsliced kernel keeps two (128 VGPRs) because it holds no totals, while acc (64) + totals (64) + two B stages (128) + A (32) exceed 256 VGPRs. Lowering live accumulators by splitting the rows over two waves frees the registers but doubles the weight-fragment loads per block (each wave of a column reads the same B): 2 B stages +32 %, BRing +4 %. Peeling the slice start (zero accumulator operand, no zeroing moves) is +3 %. Nothing is faster at ≥ 16,384 rows, so the kernel stays as O2 landed; no served A/B was run.
