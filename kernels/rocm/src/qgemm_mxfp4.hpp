@@ -31,7 +31,7 @@ int32_t quantize_act_mxfp4_run(turbine_ctx *ctx,
                                const turbine_quantize_act_desc *d);
 
 // The kernel tiles of turbine_hip_mxfp4. Auto, what the run uses, takes Prefill
-// from 512 rows, Large for every smaller prefill call (d->prefill), and picks
+// from 1,024 rows, Large for every smaller prefill call (d->prefill), and picks
 // by m otherwise:
 //   Small   -- m <= 16: one 16-row fragment, one column fragment per wave, k
 //              split over 8 waves (decode);
@@ -44,7 +44,7 @@ int32_t quantize_act_mxfp4_run(turbine_ctx *ctx,
 // Small and Medium sum a row in their own order (the k split), so a row's bits
 // depend on the tile; Large and Prefill sum it in one order (natural k, one
 // accumulator) and give it the same bits, so prefill calls are batch invariant
-// (prefix reuse needs it) and decode calls below 512 rows are not.
+// (prefix reuse needs it) and decode calls below 1,024 rows are not.
 enum class Mxfp4Tile { Auto, Small, Medium, Large, Prefill };
 
 // Enqueues the product of d (already validated: qgemm_mxfp4_supports and

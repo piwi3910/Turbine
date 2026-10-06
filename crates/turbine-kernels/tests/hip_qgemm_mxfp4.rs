@@ -41,8 +41,9 @@ const SHAPES_8B: [(&str, usize, usize); 4] = [
     ("8b.gate_up", 28672, 4096),
     ("8b.down", 4096, 14336),
 ];
-/// Every tile of `turbine_hip_mxfp4` (≤ 16, ≤ 32, ≤ 64 and above 64 rows) and partial tiles.
-const MS: [usize; 7] = [1, 7, 16, 24, 40, 128, 513];
+/// Every tile of `turbine_hip_mxfp4` (≤ 16, ≤ 32, ≤ 64, above 64 and from 1,024 rows) and partial
+/// tiles.
+const MS: [usize; 8] = [1, 7, 16, 24, 40, 128, 513, 1031];
 
 /// The implementation name of both ops (decision "P6: MXFP4 GEMM — provider evaluation").
 const IMPL: &str = "turbine_hip_mxfp4";
@@ -305,7 +306,7 @@ fn sample_rows(m: usize) -> Vec<usize> {
 
 /// One MXFP4 GEMM case: BF16 activations (quantize-dequantized to MXFP4 on the GPU first when
 /// `act` is MXFP4_EMULATED, as the decoder runs Quark W4A4 layers), then `qgemm` on the GPU at
-/// `m` rows vs the CPU reference on the sampled rows fed the same activations. From 512 rows
+/// `m` rows vs the CPU reference on the sampled rows fed the same activations. From 1,024 rows
 /// every call runs the Prefill tile; below, a decode-step call (`prefill: false`) picks its
 /// tile by m and a prefill-step call (`prefill: true`) runs the Large tile, which gives a row
 /// the Prefill tile's bits (`qgemm_mxfp4_prefill_rows_are_batch_invariant` checks it).
@@ -437,7 +438,7 @@ fn assert_implementations(p: &Pair) {
 
 /// Phase 6a S-10: `turbine_hip_mxfp4` matches the CPU reference for MXFP4 weights × BF16
 /// activations (act NONE, the W4A16 checkpoints) and × MXFP4-emulated activations (Quark W4A4),
-/// M ∈ {1, 7, 16, 24, 40, 128, 513} (every tile, full and partial), every Llama-3.2-3B and
+/// M ∈ {1, 7, 16, 24, 40, 128, 513, 1031} (every tile, full and partial), every Llama-3.2-3B and
 /// Llama-3.1-8B linear shape, BF16 out, plus F32 out and alpha ≠ 1 on one shape.
 /// Breaks if a nibble is read in the wrong order, a group's scale is applied to the wrong
 /// columns, the half-wave code exchange pairs the wrong k values with the activations, or a
@@ -495,7 +496,7 @@ fn qgemm_mxfp4_matches_cpu() {
 }
 
 /// Phase 6a S-10: `turbine_hip_mxfp4`'s MXFP4_EMULATED `quantize_act` is bit-exact with the CPU
-/// reference (values and group scales) at 1, 7, 16, 24, 40, 128 and 513 rows of every 3B / 8B input
+/// reference (values and group scales) at 1, 7, 16, 24, 40, 128, 513 and 1,031 rows of every 3B / 8B input
 /// width, from BF16 and from F32, to BF16 and F32, on dense and row-strided input and a ragged
 /// last group, including all-zero groups (scale 2^-127), groups of exact E2M1 grid points and
 /// midpoints (ties to the even code), groups whose maximum rounds the scale up (Quark `even`:
@@ -619,9 +620,9 @@ fn row_range(t: &Tensor, first: usize, rows: usize) -> TensorView<'_> {
 }
 
 /// Phase 4 prefix reuse under MXFP4 weights: a prefill-step `qgemm` gives every row the same
-/// bits whatever the call's row count and the row's position in it — rows of a 513-row call
+/// bits whatever the call's row count and the row's position in it — rows of a 1,031-row call
 /// equal the same rows computed in calls of 1, 7 and 128 rows, and in a 128-row call starting at
-/// row 200 — on a 3B and an 8B shape; the 513-row call runs the Prefill tile, the shorter ones
+/// row 200 — on a 3B and an 8B shape; the 1,031-row call runs the Prefill tile, the shorter ones
 /// the Large tile. Breaks if a prefill call picks a tile with another summation order by m
 /// (e.g. the k-split decode tiles for a short prefill chunk), or if the Prefill and Large tiles
 /// sum a row differently.
@@ -634,7 +635,7 @@ fn qgemm_mxfp4_prefill_rows_are_batch_invariant() {
     let _gpu = lock_gpu();
     let p = setup();
     let mut rng = Rng(79);
-    let m_full = 513;
+    let m_full = 1031;
     for (name, n, k) in [SHAPES_3B[0], SHAPES_8B[3]] {
         let cfg = QGemmConfig {
             n: n as u32,
@@ -669,7 +670,9 @@ fn qgemm_mxfp4_prefill_rows_are_batch_invariant() {
                 );
             }
         }
-        println!("{name}: prefill rows bitwise equal at 1, 7, 128 (at 0 and 200) and 513 rows");
+        println!(
+            "{name}: prefill rows bitwise equal at 1, 7, 128 (at 0 and 200) and {m_full} rows"
+        );
     }
 }
 

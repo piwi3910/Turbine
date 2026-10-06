@@ -65,13 +65,13 @@ constexpr int kStep = 64;
 // reuse rule)"): up to 16 rows one wave per 16 columns with k split over 8
 // waves (the weights of 1-16 rows stream at 400-500 GB/s); up to 32 and 64 rows
 // 2 and 4 row fragments with k split over 4; above, the LDS kernel with 128 x
-// 128 block tiles. From 512 rows the prefill kernel's 256 x 128 tiles (one
+// 128 block tiles. From 1,024 rows the prefill kernel's 256 x 128 tiles (one
 // decode per 256 rows, vector epilogue; Phase 5p Task 15 sweep: 10-16 % below
-// the LDS kernel at 1,024-2,048 rows, slower below 512 rows where its 256-row
-// tiles run mostly padding).
+// the LDS kernel at 2,048 rows, 5-9 % at 1,024 on 7 of 8 shapes; between 512
+// and 1,024 rows it wins only at multiples of 256, below 512 it loses).
 constexpr int kSmallMaxRows = 16;
 constexpr int kMediumMaxRows = 64;
-constexpr int kPrefillMinRows = 512;
+constexpr int kPrefillMinRows = 1024;
 
 typedef short v8s __attribute__((ext_vector_type(8)));
 typedef float v8f __attribute__((ext_vector_type(8)));
@@ -767,13 +767,13 @@ hipError_t launch_qgemm_mxfp4(hipStream_t stream, const turbine_qgemm_desc *d,
   if (p.m == 0)
     return hipSuccess;
   if (tile == Mxfp4Tile::Auto) {
-    // From 512 rows every call runs the Prefill tile. Below, a prefill step
+    // From 1,024 rows every call runs the Prefill tile. Below, a prefill step
     // runs the Large tile; both chain each output's WMMAs in natural k order
     // with the same scaled weights (no k split; a WMMA element depends only on
     // its row of A, its column of B and its accumulator), so a row gets the
     // same bits from either, whatever m is, and a prompt prefilled whole, in
     // chunks or behind a cached prefix gets the same bits (Phase 4 prefix
-    // reuse). Decode steps below 512 rows pick the fastest tile for m.
+    // reuse). Decode steps below 1,024 rows pick the fastest tile for m.
     tile = p.m >= kPrefillMinRows  ? Mxfp4Tile::Prefill
            : d->prefill != 0       ? Mxfp4Tile::Large
            : p.m <= kSmallMaxRows  ? Mxfp4Tile::Small
