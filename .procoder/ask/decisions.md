@@ -4056,3 +4056,16 @@ each), which the "wait for new prefills" rule does not remove; its cause is not 
 
 **Decision (user, 2026-10-06): B.** Find why admissions are held back under overlap at c16, fix it, re-run Llama
 c1/c16 and OLMoE; the default flips on only if TTFT p50 stays within 1.10× on both models.
+
+## 5p O2 landed; the sliced gate-up's residual cost at 16,384 rows (2026-10-06)
+
+`p5p-o2` (1dc4caf5): the sliced MoE prefill gate-up runs at k step 128 again with no spill (255 VGPRs, occupancy 5),
+every MoE tier bitwise; OLMoE c16 TTFT p50 132.5 → 128.7 ms (target ~128), p95 262 → 216, tok/s flat, golden c1/c16
+PASS. The 16,384-row prefill tier still reads ~2,780 µs/layer against ~2,645 unsliced: the remaining ~130 µs is the
+slice order in the gate-up kernel itself (diagnostic non-bitwise builds), not k step or spill.
+
+- A) Accept and close (the TTFT target is met)
+- B) Try a new tile shape for the sliced gate-up (e.g. two waves sharing the rows with half the accumulators each;
+  weight-traffic effect unmeasured), bitwise tiers kept
+
+**Decision (user, 2026-10-06): B.**
