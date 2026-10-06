@@ -175,7 +175,7 @@ pub struct RowTier {
 
 impl ImplChoice {
     /// The implementation index a call of `rows` routed rows runs: the first tier whose bound
-    /// holds `rows` (the last tier when none does). One comparison per tier (at most two).
+    /// holds `rows` (the last tier when none does). One comparison per tier (at most three).
     #[inline]
     pub fn index_for(&self, rows: usize) -> u32 {
         match self {

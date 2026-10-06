@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use half::bf16;
 use turbine_core::types::{BlockId, DType, DeviceId, KvLayout, SeqId};
 use turbine_distributed::collective::{Collective, HostCollective};
+use turbine_kernels::cards::{CardProfile, OpPreference};
+use turbine_kernels::cpu::card_reference::B1_DECODE_IMPL;
 use turbine_kernels::cpu::quant::{
     fp8_e4m3_round, fp8_e4m3_value, quantize_dequantize_activations,
 };
@@ -24,9 +26,9 @@ use turbine_kernels::{
     KernelRegistry, KvCopyConfig, KvCopyContext, KvCopyKernel, MoeExpertsConfig, MoeExpertsContext,
     MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, NormKernel, OpConfig,
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
-    ShimLibrary, cpu_reference_provider, shim_provider,
+    ShimLibrary, card_reference_provider, cpu_reference_provider, shim_provider,
 };
-use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, TqHeadTables, TqParams};
+use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, OpKind, TqHeadTables, TqParams};
 use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
 use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
 use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record};
@@ -113,9 +115,21 @@ fn executor(
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
 ) -> Single {
+    let card = provider.card_profile();
+    executor_on(spec, provider, mem, card)
+}
+
+/// [`executor`] with its kernel registry built for `card` instead of the provider's own card
+/// profile (a test profile such as [`ck_decode_card`]).
+fn executor_on(
+    spec: &TinySpec,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+    card: Option<&CardProfile>,
+) -> Single {
     let kv = SequenceKv::new(&mem, spec.config.kv_layout(BLOCK_TOKENS), MAX_SEQ_LEN).expect("kv");
     Single {
-        exec: paged_executor(spec, provider, mem),
+        exec: paged_executor_on(spec, provider, mem, card),
         kv,
     }
 }
@@ -128,10 +142,14 @@ const ALL_FUSED: ExecutorOptions = ExecutorOptions {
     fused_projections: true,
 };
 
-fn paged_executor(
+/// The tiny Llama's executor on `provider`, its kernel registry built for `card`. When `card`
+/// orders paged decode attention, checks that the registry bound the first implementation it
+/// lists.
+fn paged_executor_on(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
     mem: Arc<dyn DeviceMemory>,
+    card: Option<&CardProfile>,
 ) -> DecoderExecutor {
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
@@ -145,7 +163,9 @@ fn paged_executor(
     .expect("load");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
-    let card = provider.card_profile();
+    let enumerates = !provider
+        .implementations(OpKind::AttentionDecodePaged)
+        .is_empty();
     let registry = KernelRegistry::build(
         vec![provider],
         &order,
@@ -154,6 +174,21 @@ fn paged_executor(
         card,
     )
     .expect("every op has a provider");
+    let preferred = card
+        .and_then(|c| c.preference(OpKind::AttentionDecodePaged))
+        .and_then(|p| p.order.first());
+    if let (Some(&want), true) = (preferred, enumerates) {
+        let decode: Vec<&str> = registry
+            .selections()
+            .iter()
+            .filter(|s| s.op == OpKind::AttentionDecodePaged)
+            .map(|s| s.implementation.as_str())
+            .collect();
+        assert!(
+            !decode.is_empty() && decode.iter().all(|&i| i == want),
+            "paged decode attention bound to {decode:?}, the card prefers {want}"
+        );
+    }
     DecoderExecutor::new(
         cfg,
         families::llama::decoder_spec(),
@@ -174,6 +209,17 @@ fn cpu_executor(spec: &TinySpec) -> Single {
     executor(
         spec,
         cpu_reference_provider(),
+        HostMemory::new(DeviceId(0), 1 << 30),
+    )
+}
+
+/// The reference a run on `ctx` is held to: the cpu-reference in the numerics classes of the
+/// context's card (`turbine_kernels::cpu::card_reference`: P kept in F32 where the library runs
+/// its b1 decode kernel, BF16 where CK runs; user decision 2026-10-06 A).
+fn hip_reference_executor(spec: &TinySpec, ctx: &Arc<ShimContext>) -> Single {
+    executor(
+        spec,
+        card_reference_provider(shim_provider(ctx.clone()).card_profile()),
         HostMemory::new(DeviceId(0), 1 << 30),
     )
 }
@@ -2990,12 +3036,52 @@ fn multi_row_logits_match_single_steps() {
     }
 }
 
-/// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint. With the
-/// cpu-reference attention in CK's order (BF16 unnormalised probabilities for P·V, f32 row
-/// sum), every op models the HIP numerics and the measured worst case over 32 steps on an R9700
-/// is 3.8e-6 (0.097 while the cpu-reference kept f32 probabilities). 1e-4 leaves a 25× margin
-/// for f32 accumulation order and is ~1000× below the error one numerics-model mismatch caused.
+/// Max |Δ logit| between the HIP and cpu-reference providers on the tiny checkpoint with paged
+/// decode attention bound to CK split-KV ([`ck_decode_card`]; user decision 2026-10-06 A1). CK
+/// rounds the unnormalised probabilities P to BF16 before P·V, as the plain cpu-reference does,
+/// so every op models the HIP numerics: the measured worst case over 32 steps on an R9700 is
+/// 3.8e-6 (0.097 while the cpu-reference kept f32 probabilities against CK; 0.103 with the
+/// default b1 kernel against it). 1e-4 leaves a 25× margin for f32 accumulation order and is
+/// ~1000× below the error one numerics-model mismatch causes.
 const HIP_MAX_ABS_LOGIT_DIFF: f32 = 1e-4;
+
+/// Max |Δ logit| of the b1 leg ([`hip_b1_matches_cpu`]): the library's default paged decode
+/// (the b1 kernel for one sequence) against the cpu-reference in the card's class
+/// ([`hip_reference_executor`], P kept in F32 like b1). Calibration (lab, R9700, p5p-t16b):
+/// steps 0-6 match at ~1e-6, then one b1 attention output rounds to the other BF16 neighbour
+/// (b1's own F32 split/wave order and GPU `expf`, which a CPU reference cannot copy bit for
+/// bit), the changed value enters the KV cache and steps 7-31 sit at 0.017-0.093; greedy tokens
+/// are identical for all 32 steps. 0.15 is ~1.6× the measured 0.093 (user decision 2026-10-06
+/// A1); the identical greedy tokens are the sharp check.
+const HIP_B1_MAX_ABS_LOGIT_DIFF: f32 = 0.15;
+
+/// `card` with paged decode attention ordered CK split-KV first (then CK pagedkv and the
+/// Turbine kernel), every other preference unchanged: the test's way to bind decode attention
+/// to CK through the kernel registry's card-profile selection, with no production config key.
+/// Leaked (a test builds one or two).
+fn ck_decode_card(card: &CardProfile) -> &'static CardProfile {
+    const ORDER: &[&str] = &[
+        "ck_tile_fmha_splitkv",
+        "ck_tile_fmha_pagedkv",
+        "turbine_hip",
+    ];
+    let preferences: Vec<OpPreference> = card
+        .preferences
+        .iter()
+        .map(|p| match p.op {
+            OpKind::AttentionDecodePaged => OpPreference { order: ORDER, ..*p },
+            _ => *p,
+        })
+        .collect();
+    Box::leak(Box::new(CardProfile {
+        name: card.name,
+        vendor: card.vendor,
+        archs: card.archs,
+        capabilities: card.capabilities,
+        thresholds: card.thresholds,
+        preferences: Box::leak(preferences.into_boxed_slice()),
+    }))
+}
 
 /// A context on the first AMD device through the library `TURBINE_KERNEL_LIBRARY` names.
 fn hip_context() -> Arc<ShimContext> {
@@ -3012,10 +3098,58 @@ fn hip_graphs(ctx: &Arc<ShimContext>, max_seqs: u32) -> DecodeGraphs {
     DecodeGraphs::new(backend, graphs::capacity_for(max_seqs))
 }
 
-/// Lab only (Task 21): HIP provider logits on the head_dim-128 tiny checkpoint match the CPU
-/// provider within [`HIP_MAX_ABS_LOGIT_DIFF`] and 32 greedy tokens are identical. The HIP
-/// executor runs with decode graphs on (P2c S-10), so the decode steps after the second replay
-/// a captured graph.
+/// The prompt prefill and 32 greedy decode steps (the reference's tokens fed to both) on `cpu`
+/// and `hip`: every row's max |Δ logit| and the steps whose greedy tokens differ.
+fn greedy_diffs(cpu: &mut Single, hip: &mut Single, vocab: u32) -> (Vec<f32>, Vec<usize>) {
+    let mut tokens = prompt(vocab);
+    let mut cpu_row = forward(cpu, &tokens, 0).row(0).to_vec();
+    let mut hip_row = forward(hip, &tokens, 0).row(0).to_vec();
+    let mut diffs = Vec::new();
+    let mut greedy_differs = Vec::new();
+    for step in 0..32 {
+        diffs.push(max_abs_diff(&hip_row, &cpu_row));
+        let (c, h) = (argmax(&cpu_row), argmax(&hip_row));
+        if h != c {
+            greedy_differs.push(step);
+        }
+        let pos = tokens.len() as u32;
+        tokens.push(c);
+        cpu_row = forward(cpu, &[c], pos).row(0).to_vec();
+        hip_row = forward(hip, &[c], pos).row(0).to_vec();
+    }
+    (diffs, greedy_differs)
+}
+
+/// Asserts a [`greedy_diffs`] run of `hip`: every step within `bound`, no greedy token
+/// differing, decode graphs replayed. Prints every step's diff first.
+fn assert_greedy_run(name: &str, hip: &Single, run: (Vec<f32>, Vec<usize>), bound: f32) {
+    let (diffs, greedy_differs) = run;
+    println!("{name}: per-step max abs logit diff {diffs:?}; greedy differs at {greedy_differs:?}");
+    for (step, &diff) in diffs.iter().enumerate() {
+        assert!(
+            diff <= bound,
+            "{name} step {step}: max abs diff {diff} > {bound}"
+        );
+    }
+    assert!(
+        greedy_differs.is_empty(),
+        "{name}: greedy tokens differ at {greedy_differs:?}"
+    );
+    let graphs = hip.graph_counters();
+    assert!(
+        graphs.replayed > 0 && graphs.capture_failed == 0,
+        "{name}: decode graphs were used: {graphs:?}"
+    );
+    let worst = diffs.iter().copied().fold(0f32, f32::max);
+    println!("{name}: max abs logit diff over 32 steps {worst}; graphs {graphs:?}");
+}
+
+/// Lab only (Task 21; user decision 2026-10-06 A1): HIP provider logits on the head_dim-128
+/// tiny checkpoint, paged decode attention bound to CK split-KV ([`ck_decode_card`]), match the
+/// plain cpu-reference within [`HIP_MAX_ABS_LOGIT_DIFF`] and 32 greedy tokens are identical.
+/// The HIP executor runs with decode graphs on (P2c S-10), so the decode steps after the second
+/// replay a captured graph. Breaks if an op departs from the reference's numerics beyond f32
+/// accumulation order (with the default b1 kernel instead of CK it fails, ~0.1).
 #[test]
 #[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
 fn hip_matches_cpu() {
@@ -3023,38 +3157,52 @@ fn hip_matches_cpu() {
         return;
     }
     let ctx = hip_context();
+    let provider = shim_provider(ctx.clone());
+    let card = ck_decode_card(
+        provider
+            .card_profile()
+            .expect("the HIP context's card profile"),
+    );
 
     let tmp = TempDir::new("tiny-model-hip");
     let spec = write_gpu_tiny(tmp.path());
     let mut cpu = cpu_executor(&spec);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
-    let mut hip = executor(&spec, shim_provider(ctx.clone()), mem);
+    let mut hip = executor_on(&spec, provider, mem, Some(card));
     hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
+    assert_greedy_run("hip_matches_cpu", &hip, run, HIP_MAX_ABS_LOGIT_DIFF);
+}
 
-    let mut tokens = prompt(spec.vocab);
-    let mut cpu_row = forward(&mut cpu, &tokens, 0).row(0).to_vec();
-    let mut hip_row = forward(&mut hip, &tokens, 0).row(0).to_vec();
-    let mut worst = 0f32;
-    for step in 0..32 {
-        let diff = max_abs_diff(&hip_row, &cpu_row);
-        worst = worst.max(diff);
-        assert!(
-            diff <= HIP_MAX_ABS_LOGIT_DIFF,
-            "step {step}: max abs diff {diff}"
-        );
-        let (c, h) = (argmax(&cpu_row), argmax(&hip_row));
-        assert_eq!(h, c, "greedy token {step} differs");
-        let pos = tokens.len() as u32;
-        tokens.push(c);
-        cpu_row = forward(&mut cpu, &[c], pos).row(0).to_vec();
-        hip_row = forward(&mut hip, &[c], pos).row(0).to_vec();
+/// Lab only (user decision 2026-10-06 A1): the b1 leg of [`hip_matches_cpu`]. The library's
+/// default paged decode (the card prefers the b1 kernel, and one sequence stays on it; checked
+/// at the registry) against the cpu-reference in the card's class ([`hip_reference_executor`]:
+/// P kept in F32): 32 identical greedy tokens and every step within
+/// [`HIP_B1_MAX_ABS_LOGIT_DIFF`] (calibration there), decode graphs on. Breaks if b1 departs
+/// from the F32-P class by more than its own rounding order (against the BF16-P reference it
+/// fails), or the default stops being b1.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_b1_matches_cpu() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
     }
-    let graphs = hip.graph_counters();
-    assert!(
-        graphs.replayed > 0 && graphs.capture_failed == 0,
-        "decode graphs were used: {graphs:?}"
-    );
-    println!("hip_matches_cpu: max abs logit diff over 32 steps {worst}; graphs {graphs:?}");
+    let ctx = hip_context();
+    let provider = shim_provider(ctx.clone());
+    let preferred = provider
+        .card_profile()
+        .and_then(|c| c.preference(OpKind::AttentionDecodePaged))
+        .and_then(|p| p.order.first().copied());
+    assert_eq!(preferred, Some(B1_DECODE_IMPL), "the card's default decode");
+
+    let tmp = TempDir::new("tiny-model-hip-b1");
+    let spec = write_gpu_tiny(tmp.path());
+    let mut cpu = hip_reference_executor(&spec, &ctx);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = executor(&spec, provider, mem);
+    hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
+    assert_greedy_run("hip_b1_matches_cpu", &hip, run, HIP_B1_MAX_ABS_LOGIT_DIFF);
 }
 
 /// Decode steps of [`hip_decode_graph_matches_eager`] per batch.
@@ -3428,7 +3576,7 @@ fn hip_trace_vs_cpu() {
     let tmp = TempDir::new("tiny-model-hip-trace");
     let spec = write_gpu_tiny(tmp.path());
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
-    let mut cpu = cpu_executor(&spec);
+    let mut cpu = hip_reference_executor(&spec, &ctx);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
     let mut hip = executor(&spec, shim_provider(ctx), mem);
     let (traces, starts) = traced_run(&mut [&mut cpu, &mut hip], &prompt(spec.vocab), 3);
@@ -4344,9 +4492,12 @@ const HIP_MAX_ABS_LOGIT_DIFF_MOE: f32 = 1e-2;
 /// chooses the implementations the Rust registry binds on `libturbine_hip.so`, and on the tiny
 /// Llama and OLMoE (head_dim 128) a greedy run on it, like one on the bound v2.4 library,
 /// matches the CPU reference greedily (every step's argmax) and within a logit bound: the
-/// `hip_matches_cpu` bound for Llama, [`HIP_MAX_ABS_LOGIT_DIFF_MOE`] for OLMoE (the two libraries
-/// tune their GEMMs per context, so they are compared through the reference, not bitwise). Breaks if an older library no longer loads
-/// or serves, or if the Rust selection departs from the library's own.
+/// b1 leg's bound [`HIP_B1_MAX_ABS_LOGIT_DIFF`] for Llama (both libraries run their default
+/// paged decode, the b1 kernel, which a v2.3 library cannot be bound away from; the reference is
+/// the card-class one, user decision 2026-10-06 A1), [`HIP_MAX_ABS_LOGIT_DIFF_MOE`] for OLMoE
+/// (the two libraries tune their GEMMs per context, so they are compared through the reference,
+/// not bitwise). Breaks if an older library no longer loads or serves, or if the Rust selection
+/// departs from the library's own.
 #[test]
 #[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
 fn hip_v23_library_matches_cpu() {
@@ -4403,7 +4554,7 @@ fn hip_v23_library_matches_cpu() {
     };
     for (spec, bound_diff) in specs
         .iter()
-        .zip([HIP_MAX_ABS_LOGIT_DIFF, HIP_MAX_ABS_LOGIT_DIFF_MOE])
+        .zip([HIP_B1_MAX_ABS_LOGIT_DIFF, HIP_MAX_ABS_LOGIT_DIFF_MOE])
     {
         let name = spec.dir.display().to_string();
         let old = shim_provider(ctx.clone());
@@ -4426,7 +4577,14 @@ fn hip_v23_library_matches_cpu() {
 
         let prompt = prompt(spec.vocab);
         let n = prompt.len();
-        let mut cpu = cpu_model_with(spec, &host, 128, opts, cpu_reference_provider(), false);
+        let mut cpu = cpu_model_with(
+            spec,
+            &host,
+            128,
+            opts,
+            card_reference_provider(new.card_profile()),
+            false,
+        );
         let (feed, want) = single_sequence(cpu.as_mut(), &host, &prompt, n, 16, true);
         let mut v23 = cpu_model_with(spec, &old_mem, 128, opts, old, false);
         let (_, got) = single_sequence(v23.as_mut(), &old_mem, &feed, n, 16, false);

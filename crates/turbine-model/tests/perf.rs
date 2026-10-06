@@ -603,7 +603,8 @@ fn stacked_expert_bytes(
 /// MoE input) and `router_logits` are routed again by `moe_route`, and every enumerated
 /// `moe_experts` implementation that supports the shape runs alone on the layer's real expert
 /// weights over the first 64 / 256 / 2,048 tokens (512 / 2,048 / 16,384 routed rows: what a
-/// prefill of those tokens routes). One `moe_prefill_timing` line per (layer, size,
+/// prefill of those tokens routes; `TURBINE_MOE_TOKENS`, a comma list, picks other token counts
+/// for a tier-crossover sweep). One `moe_prefill_timing` line per (layer, size,
 /// implementation): mean time per call, TFLOPS, the routing skew (active experts, the largest
 /// expert's rows) and how many outputs differ from `turbine_hip_moe_wmma` (0: the same WMMA
 /// chain, so compatible with the small-m tier's batch invariance). No bound. Run natively on
@@ -638,9 +639,17 @@ fn moe_prefill_timings() {
         .split(',')
         .map(|s| s.trim().parse().expect("TURBINE_MOE_LAYERS: layer numbers"))
         .collect();
-    let max_t = *MOE_PREFILL_TOKENS.iter().max().expect("sizes");
+    let sizes: Vec<usize> = std::env::var("TURBINE_MOE_TOKENS").map_or_else(
+        |_| MOE_PREFILL_TOKENS.to_vec(),
+        |v| {
+            v.split(',')
+                .map(|s| s.trim().parse().expect("TURBINE_MOE_TOKENS: token counts"))
+                .collect()
+        },
+    );
+    let max_t = *sizes.iter().max().expect("sizes");
 
-    // 1. The real MoE inputs and router logits of one 2,048-token prefill.
+    // 1. The real MoE inputs and router logits of one prefill of the largest size.
     let (norms, logits) = traced_moe_inputs(&cfg, &dir, &ctx, &layers, max_t);
 
     // 2. Every moe_experts implementation, bound alone.
@@ -703,7 +712,7 @@ fn moe_prefill_timings() {
             DType::BF16,
             &stacked_expert_bytes(&index, layer, "down_proj", experts),
         );
-        for t in MOE_PREFILL_TOKENS {
+        for &t in &sizes {
             let rows = t * top_k;
             let x_bytes: Vec<u8> = norms[li][..t * hidden]
                 .iter()

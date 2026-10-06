@@ -26,6 +26,7 @@ use crate::ops::{
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
 mod activation;
 mod attention;
+pub mod card_reference;
 mod elementwise;
 mod embedding;
 mod gemm;
@@ -42,6 +43,7 @@ mod rope;
 mod topk;
 pub mod tq_attention;
 
+pub use card_reference::card_reference_provider;
 pub use topk::torch_topk;
 
 /// The `cpu-reference` provider; stateless, implements every op family.

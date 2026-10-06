@@ -223,6 +223,15 @@ mod tests {
                     ],
                 },
                 RowTierSpec {
+                    max_rows: Some(11_264),
+                    order: &[
+                        "turbine_hip_moe_wmma",
+                        "turbine_hip_moe_wmma_prefill",
+                        "hipblaslt_grouped",
+                        "hipblaslt_per_expert",
+                    ],
+                },
+                RowTierSpec {
                     max_rows: None,
                     order: &[
                         "turbine_hip_moe_wmma_prefill",

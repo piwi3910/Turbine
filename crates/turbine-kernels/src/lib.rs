@@ -20,7 +20,7 @@ pub mod registry;
 pub mod shim;
 pub mod test_support;
 
-pub use cpu::{cpu_reference_provider, round_to, torch_topk};
+pub use cpu::{card_reference_provider, cpu_reference_provider, round_to, torch_topk};
 pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,

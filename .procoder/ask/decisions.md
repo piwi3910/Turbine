@@ -3763,3 +3763,20 @@ Open items for the lead (measured, not landed — each would be its own landing)
 **Decision (user, 2026-10-06): 1 A, 2 yes.** The FP8 activation quantize is fused into the W8A8 GEMM (ABI semantics
 addition, decoder skips `quantize_act` when the bound qgemm takes BF16 activations), and FP8-block's `down` moves to
 16 waves as its own landing. Item 3 (the per-tensor golden c1 regression on the base) is bisected as a bug.
+
+## 5p tiny_model A1 landed; the b1 bound's margin, the v2.3 leg, and the OLMoE c16 TTFT left after O1 (open, 2026-10-06)
+
+`p5p-t16c` (a5bacce3, dc4a32b2): the strict leg runs decode on CK splitkv (a test-only card-profile copy) at 3.8e-6
+against 1e-4; the new `hip_b1_matches_cpu` runs b1 against `card_reference_provider`: 32/32 identical greedy tokens,
+worst 0.0927 against the 0.15 bound. Mutation check: the b1 leg against the plain BF16-P reference fails only at
+0.1548 vs 0.15 — the bound barely separates the two references. `hip_v23_library_matches_cpu` cannot pin CK (the
+v2.3 library runs b1), so its Llama leg was given the b1 bound plus identical greedy tokens. O1 (`MOE_WMMA_MAX_ROWS =
+11_264`, crossover measured) helps 65–1,408-token prompts (c1 TTFT p50 44.5 → 43.6 ms) but not c16: every c16
+prefill chunk is ≥ 16,384 routed rows, still served by the prefill tier, now 2,830–2,945 µs/layer vs ~2,500 before
+200d074d (c16 TTFT p50 134 ms vs 128 before).
+
+1. b1 bound: A) tighten to 0.12 (1.3× headroom over 0.0927; the BF16-P mutant then fails clearly) (recommended);
+   B) keep 0.15
+2. v2.3 leg on the b1 bound: A) accept (recommended); B) drop the v2.3 Llama leg's logit check, keep tokens only
+3. OLMoE c16 TTFT: A) task O2 — restore the k step 128 in the sliced prefill gate-up without register spill, same
+   order so bitwise (recommended); B) accept ~+6 ms c16 TTFT p50 as the price of invariance
