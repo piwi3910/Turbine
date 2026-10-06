@@ -49,3 +49,32 @@
   against these bounds from the per-prompt maxima of `golden1.txt` / `golden16.txt`): 16/16 at c1
   and c16 (worst likely 1.1077 at p14, worst tail 2.8894 at p16; every early divergence at a
   reference margin < 0.5 nats).
+
+## Engine summation-order spread (2026-10-06)
+
+Decision "5p golden tolerance vs engine summation order" (B). `scripts/lab/golden-engine-spread.sh`
+captured this slug on novanas GPU 0 at 2ba95514 (20 captures, free-running greedy,
+top-20): `c1-cold`, `c1-warm` (prefix reuse), `c1-heuristic` (`execution.gemm_autotune=false`),
+`c1-unfused` (`execution.fused_ops=false`) and `par-00`…`par-15` (16 captures at once: batched
+GEMMs and CK split-KV decode attention instead of the b1 kernel). `scripts/golden/engine_spread.py`
+(data: `engine_spread.json`) judges each capture against `reference.jsonl` with the compare rule
+(observed) and measures the engine's own noise: per position and reference top-5 candidate, the
+range of its logprob over every capture still on the reference's tokens there. Max noise: likely
+1.281 (p14 position 18), tail 2.845
+(p10 position 12). Triangle = today's bound + that noise (a correct engine is
+within the reference's spread of the reference and within its order noise of any reordering of
+itself, so the most the noise justifies); proposed = max(today, observed), capped at the triangle.
+The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
+`tolerance.json` is unchanged until the decision.
+
+| bound | today | observed | triangle | proposed |
+|---|---|---|---|---|
+| likely | 1.36 | 1.09 | 2.65 | 1.36 |
+| tail | 2.99 | 1.75 | 5.84 | 2.99 |
+| likely batched | 1.36 | 1.42 | 2.65 | 1.42 **changed** |
+| tail batched | 2.99 | 5.34 | 5.84 | 5.34 **changed** |
+
+Default server c1 against the reference: prefix ok 15/16, likely 1.062 (p14),
+tail 1.742 (p13).
+
+The two c16 failures (p14 likely 1.40, p16 tail 5.27 in the 2026-10-06 golden c16 run): p14's likely 1.42 is order noise (range 1.28 at p14 position 18 alone). p16 is different: the reference has a 0.10-margin near-tie at position 13; most captures take the other branch there (excused, positions ≥ 13 unjudged), 3 of 16 batched captures take the reference's branch, and on it the −9.09 tail candidate (token 198) at position 28 sits at −13.10, −14.29 and −14.43 in them (range 1.33, all 4.0–5.3 below the reference): a systematic offset on that branch, not order noise. It passes the proposed batched tail only under the uniform reading of the triangle (today's 2.99 plus the slug's largest order noise, 2.85 at p10 position 12).
