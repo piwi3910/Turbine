@@ -228,6 +228,13 @@ pub struct KvCpuConfig {
     /// Codec of the blocks L1 holds (P6b S-2): a `kv_format` registry name, checked at startup
     /// with the tier ordering (not more precise than L0).
     pub format: ModuleName,
+    /// Slabs L1 may start draining per compression-ladder tick (P5p S-18), and at most this
+    /// many draining at once: while the ladder asks L1 for a rung no free slot of the rung's
+    /// size exists for, one slab of another slot size is drained — its copies evicted, or
+    /// re-stored in L2 when L1 holds the block's only copy — and reformatted to the rung's slot
+    /// size once empty. 0 turns the drain off (6b's fallback only: copies keep the tier's own
+    /// format until a slab empties by itself). 0 ..= 8.
+    pub slab_drains_per_tick: u32,
 }
 
 impl Default for KvCpuConfig {
@@ -237,9 +244,13 @@ impl Default for KvCpuConfig {
             max_bytes: ByteSize::gib(64),
             slab_bytes: ByteSize::mib(128),
             format: ModuleName::fixed("l0"),
+            slab_drains_per_tick: 1,
         }
     }
 }
+
+/// Most `kv.cpu.slab_drains_per_tick` (P5p S-18).
+pub const MAX_SLAB_DRAINS_PER_TICK: u32 = 8;
 
 /// L2 NVMe slab-file tier.
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -397,6 +408,15 @@ impl KvConfig {
             return Err(invalid(
                 "kv.cpu.slab_bytes",
                 "must be greater than 0 when kv.cpu.enabled is true",
+            ));
+        }
+        if self.cpu.slab_drains_per_tick > MAX_SLAB_DRAINS_PER_TICK {
+            return Err(invalid(
+                "kv.cpu.slab_drains_per_tick",
+                format!(
+                    "must be 0 ..= {MAX_SLAB_DRAINS_PER_TICK}, got {}",
+                    self.cpu.slab_drains_per_tick
+                ),
             ));
         }
         self.validate_nvme()?;
@@ -682,5 +702,26 @@ mod tests {
             .validate_block_bytes(ByteSize::mib(128).0 + 1)
             .expect_err("slab below one block");
         assert_eq!(err.key(), Some("kv.cpu.slab_bytes"), "{err}");
+    }
+
+    /// P5p S-18: `kv.cpu.slab_drains_per_tick` defaults to 1, takes 0 (the drain off) through
+    /// 8, and anything above exits 2 naming the key. Breaks if the default or the bound moves.
+    #[test]
+    fn kv_cpu_slab_drains_per_tick_key() {
+        let base = "model: {path: /models/m}\n";
+        assert_eq!(
+            parse(base).expect("defaults").kv.cpu.slab_drains_per_tick,
+            1
+        );
+        for n in [0, 8] {
+            let cfg = parse(&format!(
+                "{base}kv: {{cpu: {{slab_drains_per_tick: {n}}}}}\n"
+            ))
+            .expect("in range");
+            assert_eq!(cfg.kv.cpu.slab_drains_per_tick, n);
+        }
+        let err = parse(&format!("{base}kv: {{cpu: {{slab_drains_per_tick: 9}}}}\n"))
+            .expect_err("above the bound");
+        assert_eq!(err.key(), Some("kv.cpu.slab_drains_per_tick"), "{err}");
     }
 }

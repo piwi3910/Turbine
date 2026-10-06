@@ -22,7 +22,7 @@ use turbine_core::types::{MemoryKind, PressureState};
 use turbine_tensor::{PinnedBuffer, PinnedMemory};
 
 use super::{
-    KvTier, TierBlockMut, TierBlockRef, TierError, TierHealth, TierId, TierSlot,
+    KvTier, SlabDrainStatus, TierBlockMut, TierBlockRef, TierError, TierHealth, TierId, TierSlot,
     utilization_pressure,
 };
 use crate::identity::KvKey;
@@ -54,6 +54,28 @@ struct Slab {
     slot_bytes: usize,
     slots: Vec<SlotState>,
     occupied: usize,
+    /// Draining toward slots of these bytes (P5p S-18): takes no new copy and is reformatted
+    /// to that size when its last copy leaves.
+    drain_to: Option<usize>,
+    /// Reformatted by a drain and still empty: a copy of another size does not take it over
+    /// (only another drain does), so the slots the drain made wait for the rung's copies.
+    drained: bool,
+}
+
+impl Slab {
+    /// Empty slots of `slot_bytes` bytes.
+    fn reformat(&mut self, slab_bytes: usize, slot_bytes: usize) {
+        self.slot_bytes = slot_bytes;
+        self.slots = vec![SlotState::Free; slab_bytes / slot_bytes];
+        self.drain_to = None;
+        self.drained = false;
+    }
+
+    /// [`Self::reformat`] at the end of a drain.
+    fn drained_to(&mut self, slab_bytes: usize, slot_bytes: usize) {
+        self.reformat(slab_bytes, slot_bytes);
+        self.drained = true;
+    }
 }
 
 type Loc = (usize, usize);
@@ -72,6 +94,8 @@ struct L1State {
     /// [`KvTier::room_epoch`]: bumped when a slab empties or is released, and when host
     /// pressure drops below RED (slabs may be allocated again).
     room_epoch: u64,
+    /// Slabs a drain reformatted (P5p S-18).
+    reformatted: u64,
 }
 
 pub struct L1PinnedTier {
@@ -119,6 +143,7 @@ impl L1PinnedTier {
                 bandwidth: 8e9,
                 used: 0,
                 room_epoch: 0,
+                reformatted: 0,
             }),
         }
     }
@@ -208,7 +233,7 @@ impl L1PinnedTier {
         };
         Self::slot_mut(&mut s, loc, SlotState::Stored);
         if let Some(old) = s.index.insert(*key, loc) {
-            Self::release_slot(&mut s, old);
+            self.release_slot(&mut s, old);
         }
         encode(loc)
     }
@@ -218,7 +243,7 @@ impl L1PinnedTier {
         let mut s = self.lock();
         match s.pending.remove(key) {
             Some(loc) => {
-                Self::release_slot(&mut s, loc);
+                self.release_slot(&mut s, loc);
                 true
             }
             None => false,
@@ -249,20 +274,26 @@ impl L1PinnedTier {
         slab.slots[slot] = state;
     }
 
-    /// Frees one slot; the emptied slab is released at once under host RED.
-    fn release_slot(s: &mut L1State, (slab_idx, slot): Loc) {
+    /// Frees one slot; the emptied slab is released at once under host RED, else a draining
+    /// one is reformatted to its drain's slot size (P5p S-18).
+    fn release_slot(&self, s: &mut L1State, (slab_idx, slot): Loc) {
         let release = s.host_pressure >= PressureState::Red;
         let slab = s.slabs[slab_idx].as_mut().expect("an indexed slab is live");
         slab.slots[slot] = SlotState::Free;
         slab.occupied -= 1;
         let freed = slab.slot_bytes as u64;
         let empty = slab.occupied == 0;
+        let drain_to = slab.drain_to;
         s.used -= freed;
         if empty {
             s.room_epoch += 1;
         }
         if release && empty {
             s.slabs[slab_idx] = None;
+        } else if empty && let Some(to) = drain_to {
+            let slab = s.slabs[slab_idx].as_mut().expect("the slab is live");
+            slab.drained_to(self.cfg.slab_bytes as usize, to);
+            s.reformatted += 1;
         }
     }
 
@@ -276,7 +307,8 @@ impl L1PinnedTier {
     ) -> Result<Loc, TierError> {
         let free = s.slabs.iter().enumerate().find_map(|(i, slab)| {
             let slab = slab.as_ref()?;
-            if slab.slot_bytes != slot_bytes {
+            // A draining slab takes no new copy (P5p S-18).
+            if slab.slot_bytes != slot_bytes || slab.drain_to.is_some() {
                 return None;
             }
             let j = slab.slots.iter().position(|x| *x == SlotState::Free)?;
@@ -290,13 +322,12 @@ impl L1PinnedTier {
             .then(|| {
                 s.slabs
                     .iter()
-                    .position(|x| x.as_ref().is_some_and(|x| x.occupied == 0))
+                    .position(|x| x.as_ref().is_some_and(|x| x.occupied == 0 && !x.drained))
             })
             .flatten();
         if let Some(i) = empty {
             let slab = s.slabs[i].as_mut().expect("an empty live slab");
-            slab.slot_bytes = slot_bytes;
-            slab.slots = vec![SlotState::Free; self.cfg.slab_bytes as usize / slot_bytes];
+            slab.reformat(self.cfg.slab_bytes as usize, slot_bytes);
         }
         let loc = match free.or(empty.map(|i| (i, 0))) {
             Some(loc) => loc,
@@ -323,6 +354,8 @@ impl L1PinnedTier {
                     slot_bytes,
                     slots: vec![SlotState::Free; self.cfg.slab_bytes as usize / slot_bytes],
                     occupied: 0,
+                    drain_to: None,
+                    drained: false,
                 };
                 let idx = match s.slabs.iter().position(Option::is_none) {
                     Some(i) => {
@@ -340,6 +373,7 @@ impl L1PinnedTier {
         let slab = s.slabs[loc.0].as_mut().expect("the chosen slab is live");
         slab.slots[loc.1] = state;
         slab.occupied += 1;
+        slab.drained = false;
         s.used += slot_bytes as u64;
         Ok(loc)
     }
@@ -425,7 +459,7 @@ impl KvTier for L1PinnedTier {
                 // A replacement in another format moves to a slot of its own size.
                 let loc = self.take_slot(&mut s, SlotState::Stored, bytes.len())?;
                 if let Some(old) = old {
-                    Self::release_slot(&mut s, old);
+                    self.release_slot(&mut s, old);
                 }
                 loc
             }
@@ -462,7 +496,7 @@ impl KvTier for L1PinnedTier {
     fn evict(&self, key: &KvKey) -> Result<(), TierError> {
         let mut s = self.lock();
         let loc = s.index.remove(key).ok_or(TierError::Missing)?;
-        Self::release_slot(&mut s, loc);
+        self.release_slot(&mut s, loc);
         Ok(())
     }
 
@@ -491,9 +525,13 @@ impl KvTier for L1PinnedTier {
         let live = s.slabs.iter().flatten().count();
         let mut n = 0;
         for slab in s.slabs.iter().flatten() {
+            if slab.drain_to.is_some() {
+                // Takes no copy until it is reformatted (P5p S-18).
+                continue;
+            }
             if slab.slot_bytes == len {
                 n += slab.slots.iter().filter(|x| **x == SlotState::Free).count();
-            } else if slab.occupied == 0 && live >= self.max_slabs {
+            } else if slab.occupied == 0 && !slab.drained && live >= self.max_slabs {
                 n += per_slab;
             }
         }
@@ -501,5 +539,76 @@ impl KvTier for L1PinnedTier {
             n += (self.max_slabs - live) * per_slab;
         }
         n as u64
+    }
+
+    /// P5p S-18: drains the live slab of another slot size with the fewest stored copies and
+    /// no reserved slot (a copy-stream write in flight); an empty one is reformatted at once.
+    fn begin_drain(&self, bytes: u64) -> bool {
+        let len = bytes as usize;
+        if !self.enabled || len == 0 || bytes > self.cfg.block_bytes {
+            return false;
+        }
+        let mut s = self.lock();
+        if s.health.is_degraded() {
+            return false;
+        }
+        let pick = s
+            .slabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slab)| Some((i, slab.as_ref()?)))
+            .filter(|(_, x)| {
+                x.slot_bytes != len
+                    && x.drain_to.is_none()
+                    && !x.slots.contains(&SlotState::Reserved)
+            })
+            .min_by_key(|(i, x)| (x.occupied, *i))
+            .map(|(i, _)| i);
+        let Some(i) = pick else {
+            return false;
+        };
+        let slab_bytes = self.cfg.slab_bytes as usize;
+        let slab = s.slabs[i].as_mut().expect("the picked slab is live");
+        if slab.occupied == 0 {
+            slab.drained_to(slab_bytes, len);
+            s.reformatted += 1;
+            s.room_epoch += 1;
+        } else {
+            slab.drain_to = Some(len);
+        }
+        tracing::debug!(
+            event = "kv_slab_drain",
+            tier = "l1",
+            slab = i,
+            slot_bytes = len,
+            "L1 slab draining toward a new slot size"
+        );
+        true
+    }
+
+    fn draining_keys(&self) -> Vec<KvKey> {
+        let s = self.lock();
+        s.index
+            .iter()
+            .filter(|(_, (slab, _))| {
+                s.slabs[*slab]
+                    .as_ref()
+                    .is_some_and(|x| x.drain_to.is_some())
+            })
+            .map(|(k, _)| *k)
+            .collect()
+    }
+
+    fn drain_status(&self) -> SlabDrainStatus {
+        let s = self.lock();
+        SlabDrainStatus {
+            draining: s
+                .slabs
+                .iter()
+                .flatten()
+                .filter(|x| x.drain_to.is_some())
+                .count() as u32,
+            reformatted: s.reformatted,
+        }
     }
 }

@@ -37,7 +37,8 @@ use crate::identity::{
     Blake3Hasher, KeyHasher, KvFormat, KvKey, NamespaceCache, lossy_key, prefix_keys,
 };
 use crate::metrics::{
-    EvictReason, KvMetrics, LADDER_EVICT, LadderReason, LadderTime, PartialOutcome, PrefetchOutcome,
+    EvictReason, KvMetrics, LADDER_EVICT, LadderReason, LadderTime, PartialOutcome,
+    PrefetchOutcome, SlabAction,
 };
 use crate::planner::{KvPlan, PlanInputs, PlanReason, plan_cost, plan_prefix, reuse_cap};
 use crate::policy::{
@@ -99,6 +100,9 @@ pub struct HierarchyConfig {
     /// tail copy. `false` restores Phase 4 exactly: no partial extension, no tail copies, no
     /// published partial entries.
     pub partial_prefix_reuse: bool,
+    /// `kv.cpu.slab_drains_per_tick` (P5p S-18): L1 slabs the ladder may start draining per
+    /// tick (and draining at once) when L1's rung has no free slot; 0 = 6b's fallback only.
+    pub slab_drains_per_tick: u32,
 }
 
 /// The compression ladder's settings (P6b S-6): `kv.ladder.*` and the pressure controller's
@@ -173,6 +177,7 @@ impl HierarchyConfig {
             ladder_l0: kv.ladder.l0,
             allow_lossy: kv.lossy_reuse == LossyReuse::Allow,
             partial_prefix_reuse: kv.partial_prefix_reuse,
+            slab_drains_per_tick: kv.cpu.slab_drains_per_tick,
             lossy_penalty: crate::codec::registry()
                 .iter()
                 .map(|c| {
@@ -327,6 +332,10 @@ pub struct KvStats {
     /// Ladder rewrites not submitted because their tier is backed off after a `Full` (user
     /// decision "6b Task 16: ladder proof results — four open points", 3 A).
     pub ladder_backoff_skips: u64,
+    /// P5p S-18: copies of draining L1 slabs evicted / re-stored in L2, and slabs reformatted.
+    pub slab_drain_evictions: u64,
+    pub slab_drain_restores: u64,
+    pub slab_reformats: u64,
     /// Copy-ahead copies landed: a shared parent copied down while its L0 copy stays
     /// ([`KvHierarchy::copy_ahead`]).
     pub copy_aheads: u64,
@@ -632,6 +641,8 @@ pub struct KvHierarchy {
     /// Blocks the last pressure reclaim at YELLOW or ORANGE wanted and found no unreferenced
     /// block for: what queued requests' prefixes may cover ([`Self::take_queued_prefix_demand`]).
     queued_prefix_demand: usize,
+    /// L1's `drain_status().reformatted` already counted (P5p S-18).
+    slab_reformats_seen: u64,
 }
 
 impl KvHierarchy {
@@ -722,6 +733,7 @@ impl KvHierarchy {
             l0_room_epoch: 0,
             ladder_demand: [0; 2],
             queued_prefix_demand: 0,
+            slab_reformats_seen: 0,
             layout: format.layout,
             shards: format.shards.max(1),
             tail: HashSet::new(),
@@ -3285,6 +3297,7 @@ impl KvHierarchy {
         }
         self.sync_l0_refs(pool);
         self.ladder_resume();
+        self.slab_drain(pool);
         for t in tiers.iter().rev() {
             if !self.ladder_budget() {
                 break;
@@ -3294,6 +3307,88 @@ impl KvHierarchy {
             let took = self.clock.now_mono().saturating_sub(started);
             self.metrics
                 .ladder_seconds(t.tier, LadderTime::Sweep, took.as_secs_f64());
+        }
+    }
+
+    /// The slab drain of L1 (P5p S-18), once per ladder tick while the controller is not
+    /// GREEN: the copies of L1's draining slabs leave — re-stored in L2 when L1 holds the
+    /// block's only copy and L2 takes demotions and has room, else evicted (reason
+    /// `slab_drain`); copies busy with a transfer wait for a later tick — and, while L1's rung
+    /// is lossier than its own format and no slot of the rung's size is free, up to
+    /// `kv.cpu.slab_drains_per_tick` new drains start (never more than that many draining at
+    /// once). A drained slab is reformatted to the rung's slot size by the tier once empty; the
+    /// 6b fallback (store at the tier's own format) covers the copies until then.
+    fn slab_drain(&mut self, pool: &mut BlockPool) {
+        let budget = self.cfg.slab_drains_per_tick;
+        let Some(t) = self.l1.clone() else {
+            return;
+        };
+        let mut status = t.drain_status();
+        if budget > 0 {
+            let rung = self.rung(TierId::L1);
+            let asks = crate::codec::lossier(self.tier_format(TierId::L1), rung)
+                != self.tier_format(TierId::L1);
+            let mut started = 0;
+            while asks
+                && started < budget
+                && status.draining < budget
+                && !self.rung_has_slot(TierId::L1, rung)
+                && t.begin_drain(self.format_bytes(rung))
+            {
+                started += 1;
+                status = t.drain_status();
+            }
+        }
+        if status.draining > 0 {
+            self.drain_copies(pool, &t);
+        }
+        let reformatted = t.drain_status().reformatted;
+        if reformatted > self.slab_reformats_seen {
+            self.metrics.slab_action(
+                TierId::L1,
+                SlabAction::Reformat,
+                reformatted - self.slab_reformats_seen,
+            );
+            self.stats.slab_reformats += reformatted - self.slab_reformats_seen;
+            self.slab_reformats_seen = reformatted;
+        }
+    }
+
+    /// The copies of `t`'s draining slabs leave L1 ([`Self::slab_drain`]).
+    fn drain_copies(&mut self, pool: &mut BlockPool, t: &Arc<dyn KvTier>) {
+        for k in t.draining_keys() {
+            if self.demoting.contains_key(&k)
+                || self.compressing.contains_key(&k)
+                || self.transfer.is_busy_with(&k)
+            {
+                continue;
+            }
+            let Some(b) = self.dir.get(&k) else {
+                // No directory entry: nothing reads the copy.
+                let _ = t.evict(&k);
+                continue;
+            };
+            if b.location(TierId::L1).is_none() {
+                let _ = t.evict(&k);
+                continue;
+            }
+            let only_copy = b.locations.iter().all(|l| l.tier == TierId::L1);
+            if only_copy && self.storage_accepts_demotions() {
+                let cost = self.demotion_bytes(&k, TierId::L1, TierId::L2);
+                let want = cost.div_ceil(self.format_bytes(self.rung(TierId::L2)).max(1));
+                if self.make_room(pool, TierId::L2, want as usize) >= cost
+                    && self.submit_demotion(pool, k, TierId::L1, TierId::L2)
+                {
+                    self.metrics
+                        .slab_action(TierId::L1, SlabAction::DrainRestore, 1);
+                    self.stats.slab_drain_restores += 1;
+                    continue;
+                }
+            }
+            self.remove_copy(pool, &k, TierId::L1, EvictReason::SlabDrain);
+            self.metrics
+                .slab_action(TierId::L1, SlabAction::DrainEvict, 1);
+            self.stats.slab_drain_evictions += 1;
         }
     }
 
@@ -4184,6 +4279,97 @@ pub(crate) mod tests {
         );
         assert_eq!(r.h.stats().demotions, 3);
         assert!(r.pool.used_blocks() < cached, "L0 drained");
+    }
+
+    /// P5p S-18 on the hierarchy: L1's two slabs full of `l0` copies, the ladder's L1 rung at
+    /// `fp8_e4m3` and the controller at ORANGE — the ladder tick drains one slab (its copies,
+    /// the blocks' only ones, re-stored in L2), the tier reformats it, and the next demotion
+    /// into L1 stores an `fp8_e4m3` copy; `turbine_kv_slab_reformat_total` counts the
+    /// re-stores and the reformat. With `kv.cpu.slab_drains_per_tick: 0` nothing drains and the
+    /// demotion keeps the 6b fallback (L1's own format). Breaks if the drain never starts,
+    /// loses a block, ignores the budget, or the rung copy still cannot store.
+    #[test]
+    fn slab_drain_stores_rung_copies_within_budget() {
+        for budget in [1, 0] {
+            slab_drain_case(budget);
+        }
+    }
+
+    fn slab_drain_case(budget: u32) {
+        use crate::tier::{L1Config, L1PinnedTier};
+        use turbine_tensor::host::HostPinned;
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        let l1 = Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                max_bytes: 8 * bb,
+                slab_bytes: 4 * bb,
+                block_bytes: bb,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            arc.clone(),
+        ));
+        let l2: Arc<dyn KvTier> = Arc::new(MemTier::new(TierId::L2, 64 * bb, arc));
+        let tier: Arc<dyn KvTier> = l1.clone();
+        let mut r = rig_tiers("cost_aware", 16, Some(tier), Some(l2), clock, |kv| {
+            kv.ladder.enabled = true;
+            kv.ladder.l0 = false;
+            kv.cpu.slab_drains_per_tick = budget;
+        });
+        let a: Vec<u32> = (0..66).collect();
+        let b: Vec<u32> = (1000..1066).collect();
+        run(&mut r, &a);
+        run(&mut r, &b);
+        let settle = |r: &mut Rig| {
+            for _ in 0..4 {
+                r.clock.advance(Duration::from_millis(10));
+                r.h.poll(&mut r.pool, &mut r.backend);
+            }
+        };
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        settle(&mut r);
+        assert_eq!(l1.used_bytes(), 8 * bb, "both slabs full of l0 copies");
+        let blocks = r.h.dir.len();
+        let now = r.clock.now_mono();
+        r.h.set_rung(TierId::L1, "fp8_e4m3", LadderReason::FillHighWater, now);
+        for _ in 0..3 {
+            r.clock.advance(LADDER_TICK_INTERVAL);
+            let now = r.clock.now_mono();
+            r.h.ladder_tick(&mut r.pool, PressureState::Orange, now);
+            settle(&mut r);
+        }
+        let m = |r: &Rig, a: SlabAction| r.h.metrics.slab_action_value(TierId::L1, a);
+        let fp8_in_l1 = |r: &Rig| {
+            r.h.dir
+                .iter()
+                .filter(|b| {
+                    b.location(TierId::L1)
+                        .is_some_and(|l| l.format == "fp8_e4m3")
+                })
+                .count()
+        };
+        // A third prompt's blocks demote into L1 at its rung when a slot of it is free.
+        let c: Vec<u32> = (2000..2066).collect();
+        run(&mut r, &c);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        settle(&mut r);
+        if budget == 0 {
+            for a in SlabAction::ALL {
+                assert_eq!(m(&r, a), 0, "{a:?} without a budget");
+            }
+            assert_eq!(l1.drain_status().draining, 0);
+            assert_eq!(fp8_in_l1(&r), 0, "the 6b fallback: L1's own format");
+            return;
+        }
+        assert_eq!(m(&r, SlabAction::DrainRestore), 4, "one slab's copies");
+        assert_eq!(m(&r, SlabAction::DrainEvict), 0);
+        assert_eq!(m(&r, SlabAction::Reformat), 1);
+        assert_eq!(r.h.stats().slab_reformats, 1);
+        assert!(fp8_in_l1(&r) > 0, "rung-format copies store in L1");
+        assert!(r.h.dir.len() >= blocks, "no block lost to the drain");
     }
 
     /// [`KvTier::free_slots`] on the L1 slab tier counts what [`take_slot`](L1PinnedTier::take_slot)

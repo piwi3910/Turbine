@@ -44,20 +44,23 @@ pub enum EvictReason {
     /// An L0-only partial entry reclaimed (P5p S-5; it demotes never, so a reclaim is its
     /// only way out).
     PartialL0Only,
+    /// A copy evicted from an L1 slab being drained for a rung's slot size (P5p S-18).
+    SlabDrain,
 }
 
 impl EvictReason {
     /// Label values of `turbine_kv_evictions_total{reason}`.
-    pub const EVICTION: [EvictReason; 6] = [
+    pub const EVICTION: [EvictReason; 7] = [
         EvictReason::Capacity,
         EvictReason::Pressure,
         EvictReason::SessionExpired,
         EvictReason::Checksum,
         EvictReason::TierDegraded,
         EvictReason::PartialL0Only,
+        EvictReason::SlabDrain,
     ];
     /// Label values of `turbine_kv_drops_total{reason}`.
-    pub const ALL: [EvictReason; 8] = [
+    pub const ALL: [EvictReason; 9] = [
         EvictReason::Capacity,
         EvictReason::Pressure,
         EvictReason::SessionExpired,
@@ -66,6 +69,7 @@ impl EvictReason {
         EvictReason::BelowMinValue,
         EvictReason::NoRoom,
         EvictReason::PartialL0Only,
+        EvictReason::SlabDrain,
     ];
     /// The compression ladder's reasons (P6b S-6).
     pub const LADDER: [EvictReason; 2] = [EvictReason::Compressed, EvictReason::LadderFloor];
@@ -82,6 +86,7 @@ impl EvictReason {
             EvictReason::Compressed => "compressed",
             EvictReason::LadderFloor => "ladder_floor",
             EvictReason::PartialL0Only => "partial_l0_only",
+            EvictReason::SlabDrain => "slab_drain",
         }
     }
 }
@@ -212,6 +217,34 @@ impl LadderTime {
     }
 }
 
+/// What a slab drain did (`turbine_kv_slab_reformat_total{tier,action}`, P5p S-18): a copy of a
+/// draining slab evicted (`drain_evict`: another tier held the block, or nowhere could take
+/// it), a copy re-stored one tier down (`drain_restore`: the tier held the block's only copy),
+/// and a drained slab reformatted to the rung's slot size (`reformat`).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SlabAction {
+    DrainEvict,
+    DrainRestore,
+    Reformat,
+}
+
+impl SlabAction {
+    pub const ALL: [SlabAction; 3] = [
+        SlabAction::DrainEvict,
+        SlabAction::DrainRestore,
+        SlabAction::Reformat,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlabAction::DrainEvict => "drain_evict",
+            SlabAction::DrainRestore => "drain_restore",
+            SlabAction::Reformat => "reformat",
+        }
+    }
+}
+
 /// Outcome of one prefetched block (`turbine_kv_prefetch_total{outcome}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PrefetchOutcome {
@@ -274,6 +307,8 @@ pub struct KvMetrics {
     /// `turbine_kv_ladder_action_seconds_total{tier,action}` (P5p S-14): seconds the ladder
     /// spent per tier on each [`LadderTime`].
     pub ladder_action_seconds: Family<Labels2, Counter<f64, AtomicU64>>,
+    /// `turbine_kv_slab_reformat_total{tier,action}` (P5p S-18): [`SlabAction`]s per tier.
+    pub slab_reformat: Family<Labels2, Counter>,
     /// `turbine_kv_copy_ahead_total{to}` (P6b S-8, decision "6b: shared-prefix eval never
     /// demotes the prefix to L1", A): copies of a shared parent into a lower tier made while
     /// its L0 copy stays.
@@ -325,6 +360,7 @@ impl KvMetrics {
             ladder_rung: Family::default(),
             ladder_actions: Family::default(),
             ladder_action_seconds: Family::default(),
+            slab_reformat: Family::default(),
             copy_ahead: Family::default(),
             queued_prefix_detached_blocks: Counter::default(),
             partial_reuse: Family::default(),
@@ -457,6 +493,11 @@ impl KvMetrics {
             m.ladder_action_seconds.clone(),
         );
         reg.register(
+            "turbine_kv_slab_reformat",
+            "Slab drains for a ladder rung's slot size: copies evicted, re-stored, slabs reformatted",
+            m.slab_reformat.clone(),
+        );
+        reg.register(
             "turbine_kv_copy_ahead",
             "Shared-prefix KV blocks copied into a slower tier while their L0 copy stays",
             m.copy_ahead.clone(),
@@ -553,6 +594,11 @@ impl KvMetrics {
         }
         for t in [TierId::L1, TierId::L2] {
             let _ = self.copy_ahead.get_or_create(&[("to", t.as_str())]);
+            for a in SlabAction::ALL {
+                let _ = self
+                    .slab_reformat
+                    .get_or_create(&[("tier", t.as_str()), ("action", a.as_str())]);
+            }
         }
         let _ = self.lookups.get_or_create(&[("result", "miss")]);
         for p in TransferPath::ALL {
@@ -722,6 +768,20 @@ impl KvMetrics {
                 ("reason", reason.as_str()),
             ])
             .inc();
+    }
+
+    /// `n` slab-drain `action`s on `tier` (P5p S-18).
+    pub fn slab_action(&self, tier: TierId, action: SlabAction, n: u64) {
+        self.slab_reformat
+            .get_or_create(&[("tier", tier.as_str()), ("action", action.as_str())])
+            .inc_by(n);
+    }
+
+    /// Current `turbine_kv_slab_reformat_total` value of one series.
+    pub fn slab_action_value(&self, tier: TierId, action: SlabAction) -> u64 {
+        self.slab_reformat
+            .get_or_create(&[("tier", tier.as_str()), ("action", action.as_str())])
+            .get()
     }
 
     /// `seconds` the ladder spent on `action` for `tier` (P5p S-14).
