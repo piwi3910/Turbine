@@ -3643,7 +3643,7 @@ edge moves the bitwise-invariance edge with it.
 attacks the ~1.0 ms of inter-kernel gaps toward ~0.9×. The b1 → CK splitkv hand-off is re-timed at 2–8 sequences and
 moved to the measured crossover, the invariance test's edge moving with it.
 
-## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06, open)
+## 5p Task 13: ladder serving cost — what the instrumented A/B names, and the fix (2026-10-06)
 
 From `p5p-t13t17` (instrumentation a5f4b4a3; perf log 5p "Task 13"). 6b Task 18 recipe on today's tree, 3 + 3
 interleaved runs, GPU 0, `kv.partial_prefix_reuse=false` on both arms (see the next entry). Ladder on (L1/L2 + L0,
@@ -3674,7 +3674,12 @@ the copy kernel) targets a measured cost, so nothing is landed yet.
 Builder recommendation: A now (closes the item with the trade documented, targets 1–2 met), B as a follow-up task if
 the L0 rung is meant to be used in production; not C (it bounds something that is not the cost).
 
-## 5p: partial prefix reuse fails on a classed L0 pool (2026-10-06, found in Task 13, open)
+**Decision (user, 2026-10-06): A, plus B as a follow-up.** S-14 closes on the instrumented A/B: the ladder stays
+opt-in, `kv.ladder.l0=false` is documented as the cheaper opt-in shape, and the recompute target is re-bound to the
+measured result. Follow-up: L0's compressed page classes are built only when the L0 step first fires, so
+`kv.ladder.l0=true` costs nothing until then.
+
+## 5p: partial prefix reuse fails on a classed L0 pool (2026-10-06, found in Task 13)
 
 With `kv.ladder.l0=true` (classed L0 pool) and the 5p default `kv.partial_prefix_reuse: true`, golden c1's warm prompts
 fail with HTTP 500 `copy_blocks failed: invalid argument: turbine_copy_blocks: block id 4 is outside the pool's id space`
@@ -3688,7 +3693,10 @@ library's `page_offset` rejects for the code `KvPoolView.classes` gives that id.
 - B) Stopgap: refuse `kv.partial_prefix_reuse` with a classed L0 pool at startup (exit 2, reason code), then A
 - C) Disable partial reuse silently when the pool is classed (no reason code — against TS §21 rule 7; not recommended)
 
-## 5p Task 17: drain-and-reformat vs compaction for slab mixing (2026-10-06, proposal, open)
+**Decision (user, 2026-10-06): A with B as a stopgap.** Diagnose and fix it with a GPU test; until the fix lands, the
+combination is refused at startup with exit 2 and a reason code.
+
+## 5p Task 17: drain-and-reformat vs compaction for slab mixing (2026-10-06)
 
 From `p5p-t13t17` (c7718a96; perf log 5p "Task 17"). Landed: the drain (plan's default path) — while the ladder asks L1
 for a rung without a free slot of its size, up to `kv.cpu.slab_drains_per_tick` (default 1) slabs drain per ladder tick:
@@ -3706,3 +3714,5 @@ per run at 6–8 evictions + re-stores per reformat, `rung_no_slot`/`no_room` do
   evictions — needs free `l0` slots, which this workload's L1 (full at ORANGE) almost never has; same copy bandwidth per
   survivor as a re-store
 - D) Both: compaction first when free same-size slots exist, the drain otherwise (more code; measure after A/B)
+
+**Decision (user, 2026-10-06): A.** The drain stays, `kv.cpu.slab_drains_per_tick` default 1.
