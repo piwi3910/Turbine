@@ -1792,3 +1792,27 @@ golden c1 PASS and 192/192 on every run. "L0 rewrites" = `turbine_kv_ladder_acti
   — token-granular reuse on the classed L0 pool serves (before 418b742d it was HTTP 500 + `circuit_open`).
 - labbook set `phase-5p-serving-efficiency`: `lab-bench:t13b-std-llama:cc85653a`, `lab-bench:t13c-l0{on,off}-r{1,2,3}-llama:cc85653a`,
   `lab-bench:t13b-l0{on,off}-r1-llama:cc85653a`.
+
+### S-3: overlap scheduling waits for new prefills (plan Task 4, branch `p5p-overlap`, commit 69cc4c16, 2026-10-06)
+
+User decision 2026-10-06 ("5p decode-step gaps", B + C) re-opened S-3. Under `execution.overlap_scheduling`
+a turn that finds an admitted request waiting for its first prefill chunk (`Scheduler::has_unstarted_admitted`)
+now completes the iteration in flight serially and launches nothing ahead (`finish_forced` → `finish_serial`, which
+also stops a serial completion's tail copies from being released twice). Host test
+`engine::r#loop::tests::overlap_waits_for_new_prefills` (red without the rule: `b`'s first chunk shared the plan with
+`a`'s dropped row). A/B on one build, novanas GPU 0, one session, Llama BF16 (phase2c config), `--set
+execution.overlap_scheduling=<false|true>`:
+
+| Arm              | conc              | tok/s              | ITL p50 ms | TTFT p50 ms     | host_share | golden c1 / c16 |
+| ---------------- | ----------------- | ------------------ | ---------- | --------------- | ---------- | --------------- |
+| serial (`false`) | 1 (quick, 64 req) | 82.7               | 11.9       | 54              | 0.0081     | PASS / –        |
+| overlap (`true`) | 1 (quick, 64 req) | **83.6 (+1.1 %)**  | 11.8       | 54              | 0.0052     | PASS / –        |
+| serial (`false`) | 16 (200 req)      | 853.9              | 15.5       | 207             | 0.0226     | PASS / PASS     |
+| overlap (`true`) | 16 (200 req)      | **866.6 (+1.5 %)** | 15.2       | **351 (1.70×)** | 0.0265     | PASS / PASS     |
+
+c1: ms/token 12.09 → 11.96 (−0.13 ms, the host turnaround), TTFT unchanged. c16: throughput and ITL gain, but TTFT p50
+fails S-3's ≤ 1.10× bound. The extra TTFT is time in the scheduler's queue before admission
+(`turbine_queue_wait_seconds`: sum 4.06 → 32.3 s over 232 requests; serial admits 219 of 232 within 1 ms, overlap
+only 18, most wait 16–256 ms, i.e. several iterations), not the first token's emission; pressure stayed GREEN, no
+admission-gate queueing. Its cause is not yet found (the new rule makes each such turn serial, so the hold is in
+`plan`'s admission, not a launch-ahead). Default stays `false` (S-3 rule).

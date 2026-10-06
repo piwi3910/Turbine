@@ -26,7 +26,10 @@
 //! finishes (EOS, stop ids and strings, grammars, failures) reach the scheduler one iteration
 //! late; the finished sequence's extra row is computed and dropped. A batch that needs a token
 //! the device did not choose (a constraint, a seeded draw, `top_k`, a full row, a fork's first
-//! token) first finishes the iteration in flight, as the serial loop would. Sampling, stop and
+//! token) first finishes the iteration in flight, as the serial loop would; so does a turn
+//! that finds an admitted request waiting for its first prefill chunk (P5p S-3,
+//! `Scheduler::has_unstarted_admitted`): its plan starts the request knowing every finish of
+//! the iteration before it, with no launch-ahead in front of its first token. Sampling, stop and
 //! length semantics are those of the serial loop: on the CPU reference every request gets the
 //! same tokens either way; on a GPU the dropped extra rows change batch compositions, whose
 //! BF16 rounding may differ as with any other batch.
@@ -2220,7 +2223,8 @@ impl EngineLoop {
     /// grammars) reach the scheduler one iteration late: such a sequence's row in the next
     /// iteration is computed and dropped. A batch that needs a token the device did not choose
     /// (a constrained, seeded-draw, `top_k` or full-row choice, a fork's first token) waits for
-    /// the iteration in flight first, so it runs as the serial loop does.
+    /// the iteration in flight first, so it runs as the serial loop does; so does every turn
+    /// that finds an admitted request waiting for its first prefill chunk (P5p S-3).
     fn turn_overlap(&mut self) -> Result<Turn, String> {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
@@ -2232,11 +2236,17 @@ impl EngineLoop {
         self.detect_disconnects();
         self.expire_deadlines();
         if let Some(prev) = self.in_flight.take() {
-            if prev.launched && prev.rows.iter().any(|r| r.forced.is_some()) {
-                // A jump-forward step's iteration completes serially (P5p S-10): its
-                // verification decides the appended tokens and any rollback, so the host work
-                // runs before the scheduler completes it; no iteration is launched ahead.
-                self.finish_forced(prev)?;
+            let forced = prev.launched && prev.rows.iter().any(|r| r.forced.is_some());
+            if forced || self.sched.has_unstarted_admitted() {
+                // The iteration in flight completes serially and nothing is launched ahead:
+                // - a jump-forward step's (P5p S-10): its verification decides the appended
+                //   tokens and any rollback, so the host work runs before the scheduler
+                //   completes it;
+                // - while an admitted request waits for its first prefill chunk (P5p S-3): the
+                //   plan below then starts it knowing every finish of the iteration before it
+                //   (no dropped extra rows beside it, their slots and blocks already free),
+                //   and its first token is not held behind a launch-ahead.
+                self.finish_serial(prev)?;
                 // Fall through: the plan below launches with nothing in flight.
             } else {
                 self.complete_overlap_ahead(prev)?;
@@ -2629,10 +2639,11 @@ impl EngineLoop {
         Ok(())
     }
 
-    /// A jump-forward step's iteration completes serially (P5p S-10): its verification
-    /// decides the appended tokens and any rollback, so the host work runs before the
-    /// scheduler completes the iteration, whose KV then commits the kept tokens only.
-    fn finish_forced(&mut self, mut p: InFlight) -> Result<(), String> {
+    /// The iteration in flight completes serially: its host work runs before the scheduler
+    /// completes it, whose KV then commits what was kept — a jump-forward step's (P5p S-10:
+    /// its verification decides the appended tokens and any rollback), and any iteration while
+    /// an admitted request waits for its first prefill chunk (P5p S-3).
+    fn finish_serial(&mut self, mut p: InFlight) -> Result<(), String> {
         let (ok, mut outcome) = self.collect_in_flight(&mut p);
         outcome
             .finished
@@ -2645,12 +2656,8 @@ impl EngineLoop {
                 self.kv.publish_tail(&mut self.pool, id, block, &tokens);
             }
         }
-        let tail_requests: Vec<RequestId> = p
-            .plan
-            .tail_copies
-            .iter()
-            .filter_map(|(s, _, _)| self.seqs.get(s).map(|(id, _)| *id))
-            .collect();
+        // Only `p` was launched since the last completion: its tail copies ran.
+        let tail_requests = std::mem::take(&mut self.tail_done);
         self.sched.complete(&mut self.pool, outcome);
         for id in tail_requests {
             self.kv.tail_copied(&mut self.pool, id);
@@ -4609,6 +4616,113 @@ mod tests {
         assert!(serial[3][0].logprobs.iter().all(Option::is_some));
         assert_eq!(serial[5].len(), 2);
         assert_eq!(serial[6][0].finish, Some((FinishReason::Length, 1)));
+    }
+
+    /// Folds `events` into `stream`; true once it holds the choice's `Finished`.
+    fn fold_events(stream: &mut ChoiceStream, events: Vec<GenerationEvent>) -> bool {
+        for e in events {
+            match e {
+                GenerationEvent::Token {
+                    token_id,
+                    text,
+                    logprob,
+                    ..
+                } => {
+                    stream.tokens.push(token_id);
+                    stream.logprobs.push(logprob);
+                    stream.text.push_str(&text);
+                }
+                GenerationEvent::Finished { reason, usage, .. } => {
+                    stream.finish = Some((reason, usage.unwrap().completion_tokens));
+                }
+                GenerationEvent::Started { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        stream.finish.is_some()
+    }
+
+    /// P5p S-3: under overlap scheduling, request `b` submitted right after the iteration that
+    /// yields `a`'s EOS was launched ahead has its first prefill chunk in the very next plan,
+    /// and that plan carries no row of `a` (its EOS is known: the turn completed the iteration
+    /// in flight serially, since `b` waited for its first chunk); both streams equal the serial
+    /// run's. Breaks if the engine launches ahead while an admitted request waits for its first
+    /// chunk (the plan would carry `a`'s dropped extra row beside `b`'s prefill).
+    #[test]
+    fn overlap_waits_for_new_prefills() {
+        let (_dir, spec, tokenizer) = tiny();
+        let prompt_a = vec![256, 72, 101, 108, 108, 111];
+        let (probe, _) = run_streams(&spec, &tokenizer, &[request(&prompt_a, 12)], false);
+        // The tiny model repeats itself: `a` stops at the first occurrence of its sixth token.
+        let tokens = &probe[0][0].tokens;
+        let eos = tokens[5];
+        let first_eos = tokens.iter().position(|&t| t == eos).unwrap() + 1;
+        let mut a = request(&prompt_a, 12);
+        a.stop.eos_token_ids = [eos].into_iter().collect();
+        a.stop.ignore_eos = false;
+        let b = request(&[256, 79], 4);
+        let (serial, _) = run_streams(&spec, &tokenizer, &[a.clone(), b.clone()], false);
+        assert_eq!(
+            serial[0][0].finish,
+            Some((FinishReason::Stop, first_eos as u32))
+        );
+
+        let t = engine_with(
+            tiny_reducing_executor(&spec, 8),
+            Arc::clone(&tokenizer),
+            params(4, 8),
+            true,
+        );
+        let mut engine = t.engine;
+        let (mut rx_a, _ack_a) = submit(&t.tx, a.clone());
+        let mut rx_b = None;
+        let (mut stream_a, mut stream_b) = (ChoiceStream::default(), ChoiceStream::default());
+        let (mut done_a, mut done_b) = (false, false);
+        let mut a_launches = 0;
+        let mut a_seq: Option<SeqId> = None;
+        let mut eos_iteration = None;
+        let mut b_first: Option<(u64, bool)> = None;
+        for _ in 0..200 {
+            assert!(matches!(engine.turn_overlap(), Ok(Turn::Continue)));
+            done_a |= fold_events(&mut stream_a, drain(&mut rx_a));
+            if let Some((rx, _)) = rx_b.as_mut() {
+                done_b |= fold_events(&mut stream_b, drain(rx));
+            }
+            if done_a && done_b {
+                break;
+            }
+            let Some(f) = engine.in_flight.as_ref().filter(|f| f.launched) else {
+                continue;
+            };
+            // A sequence's request is looked up while it lives; a retired one is matched by
+            // the sequence id seen before.
+            let seq_of = |id: RequestId| {
+                f.plan
+                    .items
+                    .iter()
+                    .map(|i| i.seq)
+                    .find(|s| engine.seqs.get(s).is_some_and(|(r, _)| *r == id))
+            };
+            let has_seq = |seq: Option<SeqId>| f.plan.items.iter().any(|i| Some(i.seq) == seq);
+            a_seq = a_seq.or_else(|| seq_of(a.id));
+            if eos_iteration.is_none() && has_seq(a_seq) {
+                // The prompt fits one chunk: the k-th launch with `a` yields its k-th token.
+                a_launches += 1;
+                if a_launches == first_eos {
+                    eos_iteration = Some(f.plan.iteration);
+                    rx_b = Some(submit(&t.tx, b.clone()));
+                }
+            } else if b_first.is_none() && seq_of(b.id).is_some() {
+                b_first = Some((f.plan.iteration - eos_iteration.unwrap(), has_seq(a_seq)));
+            }
+        }
+        assert!(done_a && done_b, "both streams finished");
+        assert_eq!(
+            b_first,
+            Some((1, false)),
+            "b's first chunk is in the next plan, without a's dropped row"
+        );
+        assert_eq!(vec![vec![stream_a], vec![stream_b]], serial);
     }
 
     /// Continuous batching with chunked prefill gives every request exactly the greedy tokens

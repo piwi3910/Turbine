@@ -1071,6 +1071,15 @@ impl Scheduler {
         self.running.len() + self.queue.len()
     }
 
+    /// An admitted request waits for its first prefill chunk (P5p S-3): one in the scheduler's
+    /// own queue — admitted by the gate (or, without a gate, submitted) and not started, or
+    /// preempted and waiting to prefill again. The gate's queue does not count: those requests
+    /// wait for a slot, not for the next plan. Overlap scheduling reads this before launching
+    /// an iteration ahead.
+    pub fn has_unstarted_admitted(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
     /// One iteration's batch (P2 §Scheduling rules 1–3).
     ///
     /// With micro-batches, the requests of the plans in flight are skipped and the plan is
@@ -2475,6 +2484,37 @@ mod tests {
                 failed: None,
             },
         );
+    }
+
+    /// P5p S-3: `has_unstarted_admitted` is true from submission until the request's first
+    /// prefill chunk is planned, and again while one waits for a running slot. Breaks if the
+    /// engine's overlap rule would launch ahead of a request that the next plan could start.
+    #[test]
+    fn has_unstarted_admitted_until_first_chunk() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_running_requests: 1,
+                ..params()
+            },
+            Arc::new(clock.clone()),
+        );
+        let mut p = pool(64);
+        assert!(!s.has_unstarted_admitted());
+        s.submit(request(1, 1, 8, 2), p.total_blocks()).unwrap();
+        assert!(s.has_unstarted_admitted());
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert!(!s.has_unstarted_admitted(), "the first chunk is planned");
+        complete_all(&mut s, &mut p, &plan, &[]);
+        // A second request waits behind the only running slot.
+        s.submit(request(2, 2, 8, 2), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&plan), [(1, BatchKind::Decode)]);
+        assert!(s.has_unstarted_admitted());
+        complete_all(&mut s, &mut p, &plan, &[1]);
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(kinds(&plan), [(2, BatchKind::Prefill { start: 0, len: 8 })]);
+        assert!(!s.has_unstarted_admitted());
     }
 
     #[test]
