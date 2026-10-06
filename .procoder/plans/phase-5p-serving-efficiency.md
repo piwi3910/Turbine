@@ -353,11 +353,11 @@ Interfaces:
   Covers: S-17 AC (manual measurement)
   Depends on: Task 2, Task 3
 
-- [ ] Profile (GPU 0): three `scripts/lab-bench.sh --model olmoe` runs plus a c16 `stage-share`, compared with the 6a-exit numbers (613.9 tok/s, 24.3 ms ITL, 118 ms TTFT) — the `BENCH` and stage deltas name the stage or the serving change; the lines go into `.procoder/perf-log.md`
-- [ ] If the delta is the GREEN admission headroom cap's queueing (6b's cap at RED 0.90 working as designed), record the re-bound in a decisions entry for the user; the watch item closes there. Otherwise fix what the profile named and land it alone; the standard bench keeps OLMoE ≥ 0.98 × the S-2 baseline
-- [ ] Landing (GPU 0): three `scripts/lab-bench.sh --model olmoe` runs — median ≥ 608 tok/s with golden c1/c16 PASS; perf-log rows
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `perf(server): OLMoE BF16 margin restored` (or the recorded re-bound)
+- [x] Profile (GPU 0): three `scripts/lab-bench.sh --model olmoe` runs plus a c16 `stage-share`, compared with the 6a-exit numbers (613.9 tok/s, 24.3 ms ITL, 118 ms TTFT) — the `BENCH` and stage deltas name the stage or the serving change; the lines go into `.procoder/perf-log.md` (perf log "S-17: OLMoE BF16 margin": ITL 24.3 ms and host share 0.013 match the 6a exit and S-2; no stage regressed)
+- [x] If the delta is the GREEN admission headroom cap's queueing (6b's cap at RED 0.90 working as designed), record the re-bound in a decisions entry for the user; the watch item closes there. Otherwise fix what the profile named and land it alone; the standard bench keeps OLMoE ≥ 0.98 × the S-2 baseline (no delta to fix on the merged stack, 97050b3c: no re-bound and no code change)
+- [x] Landing (GPU 0): three `scripts/lab-bench.sh --model olmoe` runs — median ≥ 608 tok/s with golden c1/c16 PASS; perf-log rows (609.5 / 614.8 / 608.8, median 609.5, golden c1/c16 PASS ×3)
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `perf(server): OLMoE BF16 margin restored` (or the recorded re-bound) (landed as `docs(perf)`: no server change was needed)
 
 ## Task 17: Slab mixing — compressed lower-tier copies actually store (S-18)
 

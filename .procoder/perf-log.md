@@ -1399,3 +1399,18 @@ labbook (in the table's order, g0a / g0b / g1): Llama c16 dc08b52f / ae7010ce / 
 Card state, from `amd-smi metric` sampled every 10 s during each run (the samples taken under load, > 100 W). Both cards have a 300 W socket power cap. Under load each card peaks at 280–300 W, with GFX clocks up to ~3.4 GHz, memory at 1258 MHz, hotspot 77–92 °C and memory 76–86 °C. The two cards behave the same: GPU 1 peaked at 300 W, 3.41 GHz and 91 °C hotspot. `THROTTLE_STATUS` reads `THROTTLED` on both cards under load, idle included for GPU 0, so it does not separate them. During the GPU 1 runs, GPU 0 carried other builders' jobs. That is allowed now that the one-GPU-job rule is lifted, and those jobs did not touch GPU 1. The PCIe chain in sysfs is the same on both cards: root port 00:01.0 or 00:01.1 → the card's switch at **Gen5 x8**, then Gen5 x16 inside the card to the GPU function (03:00.0 or 06:00.0). amd-smi's own PCIe field (GPU 0 "2.5 GT/s x8", GPU 1 "16 GT/s x8") contradicts sysfs and is not used. The old "GPU 1 is Gen4 x8" note no longer describes the hardware.
 
 Verdict: GPU 1 lands within 0.6 % of GPU 0 on both models at c16 and c1, inside the decision's ~3 % bound. **GPU 1 joins perf work**: `lab-bench.sh --gpu 1` is a peer of `--gpu 0`, and numbers from the two cards are comparable.
+
+### S-17: OLMoE BF16 margin (plan Task 16, branch `p5p-t16` from `p6b-stack` 97050b3c, 2026-10-06)
+
+novanas GPU 0, three `scripts/lab-bench.sh --model olmoe --golden16` runs (standard c16 workload, 200 requests, `phase2c` config, release client on novanas), each holding the exclusive bench lock. There is no code change on top of the merged stack (the b1 attention kernel, the MoE tier-invariance fix, the jump-forward lab legs, the GPU 1 rule lift). The comparison points are the 6a exit (613.9 tok/s, 24.3 ms ITL, 118 ms TTFT), the 6a watch value (602.5) and the S-2 row (615.4, host share 0.0119). Every run's `host_share` is the c16 `stage-share` over that run's throughput bench.
+
+| Run          | tok/s     | ITL p50 (ms) | TTFT p50 (ms) | decode fwd (ms) | host_share | golden c1 / c16 | labbook  |
+| ------------ | --------- | ------------ | ------------- | --------------- | ---------- | --------------- | -------- |
+| `p5p-t16-r1` | 609.5     | 24.3         | 133           | 23.6            | 0.0141     | PASS / PASS     | 6d16859a |
+| `p5p-t16-r2` | 614.8     | 24.1         | 132           | 23.5            | 0.0126     | PASS / PASS     | cf880e96 |
+| `p5p-t16-r3` | 608.8     | 24.4         | 133           | 23.7            | 0.0128     | PASS / PASS     | 44f7d529 |
+| **median**   | **609.5** | 24.3         | 133           | 23.6            | 0.0128     | PASS / PASS     |          |
+
+Verdict: median **609.5 ≥ 608** (0.99 × 613.9). That is 0.993× the 6a exit and 1.012× the 602.5 watch value, with golden c1 and c16 PASS on every run and 0 failed requests. **S-17 is met and the 6a watch item closes.** The profile names no stage to fix: ITL and the decode forward match the 6a exit (24.3 ms), and the host share matches S-2 (0.013 vs 0.012). The 602.5 reading does not reproduce on the current stack, and the GREEN admission cap is not involved. The same tree measured 614.9–617.7 earlier the same day (the GPU 1 vs GPU 0 section), and the MoE invariance branch measured 624.4 with `--quick`. The margin is thin: the median clears the bound by 1.5 tok/s, and r3 read 608.8. Run-to-run spread is about 1 %, so a single run can land below 608.
+
+Observation, not acted on: TTFT p50 reads 132–133 ms here, against 118 at the 6a exit and S-2 and 121–122 that morning, while the decode numbers are unchanged. TTFT is outside this task's criterion; it is noted for the phase-exit bench.
