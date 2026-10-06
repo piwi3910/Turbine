@@ -1890,3 +1890,28 @@ select `vllm_wvsplitk` (status `tiers`: ≤ 1 rows vllm_wvsplitk, above hipblasl
 | diag: plain chain, BRing (not bitwise)                                              | –                    | 2,416 / 2,470 / 2,352 / 2,348 | 2,783 / 2,858 / 2,765 / 2,783 | 3,228 / 3,281 / 3,220 / 3,193 |
 
 Finding: the slice order's accumulator handling costs nothing measurable — the plain chain with the same one-stage B ring (`BRing`) runs as slow as the sliced kernel (2,783 vs 2,800 µs at 16,384 rows). The ~100 µs residual against the unsliced kernel is the single B register stage: the unsliced kernel keeps two (128 VGPRs) because it holds no totals, while acc (64) + totals (64) + two B stages (128) + A (32) exceed 256 VGPRs. Lowering live accumulators by splitting the rows over two waves frees the registers but doubles the weight-fragment loads per block (each wave of a column reads the same B): 2 B stages +32 %, BRing +4 %. Peeling the slice start (zero accumulator operand, no zeroing moves) is +3 %. Nothing is faster at ≥ 16,384 rows, so the kernel stays as O2 landed; no served A/B was run.
+
+## 5p GEMV stage B: SiLU·up fused into the down GEMV's input (2026-10-06, branch `p5p-gemv-b`)
+
+Stage B of the same decision: kernel ABI v2.14 (`turbine_gemm_desc.a_silu_mul` / `a_up_offset`). `vllm_wvsplitk`'s LDS
+staging loop stores `silu_mul(gate, up)` read from the gate/up row (elementwise.hip's arithmetic) instead of copying
+`a`, so the down projection takes the gate_up output directly and the separate `silu_mul` launch and its boundary go
+(decode steps of dense one-device BF16 decoders only; prefill keeps GEMM + `silu_mul`). Chosen over the gate_up GLU
+epilogue: no row pairing in the tile, the prologue runs once per persistent block. Output bit-identical to
+`silu_mul` + the GEMV (`hip_ops gemv_silu_mul_matches_unfused`, 3B down shape and a small one), so no numerics change.
+
+Kernel (`hip_ops gemv_silu_mul_timings`, graph-timed as stage A, down 3072×8192): `silu_mul` + GEMV 87.3 µs, fused
+85.2 µs → −2.1 µs per layer (the plain down GEMV is 83.7: the prologue costs ~1.5 µs, the removed kernel + boundary
+~3.6). Predicted −0.059 ms per step (28 layers).
+
+Served (`lab-bench.sh --gpu 0`, one session, base = `p6b-stack` 97a70b34 detached, interleaved A/B):
+
+| Run                             | tok/s                     | ITL p50 (ms)                 | TTFT p50 (ms) | golden c1 / c16 |
+| ------------------------------- | ------------------------- | ---------------------------- | ------------- | --------------- |
+| Llama c1 `--quick` base (×2)    | 87.15 / 87.13             | 11.297 / 11.300              | 54            | PASS / —        |
+| Llama c1 `--quick` stage B (×3) | **87.66 / 87.52 / 87.66** | **11.230 / 11.246 / 11.229** | 54            | PASS / —        |
+| Llama c16 200 req (`gemvb`)     | 853.9                     | 15.5                         | 206           | PASS / PASS     |
+| OLMoE c16 `--quick` (`gemvb`)   | 627.7                     | 24.2                         | 136           | PASS / —        |
+
+Llama c1 ITL 11.30 → 11.23 ms (−0.064 ms, 0.994×; the kernel prediction); c16 unchanged (853.2 at stage A); OLMoE
+unchanged (never binds the GEMV; 622.2 at stage A).

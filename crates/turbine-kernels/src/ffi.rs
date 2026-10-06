@@ -37,6 +37,10 @@ pub(crate) struct GemmDesc {
     pub c_dtype: i32,
     pub alpha: f32,
     pub beta: f32,
+    /// v2.14: elements from a gate row to its up row (with `a_silu_mul`).
+    pub a_up_offset: i64,
+    /// v2.14: 1 when the left operand is `silu_mul(gate, up)` read from `a`.
+    pub a_silu_mul: i32,
 }
 
 /// `turbine_attention_desc` (prefill and decode share it).

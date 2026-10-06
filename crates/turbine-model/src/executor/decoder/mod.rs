@@ -479,6 +479,20 @@ impl LayerRun<'_> {
         self.exec.linear(a, w.into(), c)
     }
 
+    /// `c = silu_mul(gate, up) · wᵀ` in one call when the GEMM bound for it takes the SwiGLU
+    /// input (kernel ABI v2.14: single-row decode calls of the card's GEMV, BF16 weights, tracing
+    /// off): bit for bit `silu_mul` then [`Self::linear`]. `Ok(false)` when it does not, and
+    /// nothing ran.
+    pub fn linear_silu_mul<'w>(
+        &self,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        w: impl Into<LinearView<'w>>,
+        c: TensorView<'_>,
+    ) -> Result<bool, ModelError> {
+        self.exec.gemm_silu_mul(gate, up, w.into(), c)
+    }
+
     /// RMSNorm of `x` with weight `w` over rows of `w.len()` elements into `out` (may be `x`).
     pub fn rmsnorm(
         &self,
@@ -1579,6 +1593,41 @@ impl DecoderExecutor {
                 prefill: self.step_prefill.load(Ordering::Relaxed),
             })
         })
+    }
+
+    /// [`LayerRun::linear_silu_mul`].
+    fn gemm_silu_mul(
+        &self,
+        gate: TensorView<'_>,
+        up: TensorView<'_>,
+        w: LinearView<'_>,
+        c: TensorView<'_>,
+    ) -> Result<bool, ModelError> {
+        if w.q.is_some() || self.trace.is_on() {
+            return Ok(false);
+        }
+        let cfg = self.dims.gemm(w.w.shape[0], w.w.shape[1], c.dtype);
+        let prefill = self.step_prefill.load(Ordering::Relaxed);
+        let kernel = self.registry.gemm(&cfg);
+        if gate.dtype != cfg.a_dtype || !kernel.fuses_silu_mul(&cfg, gate.shape[0], prefill) {
+            return Ok(false);
+        }
+        // Profiled under the GEMM's config (its implementation name).
+        self.op(OpConfig::Gemm(cfg), || {
+            kernel.execute_silu_mul(
+                &mut GemmContext {
+                    a: gate,
+                    b: w.w,
+                    c,
+                    trans_b: true,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    prefill,
+                },
+                up,
+            )
+        })?;
+        Ok(true)
     }
 
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
