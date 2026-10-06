@@ -5915,6 +5915,7 @@ fn implementations_enumerated() {
         ("turbine_hip_mixed", "turbine_hip", false),
     ];
     let paged_decode = vec![
+        ("turbine_hip_b1_decode", "turbine_hip", false),
         ("ck_tile_fmha_splitkv", "ck", false),
         ("ck_tile_fmha_pagedkv", "ck", false),
         ("turbine_hip", "turbine_hip", false),
