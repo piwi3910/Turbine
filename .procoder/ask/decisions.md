@@ -3621,7 +3621,7 @@ The served TTFT target (≤ 1.05× BF16) misses: 1.21–1.25× at c1 and 1.15× 
 
 **Decision (user, 2026-10-06): A.** The Prefill tile stays (from 1,024 rows). S-16 is re-bound: the MXFP4 prefill GEMM at m = 2,048 ≤ 1.45× the BF16 prefill GEMM per shape, a no-regression bound asserted by `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound`; served TTFT is recorded, not gated; `mxfp4` stays `experimental`. Spec S-16 (its AC names `hip_qgemm_mxfp4`) and plan Task 15 amended.
 
-## 5p b1 attention II: 8.96 µs/layer, 0.81× reached — c1 ≥ 90 tok/s is not reachable from attention (open, 2026-10-06)
+## 5p b1 attention II: 8.96 µs/layer, 0.81× reached — c1 ≥ 90 tok/s is not reachable from attention (2026-10-06)
 
 From `p5p-b1attn2` (e90631a4, merged): served Llama b1 attention 16.88 → 8.96 µs/layer (V loads issued together, a
 faster split combine), and 10.64 µs with RoPE fused into the attention call (ABI v2.12, rope kernel and one boundary
@@ -3638,3 +3638,7 @@ inter-kernel gaps. Not landed: split count 4/16, one wave per split (no gain, di
 
 Separately: b1 is now ~2× faster, so the 4-sequence hand-off to CK splitkv may belong at 2–8 sequences; moving the
 edge moves the bitwise-invariance edge with it.
+
+**Decision (user, 2026-10-06): A, and re-time the edge.** The b1 attention work closes; the next decode-BW effort
+attacks the ~1.0 ms of inter-kernel gaps toward ~0.9×. The b1 → CK splitkv hand-off is re-timed at 2–8 sequences and
+moved to the measured crossover, the invariance test's edge moving with it.
