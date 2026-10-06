@@ -128,10 +128,10 @@ Interfaces:
   Covers: S-3 AC (conditional)
   Depends on: Task 3
 
-- [ ] If every c1 `host_share` in Task 3 is ≤ 0.05: mark this task done with a pointer to the Task 3 decisions entry; no code, no commit. Otherwise continue.
-- [ ] Write failing test `engine::r#loop::tests::overlap_waits_for_new_prefills`: with overlap on (CPU backend, tiny Llama), a request submitted while step N+1 is launched ahead has its first prefill chunk in the plan right after N+1, not one later, and streams equal the serial run. Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::overlap_waits_for_new_prefills` — expect FAIL
-- [ ] Implement the rule in `launch_next`; keep the Phase 2c overlap tests passing.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests && scripts/remote-cargo.sh test -p turbine-server --test tiny_server overlap_scheduling_matches_serial` — expect PASS
+- [x] If every c1 `host_share` in Task 3 is ≤ 0.05: mark this task done with a pointer to the Task 3 decisions entry; no code, no commit. Otherwise continue. — Task 3 measured ≤ 0.05 (closed 2026-10-04), then the user chose to build it anyway (decision "5p decode-step gaps", B + C, 2026-10-06): continue.
+- [x] Write failing test `engine::r#loop::tests::overlap_waits_for_new_prefills`: with overlap on (CPU backend, tiny Llama), a request submitted while step N+1 is launched ahead has its first prefill chunk in the plan right after N+1, not one later, and streams equal the serial run. Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::overlap_waits_for_new_prefills` — expect FAIL
+- [x] Implement the rule in `launch_next`; keep the Phase 2c overlap tests passing.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests && scripts/remote-cargo.sh test -p turbine-server --test tiny_server overlap_scheduling_matches_serial` — expect PASS
 - [ ] Lab A/B (GPU 0): `scripts/lab-bench.sh --model <llama|olmoe> [--concurrency 1 --quick] -- --set execution.overlap_scheduling=<true|false>` for both models at c1 and c16 — flip the default only if tok/s rises and TTFT p50 ≤ 1.10 × the serial run for both models; record all eight lines
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `perf(server): overlap scheduling waits for new prefills` (plus `feat(core): overlap scheduling on by default` only if the A/B passed)
