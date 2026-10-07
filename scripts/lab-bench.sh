@@ -7,7 +7,8 @@
 #                         [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
-# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama-gptq-own|llama-gptq-autoround|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv|llama8b-mxfp4-a4
+# <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama-gptq-own|llama-gptq-autoround|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv|llama8b-mxfp4-a4|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b
+# (Phase 7: the one-card families, scripts/lab/phase7-novanas-<model>.yaml).
 # (Phase 6a: one value per proof checkpoint; each maps to a weights directory under
 # /home/piwi/turbine-models/, a golden slug under tests/golden/ and a lab config).
 # --print-model prints "<weights> <golden slug> <config>" and exits without contacting a host.
@@ -67,7 +68,7 @@ cfg_override=""
 print_model=0
 usage() {
 	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
-	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4" >&2
+	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4 qwen3-4b mistral-7b gpt-oss-20b qwen3.5-9b" >&2
 	exit 2
 }
 while [[ $# -gt 0 ]]; do
@@ -207,6 +208,17 @@ llama-fp8kv)
 olmoe-fp8kv)
 	slug=olmoe-1b-7b-0125-instruct
 	golden_slug=olmoe-1b-7b-0125-instruct-fp8kv
+	;;
+# Phase 7 one-card families (plan Task 9): scripts/lab/phase7-novanas-<model>.yaml. The two-card
+# ones (qwen3moe, mixtral, qwen36) run through lab-cluster.sh and lab-perf.sh --placement.
+qwen3-4b | mistral-7b | gpt-oss-20b | qwen3.5-9b)
+	case "$model" in
+	qwen3-4b) slug=qwen3-4b-instruct-2507 ;;
+	mistral-7b) slug=mistral-7b-instruct-v0.3 ;;
+	gpt-oss-20b) slug=gpt-oss-20b ;;
+	qwen3.5-9b) slug=qwen3.5-9b ;;
+	esac
+	cfg="scripts/lab/phase7-novanas-$model.yaml"
 	;;
 *)
 	echo "lab-bench: unknown model $model" >&2

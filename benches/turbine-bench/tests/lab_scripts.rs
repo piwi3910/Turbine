@@ -2910,3 +2910,359 @@ fn fetch_checkpoint_dry_run_pins_revision() {
         assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
     }
 }
+
+/// Phase 7 lab models (plan Task 9): short name, slug (weights directory and golden slug), the
+/// Hugging Face repo id served as the model id, and whether it runs over both R9700s.
+const PHASE7_MODELS: [(&str, &str, &str, bool); 7] = [
+    (
+        "qwen3-4b",
+        "qwen3-4b-instruct-2507",
+        "Qwen/Qwen3-4B-Instruct-2507",
+        false,
+    ),
+    (
+        "qwen3moe",
+        "qwen3-30b-a3b-instruct-2507-fp8",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+        true,
+    ),
+    (
+        "mistral-7b",
+        "mistral-7b-instruct-v0.3",
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        false,
+    ),
+    (
+        "mixtral",
+        "mixtral-8x7b-instruct-v0.1-fp8",
+        "RedHatAI/Mixtral-8x7B-Instruct-v0.1-FP8",
+        true,
+    ),
+    ("gpt-oss-20b", "gpt-oss-20b", "openai/gpt-oss-20b", false),
+    ("qwen3.5-9b", "qwen3.5-9b", "Qwen/Qwen3.5-9B", false),
+    (
+        "qwen36",
+        "qwen3.6-35b-a3b-fp8",
+        "Qwen/Qwen3.6-35B-A3B-FP8",
+        true,
+    ),
+];
+
+/// Plan Task 9: `lab-bench.sh --model <one-card Phase 7 name>` serves its Phase 7 lab config with
+/// the host weights directory and judges golden against the slug's reference. Breaks if a name
+/// maps to the wrong slug or config, or the golden reference path drifts.
+#[test]
+fn lab_bench_dry_run_phase7_models() {
+    let text = dry_run(
+        "lab-bench.sh",
+        "bench-phase7",
+        &["--dry-run", "--model", "qwen3-4b", "--golden16"],
+    );
+    assert_in_order(
+        &text,
+        &[
+            "--config scripts/lab/phase7-novanas-qwen3-4b.yaml",
+            "--set model.path=/home/piwi/turbine-models/qwen3-4b-instruct-2507",
+            "compare --url http://127.0.0.1:18000 --reference \
+             tests/golden/qwen3-4b-instruct-2507/reference.jsonl --concurrency 1",
+            "compare --url http://127.0.0.1:18000 --reference \
+             tests/golden/qwen3-4b-instruct-2507/reference.jsonl --concurrency 16",
+        ],
+    );
+    for (short, slug, _, two_card) in PHASE7_MODELS {
+        let (out, called) = lab_script(
+            "lab-bench.sh",
+            &format!("model-p7-{short}"),
+            &["--print-model", short],
+        );
+        assert_eq!(called, None, "{short}: contacted a host");
+        if two_card {
+            // Two-card models are measured through lab-cluster.sh / lab-perf.sh, never one GPU.
+            assert_eq!(out.status.code(), Some(2), "{short}: {}", stderr(&out));
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(0), "{short}: {}", stderr(&out));
+        assert_eq!(
+            stdout(&out).trim(),
+            format!("{slug} {slug} scripts/lab/phase7-novanas-{short}.yaml"),
+            "{short}"
+        );
+    }
+}
+
+/// Plan Task 9: `lab-serve.sh --vllm` accepts the seven Phase 7 slugs and serves each under its
+/// repo id (the lab configs' `served_name`); an unknown slug still exits 2 naming the list
+/// (decision 2026-10-08 B). Breaks if a slug is missing or served under another id.
+#[test]
+fn lab_serve_dry_run_vllm_phase7_slugs() {
+    for (_, slug, repo, _) in PHASE7_MODELS {
+        let text = dry_run(
+            "lab-serve.sh",
+            &format!("vllm-p7-{slug}"),
+            &["--dry-run", "novanas", "--vllm", slug],
+        );
+        let job = applied_job(&text);
+        let args: Vec<String> = at(container(&job), "args")
+            .as_sequence()
+            .expect("args")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_string())
+            .collect();
+        let args = args.join(" ");
+        assert!(
+            args.starts_with(&format!("/models/{slug} --served-model-name {repo} ")),
+            "{slug}: {args}"
+        );
+        assert!(args.contains("--max-model-len 32768"), "{slug}: {args}");
+    }
+    let (out, called) = lab_script(
+        "lab-serve.sh",
+        "vllm-p7-bad",
+        &["novanas", "--vllm", "qwen3-8b"],
+    );
+    assert_eq!(called, None);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    for (_, slug, _, _) in PHASE7_MODELS {
+        assert!(stderr(&out).contains(slug), "{slug}: {}", stderr(&out));
+    }
+}
+
+/// Plan Task 9 (decision 2026-10-08 B): `lab-perf.sh` two-card placements serve Turbine with
+/// `--gpus 2` and the placement's config, then vLLM-ROCm on the same two cards with the tensor-
+/// (and expert-) parallel args; `--eval` runs GSM8K against vLLM; each engine is stopped by its
+/// run id; the verdict is the 0.75x ratio. One-card Phase 7 models keep one card. Breaks if a
+/// placement serves the wrong config, vLLM loses its parallel args, or a bad combination runs.
+#[test]
+fn lab_perf_dry_run_phase7_placements() {
+    let bench = |port: u16, requests: u32| {
+        format!(
+            "turbine-bench --url http://192.168.10.203:{port} --concurrency 16 \
+             --requests {requests} --prompt-words 512 --max-tokens 256 --ignore-eos --output json"
+        )
+    };
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-p7-ep2",
+        &[
+            "--dry-run",
+            "novanas",
+            "qwen3moe",
+            "--placement",
+            "ep2",
+            "--eval",
+        ],
+    );
+    assert_in_order(
+        &text,
+        &[
+            "cargo build --release -p turbine-bench --bin turbine-bench --bin turbine-golden",
+            "+ scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-qwen3moe-ep2.yaml \
+             --gpus 2 --set server.listen=0.0.0.0:18000\n",
+            &bench(18000, 16),
+            &bench(18000, 200),
+            "+ scripts/lab-serve.sh novanas --stop ",
+            "+ scripts/lab-serve.sh novanas --vllm qwen3-30b-a3b-instruct-2507-fp8 --gpus 2 \
+             --vllm-arg --tensor-parallel-size --vllm-arg 2 --vllm-arg --enable-expert-parallel\n",
+            &bench(18100, 200),
+            "turbine-golden eval --url http://192.168.10.203:18100 --tasks \
+             tests/eval/gsm8k-200.jsonl --concurrency 16 --output json > target/lab-perf/",
+            "/vllm-gsm8k.json",
+            "+ scripts/lab-serve.sh novanas --stop ",
+            "lab-perf: qwen3moe placement=ep2 turbine=<median> vllm=<median> ratio=<r> \
+             target=0.75x verdict=<PASS|FAIL>",
+        ],
+    );
+    let jobs = applied_jobs(&text);
+    assert_eq!(jobs.len(), 2, "the Turbine and the vLLM serve Jobs");
+    assert_eq!(amd_gpus(&jobs[0]), 2);
+    assert_eq!(amd_gpus(&jobs[1]), 2);
+    assert_eq!(text.matches(&bench(18000, 200)).count(), 3, "{text}");
+
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-p7-tp2",
+        &[
+            "--dry-run",
+            "novanas",
+            "mixtral",
+            "--placement",
+            "tp2",
+            "--runs",
+            "1",
+        ],
+    );
+    assert!(
+        text.contains(
+            "+ scripts/lab-serve.sh novanas --vllm mixtral-8x7b-instruct-v0.1-fp8 --gpus 2 \
+             --vllm-arg --tensor-parallel-size --vllm-arg 2\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("gsm8k"), "no --eval, no eval:\n{text}");
+
+    let text = dry_run(
+        "lab-perf.sh",
+        "perf-p7-mistral",
+        &["--dry-run", "novanas", "mistral-7b", "--runs", "1"],
+    );
+    assert_in_order(
+        &text,
+        &[
+            "+ scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-mistral-7b.yaml\n",
+            "+ scripts/lab-serve.sh novanas --vllm mistral-7b-instruct-v0.3\n",
+            "lab-perf: mistral-7b placement=tp1 turbine=<median>",
+        ],
+    );
+    assert!(!text.contains("--gpus 2"), "{text}");
+
+    for (tag, args, expect) in [
+        (
+            "perf-p7-noplacement",
+            &["novanas", "qwen3moe"][..],
+            "--placement",
+        ),
+        (
+            "perf-p7-onecard-tp2",
+            &["novanas", "mistral-7b", "--placement", "tp2"][..],
+            "--placement",
+        ),
+        (
+            "perf-p7-badplacement",
+            &["novanas", "qwen36", "--placement", "tp4"][..],
+            "usage:",
+        ),
+        (
+            "perf-p7-skipvllm",
+            &["novanas", "qwen3-4b", "--skip-vllm"][..],
+            "--skip-vllm",
+        ),
+        (
+            "perf-llama-placement",
+            &["novanas", "llama", "--placement", "tp2"][..],
+            "--placement",
+        ),
+    ] {
+        let (out, called) = lab_script("lab-perf.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+        assert!(stderr(&out).contains(expect), "{tag}: {}", stderr(&out));
+    }
+}
+
+/// Plan Task 9 (decision 2026-10-08 B): each two-card family scenario renders the two-GPU Job and
+/// its dry run prints the in-Job Turbine legs — the server on the placement's config, the
+/// batched-bounds golden at c1 and c16, the GSM8K eval and its compare against the committed vLLM
+/// baseline, the c16 bench — and no vLLM leg; the eval result is copied back before cleanup.
+/// Breaks if a scenario is missing, a leg is dropped, or a vLLM leg reappears in the pod.
+#[test]
+fn lab_cluster_dry_run_family_scenarios() {
+    for (short, slug, _, two_card) in PHASE7_MODELS {
+        if !two_card {
+            continue;
+        }
+        for placement in ["tp2", "ep2"] {
+            let scenario = format!("{short}-{placement}-novanas");
+            let text = dry_run("lab-cluster.sh", &scenario, &["--dry-run", &scenario]);
+            let id = run_id(&text, "lab-cluster");
+            let job = applied_jobs(&text).remove(1);
+            assert_eq!(env(&job, "TURBINE_LAB_SCENARIO"), scenario);
+            assert_eq!(amd_gpus(&job), 2);
+            let golden = format!(
+                "turbine-golden compare --url http://127.0.0.1:18000 --reference \
+                 tests/golden/{slug}/reference.jsonl"
+            );
+            assert_in_order(
+                &text,
+                &[
+                    &format!("kubectl -n turbine-ci logs -f job/turbine-lab-cluster-{id}"),
+                    &format!(
+                        "turbine-server --config scripts/lab/phase7-novanas-{short}-{placement}.yaml"
+                    ),
+                    &format!("{golden} --concurrency 1 --batched-bounds"),
+                    &format!("{golden} --concurrency 16 --batched-bounds"),
+                    "turbine-golden eval --url http://127.0.0.1:18000 --tasks \
+                     tests/eval/gsm8k-200.jsonl --concurrency 16 --output json",
+                    &format!("/results/turbine-{placement}.json"),
+                    &format!(
+                        "turbine-golden eval-compare --baseline tests/eval/{slug}/vllm-{placement}.json"
+                    ),
+                    "--max-drop",
+                    "turbine-bench --url http://127.0.0.1:18000 --prompt-words 512 \
+                     --max-tokens 256 --ignore-eos --concurrency 16 --requests 200",
+                    &format!("lab-cluster: dry run: in-Job steps of {scenario}"),
+                    &format!("{CI_ROOT}/runs/{id}/results/"),
+                    &format!("target/lab-cluster/{id}/"),
+                    "delete job",
+                ],
+            );
+            // (The Job manifest's comments mention the static-mode leader on 127.0.0.1:18100.)
+            for absent in [
+                "http://127.0.0.1:18100",
+                "--tensor-parallel-size",
+                "vllm serve",
+                "vllm-gsm8k",
+            ] {
+                assert!(!text.contains(absent), "{scenario}: {absent} in:\n{text}");
+            }
+            assert_eq!(
+                text.lines().last(),
+                Some(format!("lab-cluster: {scenario} PASS").as_str()),
+                "{text}"
+            );
+        }
+    }
+    // The existing scenarios print no in-Job steps.
+    let text = dry_run(
+        "lab-cluster.sh",
+        "cluster-tp2-nosteps",
+        &["--dry-run", "tp2-novanas"],
+    );
+    assert!(!text.contains("in-Job steps"), "{text}");
+}
+
+/// Plan Task 9: the ten Phase 7 lab configs load through the real configuration model with the
+/// slug's weights under the Jobs' `/models` mount, the repo id as the served model id, and the
+/// placement's parallel sizes (one-card configs listen on the host network for lab-serve.sh;
+/// two-card ones on the cluster pod's loopback). Breaks if a config drifts from its slug or
+/// placement.
+#[test]
+fn phase7_novanas_configs_load() {
+    use turbine_core::config::{DeviceSelection, SizeOrAuto};
+    use turbine_core::types::DeviceId;
+    let mut files = Vec::new();
+    for (short, slug, repo, two_card) in PHASE7_MODELS {
+        if two_card {
+            files.push((format!("phase7-novanas-{short}-tp2.yaml"), slug, repo, 2, 1));
+            files.push((format!("phase7-novanas-{short}-ep2.yaml"), slug, repo, 1, 2));
+        } else {
+            files.push((format!("phase7-novanas-{short}.yaml"), slug, repo, 1, 1));
+        }
+    }
+    assert_eq!(files.len(), 10);
+    for (file, slug, repo, tp, ep) in files {
+        let path = repo_root().join("scripts/lab").join(&file);
+        let c = turbine_core::config::load(&path, &[])
+            .unwrap_or_else(|e| panic!("{file} does not load: {e}"));
+        assert_eq!(
+            c.model.path,
+            Path::new(&format!("/models/{slug}")),
+            "{file}"
+        );
+        assert_eq!(c.model.served_name.as_deref(), Some(repo), "{file}");
+        assert_eq!(c.execution.backend.as_str(), "hip", "{file}");
+        assert_eq!(c.kv.block_tokens, 128, "{file}");
+        let p = &c.parallel;
+        if tp * ep == 1 {
+            assert_eq!(c.server.listen.to_string(), "0.0.0.0:18000", "{file}");
+        } else {
+            assert_eq!(c.server.listen.to_string(), "127.0.0.1:18000", "{file}");
+            assert_eq!(p.tensor_parallel_size, SizeOrAuto::Size(tp), "{file}");
+            assert_eq!(p.expert_parallel_size, SizeOrAuto::Size(ep), "{file}");
+            assert_eq!(
+                p.devices,
+                DeviceSelection::List(vec![DeviceId(0), DeviceId(1)]),
+                "{file}"
+            );
+        }
+    }
+}

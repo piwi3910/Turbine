@@ -3,8 +3,20 @@
 #
 #   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-novanas|collbench-sweep-novanas|
 #                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
-#                                       ep2-novanas|pp2-novanas>
+#                                       ep2-novanas|pp2-novanas|
+#                                       <qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
+#
+# Phase 7 family scenarios (plan Task 9, user decision 2026-10-08 B), <short>-<placement>-novanas:
+# Turbine legs only (the pod has no vLLM, and GPUs are per container; the vLLM-ROCm ratio comes
+# from scripts/lab-perf.sh --placement). Serves scripts/lab/phase7-novanas-<short>-<placement>.yaml
+# on the pod loopback; golden c1 and c16 with --batched-bounds against tests/golden/<slug>/; the
+# GSM8K set at concurrency 16 into $RUN_DIR/results/turbine-<placement>.json (copied back to
+# target/lab-cluster/<run id>/ before cleanup) and eval-compare against the committed
+# tests/eval/<slug>/vllm-<placement>.json with gate.json's max_drop (gsm8k=nobaseline when it is
+# not committed yet); the c16 bench after a 16-request warm-up. The Job's last line is
+# `lab-cluster: <scenario> PASS|FAIL golden1=… golden16=… gsm8k=<PASS|FAIL|nobaseline> tok_s=<t>`;
+# --dry-run prints these in-Job steps too (the other scenarios' dry runs do not).
 #
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
 #   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
@@ -109,7 +121,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|<qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -118,7 +130,22 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas)$ ]] ||
+		family_scenario "$1"
+}
+
+# family_scenario <scenario>: a Phase 7 two-card family scenario (<short>-<tp2|ep2>-novanas).
+family_scenario() {
+	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-(tp2|ep2)-novanas$ ]]
+}
+
+# family_slug <short>: the checkpoint slug (weights, tests/golden/<slug>, tests/eval/<slug>).
+family_slug() {
+	case "$1" in
+	qwen3moe) echo qwen3-30b-a3b-instruct-2507-fp8 ;;
+	mixtral) echo mixtral-8x7b-instruct-v0.1-fp8 ;;
+	qwen36) echo qwen3.6-35b-a3b-fp8 ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -915,6 +942,84 @@ scenario_pp2() {
 	fi
 }
 
+# Phase 7 family scenarios (plan Task 9, decision 2026-10-08 B). FAMILY_DRY=1 (the workstation's
+# --dry-run) prints each step as `+ <command>` instead of running it.
+FAMILY_DRY=0
+
+# fam_run <out file|-> <command>...: runs a family step (stdout into <out file> unless -), or
+# prints it under FAMILY_DRY; returns the command's status.
+fam_run() {
+	local out="$1"
+	shift
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		if [[ $out == - ]]; then echo "+ $*"; else echo "+ $* > ${out}"; fi
+		return 0
+	fi
+	echo "lab-step: $*"
+	if [[ $out == - ]]; then "$@"; else "$@" >"$out"; fi
+}
+
+# scenario_family <short> <tp2|ep2>: the Turbine legs of a family's two-card gate (S-13).
+scenario_family() {
+	local short="$1" placement="$2" slug c
+	slug="$(family_slug "$short")"
+	local config="scripts/lab/phase7-novanas-${short}-${placement}.yaml"
+	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
+	local eval_json="${results}/turbine-${placement}.json"
+	local baseline="tests/eval/${slug}/vllm-${placement}.json"
+	local golden1=PASS golden16=PASS gsm8k=nobaseline tok_s=none verdict=PASS
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		echo "+ ${BIN}/turbine-server --config ${config} (background; until ${URL}/ready answers 200)"
+	else
+		start_server "${WORK}/${short}-${placement}.log" "$config"
+		wait_ready "$URL" "${WORK}/${short}-${placement}.log"
+	fi
+	for c in 1 16; do
+		if ! fam_run - "${BIN}/turbine-golden" compare --url "$URL" \
+			--reference "tests/golden/${slug}/reference.jsonl" --concurrency "$c" --batched-bounds; then
+			if [[ $c == 1 ]]; then golden1=FAIL; else golden16=FAIL; fi
+			verdict=FAIL
+		fi
+	done
+	fam_run - mkdir -p "$results" || job_fail "cannot create ${results}"
+	# The pod runs as root: a world-writable directory lets the host's user remove its files
+	# (cleanup's rm -rf of the run directory).
+	fam_run - chmod a+rwx "$results" || true
+	fam_run "$eval_json" "${BIN}/turbine-golden" eval --url "$URL" --tasks tests/eval/gsm8k-200.jsonl \
+		--concurrency 16 --output json || job_fail "turbine-golden eval failed"
+	local drop="<gate.json max_drop>"
+	if [[ $FAMILY_DRY -eq 0 ]]; then
+		drop="$(jq -r '.max_drop // 0.01' "tests/eval/${slug}/gate.json" 2>/dev/null || echo 0.01)"
+	fi
+	if [[ $FAMILY_DRY -eq 1 || -f $baseline ]]; then
+		if fam_run - "${BIN}/turbine-golden" eval-compare --baseline "$baseline" \
+			--candidate "$eval_json" --max-drop "$drop"; then
+			gsm8k=PASS
+		else
+			gsm8k=FAIL
+			verdict=FAIL
+		fi
+	else
+		echo "lab-info: ${baseline} is not committed: no GSM8K verdict (lab-perf.sh --placement ${placement} --eval writes it)"
+	fi
+	local bench=("${BIN}/turbine-bench" --url "$URL" "${STANDARD_BENCH[@]}" --concurrency 16)
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		fam_run "${WORK}/c16-warmup.json" "${bench[@]}" --requests 16 --output json
+		fam_run "${WORK}/c16-bench.json" "${bench[@]}" --requests 200 --output json
+		echo "lab-cluster: dry run: in-Job steps of ${SCENARIO} (above); the Job ends with"
+		echo "lab-cluster: dry run:   lab-cluster: ${SCENARIO} PASS|FAIL golden1=<PASS|FAIL> golden16=<PASS|FAIL> gsm8k=<PASS|FAIL|nobaseline> tok_s=<t>"
+		return 0
+	fi
+	bench_ok 16 "${WORK}/c16-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 200
+	tok_s="$(jq -r '.output_token_throughput * 10 | round / 10' "${WORK}/c16-bench.json")"
+	cp "${WORK}/c16-bench.json" "${results}/turbine-${placement}-c16-bench.json" || true
+	stop_servers
+	echo "lab-cluster: ${SCENARIO} ${verdict} golden1=${golden1} golden16=${golden16} gsm8k=${gsm8k} tok_s=${tok_s}"
+	[[ $verdict == PASS ]] || exit 1
+	exit 0
+}
+
 in_job() {
 	SCENARIO="$1"
 	valid_scenario "$SCENARIO" || usage
@@ -931,6 +1036,7 @@ in_job() {
 	dp2-novanas) scenario_dp2 ;;
 	ep2-novanas) scenario_ep2 ;;
 	pp2-novanas) scenario_pp2 ;;
+	*) scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")" ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
 }
@@ -1238,6 +1344,16 @@ run_scenario() {
 	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
+	if family_scenario "$SCENARIO"; then
+		# A dry run cannot stream the pod log: print the in-Job steps of the family scenario.
+		[[ $DRY_RUN -eq 0 ]] || family_dry_steps
+		# The GSM8K report (and the bench) outlive the run directory: copy them back first.
+		local results="${REPO_ROOT}/target/lab-cluster/${RUN_ID}/"
+		say "copying ${RUN_DIR}/results/ to ${results}"
+		run mkdir -p "$results"
+		run rsync -rlpcz -e "ssh ${SSH_OPTS[*]}" "${REMOTE}:${RUN_DIR}/results/" "$results" ||
+			echo "lab-cluster: novanas: no results copied from ${RUN_DIR}/results/" >&2
+	fi
 	say "deleting the jobs of run ${RUN_ID}"
 	cleanup
 	[[ $DRY_RUN -eq 1 ]] && say "dry run: nothing contacted"
@@ -1246,6 +1362,21 @@ run_scenario() {
 	else
 		fail "job ${JOB} failed (see the log above)"
 	fi
+}
+
+# family_dry_steps: the in-Job commands of the family scenario, printed by scenario_family itself
+# (the Job's paths stand in as their variable names).
+family_dry_steps() {
+	(
+		FAMILY_DRY=1
+		# shellcheck disable=SC2016 # the Job's variable names, printed on purpose
+		BIN='$CARGO_TARGET_DIR/release'
+		# shellcheck disable=SC2016
+		WORK='$WORK'
+		TURBINE_LAB_ROOT="$CI_ROOT"
+		TURBINE_LAB_RUN_ID="$RUN_ID"
+		scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")"
+	)
 }
 
 stop_run() {
