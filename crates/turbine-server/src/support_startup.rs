@@ -707,14 +707,20 @@ mod tests {
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(after_discovery(&cpu, &none, d.clone()).unwrap(), d);
 
-        // A Phase 7 family is refused on the GPU vendor before discovery, served on the host.
+        // A Phase 7 family is experimental on the GPU vendor before discovery until its gate
+        // closes (S-13), and served on the host.
         let qwen = model_dir(
             "qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
         );
-        let err = before_discovery(&config("hip", qwen.path())).unwrap_err();
-        assert_eq!(err.key(), Some("execution.backend"));
-        assert!(err.to_string().contains("phase-7-model-families"), "{err}");
+        let d = before_discovery(&config("hip", qwen.path())).unwrap();
+        assert_eq!(d.status, SupportStatus::Experimental);
+        assert!(
+            d.view()
+                .reason
+                .is_some_and(|r| r.contains("phase-7-model-families")),
+            "{d:?}"
+        );
         assert!(before_discovery(&config("cpu", qwen.path())).is_ok());
 
         // No config.json: the architecture is unknown.

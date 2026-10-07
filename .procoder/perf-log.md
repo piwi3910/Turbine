@@ -1831,14 +1831,14 @@ completion of a failed launch carry its iteration (the rule hung `overlap_failed
 the scheduler never matched an iteration-0 completion). A/B on one build, novanas GPU 0, one session (2026-10-07
 15:19–16:02), `scripts/lab-bench.sh … -- --set execution.overlap_scheduling=<false|true>`:
 
-| Model | Arm | conc | tok/s | ITL p50 ms | TTFT p50 ms | TTFT p95 ms | host_share | golden c1 / c16 |
-| ----- | --- | ---- | ----- | ---------- | ----------- | ----------- | ---------- | --------------- |
-| Llama BF16 | serial (`false`) | 1 (quick, 64 req) | 87.6 | 11.24 | 53.7 | 54.1 | 0.0050 | PASS / – |
-| Llama BF16 | overlap (`true`) | 1 (quick, 64 req) | **88.3 (+0.8 %)** | 11.16 | 53.5 (1.00×) | 54.2 | 0.0052 | PASS / – |
-| Llama BF16 | serial (`false`) | 16 (200 req) | 855.3 | 15.44 | 206.1 | 360.2 | 0.0203 | PASS / PASS |
-| Llama BF16 | overlap (`true`) | 16 (200 req) | **865.7 (+1.2 %)** | 15.26 | **205.6 (1.00×)** | 383.8 (1.07×) | 0.0233 | PASS / PASS |
-| OLMoE BF16 | serial (`false`) | 16 (200 req) | 615.4 | 24.09 | 128.2 | 257.7 | 0.0129 | PASS / PASS |
-| OLMoE BF16 | overlap (`true`) | 16 (200 req) | **637.4 (+3.6 %)** | 23.21 | **127.9 (1.00×)** | 210.4 (0.82×) | 0.0133 | PASS / PASS |
+| Model      | Arm              | conc              | tok/s              | ITL p50 ms | TTFT p50 ms       | TTFT p95 ms   | host_share | golden c1 / c16 |
+| ---------- | ---------------- | ----------------- | ------------------ | ---------- | ----------------- | ------------- | ---------- | --------------- |
+| Llama BF16 | serial (`false`) | 1 (quick, 64 req) | 87.6               | 11.24      | 53.7              | 54.1          | 0.0050     | PASS / –        |
+| Llama BF16 | overlap (`true`) | 1 (quick, 64 req) | **88.3 (+0.8 %)**  | 11.16      | 53.5 (1.00×)      | 54.2          | 0.0052     | PASS / –        |
+| Llama BF16 | serial (`false`) | 16 (200 req)      | 855.3              | 15.44      | 206.1             | 360.2         | 0.0203     | PASS / PASS     |
+| Llama BF16 | overlap (`true`) | 16 (200 req)      | **865.7 (+1.2 %)** | 15.26      | **205.6 (1.00×)** | 383.8 (1.07×) | 0.0233     | PASS / PASS     |
+| OLMoE BF16 | serial (`false`) | 16 (200 req)      | 615.4              | 24.09      | 128.2             | 257.7         | 0.0129     | PASS / PASS     |
+| OLMoE BF16 | overlap (`true`) | 16 (200 req)      | **637.4 (+3.6 %)** | 23.21      | **127.9 (1.00×)** | 210.4 (0.82×) | 0.0133     | PASS / PASS     |
 
 Before the rule (commit a9f7779a, same recipe): Llama c16 TTFT p50 376 (1.83×), OLMoE 216 (1.69×). With it, TTFT p50
 is within 1.10× on both models and the throughput gain stays. Default unchanged (`false`) pending the decision
@@ -1951,26 +1951,26 @@ bit-equal to CK `rmsnorm` + GEMV on the 3B qkv (5120/5120) and gate_up (16384/16
 
 Kernel (`hip_ops gemv_norm_residual_timings`, graph-timed, 3B shapes):
 
-| Pair                                         | unfused (µs) | fused (µs) | saved |
-| -------------------------------------------- | ------------ | ---------- | ----- |
+| Pair                                          | unfused (µs) | fused (µs) | saved |
+| --------------------------------------------- | ------------ | ---------- | ----- |
 | o_proj + add_rmsnorm vs o_proj(res) + rmsnorm | 35.2         | 35.2       | 0.0   |
-| rmsnorm + qkv vs qkv(norm)                   | 54.4         | 52.8       | 1.7   |
-| rmsnorm + gate_up vs gate_up(norm)           | 162.6        | 160.9      | 1.7   |
-| o_proj + add_rmsnorm + gate_up (boundary)    | 194.9        | 193.4      | 1.5   |
-| down(silu) + add_rmsnorm + qkv (boundary)    | 139.6        | 138.0      | 1.6   |
+| rmsnorm + qkv vs qkv(norm)                    | 54.4         | 52.8       | 1.7   |
+| rmsnorm + gate_up vs gate_up(norm)            | 162.6        | 160.9      | 1.7   |
+| o_proj + add_rmsnorm + gate_up (boundary)     | 194.9        | 193.4      | 1.5   |
+| down(silu) + add_rmsnorm + qkv (boundary)     | 139.6        | 138.0      | 1.6   |
 
 −3.1 µs per layer → −0.087 ms per step predicted (28 layers).
 
 Served (`lab-bench.sh --gpu 0`, one session, base = `p6b-stack` abaa8a6d detached, interleaved A/B):
 
-| Run                              | tok/s             | ITL p50 (ms)      | TTFT p50 (ms) | golden c1 / c16 |
-| -------------------------------- | ----------------- | ----------------- | ------------- | --------------- |
-| Llama c1 `--quick` base (×2)     | 87.62 / 87.59     | 11.238 / 11.239   | 54            | PASS / —        |
-| Llama c1 `--quick` stage C (×2)  | **88.41 / 88.29** | **11.135 / 11.142** | 54          | PASS / —        |
-| Llama c16 200 req base (×2)      | 854.3 / 856.4     | 15.5 / 15.4       | 207 / 206     | PASS / —        |
-| Llama c16 200 req stage C (×2)   | 849.5 / 856.0     | 15.6 / 15.4       | 206 / 207     | PASS / PASS     |
-| OLMoE c16 `--quick` base         | 626.0             | 24.2              | 130           | PASS / —        |
-| OLMoE c16 `--quick` stage C      | 628.4             | 24.1              | 130           | PASS / —        |
+| Run                             | tok/s             | ITL p50 (ms)        | TTFT p50 (ms) | golden c1 / c16 |
+| ------------------------------- | ----------------- | ------------------- | ------------- | --------------- |
+| Llama c1 `--quick` base (×2)    | 87.62 / 87.59     | 11.238 / 11.239     | 54            | PASS / —        |
+| Llama c1 `--quick` stage C (×2) | **88.41 / 88.29** | **11.135 / 11.142** | 54            | PASS / —        |
+| Llama c16 200 req base (×2)     | 854.3 / 856.4     | 15.5 / 15.4         | 207 / 206     | PASS / —        |
+| Llama c16 200 req stage C (×2)  | 849.5 / 856.0     | 15.6 / 15.4         | 206 / 207     | PASS / PASS     |
+| OLMoE c16 `--quick` base        | 626.0             | 24.2                | 130           | PASS / —        |
+| OLMoE c16 `--quick` stage C     | 628.4             | 24.1                | 130           | PASS / —        |
 
 Llama c1 ITL 11.238 → 11.138 ms (−0.10 ms, 0.991×; prediction −0.087); at 640 GB/s over the 6.43 GB of BF16 weights
 read per step (10.05 ms) that is 0.894× → **0.902×** of peak. c16 unchanged (the first stage C run followed its golden
@@ -1992,3 +1992,12 @@ tiny_model 41/41 on the GPU, gate ok.
   all eight checks true (no restart, only 503 overload codes, streams complete, ITL p99 208.1 ms vs calibration
   172.8 ms within 2×, reached ORANGE, GREEN 0 s after cool-down, KV idle, reserve held); 200: 4750, 429: 101
   (`queue_full` 101, `queue_timeout` 3585), 0 client drops.
+
+## Phase 7: model families (branch `p7-stack`, labbook set `phase-7-model-families`)
+
+Every Phase 7 gate result (S-13) is one list line in this section, naming one `turbine_core::support::PHASE7_ROWS` entry as `<architecture>/<weight>/<kv>/<placement>` (placement `tp1`, `tp2` or `ep2`) followed by its evidence run ids:
+
+- a closed gate starts with `P7 closed:` and the entry, e.g. `MistralForCausalLM/bf16/bf16/tp1 <labbook run ids>`; the entry's `SUPPORT_MATRIX` row flips to `supported` in the same commit;
+- a missed or deferred gate starts with `P7 open:`, the entry and the reason; the row stays `experimental`.
+
+`support::tests::phase7_rows` (crates/turbine-core) reads the `P7 closed:` lines and fails when a closed entry is not `supported`, a `supported` entry has no closed line, or a closed line names no `PHASE7_ROWS` entry. No gate has closed yet.

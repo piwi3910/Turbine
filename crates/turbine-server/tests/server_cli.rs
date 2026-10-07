@@ -876,13 +876,26 @@ fn support_matrix_output() {
                 .is_some_and(|r| r.contains("phase-2b-nvidia"))),
         "{v}"
     );
+    // Phase 7 families (S-13): experimental on amd until their gate closes, naming it.
     for architecture in [
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "MistralForCausalLM",
         "MixtralForCausalLM",
+        "GptOssForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     ] {
-        assert!(has("amd", "*", architecture, "unsupported"), "{v}");
+        assert!(
+            rows.iter().any(|r| r["vendor"] == "amd"
+                && r["arch"] == "*"
+                && r["architecture"] == architecture
+                && r["status"] == "experimental"
+                && r["reason"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("phase-7-model-families"))),
+            "{architecture}: {v}"
+        );
     }
     assert!(has("cpu", "*", "*", "experimental"), "{v}");
     // P5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is refused.
@@ -968,13 +981,16 @@ fn check_config_reports_support_row() {
         Some("support: supported (amd/*/*/bf16/bf16/none)")
     );
 
-    // An unsupported row is a configuration error under --check-config too.
-    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    // An unsupported row is a configuration error under --check-config too (an architecture
+    // with no row on amd).
+    set_architecture(dir.path(), UNREGISTERED_ARCH);
     let out = check(&[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("support matrix: amd/*/Qwen3ForCausalLM/bf16/bf16/none is unsupported"),
+        stderr.contains(
+            "support matrix: amd/*/ExampleUnregisteredForCausalLM/bf16/bf16/none is unsupported"
+        ),
         "{stderr}"
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("config ok"));
@@ -988,14 +1004,17 @@ fn set_architecture(model_dir: &Path, architecture: &str) {
     std::fs::write(&path, v.to_string()).unwrap();
 }
 
+/// An architecture no family registers and no support-matrix row names.
+const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
 /// Phase 2m S-11: a model whose architecture has an `unsupported` row on the configured
 /// backend's vendor is a configuration error — exit 2 before device discovery and before the
-/// port is bound (Phase 8 families stay refused on GPU vendors until their track closes).
+/// port is bound (an architecture with no row on the GPU vendor).
 #[test]
 fn unsupported_row_exits_2_before_bind() {
     let dir = TempDir::new("turbine-server-unsupported-row");
     write_tiny_llama(dir.path(), 5);
-    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    set_architecture(dir.path(), UNREGISTERED_ARCH);
     let port = free_port();
     let cfg = TempConfig::new(
         "unsupported-row",
@@ -1009,11 +1028,8 @@ fn unsupported_row_exits_2_before_bind() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("support matrix"), "stderr: {stderr}");
-    assert!(stderr.contains("Qwen3ForCausalLM"), "stderr: {stderr}");
-    assert!(
-        stderr.contains("phase-7-model-families"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(UNREGISTERED_ARCH), "stderr: {stderr}");
+    assert!(stderr.contains("no support-matrix row"), "stderr: {stderr}");
     let logs = format!("{stdout}\n{stderr}");
     assert!(
         !logs.contains("device_discovery"),
