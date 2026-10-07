@@ -40,6 +40,7 @@ use turbine_distributed::router::RouterPolicy;
 use turbine_kernels::{KvTranscodeConfig, KvTranscodeFormat, OpConfig, Selection};
 use turbine_kv::blocks_for_tokens;
 use turbine_kv::hierarchy::PrefetchError;
+use turbine_model::reasoning::ReasoningParser;
 use turbine_model::weights::QuantizationSummary;
 use turbine_model::{ChatTemplate, RopeSummary, Tokenizer, ToolChoice};
 use turbine_observability::MetricsRegistry;
@@ -50,7 +51,7 @@ use turbine_scheduler::{SchedulerMetrics, SubmitError};
 use crate::engine::grammar::GrammarService;
 use crate::engine::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineHandle, EngineMetrics, EngineShared, Fatal,
-    Submission, ToolOutput, ToolParser,
+    ReasoningStart, Submission, ToolOutput, ToolParser,
 };
 use crate::kv_orchestrator::{PrefetchRefused, PrefetchTargetOwned};
 use crate::metrics::{Outcome, ServerMetrics};
@@ -228,6 +229,8 @@ pub struct ModelBackend {
     grammars: GrammarService,
     /// The format of `model.tool_call_parser`; `None` when it resolved to `none`.
     tool_parser: Option<ToolParser>,
+    /// The resolved `model.reasoning_parser` (P7 S-10); `None` when off.
+    reasoning_parser: Option<&'static dyn ReasoningParser>,
     metrics: ServerMetrics,
     /// `turbine_admission_total` for `invalid_json_schema` (refused before the scheduler).
     admission: SchedulerMetrics,
@@ -380,6 +383,7 @@ impl ModelBackend {
                 metrics.model.clone(),
             ),
             tool_parser,
+            reasoning_parser: model.reasoning_parser,
             metrics: metrics.server.clone(),
             admission: metrics.scheduler.clone(),
             started: Instant::now(),
@@ -582,12 +586,13 @@ impl ModelBackend {
 
     /// Prompt token ids: the rendered chat template (its text carries the BOS token; `tools`
     /// rendered when given), the tokenized prompt string (`add_special_tokens`), or the given
-    /// ids.
+    /// ids; with the rendered chat prompt, which starts the reasoning parser (P7 S-10).
     fn prompt_tokens(
         &self,
         req: &InferenceRequest,
         tools: Option<&[Value]>,
-    ) -> Result<Vec<u32>, ApiError> {
+    ) -> Result<(Vec<u32>, Option<String>), ApiError> {
+        let mut rendered = None;
         let tokens = match req.endpoint {
             Endpoint::ChatCompletions => {
                 let empty = serde_json::Map::new();
@@ -596,9 +601,12 @@ impl ModelBackend {
                     .template
                     .render(&req.body.messages_json(), tools, true, kwargs)
                     .map_err(|e| ApiError::template_error(e.to_string()))?;
-                self.tokenizer
+                let tokens = self
+                    .tokenizer
                     .encode(&text, false)
-                    .map_err(|e| ApiError::invalid_request(e.to_string()))?
+                    .map_err(|e| ApiError::invalid_request(e.to_string()))?;
+                rendered = Some(text);
+                tokens
             }
             _ => match &req.body.prompt {
                 Some(PromptInput::Text(text)) => self
@@ -622,7 +630,7 @@ impl ModelBackend {
                 "the prompt tokenizes to 0 tokens",
             ));
         }
-        Ok(tokens)
+        Ok((tokens, rendered))
     }
 
     /// Builds the submission: prompt tokens (tools rendered unless `tool_choice` is `none`),
@@ -639,7 +647,11 @@ impl ModelBackend {
             (None, false) => return Err(ApiError::tools_not_supported(&self.served_name)),
         };
         let render_tools = (mode != ToolChoiceMode::None).then_some(tools.as_slice());
-        let prompt_tokens = self.prompt_tokens(req, render_tools)?;
+        let (prompt_tokens, rendered) = self.prompt_tokens(req, render_tools)?;
+        let reasoning = self
+            .reasoning_parser
+            .zip(rendered)
+            .map(|(parser, prompt)| ReasoningStart::new(parser, &prompt));
         let prompt_len = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
         let logit_bias = body.logit_bias();
         let stop_token_ids = body.stop_token_ids.clone().unwrap_or_default();
@@ -741,6 +753,7 @@ impl ModelBackend {
             matchers: Vec::new(),
             tools: tool_output,
             echo_text,
+            reasoning,
         })
     }
 

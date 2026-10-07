@@ -322,6 +322,13 @@ pub enum GenerationEvent {
         logprob: Option<f32>,
         top_logprobs: Vec<(u32, f32)>,
     },
+    /// Reasoning text of a choice (Phase 7 S-10, `reasoning_content`): what the model's
+    /// reasoning parser split off the output, sent before the `Token` event of the token that
+    /// produced it; that token's `text` carries only content.
+    Reasoning {
+        choice: u32,
+        text: String,
+    },
     /// The choice's output parsed into tool calls (Phase 2); followed by `Finished`.
     ToolCalls {
         choice: u32,

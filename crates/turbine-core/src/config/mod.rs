@@ -121,6 +121,8 @@ impl std::fmt::Display for ModuleName {
 pub struct ModuleNames<'a> {
     /// `model.tool_call_parser` (`none` is always accepted).
     pub tool_formats: &'a [&'a str],
+    /// `model.reasoning_parser` (Phase 7; `auto` and `none` are always accepted).
+    pub reasoning_parsers: &'a [&'a str],
     /// `execution.backend`.
     pub backends: &'a [&'a str],
     /// `execution.card_profile` (`auto` is always accepted).
@@ -186,7 +188,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelConfig {
     /// Required; the empty default is rejected by `validate`.
@@ -210,6 +212,25 @@ pub struct ModelConfig {
     /// [`Config::validate`] (dynamic scaling would change cached keys mid-sequence); the fields
     /// are checked when the model loads.
     pub rope_scaling: Option<serde_json::Value>,
+    /// Reasoning parser (Phase 7 S-10): a `reasoning_parser` registry name; `auto` (default)
+    /// is the family's default parser, `none` turns `reasoning_content` off.
+    pub reasoning_parser: ModuleName,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        ModelConfig {
+            path: PathBuf::new(),
+            dtype: ModelDtype::default(),
+            served_name: None,
+            tokenizer: None,
+            chat_template: None,
+            max_seq_len: None,
+            tool_call_parser: None,
+            rope_scaling: None,
+            reasoning_parser: ModuleName::fixed("auto"),
+        }
+    }
 }
 
 /// The RoPE scaling types `model.rope_scaling` may name.
@@ -555,8 +576,9 @@ impl Config {
     }
 
     /// Checks every module key against the registries' names (`known`): exit 2, before device
-    /// discovery and before binding. `none` (`model.tool_call_parser`) and `auto`
-    /// (`execution.card_profile`) are always accepted.
+    /// discovery and before binding. `none` (`model.tool_call_parser`,
+    /// `model.reasoning_parser`) and `auto` (`model.reasoning_parser`, `execution.card_profile`)
+    /// are always accepted.
     pub fn validate_modules(&self, known: &ModuleNames<'_>) -> Result<(), ConfigError> {
         fn check(
             key: &str,
@@ -582,6 +604,14 @@ impl Config {
                 parser,
                 known.tool_formats,
                 Some("none"),
+            )?;
+        }
+        if !matches!(self.model.reasoning_parser.as_str(), "auto" | "none") {
+            check(
+                "model.reasoning_parser",
+                &self.model.reasoning_parser,
+                known.reasoning_parsers,
+                None,
             )?;
         }
         check(

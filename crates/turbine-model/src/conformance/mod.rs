@@ -10,6 +10,7 @@
 //! | `tool_format`      | [`formats_suite`]   | special tokens, render, grammar for `auto` / `required` / named, parse of its sample call, round trip, opening |
 //! | `weight_format`    | [`weights_suite`]   | bytes per parameter, a registered family's tiny checkpoint loads in the format                                 |
 //! | `logits_processor` | [`processors_suite`] | neutral requests untouched, applies when asked, host == device (`logits_reduce` CPU reference) when device-capable |
+//! | `reasoning_parser` | [`reasoning_suite`] | its sample split the same whole, one char per push and in two pieces at every char boundary            |
 //!
 //! The suites of the other crates' extension points follow the same shape:
 //! `turbine_scheduler::policy::conformance::policies_suite` (simulator invariants),
@@ -28,11 +29,13 @@ use turbine_core::registry::{Module, Registry};
 mod families;
 mod formats;
 mod processors;
+pub mod reasoning;
 mod weights;
 
 pub use families::families_suite;
 pub use formats::{feed_text, fixture_tools, formats_suite};
 pub use processors::processors_suite;
+pub use reasoning::suite as reasoning_suite;
 pub use weights::weights_suite;
 
 /// One broken check of one module.
