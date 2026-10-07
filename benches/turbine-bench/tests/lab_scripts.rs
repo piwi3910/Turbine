@@ -2871,3 +2871,42 @@ fn lab_bench_dry_run_defaults_are_unchanged() {
         "the host share is always measured:\n{text}"
     );
 }
+
+/// P7 S-17: a dry run of the checkpoint fetch prints the disk check and the pinned download of
+/// the slug's row (revision, include globs, local dir) and never a token; an unknown slug is a
+/// usage error. The `ssh` stub fails, so nothing is contacted.
+#[test]
+fn fetch_checkpoint_dry_run_pins_revision() {
+    let text = dry_run(
+        "fetch-checkpoint.sh",
+        "fetch-dry-gptoss",
+        &["--dry-run", "novanas", "gpt-oss-20b"],
+    );
+    assert_in_order(
+        &text,
+        &[
+            "df --output=avail",
+            "/home/piwi/turbine-models",
+            "hf download openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
+             --local-dir /home/piwi/turbine-models/gpt-oss-20b --include \
+             'model-0000*-of-00002.safetensors' --include '*.json' --include 'tokenizer*' \
+             --include chat_template.jinja",
+        ],
+    );
+    assert!(!text.contains("original/"), "no original/ path:\n{text}");
+    assert!(!text.contains("HF_TOKEN"), "no token:\n{text}");
+    assert!(!text.contains("--token"), "no token:\n{text}");
+
+    for (tag, args) in [
+        (
+            "fetch-unknown",
+            &["--dry-run", "novanas", "no-such-model"][..],
+        ),
+        ("fetch-noargs", &[][..]),
+        ("fetch-host", &["--dry-run", "dgx-spark", "gpt-oss-20b"][..]),
+    ] {
+        let (out, called) = lab_script("fetch-checkpoint.sh", tag, args);
+        assert_eq!(called, None, "{tag}: contacted a host");
+        assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
+    }
+}
