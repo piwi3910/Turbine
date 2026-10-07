@@ -1418,6 +1418,24 @@ impl DecoderExecutor {
         self.profiler.take()
     }
 
+    /// Whether decode steps run RoPE inside the paged attention call (P5p b1 attention II,
+    /// kernel ABI v2.12: the same operations, one launch and one boundary fewer) rather than as
+    /// a `rope` op: the bound decode kernel takes it, and tracing, which records the rotated q
+    /// and k, is off.
+    pub fn decode_fuses_rope(&self) -> bool {
+        let d = &self.dims;
+        let attn = d.attention(
+            AttentionKind::DecodePaged,
+            self.kv_layout.block_tokens,
+            self.kv_layout.dtype,
+        );
+        !self.trace.is_on()
+            && self
+                .registry
+                .attention(&attn)
+                .fuses_decode_rope(&attn, &d.rope())
+    }
+
     /// The decode graph key [`ModelExecutor::launch`] would run `batch` with `feeds` under
     /// (graphs on, no tracing or profiling, the FFN hook allowing capture): `None` when the
     /// batch is not decode-only, mixes reduced and full rows or feeds tokens other than one
@@ -2096,12 +2114,7 @@ impl DecoderExecutor {
         // P5p b1 attention II: on decode steps RoPE rides in the attention call when its kernel
         // takes it (kernel ABI v2.12: the same operations, one launch and one boundary fewer),
         // except while tracing, which records the rotated q and k.
-        let fused_rope = p.is_decode()
-            && !self.trace.is_on()
-            && self
-                .registry
-                .attention(&attn)
-                .fuses_decode_rope(&attn, &rope);
+        let fused_rope = p.is_decode() && self.decode_fuses_rope();
         if !fused_rope {
             self.op(OpConfig::Rope(rope), || {
                 self.registry.rope(&rope).execute(&mut RopeContext {

@@ -63,6 +63,7 @@ fn lock_gpu() -> MutexGuard<'static, ()> {
 trait Profiled: ModelExecutor {
     fn set_profile(&mut self, on: bool);
     fn take_profile(&mut self) -> OpProfile;
+    fn decode_fuses_rope(&self) -> bool;
 }
 
 impl Profiled for DecoderExecutor {
@@ -71,6 +72,9 @@ impl Profiled for DecoderExecutor {
     }
     fn take_profile(&mut self) -> OpProfile {
         DecoderExecutor::take_profile(self)
+    }
+    fn decode_fuses_rope(&self) -> bool {
+        DecoderExecutor::decode_fuses_rope(self)
     }
 }
 
@@ -287,25 +291,36 @@ fn profile_model(
     ));
 
     // Every op kind the executor's requirements name, per case: the decode cases run no
-    // prefill attention and the prefill case no decode attention; no case forks blocks.
+    // prefill attention and the prefill case no decode attention; no case forks blocks. Decode
+    // cases launch no rope op when the decode attention kernel fuses RoPE (kernel ABI v2.12),
+    // and the one-row case folds elementwise ops into its GEMVs (the norms, residual adds and
+    // SiLU·up of the fused decode form): an op it lacks must show in another decode case.
+    let fused_rope = exec.decode_fuses_rope();
     let kinds: Vec<OpKind> = hip_requirements(&cfg, ctx, opts)
         .iter()
         .map(|r| r.op)
         .filter(|op| *op != OpKind::CopyBlocks)
         .collect();
+    let profiled =
+        |case: &CaseReport, kind: &OpKind| case.ops.iter().any(|e| e.op == kind.as_str());
     for case in &cases {
         let decode = case.case.starts_with("decode");
+        let one_row = case.case.starts_with("decode_b1_");
         for kind in &kinds {
             let unused = if decode {
                 OpKind::AttentionPrefillPaged
             } else {
                 OpKind::AttentionDecodePaged
             };
-            if *kind == unused {
+            if *kind == unused || (decode && fused_rope && *kind == OpKind::Rope) {
                 continue;
             }
+            let folded = one_row
+                && cases.iter().any(|c| {
+                    c.case.starts_with("decode") && !std::ptr::eq(c, case) && profiled(c, kind)
+                });
             assert!(
-                case.ops.iter().any(|e| e.op == kind.as_str()),
+                profiled(case, kind) || folded,
                 "{} {}: no {kind} in the profile",
                 dir.display(),
                 case.case
