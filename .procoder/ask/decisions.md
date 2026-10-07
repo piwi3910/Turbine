@@ -4166,3 +4166,6 @@ cases: overlap off + jump 4.20 s, overlap on + jump 4.37 s. Not fixable by code 
 - A') As A, but serial only when the grammar can force a token after the next one (narrower; a check per step).
 - B) Re-bound: keep the 0.90× bound on a leg pinned to `overlap_scheduling: false`; the overlap leg requires bit-exact
   outputs and steps ≤ masked. Accepts that jump-forward gives little on Llama under overlap.
+
+**Decision (user, 2026-10-07): A** — iterations complete serially while a jump-forward-eligible constrained choice is
+running.
