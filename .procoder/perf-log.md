@@ -1915,3 +1915,39 @@ Served (`lab-bench.sh --gpu 0`, one session, base = `p6b-stack` 97a70b34 detache
 
 Llama c1 ITL 11.30 → 11.23 ms (−0.064 ms, 0.994×; the kernel prediction); c16 unchanged (853.2 at stage A); OLMoE
 unchanged (never binds the GEMV; 622.2 at stage A).
+
+## 5p GEMV stage C: residual-add epilogue + RMSNorm input on the m = 1 GEMV (2026-10-07, branch `p5p-gemv-c`)
+
+Stage C of the same decision: kernel ABI v2.15 (`turbine_gemm_desc.c_residual`, `a_norm_weight`, `a_norm_eps`). On a
+dense, unquantized, one-GPU decode step of one row, qkv and gate_up normalise `x` as they stage it (sum of squares in
+the staging LDS) and o_proj and down add into `x` in their epilogues, so the step launches no `add_rmsnorm` (and no
+first `rmsnorm`). Residual epilogue bitwise vs GEMV + `add` and vs CK `add_rmsnorm`'s sum; the norm input measured
+bit-equal to CK `rmsnorm` + GEMV on the 3B qkv (5120/5120) and gate_up (16384/16384) outputs.
+
+Kernel (`hip_ops gemv_norm_residual_timings`, graph-timed, 3B shapes):
+
+| Pair                                         | unfused (µs) | fused (µs) | saved |
+| -------------------------------------------- | ------------ | ---------- | ----- |
+| o_proj + add_rmsnorm vs o_proj(res) + rmsnorm | 35.2         | 35.2       | 0.0   |
+| rmsnorm + qkv vs qkv(norm)                   | 54.4         | 52.8       | 1.7   |
+| rmsnorm + gate_up vs gate_up(norm)           | 162.6        | 160.9      | 1.7   |
+| o_proj + add_rmsnorm + gate_up (boundary)    | 194.9        | 193.4      | 1.5   |
+| down(silu) + add_rmsnorm + qkv (boundary)    | 139.6        | 138.0      | 1.6   |
+
+−3.1 µs per layer → −0.087 ms per step predicted (28 layers).
+
+Served (`lab-bench.sh --gpu 0`, one session, base = `p6b-stack` abaa8a6d detached, interleaved A/B):
+
+| Run                              | tok/s             | ITL p50 (ms)      | TTFT p50 (ms) | golden c1 / c16 |
+| -------------------------------- | ----------------- | ----------------- | ------------- | --------------- |
+| Llama c1 `--quick` base (×2)     | 87.62 / 87.59     | 11.238 / 11.239   | 54            | PASS / —        |
+| Llama c1 `--quick` stage C (×2)  | **88.41 / 88.29** | **11.135 / 11.142** | 54          | PASS / —        |
+| Llama c16 200 req base (×2)      | 854.3 / 856.4     | 15.5 / 15.4       | 207 / 206     | PASS / —        |
+| Llama c16 200 req stage C (×2)   | 849.5 / 856.0     | 15.6 / 15.4       | 206 / 207     | PASS / PASS     |
+| OLMoE c16 `--quick` base         | 626.0             | 24.2              | 130           | PASS / —        |
+| OLMoE c16 `--quick` stage C      | 628.4             | 24.1              | 130           | PASS / —        |
+
+Llama c1 ITL 11.238 → 11.138 ms (−0.10 ms, 0.991×; prediction −0.087); at 640 GB/s over the 6.43 GB of BF16 weights
+read per step (10.05 ms) that is 0.894× → **0.902×** of peak. c16 unchanged (the first stage C run followed its golden
+c16 pass; the second pair is 856.0 vs 856.4); OLMoE unchanged (never folds). Lab: hip_ops `gemv_` (all pass),
+tiny_model 41/41 on the GPU, gate ok.

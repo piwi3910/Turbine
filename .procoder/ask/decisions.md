@@ -4037,6 +4037,15 @@ registry entry, the conformance suite); then own `wvSplitK`-structured kernels a
 residual add with the rmsnorm fusion — one stage at a time, each measured, stopping at any stage that does not
 measure faster. TP (`rmsnorm_sharded` bitwise), prefill, OLMoE and quantized paths unchanged.
 
+As built, stage C (`p5p-gemv-c`, 2026-10-07; the fused norm's numerics class accepted by the user for dense,
+unquantized, one-GPU Llama decode): kernel ABI v2.15 adds `c_residual` (bitwise GEMV + `add`) and `a_norm_weight` /
+`a_norm_eps` (the norm up to its sum order; measured bit-equal to CK `rmsnorm` on the 3B qkv and gate_up shapes) to
+`turbine_gemm_desc`; `vllm_wvsplitk` takes them for m = 1 wave32 decode rows with no prefill fallback. The decoder folds
+the step's first `rmsnorm` and every `add_rmsnorm` into qkv / gate_up (norm) and o_proj / down (residual) when one decode
+row runs untraced on one device with BF16 weights, the fused qkv and an FFN hook that agrees (SwiGLU). Kernel −3.1 µs
+per layer; served Llama c1 ITL 11.238 → 11.138 ms (0.902× of 640 GB/s), c16 and OLMoE unchanged, golden c1 / c16
+PASS (perf log "5p GEMV stage C"). The LM head's final-norm prologue was not built (0.003 ms estimated).
+
 ## 5p Task 4: overlap scheduling A/B — c1 gains, c16 TTFT 1.70× (2026-10-06)
 
 From `p5p-overlap` (commit 69cc4c16; perf log 5p "S-3: overlap scheduling waits for new prefills"). Llama BF16,
