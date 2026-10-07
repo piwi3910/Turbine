@@ -1185,6 +1185,72 @@ pub trait GemmKernel: Send + Sync {
             message: "this GEMM provider does not fuse silu_mul into its input".into(),
         })
     }
+    /// True when [`Self::execute_fused`] runs `fusion` for `rows`-row calls of `cfg` in a step
+    /// that prefills (`prefill`) or not (kernel ABI v2.15: the residual-add epilogue and the
+    /// RMSNorm input; v2.14: the SwiGLU input). By default only the SwiGLU input alone, as
+    /// [`Self::fuses_silu_mul`] says.
+    fn fuses(&self, cfg: &GemmConfig, rows: usize, prefill: bool, fusion: GemmFusion) -> bool {
+        fusion
+            == GemmFusion {
+                silu_mul: true,
+                ..GemmFusion::default()
+            }
+            && self.fuses_silu_mul(cfg, rows, prefill)
+    }
+    /// [`Self::execute`] with the fused forms of `f`, only for calls [`Self::fuses`] accepts:
+    /// `f.up` the SwiGLU input ([`Self::execute_silu_mul`]); `f.norm` the RMSNorm input
+    /// (`ctx.a` rows normalised with the weight and eps as the `rmsnorm` op computes them, up to
+    /// the order of the sum of squares: the operand may differ in its last bit); `f.residual`
+    /// (`[m, n]`, may be `ctx.c` itself) the residual-add epilogue, bit for bit the plain call
+    /// followed by the `add` op of the residual and its output. The default runs the SwiGLU
+    /// input alone and refuses the rest.
+    fn execute_fused(
+        &self,
+        ctx: &mut GemmContext<'_>,
+        f: GemmFused<'_>,
+    ) -> Result<(), KernelError> {
+        match f {
+            GemmFused {
+                up: Some(up),
+                norm: None,
+                residual: None,
+            } => self.execute_silu_mul(ctx, up),
+            _ => Err(KernelError::Unsupported {
+                message: "this GEMM provider does not fuse a residual add or an RMSNorm".into(),
+            }),
+        }
+    }
+}
+
+/// The fused forms of one GEMM call ([`GemmKernel::fuses`]): the SwiGLU input (kernel ABI
+/// v2.14), the RMSNorm input and the residual-add epilogue (v2.15).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GemmFusion {
+    pub silu_mul: bool,
+    pub rmsnorm: bool,
+    pub residual: bool,
+}
+
+/// The operands of the fused forms of [`GemmKernel::execute_fused`].
+#[derive(Default)]
+pub struct GemmFused<'a> {
+    /// The SwiGLU input's up columns (`ctx.a` holds the gate columns).
+    pub up: Option<TensorView<'a>>,
+    /// The RMSNorm input's weight (`k` elements) and eps.
+    pub norm: Option<(TensorView<'a>, f32)>,
+    /// The residual added to the rounded output (`[m, n]`, may be `ctx.c`).
+    pub residual: Option<TensorView<'a>>,
+}
+
+impl GemmFused<'_> {
+    /// The forms present.
+    pub fn fusion(&self) -> GemmFusion {
+        GemmFusion {
+            silu_mul: self.up.is_some(),
+            rmsnorm: self.norm.is_some(),
+            residual: self.residual.is_some(),
+        }
+    }
 }
 
 /// Prefill and decode attention (`cfg.kind` selects the entry point): `execute` runs the

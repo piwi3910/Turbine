@@ -23,15 +23,15 @@ use turbine_kernels::test_support::require_backend;
 use turbine_kernels::{
     ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
     AttentionContext, AttentionKind, ElementwiseConfig, ElementwiseContext, EmbeddingConfig,
-    EmbeddingContext, FusedRope, GemmConfig, GemmContext, ImplChoice, ImplInfo, KV_FMT_BF16,
-    KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns, KvCopyConfig,
-    KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat, KvTranscodeTables,
-    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
-    MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext, OpConfig, OpKind,
-    PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary, TURBINE_OPTION_GEMM_AUTOTUNE,
-    TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged, TqParams, cpu_reference_provider,
-    shim_provider,
+    EmbeddingContext, FusedRope, GemmConfig, GemmContext, GemmFused, GemmFusion, ImplChoice,
+    ImplInfo, KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider, KvCodecFns,
+    KvCopyConfig, KvCopyContext, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
+    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
+    OpConfig, OpKind, PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext,
+    RopeConfig, RopeContext, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
+    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged,
+    TqParams, cpu_reference_provider, shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, HostStaging, Tensor, TensorView};
@@ -496,6 +496,481 @@ fn gemv_silu_mul_matches_unfused() {
         println!("gemv_silu_mul_matches_unfused n={n} k={inter}: ok");
     }
 }
+
+/// Kernel ABI v2.15 (P5p GEMV stage C): the residual-add epilogue of the single-row GEMV —
+/// o_proj alone and the down projection with its SwiGLU input — written in place over the
+/// residual equals the plain GEMV followed by `add`, bit for bit, three runs; and the residual
+/// then CK `rmsnorm` equals today's GEMV then CK `add_rmsnorm` in both outputs (residual and
+/// normalised row). A prefill step refuses the form with nothing written; only single-row
+/// decode calls take it, hipBLASLt never. Breaks if the epilogue rounds differently from the
+/// `add` op (a numerics-class change in the residual stream) or the gating regresses.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_residual_matches_gemv_then_add() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(61);
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let blaslt = bound_gemm(&p, "hipblaslt");
+    let gemm = gemv.hip.gemm().expect("hip gemm");
+    let silu = p.hip.activation().expect("hip silu_mul");
+    let add = p.hip.elementwise().expect("hip add");
+    let norm = p.hip.norm().expect("hip rmsnorm");
+    let add_norm = p.hip.add_rmsnorm().expect("hip add_rmsnorm");
+    let residual = GemmFusion {
+        residual: true,
+        ..GemmFusion::default()
+    };
+    let silu_residual = GemmFusion {
+        silu_mul: true,
+        ..residual
+    };
+    for (n, k, glu) in [(HIDDEN, HIDDEN, false), (HIDDEN, INTERMEDIATE, true)] {
+        let cfg = GemmConfig {
+            gemv: true,
+            ..gemm_config(n, k, DType::BF16)
+        };
+        let fusion = if glu { silu_residual } else { residual };
+        assert!(gemm.fuses(&cfg, 1, false, fusion), "n={n} k={k}");
+        assert!(!gemm.fuses(&cfg, 1, true, fusion), "n={n} k={k}");
+        assert!(!gemm.fuses(&cfg, 2, false, fusion), "n={n} k={k}");
+        let blaslt_gemm = blaslt.hip.gemm().expect("hip gemm");
+        assert!(!blaslt_gemm.fuses(&cfg, 1, false, fusion), "n={n} k={k}");
+        let w = on_hip(
+            &p,
+            &[n, k],
+            DType::BF16,
+            &rng.normal(n * k, 1.0 / (k as f32).sqrt()),
+        );
+        // The input row (gate then up columns for the SwiGLU input) and the residual stream.
+        let input = on_hip(&p, &[1, 2 * k], DType::BF16, &rng.normal(2 * k, 3.0));
+        let res_vals = rng.normal(n, 4.0);
+        let norm_w: Vec<f32> = rng.normal(n, 0.3).iter().map(|v| 1.0 + v).collect();
+        let norm_w = on_hip(&p, &[n], DType::BF16, &norm_w);
+        let act = if glu {
+            let act = zeros_on_hip(&p, &[1, k], DType::BF16);
+            silu.execute(&mut ActivationContext {
+                gate: row_part(&input, 0, k),
+                up: row_part(&input, k, k),
+                out: act.view(),
+            })
+            .expect("silu_mul");
+            act
+        } else {
+            on_hip(&p, &[1, k], DType::BF16, &read(&input)[..k])
+        };
+        // Today: the GEMV into proj, add / add_rmsnorm into the residual.
+        let proj = zeros_on_hip(&p, &[1, n], DType::BF16);
+        gemm.execute(&mut decode_ctx(act.view(), &w, &proj))
+            .expect("gemv");
+        let want_x = on_hip(&p, &[1, n], DType::BF16, &res_vals);
+        add.execute(&mut ElementwiseContext {
+            a: want_x.view(),
+            b: proj.view(),
+            out: want_x.view(),
+        })
+        .expect("add");
+        let today_x = on_hip(&p, &[1, n], DType::BF16, &res_vals);
+        let today_h = zeros_on_hip(&p, &[1, n], DType::BF16);
+        add_norm
+            .execute(&mut AddRmsnormContext {
+                residual: today_x.view(),
+                x: proj.view(),
+                weight: norm_w.view(),
+                out: today_h.view(),
+                eps: 1e-5,
+            })
+            .expect("add_rmsnorm");
+        let bits = |t: &Tensor| read(t).iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert!(
+            bits(&want_x) == bits(&today_x),
+            "n={n} k={k}: add vs add_rmsnorm residual"
+        );
+        let fused = |prefill: bool| {
+            let x = on_hip(&p, &[1, n], DType::BF16, &res_vals);
+            let a = if glu {
+                row_part(&input, 0, k)
+            } else {
+                act.view()
+            };
+            let r = gemm.execute_fused(
+                &mut GemmContext {
+                    prefill,
+                    ..decode_ctx(a, &w, &x)
+                },
+                GemmFused {
+                    up: glu.then(|| row_part(&input, k, k)),
+                    residual: Some(x.view()),
+                    ..GemmFused::default()
+                },
+            );
+            (r, x)
+        };
+        for run in 0..3 {
+            let (r, x) = fused(false);
+            r.expect("fused gemv");
+            assert!(
+                bits(&x) == bits(&want_x),
+                "n={n} k={k}: fused run {run} differs from GEMV + add"
+            );
+            let h = zeros_on_hip(&p, &[1, n], DType::BF16);
+            norm.execute(&mut NormContext {
+                x: x.view(),
+                weight: norm_w.view(),
+                out: h.view(),
+                eps: 1e-5,
+            })
+            .expect("rmsnorm");
+            assert!(
+                bits(&h) == bits(&today_h),
+                "n={n} k={k}: fused + rmsnorm run {run} differs from GEMV + add_rmsnorm"
+            );
+        }
+        let (r, x) = fused(true);
+        assert!(
+            r.is_err(),
+            "n={n} k={k}: a prefill step took the residual form"
+        );
+        p.hip_mem.synchronize().expect("synchronize");
+        assert_eq!(read(&x), read(&on_hip(&p, &[1, n], DType::BF16, &res_vals)));
+        println!("gemv_residual_matches_gemv_then_add n={n} k={k} glu={glu}: ok");
+    }
+}
+
+/// Kernel ABI v2.15 (P5p GEMV stage C): the RMSNorm input of the single-row GEMV (qkv and
+/// gate_up shapes) against the cpu reference's fused call (`rmsnorm` then the GEMM, within the
+/// GEMV tolerance), and against CK `rmsnorm` + the plain GEMV on the card: prints how many
+/// outputs are bit-equal and the largest |Δ| (the sum of squares is reduced in the GEMV's order,
+/// so the operand may differ from CK's in its last bit — user decision B, staged). Three runs
+/// bit-identical; a prefill step refuses the form. Breaks if the prologue's norm or rounding
+/// is wrong (beyond the bound) or nondeterministic.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_rmsnorm_matches_reference() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(67);
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let gemm = gemv.hip.gemm().expect("hip gemm");
+    let cpu_gemm = p.cpu.gemm().expect("cpu gemm");
+    let norm = p.hip.norm().expect("hip rmsnorm");
+    let fusion = GemmFusion {
+        rmsnorm: true,
+        ..GemmFusion::default()
+    };
+    let qkv = (Q_HEADS + 2 * KV_HEADS) * HEAD_DIM;
+    for (n, k) in [(qkv, HIDDEN), (2 * INTERMEDIATE, HIDDEN)] {
+        let cfg = GemmConfig {
+            gemv: true,
+            ..gemm_config(n, k, DType::BF16)
+        };
+        assert!(gemm.fuses(&cfg, 1, false, fusion), "n={n} k={k}");
+        assert!(!gemm.fuses(&cfg, 1, true, fusion), "n={n} k={k}");
+        assert!(!gemm.fuses(&cfg, 2, false, fusion), "n={n} k={k}");
+        let w_vals = rng.normal(n * k, 1.0 / (k as f32).sqrt());
+        let x_vals = rng.normal(k, 2.0);
+        let g_vals: Vec<f32> = rng.normal(k, 0.3).iter().map(|v| 1.0 + v).collect();
+        let w = on_hip(&p, &[n, k], DType::BF16, &w_vals);
+        let x = on_hip(&p, &[1, k], DType::BF16, &x_vals);
+        let g = on_hip(&p, &[k], DType::BF16, &g_vals);
+        let fused = |prefill: bool| {
+            let c = zeros_on_hip(&p, &[1, n], DType::BF16);
+            let r = gemm.execute_fused(
+                &mut GemmContext {
+                    prefill,
+                    ..decode_ctx(x.view(), &w, &c)
+                },
+                GemmFused {
+                    norm: Some((g.view(), 1e-5)),
+                    ..GemmFused::default()
+                },
+            );
+            (r, c)
+        };
+        let (r, got) = fused(false);
+        r.expect("fused gemv");
+        let got = read(&got);
+        for run in 1..3 {
+            let (r, again) = fused(false);
+            r.expect("fused gemv");
+            assert!(
+                read(&again)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(got.iter().map(|v| v.to_bits())),
+                "n={n} k={k}: run {run} differs"
+            );
+        }
+        assert!(
+            fused(true).0.is_err(),
+            "n={n} k={k}: a prefill step took the norm form"
+        );
+        // The cpu reference's fused call.
+        let on_cpu = |shape: &[usize], v: &[f32]| {
+            let mut t = Tensor::empty(&p.cpu_mem, shape, DType::BF16).expect("cpu alloc");
+            t.storage
+                .copy_from_host(0, &encode(DType::BF16, v))
+                .expect("copy");
+            t
+        };
+        let (cw, cx, cg, cc) = (
+            on_cpu(&[n, k], &w_vals),
+            on_cpu(&[1, k], &x_vals),
+            on_cpu(&[k], &g_vals),
+            on_cpu(&[1, n], &vec![0.0; n]),
+        );
+        cpu_gemm
+            .execute_fused(
+                &mut decode_ctx(cx.view(), &cw, &cc),
+                GemmFused {
+                    norm: Some((cg.view(), 1e-5)),
+                    ..GemmFused::default()
+                },
+            )
+            .expect("cpu fused");
+        assert_close(
+            "gemv rmsnorm input vs cpu",
+            GEMV_IMPL,
+            &got,
+            &read(&cc),
+            DType::BF16,
+        );
+        // CK rmsnorm + the plain GEMV on the card.
+        let h = zeros_on_hip(&p, &[1, k], DType::BF16);
+        norm.execute(&mut NormContext {
+            x: x.view(),
+            weight: g.view(),
+            out: h.view(),
+            eps: 1e-5,
+        })
+        .expect("rmsnorm");
+        let c = zeros_on_hip(&p, &[1, n], DType::BF16);
+        gemm.execute(&mut decode_ctx(h.view(), &w, &c))
+            .expect("gemv");
+        let unfused = read(&c);
+        let equal = got
+            .iter()
+            .zip(&unfused)
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count();
+        let worst = got
+            .iter()
+            .zip(&unfused)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "gemv_rmsnorm_matches_reference n={n} k={k}: {equal}/{n} bit-equal to CK rmsnorm + \
+             GEMV, max |d| {worst:e}"
+        );
+        assert_close(
+            "gemv rmsnorm input vs CK rmsnorm + GEMV",
+            GEMV_IMPL,
+            &got,
+            &unfused,
+            DType::BF16,
+        );
+    }
+}
+
+/// Lab microbenchmark (P5p GEMV stage C): the fused forms against today's ops on the Llama
+/// decode shapes, each call one node of a captured graph of ≥ 112 calls, weights cycled over
+/// ≥ 512 MB: (1) o_proj + `add_rmsnorm` vs o_proj with the residual epilogue + `rmsnorm`;
+/// (2) `rmsnorm` + qkv / gate_up vs the GEMV with the RMSNorm input; (3) the layer's two
+/// boundaries: o_proj + `add_rmsnorm` + gate_up vs o_proj(residual) + gate_up(norm), and
+/// down(SwiGLU) + `add_rmsnorm` + qkv vs down(SwiGLU, residual) + qkv(norm). Prints µs per
+/// node group and the savings; asserts nothing (the stage rule is judged on the numbers).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_norm_residual_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(71);
+    const ITERS: u32 = 15;
+    const GRAPH_CALLS: usize = 112;
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let gemm = gemv.hip.gemm().expect("hip gemm");
+    let norm = p.hip.norm().expect("hip rmsnorm");
+    let add_norm = p.hip.add_rmsnorm().expect("hip add_rmsnorm");
+    let qkv_n = (Q_HEADS + 2 * KV_HEADS) * HEAD_DIM;
+    let weights = |rng: &mut Rng, n: usize, k: usize| {
+        let raw = encode(DType::BF16, &pattern(rng, n * k, 1.0 / (k as f32).sqrt()));
+        let copies = (512usize << 20).div_ceil(n * k * 2).max(2);
+        (0..copies)
+            .map(|_| raw_on_hip(&p, &[n, k], DType::BF16, &raw))
+            .collect::<Vec<Tensor>>()
+    };
+    let o_w = weights(&mut rng, HIDDEN, HIDDEN);
+    let qkv_w = weights(&mut rng, qkv_n, HIDDEN);
+    let gu_w = weights(&mut rng, 2 * INTERMEDIATE, HIDDEN);
+    let down_w = weights(&mut rng, HIDDEN, INTERMEDIATE);
+    let g = on_hip(
+        &p,
+        &[HIDDEN],
+        DType::BF16,
+        &rng.normal(HIDDEN, 0.3)
+            .iter()
+            .map(|v| 1.0 + v)
+            .collect::<Vec<_>>(),
+    );
+    let x = on_hip(&p, &[1, HIDDEN], DType::BF16, &rng.normal(HIDDEN, 2.0));
+    let h = on_hip(&p, &[1, HIDDEN], DType::BF16, &rng.normal(HIDDEN, 1.0));
+    let attn = on_hip(&p, &[1, HIDDEN], DType::BF16, &rng.normal(HIDDEN, 1.0));
+    let gate_up = on_hip(
+        &p,
+        &[1, 2 * INTERMEDIATE],
+        DType::BF16,
+        &rng.normal(2 * INTERMEDIATE, 3.0),
+    );
+    let proj = zeros_on_hip(&p, &[1, HIDDEN], DType::BF16);
+    let qkv_out = zeros_on_hip(&p, &[1, qkv_n], DType::BF16);
+    let gu_out = zeros_on_hip(&p, &[1, 2 * INTERMEDIATE], DType::BF16);
+    let rmsnorm = || {
+        norm.execute(&mut NormContext {
+            x: x.view(),
+            weight: g.view(),
+            out: h.view(),
+            eps: 1e-5,
+        })
+        .expect("rmsnorm");
+    };
+    let add_rmsnorm = || {
+        add_norm
+            .execute(&mut AddRmsnormContext {
+                residual: x.view(),
+                x: proj.view(),
+                weight: g.view(),
+                out: h.view(),
+                eps: 1e-5,
+            })
+            .expect("add_rmsnorm");
+    };
+    let plain = |a: TensorView<'_>, w: &Tensor, c: &Tensor| {
+        gemm.execute(&mut decode_ctx(a, w, c)).expect("gemv");
+    };
+    let fused = |a: TensorView<'_>, w: &Tensor, c: &Tensor, f: GemmFused<'_>| {
+        gemm.execute_fused(&mut decode_ctx(a, w, c), f)
+            .expect("fused gemv");
+    };
+    let with_norm = || GemmFused {
+        norm: Some((g.view(), 1e-5)),
+        ..GemmFused::default()
+    };
+    let with_res = |up: bool| GemmFused {
+        up: up.then(|| row_part(&gate_up, INTERMEDIATE, INTERMEDIATE)),
+        residual: Some(x.view()),
+        ..GemmFused::default()
+    };
+    let gate = || row_part(&gate_up, 0, INTERMEDIATE);
+    let calls: Vec<TimedCall<'_>> = vec![
+        (
+            "o_proj + add_rmsnorm",
+            Box::new(|j| {
+                plain(attn.view(), &o_w[j % o_w.len()], &proj);
+                add_rmsnorm();
+            }),
+        ),
+        (
+            "o_proj(res) + rmsnorm",
+            Box::new(|j| {
+                fused(attn.view(), &o_w[j % o_w.len()], &x, with_res(false));
+                rmsnorm();
+            }),
+        ),
+        (
+            "rmsnorm + qkv",
+            Box::new(|j| {
+                rmsnorm();
+                plain(h.view(), &qkv_w[j % qkv_w.len()], &qkv_out);
+            }),
+        ),
+        (
+            "qkv(norm)",
+            Box::new(|j| {
+                fused(x.view(), &qkv_w[j % qkv_w.len()], &qkv_out, with_norm());
+            }),
+        ),
+        (
+            "rmsnorm + gate_up",
+            Box::new(|j| {
+                rmsnorm();
+                plain(h.view(), &gu_w[j % gu_w.len()], &gu_out);
+            }),
+        ),
+        (
+            "gate_up(norm)",
+            Box::new(|j| {
+                fused(x.view(), &gu_w[j % gu_w.len()], &gu_out, with_norm());
+            }),
+        ),
+        (
+            "o_proj + add_rmsnorm + gate_up",
+            Box::new(|j| {
+                plain(attn.view(), &o_w[j % o_w.len()], &proj);
+                add_rmsnorm();
+                plain(h.view(), &gu_w[j % gu_w.len()], &gu_out);
+            }),
+        ),
+        (
+            "o_proj(res) + gate_up(norm)",
+            Box::new(|j| {
+                fused(attn.view(), &o_w[j % o_w.len()], &x, with_res(false));
+                fused(x.view(), &gu_w[j % gu_w.len()], &gu_out, with_norm());
+            }),
+        ),
+        (
+            "down(silu) + add_rmsnorm + qkv",
+            Box::new(|j| {
+                gemm.execute_silu_mul(
+                    &mut decode_ctx(gate(), &down_w[j % down_w.len()], &proj),
+                    row_part(&gate_up, INTERMEDIATE, INTERMEDIATE),
+                )
+                .expect("down");
+                add_rmsnorm();
+                plain(h.view(), &qkv_w[j % qkv_w.len()], &qkv_out);
+            }),
+        ),
+        (
+            "down(silu,res) + qkv(norm)",
+            Box::new(|j| {
+                fused(gate(), &down_w[j % down_w.len()], &x, with_res(true));
+                fused(x.view(), &qkv_w[j % qkv_w.len()], &qkv_out, with_norm());
+            }),
+        ),
+    ];
+    let mut us = Vec::new();
+    for (name, call) in &calls {
+        call(0);
+        p.hip_mem.synchronize().expect("synchronize");
+        p.ctx.graph_begin().expect("graph begin");
+        for j in 0..GRAPH_CALLS {
+            call(j);
+        }
+        let graph = p.ctx.graph_end().expect("graph end");
+        let t = time_us(&p, ITERS, || {
+            p.ctx.graph_launch(&graph).expect("graph launch");
+        }) / GRAPH_CALLS as f64;
+        println!("gemv_norm_residual_timings {name}: {t:.1} us");
+        us.push(t);
+    }
+    for pair in us.chunks(2) {
+        println!(
+            "gemv_norm_residual_timings saved {:.1} us",
+            pair[0] - pair[1]
+        );
+    }
+}
+
+/// A named group of launches, called with the graph node index.
+type TimedCall<'a> = (&'static str, Box<dyn Fn(usize) + 'a>);
 
 /// Columns `off..off + k` of the one-row tensor `t` as `[1, k]`.
 fn row_part(t: &Tensor, off: usize, k: usize) -> TensorView<'_> {
