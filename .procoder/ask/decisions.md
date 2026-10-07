@@ -4128,3 +4128,6 @@ overlap on and are pinned to serial there:
    `lab-bench` keeps benching serial.
    - A) Flip them to `true` so benches track the shipped default (new baselines from here on).
    - B) Keep `false` (baselines comparable with history; pass `--set` to bench overlap).
+
+**Decision (user, 2026-10-07): 1 A, 2 B, 3 A** — merge the flip; jump-forward works under overlap before the 5p exit
+(test requires overlap jumps); the stage accounting adds up under overlap; the phase2c lab configs flip to `true`.
