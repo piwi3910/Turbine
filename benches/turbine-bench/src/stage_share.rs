@@ -4,6 +4,16 @@
 //! the delta of each stage's `_sum` between the scrapes is that stage's seconds over the
 //! interval, and `host_share` is every stage but `device_wait` (the GPU) over all eight —
 //! `launch` counts as host time because its graph launch blocks while the GPU idles.
+//!
+//! The histograms time engine turns, which partition the engine thread's time on both loops,
+//! so `host_share` is always the share of that time spent off the device wait. On the serial
+//! loop the GPU idles through it, so it is the GPU's idle share too. Under overlap scheduling
+//! (the default since 2026-10-07) the next iteration runs on the GPU behind most host stages:
+//! `host_share` stays the engine thread's host-work share — near 1 the host sets the pace
+//! (the GPU waits for launches), while the `device_wait` share is the host's slack behind the
+//! GPU — and only an upper bound on the GPU's idle share. The per-iteration hidden device time
+//! is `last_iteration.overlap_ms` in `/turbine/v1/scheduler`; compare host shares only between
+//! runs of the same loop.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

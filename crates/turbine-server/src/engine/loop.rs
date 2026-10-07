@@ -55,7 +55,12 @@
 //!
 //! Every turn is timed in the eight stages of [`Stage`] (P2c S-1) by marks around these steps;
 //! an executed iteration records them in `turbine_engine_iteration_seconds{stage}`, and every
-//! published scheduler document carries the last turn's `stages_ms`.
+//! published scheduler document carries the last turn's `stages_ms`. Under overlap scheduling an
+//! iteration runs from its plan in one turn to its completion in the next, so the document
+//! carries instead the last completed iteration's own window (the difference of two running
+//! stage totals, [`EngineLoop::close_window`]) — its stages sum to its `duration_ms` — with
+//! `overlap_ms`, the part of it its forward pass ran on the device behind host work (user
+//! decision 2026-10-07 2 B); the stage clock then runs on between turns.
 //!
 //! Reliability (P3 S-9 … S-12; CONFLICT C-25 retires the Phase 2 exit after three failed
 //! iterations): each turn reads the pressure controller's snapshot once — its throttle plan
@@ -108,13 +113,13 @@ use turbine_reliability::recovery::RecoveryStep;
 use turbine_reliability::step_window::{DecodeStepWindow, StepSample};
 use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
-    SchedRequest, Scheduler, SubmitError,
+    LastIteration, SchedRequest, Scheduler, SubmitError,
 };
 
 use super::deadlines::{Deadlines, Timeouts};
 use super::pp::PipelineStats;
 use super::requests::{ActiveRequest, Delivery, Flush, Step, Submission};
-use super::stages::{Stage, StageClock};
+use super::stages::{IterationStages, Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
@@ -210,6 +215,13 @@ pub(crate) struct EngineLoop {
     idle_turn: bool,
     /// Times the current turn's stages.
     stages: StageClock,
+    /// The stages of every turn closed so far (overlap scheduling: an iteration's window is
+    /// the difference of two running totals, [`EngineLoop::stages_total`]).
+    stages_done: IterationStages,
+    /// Overlap scheduling: the last completed iteration as the scheduler document reports it,
+    /// with the stages of its window and its overlapped device time (user decision
+    /// 2026-10-07 2 B).
+    last_window: Option<LastIteration>,
     /// The executor's decode graph counters at the last forward
     /// (`turbine_decode_graph_total{outcome}` adds what changed since).
     graph_counters: GraphCounters,
@@ -354,6 +366,11 @@ struct InFlight {
     launch_time: Duration,
     /// KV copies at launch: the step's drift exclusion ([`CopyMark::overlapped`]).
     copies: CopyMark,
+    /// The running stage total at its plan and right after its launch returned, and its own
+    /// device wait: its window in the scheduler document ([`EngineLoop::close_window`]).
+    at_plan: IterationStages,
+    at_launch: IterationStages,
+    waited: Duration,
     /// The full blocks the iteration writes (Phase 4), held (one pool reference each) from its
     /// ahead completion until it is collected: committed on success, then released.
     commits: Vec<KvCommit>,
@@ -414,6 +431,8 @@ impl EngineLoop {
             shutting_down: false,
             idle_turn: false,
             stages: StageClock::start(),
+            stages_done: IterationStages::default(),
+            last_window: None,
             graph_counters: GraphCounters::default(),
             overlap,
             in_flight: None,
@@ -1065,7 +1084,12 @@ impl EngineLoop {
             if self.idle_turn {
                 std::thread::sleep(IDLE_POLL);
             }
-            self.stages = StageClock::start();
+            // Under overlap scheduling an iteration's window spans the gap between turns, so
+            // the clock `publish` restarted keeps running across it (no time is lost);
+            // nothing is in flight after an idle turn.
+            if !self.overlap || self.idle_turn {
+                self.stages = StageClock::start();
+            }
         }
         self.take_commands();
         true
@@ -2214,6 +2238,8 @@ impl EngineLoop {
             self.pool.incref(*block);
         }
         self.sched.complete(&mut self.pool, outcome);
+        self.stages.mark(Stage::Complete);
+        self.close_window(&prev);
         // The tail copies of the completed iteration ran: their sources go back.
         for id in std::mem::take(&mut self.tail_done) {
             self.kv.tail_copied(&mut self.pool, id);
@@ -2246,6 +2272,8 @@ impl EngineLoop {
         self.detect_disconnects();
         self.expire_deadlines();
         let ended = std::mem::take(&mut self.ended_since_turn);
+        // The checks above close the time before the completion (the iteration windows).
+        self.stages.mark(Stage::Schedule);
         if let Some(prev) = self.in_flight.take() {
             let forced = prev.launched && prev.rows.iter().any(|r| r.forced.is_some());
             if forced || ended || self.sched.has_unstarted_admitted() {
@@ -2275,6 +2303,9 @@ impl EngineLoop {
         }
         let limits = self.read_snapshot()?;
         self.kv_before_plan();
+        // The plan's window starts here, as its scheduler clock does.
+        self.stages.mark(Stage::Schedule);
+        let at_plan = self.stages_total();
         let plan = self.sched.plan(&mut self.pool, &limits);
         self.kv.after_plan(&mut self.pool);
         self.note_table_blocks(&plan);
@@ -2306,7 +2337,7 @@ impl EngineLoop {
         }
         self.idle_turn = false;
         self.iteration_requests = plan_requests(&plan, &self.seqs);
-        let next = self.launch_next(plan, &mut prev)?;
+        let next = self.launch_next(plan, at_plan, &mut prev)?;
         if let Some(p) = prev {
             self.finish(p)?;
         }
@@ -2368,6 +2399,7 @@ impl EngineLoop {
     fn launch_next(
         &mut self,
         plan: IterationPlan,
+        at_plan: IterationStages,
         prev: &mut Option<InFlight>,
     ) -> Result<Option<InFlight>, String> {
         let requests = plan_requests(&plan, &self.seqs);
@@ -2380,6 +2412,9 @@ impl EngineLoop {
             phase: ForwardPhase::Decode,
             launch_time: Duration::ZERO,
             copies: self.kv.copy_mark(),
+            at_launch: at_plan.clone(),
+            at_plan,
+            waited: Duration::ZERO,
             commits: Vec::new(),
             publishes: Vec::new(),
         };
@@ -2442,6 +2477,7 @@ impl EngineLoop {
         next.launch_time = launch_time;
         self.record_graph_counters();
         self.stages.mark(Stage::Launch);
+        next.at_launch = self.stages_total();
         if let Err(e) = launched {
             let error =
                 IterationError::model(&format!("{} forward pass failed", next.phase.as_str()), e);
@@ -2496,6 +2532,7 @@ impl EngineLoop {
         if let Some(p) = prev.take() {
             self.finish(p)?;
         }
+        let next_at_plan = next.at_plan;
         let mut plan = next.plan;
         let started = Instant::now();
         let copies = self.kv.copy_mark();
@@ -2505,6 +2542,11 @@ impl EngineLoop {
             .extend(std::mem::take(&mut self.late_finished));
         let failed = outcome.failed.is_some();
         self.sched.complete(&mut self.pool, outcome);
+        self.stages.mark(Stage::Complete);
+        // Run serially: no device time hidden behind other host work.
+        let mut last = self.sched.last_iteration().clone();
+        last.stages_ms = stages_ms(&self.stages_total().since(&next_at_plan));
+        self.last_window = Some(last);
         if !failed {
             self.observe(&plan, started.elapsed().as_secs_f64(), copies);
         }
@@ -2680,10 +2722,35 @@ impl EngineLoop {
         // Only `p` was launched since the last completion: its tail copies ran.
         let tail_requests = std::mem::take(&mut self.tail_done);
         self.sched.complete(&mut self.pool, outcome);
+        self.stages.mark(Stage::Complete);
+        self.close_window(&p);
         for id in tail_requests {
             self.kv.tail_copied(&mut self.pool, id);
         }
         Ok(())
+    }
+
+    /// The running stage total: every closed turn's stages and this turn's marks so far.
+    fn stages_total(&self) -> IterationStages {
+        self.stages_done.plus(&self.stages.so_far())
+    }
+
+    /// Overlap scheduling: the iteration `p` was just completed in the scheduler (after a
+    /// `Complete` mark); the scheduler document reports it with the stages of its window —
+    /// from its plan to now, as the scheduler's `duration_ms` — and, as `overlap_ms`, the part
+    /// of the window after its launch returned that was not its own device wait: its forward
+    /// pass ran on the device while the host worked (user decision 2026-10-07 2 B).
+    fn close_window(&mut self, p: &InFlight) {
+        let now = self.stages_total();
+        let mut last = self.sched.last_iteration().clone();
+        last.stages_ms = stages_ms(&now.since(&p.at_plan));
+        last.overlap_ms = if p.launched {
+            let after_launch = now.since(&p.at_launch).total();
+            after_launch.saturating_sub(p.waited).as_secs_f64() * 1000.0
+        } else {
+            0.0
+        };
+        self.last_window = Some(last);
     }
 
     /// [`EngineLoop::finish`]'s device wait and host work; true when the iteration succeeded.
@@ -2702,6 +2769,7 @@ impl EngineLoop {
         let collected = self.exec.collect();
         let waited = started.elapsed();
         self.stages.mark(Stage::DeviceWait);
+        p.waited = waited;
         self.metrics
             .model
             .observe_forward(p.phase, (p.launch_time + waited).as_secs_f64());
@@ -3119,11 +3187,13 @@ impl EngineLoop {
         if executed {
             self.metrics.server.observe_stages(&stages);
         }
-        scheduler.last_iteration.stages_ms = stages
-            .to_ms_map()
-            .into_iter()
-            .map(|(stage, ms)| (stage.to_string(), ms))
-            .collect();
+        self.stages_done = self.stages_done.plus(&stages);
+        match &self.last_window {
+            // Overlap scheduling: the last completed iteration over its own window (two
+            // turns), not this turn's stages, whose plan completes next turn.
+            Some(last) if self.overlap => scheduler.last_iteration = last.clone(),
+            _ => scheduler.last_iteration.stages_ms = stages_ms(&stages),
+        }
         self.shared.publish(EngineDocs {
             scheduler,
             kv,
@@ -3259,6 +3329,15 @@ impl IterationError {
 /// generated (the data-parallel router's load measure, P5 S-7).
 fn outstanding(prompt_len: u32, n: u32, max_tokens: u32, generated: u64) -> u64 {
     (u64::from(prompt_len) + u64::from(n.max(1)) * u64::from(max_tokens)).saturating_sub(generated)
+}
+
+/// The scheduler document's `stages_ms` of `stages`.
+fn stages_ms(stages: &IterationStages) -> std::collections::BTreeMap<String, f64> {
+    stages
+        .to_ms_map()
+        .into_iter()
+        .map(|(stage, ms)| (stage.to_string(), ms))
+        .collect()
 }
 
 /// Distinct requests of the plan's items and forks, in plan order.

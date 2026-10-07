@@ -1,5 +1,7 @@
 //! The engine iteration's stage breakdown (P2c S-1): [`StageClock`] partitions one turn of the
 //! engine loop into the eight [`Stage`]s, so their durations sum to the iteration's duration.
+//! Under overlap scheduling an iteration spans two turns; its stages are the difference of two
+//! running totals ([`IterationStages::plus`], [`IterationStages::since`]).
 //! One `Instant::now()` per mark and no allocation per iteration.
 
 use std::collections::BTreeMap;
@@ -96,6 +98,12 @@ impl StageClock {
         self.carried += d;
     }
 
+    /// The stages marked so far, the clock still running (overlap scheduling's iteration
+    /// windows, which span two turns: [`IterationStages::since`]).
+    pub fn so_far(&self) -> IterationStages {
+        IterationStages(self.stages)
+    }
+
     /// The stages marked so far; time after the last mark is not counted.
     pub fn finish(self) -> IterationStages {
         IterationStages(self.stages)
@@ -109,6 +117,23 @@ pub struct IterationStages(pub [Duration; 8]);
 impl IterationStages {
     pub fn get(&self, stage: Stage) -> Duration {
         self.0[stage.index()]
+    }
+
+    /// Stage by stage, `self` plus `other` (a running total over turns).
+    pub fn plus(&self, other: &IterationStages) -> IterationStages {
+        IterationStages(std::array::from_fn(|i| self.0[i] + other.0[i]))
+    }
+
+    /// Stage by stage, the time marked since the running total `earlier` was read.
+    pub fn since(&self, earlier: &IterationStages) -> IterationStages {
+        IterationStages(std::array::from_fn(|i| {
+            self.0[i].saturating_sub(earlier.0[i])
+        }))
+    }
+
+    /// Every stage's time together.
+    pub fn total(&self) -> Duration {
+        self.0.iter().sum()
     }
 
     /// Milliseconds per stage name (the `stages_ms` document field).
@@ -148,5 +173,20 @@ mod tests {
         want.sort_unstable();
         assert_eq!(keys, want);
         assert_eq!(map["launch"], 1.0);
+    }
+
+    /// A window read from two running totals has the stages marked between the reads and
+    /// sums to their total; breaks if `since` or `plus` mixes up stages.
+    #[test]
+    fn running_totals_give_a_window() {
+        let ms = Duration::from_millis;
+        let mut before = IterationStages::default();
+        before.0[Stage::Schedule.index()] = ms(2);
+        let turn = IterationStages(std::array::from_fn(|i| ms(i as u64)));
+        let after = before.plus(&turn);
+        let window = after.since(&before);
+        assert_eq!(window, turn);
+        assert_eq!(window.total(), ms(28));
+        assert_eq!(before.since(&after), IterationStages::default());
     }
 }
