@@ -4198,3 +4198,14 @@ Disk follow-up (user, 2026-10-07): **the user creates** a 500 GB zvol and iSCSI 
 moves the Phase 6a checkpoints no default test reads (llama-3.1-8b and its MXFP4 variants; the Llama-3.2-3B awq /
 gptq / gptq-own / autoround-gptq / mxfp4-a4 variants) there. Active models stay on local disk; a Phase 7 checkpoint is
 downloaded locally while its family is active and moves to the iSCSI volume once the family closes.
+
+Phase 7 spec, second round (user, 2026-10-07):
+- gpt-oss Harmony — A) full Harmony (registered template + tool-call parser; analysis channel → `reasoning_content`,
+  tool calls → `tool_calls`, reasoning effort from the request; golden and GSM8K judged on the final channel);
+  B) final channel only, tools refused. **Decision: A.**
+- Hybrid prefix reuse — A) state snapshot at each full-block boundary stored with the block, restored with the KV on a
+  prefix hit, tiers L0–L2, partial-block reuse L0-only (the 5p rule); B) snapshots L0 only; C) no reuse for hybrids.
+  **Decision: A.**
+- No vLLM-ROCm baseline for a family — A) try a newer rocm/vllm tag, else the row needs golden + eval only and the
+  throughput is logged with the reason; B) llama.cpp HIP baseline at 0.75×; C) c1 ≥ 0.80× roofline. **Decision: A.**
+- Disk: the user created the iSCSI volume as **10 TB** (not 500 GB), 2026-10-07.
