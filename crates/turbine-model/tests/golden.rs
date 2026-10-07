@@ -628,6 +628,7 @@ struct Runner {
     kv: SequenceKv,
 }
 
+/// A traceable executor of a dense model (Llama or Qwen3) in `model_dir`.
 fn build_executor(
     model_dir: &Path,
     provider: Arc<dyn KernelProvider>,
@@ -636,8 +637,13 @@ fn build_executor(
 ) -> Runner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
-    let weights = WeightLoader::load(&index, &llama_slots(&cfg), &mem, MAX_STAGING_BYTES)
-        .expect("load weights");
+    let weights = WeightLoader::load(
+        &index,
+        &cfg.family.0.weight_slots(&cfg),
+        &mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load weights");
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
     let order = [provider.id()];
     let card = provider.card_profile();
@@ -650,9 +656,14 @@ fn build_executor(
     )
     .expect("every op has a provider");
     let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    let spec = match cfg.family.0.name() {
+        "llama" => families::llama::decoder_spec(),
+        "qwen3" => families::qwen3::decoder_spec(),
+        other => panic!("no traced decoder for family {other}"),
+    };
     let exec = DecoderExecutor::new(
         &cfg,
-        families::llama::decoder_spec(),
+        spec,
         weights,
         Arc::new(registry),
         mem,
@@ -866,6 +877,128 @@ fn hip_trace_vs_cpu_3b() {
             )
         );
     }
+}
+
+/// Largest BF16-ulp error a HIP per-head Q/K norm may add over its host recompute from the HIP
+/// trace's own input ([`LocalChecker`]: `bf(bf(x · rsqrt) · w)`): an f32 `rsqrt` computed in
+/// another summation order can flip the first BF16 rounding, which the second (the weight
+/// product) can carry one more ulp. Calibration (lab, R9700, p7-t10, p01 prefill + 2 decodes):
+/// 1 ulp on most layers, 2 on one element of 14,336 (layer 18 `k_norm`, |Δ| 4.9e-4).
+const QWEN3_QK_NORM_MAX_ULPS: f32 = 2.0;
+
+/// Lab only (P7 S-2; needs `TURBINE_TEST_QWEN3_MODEL_DIR` = Qwen3-4B-Instruct-2507, which the
+/// lab test Job sets to `/models/qwen3-4b-instruct-2507`): a no-op in a debug build (the
+/// cpu-reference executor on the 4B model is scalar; run it with `--release`). Prompt p01 of
+/// `tests/golden/prompts.jsonl` on the HIP and the cpu-reference providers, the prefill and 2
+/// decode steps teacher-forced with the cpu-reference's greedy tokens, traced. Prints the
+/// op-by-op HIP-vs-CPU table and every HIP op recomputed on the host from the HIP trace's own
+/// inputs; asserts the Phase 1 trace bounds where they are per-op: every HIP `q_norm` /
+/// `k_norm` (one `rmsnorm` over `[tokens · heads, head_dim]` rows) within
+/// [`QWEN3_QK_NORM_MAX_ULPS`] of its host recompute, and each step's top-5 logits in the
+/// cpu-reference's order. Breaks if the HIP per-head norm reads the wrong rows or is skipped,
+/// or the HIP path departs from the reference enough to reorder the likely tokens.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_QWEN3_MODEL_DIR, release"]
+fn hip_trace_vs_cpu_qwen3() {
+    let _gpu = gpu_model_lock();
+    const TRACE_DECODE: usize = 2;
+    if cfg!(debug_assertions) {
+        println!("hip_trace_vs_cpu_qwen3: debug build, nothing traced (run it with --release)");
+        return;
+    }
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_QWEN3_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let cfg = load_model_config(&model_dir).expect("config.json");
+    assert_eq!(
+        cfg.family.0.name(),
+        "qwen3",
+        "TURBINE_TEST_QWEN3_MODEL_DIR must hold a Qwen3 checkpoint"
+    );
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let p01 = prompts.iter().find(|p| p.id == "p01").expect("prompt p01");
+    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    let template = ChatTemplate::resolve(&model_dir, None).expect("chat template");
+    let ids = prompt_token_ids(&tokenizer, &template, p01);
+    let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let host = HostMemory::new(turbine_core::types::DeviceId(0), 16 << 30);
+    let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    cpu.exec.set_trace(true);
+    hip.exec.set_trace(true);
+    let weights = |name: &str| read_bf16_weight(&index, name);
+    let mut checker = LocalChecker::new(&cfg, &weights);
+    let (mut accumulated, mut local) = (Vec::new(), Vec::new());
+    let mut batch = ids;
+    let mut p0 = 0usize;
+    let top5 = |row: &[f32]| -> Vec<usize> {
+        let mut order: Vec<usize> = (0..row.len()).collect();
+        order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        order.truncate(5);
+        order
+    };
+    let mut reordered = Vec::new();
+    for step in 0..=TRACE_DECODE {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let mut rows = Vec::new();
+        for r in [&mut cpu, &mut hip] {
+            let logits =
+                r.kv.forward(&mut r.exec, &batch, &positions)
+                    .expect("forward");
+            rows.push(logits.row(0).to_vec());
+        }
+        let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
+        accumulated.extend(compare_traces(step, &c, &h));
+        local.extend(checker.check_step(step, p0, &h));
+        let (want, got) = (top5(&rows[0]), top5(&rows[1]));
+        if want != got {
+            reordered.push((step, want.clone(), got));
+        }
+        p0 += batch.len();
+        batch = vec![want[0] as u32];
+    }
+    println!(
+        "{}",
+        render(
+            "Qwen3-4B p01: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+    println!(
+        "{}",
+        render(
+            "Qwen3-4B p01: HIP op vs host recompute from its own inputs (local)",
+            &local
+        )
+    );
+    let norms: Vec<_> = local
+        .iter()
+        .filter(|r| r.name == "q_norm" || r.name == "k_norm")
+        .collect();
+    assert_eq!(
+        norms.len(),
+        2 * cfg.num_layers as usize * (TRACE_DECODE + 1),
+        "a q_norm and a k_norm per layer and step"
+    );
+    for r in norms {
+        assert!(
+            r.stats.max_ulps <= QWEN3_QK_NORM_MAX_ULPS,
+            "step {} layer {:?} {}: {} BF16 ulps from the host recompute ({:?})",
+            r.step,
+            r.layer,
+            r.name,
+            r.stats.max_ulps,
+            r.stats
+        );
+    }
+    assert!(
+        reordered.is_empty(),
+        "top-5 logits order differs from the cpu-reference (step, cpu, hip): {reordered:?}"
+    );
 }
 
 // ------------------------------------------------------------------------------- OLMoE

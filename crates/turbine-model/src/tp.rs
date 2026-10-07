@@ -89,7 +89,7 @@ fn refuse(cfg: &ModelArchConfig, s: ShardSpec, why: String) -> ModelError {
         format!("{} ({} {why})", s.world, cfg.family.0.name()),
         "a size dividing the attention heads, the KV heads (or a multiple of them), the \
          intermediate size and every expert's, for a family with tensor-parallel hooks (llama, \
-         olmoe)",
+         olmoe, qwen3)",
     )
 }
 

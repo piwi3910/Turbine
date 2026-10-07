@@ -44,14 +44,16 @@ use turbine_model::kv_scales::{KvCache, TqKv};
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
-    TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
-    write_tiny_olmoe_with_head_dim, write_tiny_quantized,
+    TinyOptions, TinySpec, write_tiny_family_with_head_dim, write_tiny_llama,
+    write_tiny_llama_with, write_tiny_olmoe, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
 };
-use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
+use turbine_model::testing::trace::{
+    DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
+};
 use turbine_model::tp;
 use turbine_model::{
     EpContext, MAX_STAGING_BYTES, ModelError, PpContext, SafetensorsIndex, TpContext, WeightLoader,
-    llama_slots, olmoe_slots,
+    olmoe_slots,
 };
 use turbine_observability::MetricsRegistry;
 use turbine_tensor::host::HostMemory;
@@ -142,9 +144,9 @@ const ALL_FUSED: ExecutorOptions = ExecutorOptions {
     fused_projections: true,
 };
 
-/// The tiny Llama's executor on `provider`, its kernel registry built for `card`. When `card`
-/// orders paged decode attention, checks that the registry bound the first implementation it
-/// lists.
+/// The tiny checkpoint's executor (its family's slots and [`decoder_spec`]) on `provider`, its
+/// kernel registry built for `card`. When `card` orders paged decode attention, checks that the
+/// registry bound the first implementation it lists.
 fn paged_executor_on(
     spec: &TinySpec,
     provider: Arc<dyn KernelProvider>,
@@ -156,7 +158,7 @@ fn paged_executor_on(
     let weights = WeightLoader::load_format(
         cfg.weight_format.get(),
         &index,
-        &llama_slots(cfg),
+        &cfg.family.0.weight_slots(cfg),
         &mem,
         MAX_STAGING_BYTES,
     )
@@ -191,7 +193,7 @@ fn paged_executor_on(
     }
     DecoderExecutor::new(
         cfg,
-        families::llama::decoder_spec(),
+        decoder_spec(cfg),
         weights,
         Arc::new(registry),
         mem,
@@ -3614,6 +3616,106 @@ fn hip_trace_vs_cpu() {
     );
 }
 
+/// Largest BF16-ulp error a HIP per-head Q/K norm may add over the host recompute from the same
+/// input ([`LocalChecker`]: `bf(bf(x · rsqrt) · w)`): the f32 sum of squares runs in another
+/// order, which can move `rsqrt` by an f32 ulp and so flip the first BF16 rounding, which the
+/// weight product can carry one more ulp (measured: 1 on the tiny model, 2 on Qwen3-4B,
+/// `golden hip_trace_vs_cpu_qwen3`).
+const HIP_QK_NORM_MAX_ULPS: f32 = 2.0;
+
+/// Max |Δ logit| of the tiny Qwen3 greedy leg of [`hip_trace_vs_cpu_qwen3_tiny`] (default b1
+/// decode against the cpu-reference in the card's class, as [`HIP_B1_MAX_ABS_LOGIT_DIFF`]).
+/// Calibration (lab, R9700, p7-t10): one `k_norm` element of the prefill rounds to the other
+/// BF16 neighbour (1 ulp, the local check above: HIP's `rsqrt` from another summation order),
+/// the flip enters the KV cache at step 0 rather than step 7 as on Llama, and the 32 steps sit
+/// at 0.039-0.1285 with identical greedy tokens. 0.16 is ~1.25× the measured 0.1285; the
+/// identical greedy tokens and the per-op norm bound stay the sharp checks.
+const HIP_QWEN3_MAX_ABS_LOGIT_DIFF: f32 = 0.16;
+
+/// Lab only (P7 S-2): the head_dim-128 tiny Qwen3 (per-head Q/K norm, the `qk_norm_per_head` hook: one
+/// `rmsnorm` over `[tokens · heads, head_dim]` rows of Q and of K before RoPE) on the HIP
+/// provider against the cpu-reference in the card's class, op by op for the prefill and 3 decode
+/// steps (both tables printed): every HIP `q_norm` / `k_norm` is within
+/// [`HIP_QK_NORM_MAX_ULPS`] of its host recompute from the HIP trace's own inputs; then 32
+/// greedy tokens identical and every step's logits within [`HIP_QWEN3_MAX_ABS_LOGIT_DIFF`] with
+/// decode graphs on. Breaks if the per-head rows reach the HIP norm with the wrong shape or
+/// stride (a norm over the whole projection, or heads of another token), or the norm is skipped.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_trace_vs_cpu_qwen3_tiny() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let ctx = hip_context();
+    let tmp = TempDir::new("tiny-model-hip-qwen3");
+    let spec = write_tiny_family_with_head_dim(tmp.path(), "qwen3", SEED, GPU_HEAD_DIM);
+    assert!(
+        spec.config.qk_norm_per_head,
+        "the tiny Qwen3 norms per head"
+    );
+    let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
+    let mut cpu = hip_reference_executor(&spec, &ctx);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = executor(&spec, shim_provider(ctx.clone()), mem.clone());
+    let (traces, starts) = traced_run(&mut [&mut cpu, &mut hip], &prompt(spec.vocab), 3);
+
+    let mut accumulated = Vec::new();
+    for (step, (c, h)) in traces[0].iter().zip(&traces[1]).enumerate() {
+        accumulated.extend(compare_traces(step, c, h));
+    }
+    println!(
+        "{}",
+        render(
+            "tiny Qwen3 hd128: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+    let weights = |name: &str| read_bf16_weight(&index, name);
+    let mut checker = LocalChecker::new(&spec.config, &weights);
+    let mut local = Vec::new();
+    for (step, trace) in traces[1].iter().enumerate() {
+        local.extend(checker.check_step(step, starts[step], trace));
+    }
+    println!(
+        "{}",
+        render(
+            "tiny Qwen3 hd128: HIP op vs host recompute from its own inputs (local)",
+            &local
+        )
+    );
+    let norms: Vec<&DiffRow> = local
+        .iter()
+        .filter(|r| r.name == "q_norm" || r.name == "k_norm")
+        .collect();
+    assert_eq!(
+        norms.len(),
+        2 * spec.config.num_layers as usize * starts.len(),
+        "a q_norm and a k_norm per layer and step"
+    );
+    for r in norms {
+        assert!(
+            r.stats.max_ulps <= HIP_QK_NORM_MAX_ULPS,
+            "step {} layer {:?} {}: {} BF16 ulps from the host recompute ({:?})",
+            r.step,
+            r.layer,
+            r.name,
+            r.stats.max_ulps,
+            r.stats
+        );
+    }
+
+    let mut cpu = hip_reference_executor(&spec, &ctx);
+    let mut hip = executor(&spec, shim_provider(ctx.clone()), mem);
+    hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
+    assert_greedy_run(
+        "hip_trace_vs_cpu_qwen3_tiny",
+        &hip,
+        run,
+        HIP_QWEN3_MAX_ABS_LOGIT_DIFF,
+    );
+}
+
 /// The reduction `logits_reduce` defines for `row`: top-n by value (ties to the lower id),
 /// log-sum-exp and the id-order inverse-CDF draw, sums in f64 in id order.
 fn expected_reduction(row: &[f32], r: &RowReduce) -> ReducedRow {
@@ -4218,6 +4320,7 @@ fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
     match cfg.family.0.name() {
         "llama" => families::llama::decoder_spec(),
         "olmoe" => families::olmoe::decoder_spec(),
+        "qwen3" => families::qwen3::decoder_spec(),
         other => panic!("no tiny decoder spec for family {other}"),
     }
 }
@@ -4945,6 +5048,50 @@ fn tp2_matches_tp1_on_host() {
             );
         }
     }
+}
+
+/// P7 S-2: every registered family with tensor-parallel hooks (`tp_decoder_spec` some), on its
+/// own tiny checkpoint and the cpu-reference provider, split over 2 ranks on the host
+/// collective gives one device's greedy tokens exactly and top-5 logprobs within the strict
+/// golden bounds, with every rank's logits bitwise equal (a group of one bitwise one device);
+/// Qwen3 (per-head Q/K norm, its `[head_dim]` norm weights replicated on every rank) must be
+/// among the families run. Breaks if a family's tensor-parallel hooks shard or replicate a
+/// tensor wrongly, or if Qwen3 loses its `tp_decoder_spec`.
+#[test]
+fn tp2_matches_tp1_on_host_every_tp_family() {
+    let tmp = TempDir::new("tiny-model-tp-families");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let mut ran = Vec::new();
+    for family in families::registry().iter() {
+        let name = family.name();
+        if family.tp_decoder_spec().is_none() {
+            continue;
+        }
+        let spec = family.write_tiny(&tmp.path().join(name), SEED);
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut one = cpu_model(&spec, &host, 64);
+        let layout = spec.config.kv_layout(BLOCK_TOKENS);
+        let storage = pool(&host, &layout, 4);
+        let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+        for world in [1u32, 2] {
+            let ranks = tp_group(&spec, world, |rank| {
+                let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+                (mem, cpu_reference_provider())
+            });
+            let what = format!("{name} tp {world}");
+            let bound = if world == 1 { TpBound::Bitwise } else { golden };
+            let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+            println!(
+                "tp2_matches_tp1_on_host_every_tp_family {what}: worst top-k |Δ logprob| / \
+                 golden bound {worst:.3}"
+            );
+        }
+        ran.push(name);
+    }
+    assert!(
+        ran.contains(&"qwen3"),
+        "Qwen3 has no tp_decoder_spec (ran: {ran:?})"
+    );
 }
 
 /// Phase 6a S-12: quantized dense layers under tensor parallelism on the CPU provider — each

@@ -184,7 +184,8 @@ pub enum AttnProbs {
     Bf16Unnormalised,
 }
 
-/// Recomputes each op of a Llama trace from the trace's own inputs.
+/// Recomputes each op of a Llama or Qwen3 (per-head Q/K norm) trace from the trace's own
+/// inputs.
 pub struct LocalChecker<'a> {
     cfg: &'a ModelArchConfig,
     /// Weight tensor values by checkpoint name (widened to f32).
@@ -348,6 +349,26 @@ impl<'a> LocalChecker<'a> {
             push(l, "q", &bf_linear(attn_norm, "self_attn.q_proj", hidden), q);
             push(l, "k", &bf_linear(attn_norm, "self_attn.k_proj", hidden), k);
             push(l, "v", &bf_linear(attn_norm, "self_attn.v_proj", hidden), v);
+            // Qwen3: RMSNorm over each `head_dim` slice of Q and K, in place before RoPE.
+            let (q, k) = if cfg.qk_norm_per_head {
+                let q_norm = &get(l, "q_norm").data;
+                let k_norm = &get(l, "k_norm").data;
+                push(
+                    l,
+                    "q_norm",
+                    &self.rmsnorm(q, &w("self_attn.q_norm")),
+                    q_norm,
+                );
+                push(
+                    l,
+                    "k_norm",
+                    &self.rmsnorm(k, &w("self_attn.k_norm")),
+                    k_norm,
+                );
+                (q_norm, k_norm)
+            } else {
+                (q, k)
+            };
             let q_rope = &get(l, "q_rope").data;
             let k_rope = &get(l, "k_rope").data;
             push(

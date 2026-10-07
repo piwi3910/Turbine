@@ -292,12 +292,29 @@ pub const TINY_PHASE8_FAMILIES: [&str; 4] = ["qwen3", "qwen3_moe", "mistral", "m
 ///
 /// Same files and determinism as [`write_tiny_llama_with`]. Panics for another family.
 pub fn write_tiny_family(dir: &Path, family: &str, seed: u64) -> TinySpec {
+    write_tiny_family_with_head_dim(dir, family, seed, 16)
+}
+
+/// [`write_tiny_family`] with heads of dimension `head_dim` (the explicit `config.json`
+/// `head_dim`; hidden stays 64): GPU executor tests use 128, the only head_dim the HIP
+/// attention supports.
+pub fn write_tiny_family_with_head_dim(
+    dir: &Path,
+    family: &str,
+    seed: u64,
+    head_dim: u32,
+) -> TinySpec {
     let opts = TinyOptions {
         tied: family == "qwen3",
         template_with_tools: false,
+        head_dim,
         ..TinyOptions::default()
     };
-    write_tiny(dir, seed, &family_config_json(family), &opts)
+    let mut config = family_config_json(family);
+    if head_dim != 16 {
+        config["head_dim"] = json!(head_dim);
+    }
+    write_tiny(dir, seed, &config, &opts)
 }
 
 /// `config.json` of [`write_tiny_family`].

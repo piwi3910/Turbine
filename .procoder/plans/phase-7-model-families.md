@@ -235,7 +235,7 @@ Files: `crates/turbine-model/src/executor/decoder/hooks/` (the `QK_NORM_PER_HEAD
 Interfaces:
 
 - `Qwen3::tp_decoder_spec() -> Some(DecoderSpec { hooks: [QK_NORM_PER_HEAD, SWIGLU], .. })` — heads and KV heads split by `turbine_distributed::tp` (32/8 over 2 ranks), per-head norm weights replicated
-- Lab test `golden hip_trace_vs_cpu_qwen3` (needs `TURBINE_TEST_MODEL_DIR=/models/qwen3-4b-instruct-2507`): HIP vs CPU per-op trace on prompt p01 within the Phase 1 trace bounds
+- Lab test `golden hip_trace_vs_cpu_qwen3` (needs `TURBINE_TEST_QWEN3_MODEL_DIR`, which `scripts/lab/novanas-test-job.yaml` sets to `/models/qwen3-4b-instruct-2507` beside `TURBINE_TEST_MOE_MODEL_DIR` — `lab-test.sh` passes no environment through; a no-op in a debug build, run with `--release`): HIP vs CPU per-op trace on prompt p01 within the Phase 1 trace bounds (per op: HIP `q_norm`/`k_norm` within 2 BF16 ulps (two roundings) of the host recompute from their own inputs; top-5 logits order equal each step)
   Covers: S-2 (code)
   Depends on: Task 2
 
@@ -243,7 +243,7 @@ Interfaces:
 - [ ] Implement `Qwen3::tp_decoder_spec` — run, expect PASS.
 - [ ] Write the lab test `tiny_model hip_trace_vs_cpu_qwen3_tiny` (the tiny Qwen3 checkpoint, HIP vs CPU per op, `#[ignore]`) and `golden hip_trace_vs_cpu_qwen3`; implement the HIP path of the hook.
 - [ ] Lab (ask the user first; the download is a new lab class): `scripts/fetch-checkpoint.sh novanas qwen3-4b-instruct-2507` — expect `fetch: qwen3-4b-instruct-2507 cdbee75f… ok`
-- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model -- hip_trace_vs_cpu_qwen3_tiny --include-ignored` — expect exit 0; then `TURBINE_TEST_MODEL_DIR=/models/qwen3-4b-instruct-2507 scripts/lab-test.sh novanas -- -p turbine-model --test golden -- hip_trace_vs_cpu_qwen3 --include-ignored` — expect exit 0
+- [ ] Lab: `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-test.sh novanas -- -p turbine-model --test tiny_model -- hip_trace_vs_cpu_qwen3_tiny --include-ignored` — expect exit 0; then `scripts/lab-test.sh novanas -- --release -p turbine-model --test golden -- hip_trace_vs_cpu_qwen3` — expect exit 0
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `feat(model): Qwen3 on HIP (per-head QK-norm) and tensor parallel`
 
