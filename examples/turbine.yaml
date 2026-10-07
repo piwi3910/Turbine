@@ -174,9 +174,10 @@ execution:
   sampler_threads: 4
   # Launch each engine iteration before the host work (sampling, detokenisation, events) of the
   # previous one, its decodes taking their tokens on the device. Ignored when the kernel library
-  # lacks host staging (ABI v2.3) or device_sampling is off. Off by default: on novanas it
-  # measured no faster and raised OLMoE's median time to first token.
-  overlap_scheduling: false
+  # lacks host staging (ABI v2.3) or device_sampling is off, and under a tensor- or
+  # expert-parallel group. On by default (user decision 2026-10-07 A): on novanas it measured
+  # +1.2 % (Llama) / +3.6 % (OLMoE) tok/s at 16 concurrent requests, TTFT p50 unchanged.
+  overlap_scheduling: true
 parallel:
   # Phase 5 multi-GPU plan, validated before the port is bound (exit 2). Integer or auto:
   # tensor parallelism 1..8 (a power of two dividing the attention heads), data parallelism 1..64.
