@@ -178,6 +178,9 @@ const LONG_TOKENS: u32 = 1500;
 /// `server` keys for tests whose streams must stay paused longer than the default 30 s
 /// `server.slow_client_timeout` might allow on a loaded host.
 const HOLD_PAUSED: &str = "  slow_client_timeout: 10m\n";
+/// `execution` keys of a test that needs the serial engine loop (overlap scheduling is on by
+/// default).
+const SERIAL: &str = "  overlap_scheduling: false\n";
 /// KV blocks of the 16 MiB test pool (the default 128-token page, 32 KiB per tiny block).
 const POOL_BLOCKS: u64 = 512;
 
@@ -2725,8 +2728,20 @@ fn response_format_json_schema() {
 fn jump_forward_matches_token_by_token() {
     // The tool-call prompt (the tools rendered into the chat template) is past the tiny
     // checkpoint's 512 positions, so both servers patch them to the long horizon.
-    let on = TinyServer::start_long("");
-    let off = TinyServer::start_long("structured_output:\n  jump_forward: false\n");
+    // Serial loop on both servers (`execution.overlap_scheduling` is on by default since user
+    // decision 2026-10-07 A): this test counts the jump-forward's accepted tokens, which the
+    // serial path takes; the overlapped path is `engine::r#loop`'s
+    // `jump_forward_overlap_matches_serial`.
+    let long = |extra| {
+        TinyServer::launch(&Setup {
+            execution_extra: SERIAL,
+            extra,
+            max_positions: Some(LONG_POSITIONS),
+            ..Setup::default()
+        })
+    };
+    let on = long("");
+    let off = long("structured_output:\n  jump_forward: false\n");
     let schema_format = json!({"type": "json_schema",
         "json_schema": {"name": "small", "schema": small_schema()}});
     let named = json!({"type": "function", "function": {"name": "get_weather"}});
@@ -3337,7 +3352,13 @@ const STAGES: [&str; 8] = [
 /// the scheduler document's `last_iteration.stages_ms` partitions its `duration_ms`.
 #[test]
 fn iteration_stage_breakdown() {
-    let server = TinyServer::start("");
+    // Serial loop: the eight stages partition one iteration's `duration_ms` only when the
+    // iterations run one at a time (`execution.overlap_scheduling` is on by default since user
+    // decision 2026-10-07 A; under it a launch ahead splits an iteration across two turns).
+    let server = TinyServer::launch(&Setup {
+        execution_extra: SERIAL,
+        ..Setup::default()
+    });
     let handles: Vec<_> = (0..8)
         .map(|i| {
             let (addr, model) = (server.addr, server.model.clone());
@@ -3392,7 +3413,7 @@ fn iteration_stage_breakdown() {
     );
 }
 
-/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true and false (the default)
+/// P2c overlap scheduling end to end: `execution.overlap_scheduling` true (the default) and false
 /// give every request of a concurrent mix the same completion — greedy with and without
 /// logprobs, a stop string, EOS honoured, a seeded draw, `n` = 2, a JSON schema — and the server
 /// logs whether overlap scheduling is on (`overlap_scheduling`, `enabled`). Breaks if the key is

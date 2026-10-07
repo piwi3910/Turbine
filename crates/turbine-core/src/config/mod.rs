@@ -407,8 +407,10 @@ pub struct ExecutionConfig {
     pub sampler_threads: u32,
     /// Launch each engine iteration before the host work of the previous one, its decodes
     /// taking their tokens on the device (false: one iteration at a time). Needs a kernel
-    /// library with host staging (ABI v2.3) and device sampling; otherwise ignored. Off by
-    /// default: it measured no faster on novanas and delayed OLMoE's first tokens.
+    /// library with host staging (ABI v2.3) and device sampling; otherwise ignored, as it is
+    /// under a tensor- or expert-parallel group. On by default (user decision 2026-10-07 A):
+    /// with the P5p S-3 rules it measured +1.2 % (Llama) / +3.6 % (OLMoE) tok/s at c16 on
+    /// novanas with TTFT p50 unchanged.
     pub overlap_scheduling: bool,
 }
 
@@ -424,7 +426,7 @@ impl Default for ExecutionConfig {
             device_sampling: true,
             fused_ops: true,
             sampler_threads: 4,
-            overlap_scheduling: false,
+            overlap_scheduling: true,
         }
     }
 }

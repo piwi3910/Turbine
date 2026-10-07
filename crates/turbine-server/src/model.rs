@@ -834,7 +834,10 @@ fn prepare_with(
         && config.execution.overlap_scheduling
         && position.is_some_and(|s| s.rank == 0)
     {
-        tracing::warn!(
+        // INFO, not WARN: the key is on by default (user decision 2026-10-07 A), so every
+        // tensor- or expert-parallel start lands here; like the engine's own `overlap_scheduling`
+        // INFO (P2c S-16), an ignored switch is reported, not warned about.
+        tracing::info!(
             event = "overlap_scheduling_unavailable",
             reason = group_reason,
             "execution.overlap_scheduling is on but a tensor- or expert-parallel group runs \

@@ -124,7 +124,7 @@ Files: (only if Task 3 recorded a c1 host share > 0.05) `crates/turbine-server/s
 Interfaces:
 
 - `Scheduler::has_unstarted_admitted(&self) -> bool` — an admitted request whose prefill has not started exists (read before launching ahead)
-- `execution.overlap_scheduling` default `false` → `true` only when the A/B passes
+- `execution.overlap_scheduling` default `false` → `true` only when the A/B passes (flipped 2026-10-07, user decision "5p overlap: serial turn after a finish — new S-3 rule" A)
   Covers: S-3 AC (conditional)
   Depends on: Task 3
 
@@ -134,7 +134,7 @@ Interfaces:
 - [x] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests && scripts/remote-cargo.sh test -p turbine-server --test tiny_server overlap_scheduling_matches_serial` — expect PASS
 - [x] Lab A/B (GPU 0): `scripts/lab-bench.sh --model <llama|olmoe> [--concurrency 1 --quick] -- --set execution.overlap_scheduling=<true|false>` for both models at c1 and c16 — flip the default only if tok/s rises and TTFT p50 ≤ 1.10 × the serial run for both models; record all eight lines — Llama only (job scope), 4 lines in the perf log; c16 TTFT p50 1.70× → default stays `false`; OLMoE and the follow-up open (decisions "5p Task 4: overlap scheduling A/B")
 - [x] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [x] Commit: `perf(server): overlap scheduling waits for new prefills` (plus `feat(core): overlap scheduling on by default` only if the A/B passed)
+- [x] Commit: `perf(server): overlap scheduling waits for new prefills` (plus `feat(core): overlap scheduling on by default` only if the A/B passed) — after the follow-up rule (serial turn after a finish) the A/B passed: `feat(config): execution.overlap_scheduling defaults to true (user decision 2026-10-07 A)`
 
 ## Task 5: Phase 5p configuration keys
 
