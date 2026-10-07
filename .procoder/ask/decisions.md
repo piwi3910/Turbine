@@ -4076,3 +4076,22 @@ rows); the unsliced kernel's edge is its second B stage, which the sliced kernel
 
 - two B stages + A exceed 256 VGPRs). Two-wave splits free registers but double the block's weight loads (+4 to
   +32 %). The ~100 µs/layer stays as the price of bitwise MoE tiers; c16 TTFT is at target (128.7 ms).
+
+## 5p overlap: serial turn after a finish — new S-3 rule (2026-10-07)
+
+From decision "5p Task 4" B (branch `p5p-overlap2`, commits a9f7779a, 4a03d787, 36edc3bc; perf log 5p "S-3: overlap
+completes serially the turn after a request ended"). Cause of the c16 TTFT: under overlap a closed-loop client's
+next request, sent on the final event, missed the plan already made for the next iteration and waited one more; at
+c16 the waves then bunched up behind the prefill budget. The fix is a new S-3 line: **the turn after a request ended
+completes the iteration in flight serially** (then takes the channel and plans, as the serial loop does). Bit-exact:
+`tiny_server overlap_scheduling_matches_serial`, the `engine::r#loop` tests and the new
+`overlap_admits_resubmissions_in_the_next_plan` pass; gate ok (182 passed). A/B, one build, GPU 0, one session,
+off → on: Llama c1 (quick) 87.6 → 88.3 tok/s, TTFT p50 53.7 → 53.5, p95 54.1 → 54.2; Llama c16 855.3 → 865.7 tok/s
+(+1.2 %), TTFT p50 206.1 → 205.6 (**1.00×**), p95 360 → 384 (1.07×); OLMoE c16 615.4 → 637.4 tok/s (+3.6 %),
+TTFT p50 128.2 → 127.9 (**1.00×**), p95 258 → 210 (0.82×); golden c1/c16 PASS on every leg. Before the rule:
+TTFT p50 1.83× (Llama) / 1.69× (OLMoE).
+
+- A) Approve the rule and flip `execution.overlap_scheduling` default to `true` — the user's bar (TTFT p50 ≤ 1.10×
+  of off on both models) is met.
+- B) Approve the rule, keep the default `false` (overlap opt-in; +0.8–3.6 % tok/s left on the table).
+- C) Reject the rule (overlap stays as before: c16 TTFT p50 1.7–1.8×, default `false`).

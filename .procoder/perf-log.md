@@ -1819,6 +1819,31 @@ only 18, most wait 16–256 ms, i.e. several iterations), not the first token's 
 admission-gate queueing. Its cause is not yet found (the new rule makes each such turn serial, so the hold is in
 `plan`'s admission, not a launch-ahead). Default stays `false` (S-3 rule).
 
+### S-3: overlap completes serially the turn after a request ended (branch `p5p-overlap2`, commit 36edc3bc, 2026-10-07)
+
+Decision "5p Task 4" B found the c16 queue wait: under overlap, a closed-loop client's next request (sent on the
+final event of iteration N) reached the channel after N+1 was already planned, so it waited a whole further
+iteration; at c16 the request waves then bunched up behind the 2048-token prefill budget (finishes of two
+iterations arriving together, 1–2 requests left queued per wave). Fixes: a9f7779a takes the channel again after a
+serial device wait; 36edc3bc adds the rule "the turn after a request ended completes the iteration in flight
+serially" (host test `overlap_admits_resubmissions_in_the_next_plan`, red without it); 4a03d787 makes a serial
+completion of a failed launch carry its iteration (the rule hung `overlap_failed_steps_fail_their_requests_only`:
+the scheduler never matched an iteration-0 completion). A/B on one build, novanas GPU 0, one session (2026-10-07
+15:19–16:02), `scripts/lab-bench.sh … -- --set execution.overlap_scheduling=<false|true>`:
+
+| Model | Arm | conc | tok/s | ITL p50 ms | TTFT p50 ms | TTFT p95 ms | host_share | golden c1 / c16 |
+| ----- | --- | ---- | ----- | ---------- | ----------- | ----------- | ---------- | --------------- |
+| Llama BF16 | serial (`false`) | 1 (quick, 64 req) | 87.6 | 11.24 | 53.7 | 54.1 | 0.0050 | PASS / – |
+| Llama BF16 | overlap (`true`) | 1 (quick, 64 req) | **88.3 (+0.8 %)** | 11.16 | 53.5 (1.00×) | 54.2 | 0.0052 | PASS / – |
+| Llama BF16 | serial (`false`) | 16 (200 req) | 855.3 | 15.44 | 206.1 | 360.2 | 0.0203 | PASS / PASS |
+| Llama BF16 | overlap (`true`) | 16 (200 req) | **865.7 (+1.2 %)** | 15.26 | **205.6 (1.00×)** | 383.8 (1.07×) | 0.0233 | PASS / PASS |
+| OLMoE BF16 | serial (`false`) | 16 (200 req) | 615.4 | 24.09 | 128.2 | 257.7 | 0.0129 | PASS / PASS |
+| OLMoE BF16 | overlap (`true`) | 16 (200 req) | **637.4 (+3.6 %)** | 23.21 | **127.9 (1.00×)** | 210.4 (0.82×) | 0.0133 | PASS / PASS |
+
+Before the rule (commit a9f7779a, same recipe): Llama c16 TTFT p50 376 (1.83×), OLMoE 216 (1.69×). With it, TTFT p50
+is within 1.10× on both models and the throughput gain stays. Default unchanged (`false`) pending the decision
+"5p overlap: serial turn after a finish — new S-3 rule".
+
 ### OLMoE O2: sliced prefill gate-up back at k step 128 (branch `p5p-o2`, user decision 2026-10-06 O2)
 
 `PrefillGateUpSliced` = `Stream<1, 8, 4, 1, 128, BRing>`: one B register stage instead of two, each 16-k fragment reloaded with the next step's right after its WMMAs (same loads, same WMMA chain, same slice-summed order). Compiled ISA (gfx1201, `-Rpass-analysis=kernel-resource-usage`): 255 VGPRs, 0 spilled, occupancy 5 (two stages at k 128: 112 spilled; k 64: occupancy 6). `moe_rows_are_batch_invariant` and `olmoe_rows_are_batch_invariant`: 0 differing; every `moe_prefill_timings` output bitwise equal to `wmma`.
