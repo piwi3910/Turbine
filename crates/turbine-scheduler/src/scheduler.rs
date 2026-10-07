@@ -366,9 +366,18 @@ pub struct LastIteration {
     pub requests: u32,
     pub duration_ms: f64,
     /// Milliseconds of the iteration per engine stage (P2c S-1: `schedule`, `prepare`,
-    /// `launch`, `device_wait`, `sample`, `detokenize`, `emit`, `complete`). The scheduler
-    /// leaves it empty; the engine fills it in the document it publishes.
+    /// `launch`, `device_wait`, `sample`, `detokenize`, `emit`, `complete`); they sum to
+    /// `duration_ms`. The scheduler leaves it empty; the engine fills it in the document it
+    /// publishes. Under overlap scheduling the iteration's window (its plan to its completion)
+    /// spans two engine turns, and its stages are the host's time over that window — which
+    /// includes waiting for and finishing the iteration before it.
     pub stages_ms: BTreeMap<String, f64>,
+    /// Milliseconds of `duration_ms` after the iteration's launch returned during which its
+    /// forward pass was in flight on the device while the host was in other stages (the
+    /// previous iteration's wait and host work, the next plan: the device time overlap
+    /// scheduling hides; user decision 2026-10-07 2 B). A part of
+    /// `duration_ms`, already counted in `stages_ms`; 0 on the serial loop. The engine fills it.
+    pub overlap_ms: f64,
 }
 
 struct ReqEntry {
@@ -1277,6 +1286,7 @@ impl Scheduler {
             requests: plan.items.len() as u32,
             duration_ms: 0.0,
             stages_ms: BTreeMap::new(),
+            overlap_ms: 0.0,
         };
         self.in_flight.insert(
             plan.iteration,
@@ -1329,6 +1339,12 @@ impl Scheduler {
             self.params.max_batch_tokens
         };
         (seqs, tokens)
+    }
+
+    /// The snapshot's `last_iteration` (no stages): right after [`Scheduler::complete`], the
+    /// iteration it completed, `duration_ms` included (a `plan` replaces it).
+    pub fn last_iteration(&self) -> &LastIteration {
+        &self.last
     }
 
     /// Apply an executed plan: prefill completion, appended tokens, finished sequences, or

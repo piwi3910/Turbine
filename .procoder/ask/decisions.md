@@ -4142,3 +4142,12 @@ one-ahead extension item makes `build_batch` wait for that sample (`NeedsHost`) 
 pending-run guard. A draft the in-flight token contradicts (a non-canonical split) only rolls back. Tests:
 `jump_forward_overlap_matches_serial` requires steps and accepted tokens on each loop; `jump_forward_matches_token_by_token`
 runs under the default (overlap) — 14 jump steps there vs 16 serial (a one-token run is taken by the in-flight decode).
+As built (2 B, 3 A; branch `p5p-stage-acct`, 61831c73 and the lab-config commit): under overlap the scheduler
+document's `last_iteration` is the last completed iteration over its own window (plan to completion, two engine
+turns; the difference of two running stage totals), so `stages_ms` sums to `duration_ms`; the new
+`last_iteration.overlap_ms` is the part of the window after its launch returned that was not its own device wait
+(0 on the serial loop, whose numbers are unchanged). The `turbine_engine_iteration_seconds{stage}` histograms (and
+`turbine-bench stage-share`) stay per turn; under overlap `host_share` is the engine thread's host-work share, an
+upper bound on GPU idle. `tiny_server iteration_stage_breakdown` runs on the default overlap again, with a
+`_serial` leg. `scripts/lab/phase2c-novanas-{llama,olmoe}.yaml` set `overlap_scheduling: true` (earlier perf-log
+numbers from them are serial).

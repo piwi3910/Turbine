@@ -3349,14 +3349,27 @@ const STAGES: [&str; 8] = [
 ];
 
 /// P2c S-1: every iteration is timed in eight stages; `/metrics` has a histogram per stage and
-/// the scheduler document's `last_iteration.stages_ms` partitions its `duration_ms`.
+/// the scheduler document's `last_iteration.stages_ms` partitions its `duration_ms` — under
+/// overlap scheduling (the default) too, where the iteration's window spans two engine turns
+/// and `overlap_ms` is the part of it its forward pass ran behind host work (user decision
+/// 2026-10-07 2 B). Breaks if a stage is missing or double-counted, if the overlap document
+/// reports one turn's stages against another iteration's duration, or if `overlap_ms` leaves
+/// the window.
 #[test]
 fn iteration_stage_breakdown() {
-    // Serial loop: the eight stages partition one iteration's `duration_ms` only when the
-    // iterations run one at a time (`execution.overlap_scheduling` is on by default since user
-    // decision 2026-10-07 A; under it a launch ahead splits an iteration across two turns).
+    stage_breakdown("", true);
+}
+
+/// [`iteration_stage_breakdown`] on the serial loop: the stages partition the iteration and
+/// `overlap_ms` is 0.
+#[test]
+fn iteration_stage_breakdown_serial() {
+    stage_breakdown(SERIAL, false);
+}
+
+fn stage_breakdown(execution_extra: &str, overlap: bool) {
     let server = TinyServer::launch(&Setup {
-        execution_extra: SERIAL,
+        execution_extra,
         ..Setup::default()
     });
     let handles: Vec<_> = (0..8)
@@ -3407,10 +3420,24 @@ fn iteration_stage_breakdown() {
     }
     let duration = last["duration_ms"].as_f64().unwrap();
     assert!(duration > 0.0, "{doc}");
+    let tolerance = (0.05 * duration).max(0.5);
     assert!(
-        (sum - duration).abs() <= (0.05 * duration).max(0.5),
+        (sum - duration).abs() <= tolerance,
         "stages sum to {sum} ms, the iteration took {duration} ms: {doc}"
     );
+    let overlapped = last["overlap_ms"].as_f64().expect("overlap_ms");
+    if overlap {
+        assert!(
+            (0.0..=duration + tolerance).contains(&overlapped),
+            "overlap_ms {overlapped} outside the {duration} ms window: {doc}"
+        );
+        assert!(
+            last["requests"].as_u64().unwrap() > 0,
+            "an executed iteration: {doc}"
+        );
+    } else {
+        assert_eq!(overlapped, 0.0, "{doc}");
+    }
 }
 
 /// P2c overlap scheduling end to end: `execution.overlap_scheduling` true (the default) and false
