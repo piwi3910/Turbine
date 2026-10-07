@@ -14,13 +14,25 @@ pub struct BudgetTerms {
     pub workspace: u64,
     pub emergency_reserve: u64,
     pub available: u64,
+    /// The model's per-sequence state ([`turbine_core::types::StateLayout::bytes_per_sequence`],
+    /// P7 S-1); 0 for attention-only families.
+    pub state_bytes_per_sequence: u64,
+    /// `scheduler.max_running_requests`: each running sequence holds one state.
+    pub max_running_requests: u32,
 }
 
 impl BudgetTerms {
+    /// The state of every running sequence: `max_running_requests × state_bytes_per_sequence`
+    /// (saturating).
+    pub fn state_reservation(&self) -> u64 {
+        u64::from(self.max_running_requests).saturating_mul(self.state_bytes_per_sequence)
+    }
+
     /// Everything the model needs (saturating: an overflow can never fit).
     pub fn required(&self) -> u64 {
         self.weights
             .saturating_add(self.kv_reservation)
+            .saturating_add(self.state_reservation())
             .saturating_add(self.workspace)
             .saturating_add(self.emergency_reserve)
     }
@@ -42,10 +54,12 @@ pub fn available_bytes(kind: MemoryKind, device_free: u64, host_mem_available: O
 pub fn check_budget(terms: &BudgetTerms) -> Result<(), ModelError> {
     let required = terms.required();
     let fits = required <= terms.available;
+    let state = terms.state_reservation();
     tracing::info!(
         event = "memory_budget",
         weights = terms.weights,
         kv_reservation = terms.kv_reservation,
+        state_reservation = state,
         workspace = terms.workspace,
         emergency_reserve = terms.emergency_reserve,
         required,
@@ -55,9 +69,18 @@ pub fn check_budget(terms: &BudgetTerms) -> Result<(), ModelError> {
     if fits {
         return Ok(());
     }
+    // The state term is named only when the model keeps state (the P1 message is unchanged).
+    let state = if state == 0 {
+        String::new()
+    } else {
+        format!(
+            " + state {} × {} B",
+            terms.max_running_requests, terms.state_bytes_per_sequence
+        )
+    };
     Err(ModelError::Budget(format!(
-        "weights {} B + kv_reservation {} B + workspace {} B + emergency_reserve {} B = {required} \
-         B > available {} B",
+        "weights {} B + kv_reservation {} B{state} + workspace {} B + emergency_reserve {} B = \
+         {required} B > available {} B",
         terms.weights,
         terms.kv_reservation,
         terms.workspace,
@@ -73,7 +96,7 @@ pub use turbine_device::host_mem_available;
 mod tests {
     use std::sync::Arc;
 
-    use turbine_core::types::{DeviceId, MemoryKind};
+    use turbine_core::types::{DeviceId, MemoryKind, StateDtype, StateLayout};
     use turbine_tensor::DeviceMemory;
     use turbine_tensor::host::HostMemory;
 
@@ -106,6 +129,8 @@ mod tests {
             workspace: MIB,
             emergency_reserve: MIB,
             available: 1024,
+            state_bytes_per_sequence: spec.config.state.bytes_per_sequence(),
+            max_running_requests: 4,
         };
         let err = check_budget(&terms).expect_err("budget must be refused");
         let text = err.to_string();
@@ -135,6 +160,56 @@ mod tests {
             ..terms
         };
         check_budget(&fits).unwrap();
+    }
+
+    /// A model with per-sequence state (P7 S-1) is charged `max_running_requests` states beside
+    /// its KV: KV + state for 4 running sequences over the budget is refused, naming the term.
+    #[test]
+    fn charges_state_per_running_sequence() {
+        let state = StateLayout {
+            linear_layers: 3,
+            recurrent_bytes_per_layer: 1 << 20,
+            conv_bytes_per_layer: 4096,
+            dtype: Some(StateDtype::F32),
+        };
+        let per_seq = state.bytes_per_sequence();
+        assert_eq!(per_seq, 3 * (MIB + 4096));
+        let terms = BudgetTerms {
+            weights: 64 * MIB,
+            kv_reservation: 16 * MIB,
+            workspace: MIB,
+            emergency_reserve: MIB,
+            available: 0,
+            state_bytes_per_sequence: per_seq,
+            max_running_requests: 4,
+        };
+        let without_state = 64 * MIB + 16 * MIB + MIB + MIB;
+        assert_eq!(terms.state_reservation(), 4 * per_seq);
+        assert_eq!(terms.required(), without_state + 4 * per_seq);
+
+        // Room for the weights, KV and three states: refused.
+        let short = BudgetTerms {
+            available: without_state + 3 * per_seq,
+            ..terms
+        };
+        match check_budget(&short) {
+            Err(ModelError::Budget(msg)) => {
+                assert!(msg.contains(&format!("+ state 4 × {per_seq} B")), "{msg}")
+            }
+            other => panic!("expected Budget, got {other:?}"),
+        }
+        // The same terms without state fit.
+        check_budget(&BudgetTerms {
+            state_bytes_per_sequence: 0,
+            ..short
+        })
+        .unwrap();
+        // Room for all four states fits.
+        check_budget(&BudgetTerms {
+            available: terms.required(),
+            ..terms
+        })
+        .unwrap();
     }
 
     #[test]

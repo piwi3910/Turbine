@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use turbine_core::registry::{Module, Registry};
+use turbine_core::types::StateLayout;
 use turbine_kernels::{KernelRegistry, OpRequirement};
 use turbine_tensor::DeviceMemory;
 
@@ -84,6 +85,26 @@ pub trait ModelFamily: Module {
     /// suite ([`crate::conformance::families_suite`]) runs on the CPU provider. A test
     /// utility: panics on I/O errors.
     fn write_tiny(&self, dir: &Path, seed: u64) -> TinySpec;
+    /// One kind per layer of `cfg` (P7 S-1). The default: every layer full attention.
+    fn layer_kinds(&self, cfg: &ModelArchConfig) -> Vec<LayerKind> {
+        vec![LayerKind::FullAttention; cfg.num_layers as usize]
+    }
+    /// The per-sequence state `cfg` keeps beside its paged KV (P7 S-1). The default: none.
+    fn state_layout(&self, cfg: &ModelArchConfig) -> StateLayout {
+        let _ = cfg;
+        StateLayout::default()
+    }
+}
+
+/// How one decoder layer mixes tokens (P7 S-1): full causal attention, attention over the last
+/// `window` positions, or a linear-attention (recurrent) layer with per-sequence state and no
+/// paged KV.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum LayerKind {
+    FullAttention,
+    SlidingWindow { window: u32 },
+    LinearAttention,
 }
 
 impl std::fmt::Debug for dyn ModelFamily {
@@ -211,19 +232,21 @@ fn family_for(name: &str) -> Result<Option<&'static dyn ModelFamily>, ModelError
 }
 
 /// The family of a parsed top-level `config.json` and the object its text-model keys are read
-/// from: `architectures[0]` of the top level (the object is the top level), else of a wrapper's
-/// `text_config` (the object is `text_config`). No registered family, or two claiming the name,
+/// from: `architectures[0]` of the top level, else of a wrapper's `text_config`; the object is
+/// `text_config` whenever the top level has one (P7 S-1), else the top level. No registered
+/// family, or two claiming the name,
 /// is [`ModelError::Unsupported`] naming the top-level `architectures` and the registered
 /// families.
 pub fn resolve(
     top: &serde_json::Value,
 ) -> Result<(&'static dyn ModelFamily, &serde_json::Value), ModelError> {
+    let text_config = top.get("text_config").filter(|t| t.is_object());
     if let Some(name) = single_architecture(top)
         && let Some(family) = family_for(name)?
     {
-        return Ok((family, top));
+        return Ok((family, text_config.unwrap_or(top)));
     }
-    if let Some(text) = top.get("text_config").filter(|t| t.is_object())
+    if let Some(text) = text_config
         && let Some(name) = single_architecture(text)
         && let Some(family) = family_for(name)?
     {
@@ -321,6 +344,114 @@ mod tests {
             err.starts_with("unsupported architectures = <missing>;"),
             "{err}"
         );
+    }
+
+    /// The layer kinds and per-sequence state of a raw `config.json`, derived independently of
+    /// the families: `layer_types` when present, else `full_attention_interval` (every n-th layer
+    /// full, the rest linear), else one window (`sliding_window`, unless `use_sliding_window` is
+    /// false) or full attention for every layer. Families without linear layers carry no state.
+    fn expected_kinds_and_state(
+        family: &str,
+        config: &serde_json::Value,
+    ) -> (Vec<LayerKind>, StateLayout) {
+        let text = config
+            .get("text_config")
+            .filter(|t| t.is_object())
+            .unwrap_or(config);
+        let layers = text["num_hidden_layers"].as_u64().unwrap() as usize;
+        let window = text
+            .get("sliding_window")
+            .and_then(|w| w.as_u64())
+            .filter(|_| text.get("use_sliding_window") != Some(&json!(false)))
+            .map(|w| w as u32);
+        let kinds: Vec<LayerKind> = if let Some(types) = text["layer_types"].as_array() {
+            types
+                .iter()
+                .map(|t| match t.as_str().unwrap() {
+                    "full_attention" => LayerKind::FullAttention,
+                    "sliding_attention" => LayerKind::SlidingWindow {
+                        window: window.expect("sliding_attention needs sliding_window"),
+                    },
+                    "linear_attention" => LayerKind::LinearAttention,
+                    other => panic!("{family}: unknown layer type {other}"),
+                })
+                .collect()
+        } else if let Some(n) = text["full_attention_interval"].as_u64() {
+            (0..layers)
+                .map(|i| {
+                    if (i as u64 + 1).is_multiple_of(n) {
+                        LayerKind::FullAttention
+                    } else {
+                        LayerKind::LinearAttention
+                    }
+                })
+                .collect()
+        } else if let Some(window) = window {
+            vec![LayerKind::SlidingWindow { window }; layers]
+        } else {
+            vec![LayerKind::FullAttention; layers]
+        };
+        let linear = kinds
+            .iter()
+            .filter(|k| **k == LayerKind::LinearAttention)
+            .count();
+        assert_eq!(
+            linear, 0,
+            "{family}: derive the linear-attention state bytes here when such a family registers"
+        );
+        (kinds, StateLayout::default())
+    }
+
+    #[test]
+    fn layer_kinds_and_state_layout() {
+        let tmp = TempDir::new("families-layer-kinds");
+        for family in registry().iter() {
+            let dir = tmp.path().join(family.name());
+            let spec = family.write_tiny(&dir, 7);
+            let cfg = crate::config::load_model_config(&dir).unwrap();
+            assert_eq!(cfg, spec.config, "{}", family.name());
+            let expect = expected_kinds_and_state(family.name(), &config_json(&dir));
+            assert_eq!(cfg.layer_kinds, expect.0, "{}", family.name());
+            assert_eq!(cfg.state, expect.1, "{}", family.name());
+            assert_eq!(
+                cfg.kv_layout(128).num_layers,
+                cfg.attention_layers(),
+                "{}",
+                family.name()
+            );
+            let mut next = 0;
+            for layer in 0..cfg.num_layers {
+                let slot = cfg.kv_layer_index(layer);
+                if cfg.layer_kinds[layer as usize] == LayerKind::LinearAttention {
+                    assert_eq!(slot, None, "{} layer {layer}", family.name());
+                } else {
+                    assert_eq!(slot, Some(next), "{} layer {layer}", family.name());
+                    next += 1;
+                }
+            }
+        }
+
+        // A `text_config`-wrapped copy of the tiny Qwen3 config (`architectures` stays at the
+        // top level) parses to the same `ModelArchConfig`.
+        let dir = tmp.path().join("qwen3");
+        let plain = crate::config::load_model_config(&dir).unwrap();
+        let mut text = config_json(&dir);
+        let architectures = text
+            .as_object_mut()
+            .unwrap()
+            .remove("architectures")
+            .unwrap();
+        let wrapped = json!({
+            "architectures": architectures,
+            "model_type": "qwen3_wrapper",
+            "text_config": text,
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&wrapped).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(crate::config::load_model_config(&dir).unwrap(), plain);
     }
 
     /// One line per slot: name, shape and, for a slice of a stacked parameter, the stack's name,

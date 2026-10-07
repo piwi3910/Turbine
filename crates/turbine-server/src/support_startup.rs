@@ -40,9 +40,13 @@ pub fn read_architecture(model_dir: &Path) -> Option<String> {
             .as_str()
             .map(str::to_string)
     };
-    // A wrapper checkpoint names its text model in `text_config`: the registry resolved it there.
-    if let Ok((_, obj)) = turbine_model::families::resolve(&top) {
-        return first(obj);
+    // A wrapper checkpoint names its text model in `text_config`: the registry resolved it there
+    // (a registered top-level name keeps the top level's, P7 S-1).
+    if let Ok((family, obj)) = turbine_model::families::resolve(&top) {
+        return [&top, obj]
+            .into_iter()
+            .filter_map(first)
+            .find(|name| family.hf_architectures().contains(&name.as_str()));
     }
     first(&top)
 }
