@@ -4192,3 +4192,9 @@ no Phase 7 checkpoints present; per-family candidates and kernel providers).
 
 **Decision (user, 2026-10-07): 1 A, 2 A, 3 A, 5 A, 6 all four.** 4: none of the options — "add an iSCSI volume
 from our TrueNAS and offload older, no longer needed models there" (details below).
+
+Disk follow-up (user, 2026-10-07): **the user creates** a 500 GB zvol and iSCSI target/extent on the TrueNAS
+(192.168.10.253); the lead sets up open-iscsi on novanas, formats it ext4, mounts it with a `_netdev` fstab entry and
+moves the Phase 6a checkpoints no default test reads (llama-3.1-8b and its MXFP4 variants; the Llama-3.2-3B awq /
+gptq / gptq-own / autoround-gptq / mxfp4-a4 variants) there. Active models stay on local disk; a Phase 7 checkpoint is
+downloaded locally while its family is active and moves to the iSCSI volume once the family closes.
