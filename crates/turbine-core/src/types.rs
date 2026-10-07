@@ -161,6 +161,50 @@ impl KvLayout {
     }
 }
 
+/// The element type of a per-sequence recurrent state (P7 S-1).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum StateDtype {
+    F32,
+    Bf16,
+}
+
+impl StateDtype {
+    /// Bytes of one element.
+    pub fn bytes(self) -> u64 {
+        match self {
+            StateDtype::F32 => 4,
+            StateDtype::Bf16 => 2,
+        }
+    }
+}
+
+/// The per-sequence state a model keeps beside its paged KV (P7 S-1): one recurrent and one
+/// convolution state per linear-attention layer. Families without linear layers have the
+/// default, empty layout. The scheduler and the KV crates see only this type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct StateLayout {
+    pub linear_layers: u32,
+    pub recurrent_bytes_per_layer: u64,
+    pub conv_bytes_per_layer: u64,
+    pub dtype: Option<StateDtype>,
+}
+
+impl StateLayout {
+    /// `linear_layers × (recurrent + conv)` bytes for one sequence, saturating at `u64::MAX`.
+    pub fn bytes_per_sequence(&self) -> u64 {
+        u64::from(self.linear_layers).saturating_mul(
+            self.recurrent_bytes_per_layer
+                .saturating_add(self.conv_bytes_per_layer),
+        )
+    }
+
+    /// True when a sequence keeps no state.
+    pub fn is_empty(&self) -> bool {
+        self.bytes_per_sequence() == 0
+    }
+}
+
 /// Model description consumed by budget and planners.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ModelShape {
@@ -226,6 +270,27 @@ pub enum PriorityClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_layout_bytes() {
+        assert!(StateLayout::default().is_empty());
+        assert_eq!(StateLayout::default().bytes_per_sequence(), 0);
+        let state = StateLayout {
+            linear_layers: 3,
+            recurrent_bytes_per_layer: 1 << 20,
+            conv_bytes_per_layer: 4096,
+            dtype: Some(StateDtype::F32),
+        };
+        assert_eq!(state.bytes_per_sequence(), 3 * ((1 << 20) + 4096));
+        assert!(!state.is_empty());
+        let huge = StateLayout {
+            linear_layers: u32::MAX,
+            recurrent_bytes_per_layer: u64::MAX,
+            ..state
+        };
+        assert_eq!(huge.bytes_per_sequence(), u64::MAX);
+        assert_eq!((StateDtype::F32.bytes(), StateDtype::Bf16.bytes()), (4, 2));
+    }
 
     #[test]
     fn dtype_codes_and_kv_layout_sizes() {

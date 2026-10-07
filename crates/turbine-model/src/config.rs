@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use turbine_core::types::{KvLayout, ModelShape};
+use turbine_core::types::{KvLayout, ModelShape, StateLayout};
 
 use crate::ModelError;
 use crate::executor::rope::yarn_attention_factor;
-use crate::families::{FamilyRef, resolve};
+use crate::families::{FamilyRef, LayerKind, resolve};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{WeightFormatRef, detect};
 
@@ -94,6 +94,12 @@ pub struct ModelArchConfig {
     /// How the paged KV pool stores K and V (`kv.dtype`, Phase 6a S-13): BF16 as parsed; the
     /// server sets FP8 and its per-layer scales before the executor is built.
     pub kv_cache: crate::kv_scales::KvCache,
+    /// One kind per layer ([`crate::families::ModelFamily::layer_kinds`], P7 S-1): only the
+    /// attention layers (every kind but `LinearAttention`) have a slot in the paged KV.
+    pub layer_kinds: Vec<LayerKind>,
+    /// The per-sequence state beside the paged KV
+    /// ([`crate::families::ModelFamily::state_layout`]); empty for every attention-only family.
+    pub state: StateLayout,
 }
 
 /// Per-layer mixture of experts: a router picks `experts_per_token` of `num_experts` SwiGLU
@@ -267,11 +273,33 @@ impl ModelArchConfig {
         canonical_json(&value)
     }
 
-    /// Per-token K and V of every layer in the [`ModelArchConfig::kv_cache`] dtype (BF16, or
-    /// FP8 e4m3 under `kv.dtype: fp8_e4m3`), in blocks of `block_tokens` tokens.
+    /// The layers with a slot in the paged KV: every layer kind but `LinearAttention`.
+    pub fn attention_layers(&self) -> u32 {
+        self.layer_kinds
+            .iter()
+            .filter(|k| **k != LayerKind::LinearAttention)
+            .count() as u32
+    }
+
+    /// The paged-KV slot of `layer`: its index among the attention layers; `None` for a
+    /// linear-attention layer (or a layer past the model's last).
+    pub fn kv_layer_index(&self, layer: u32) -> Option<u32> {
+        let kinds = self.layer_kinds.get(..=layer as usize)?;
+        let (last, before) = kinds.split_last()?;
+        (*last != LayerKind::LinearAttention).then(|| {
+            before
+                .iter()
+                .filter(|k| **k != LayerKind::LinearAttention)
+                .count() as u32
+        })
+    }
+
+    /// Per-token K and V of every attention layer ([`ModelArchConfig::attention_layers`]) in the
+    /// [`ModelArchConfig::kv_cache`] dtype (BF16, or FP8 e4m3 under `kv.dtype: fp8_e4m3`), in
+    /// blocks of `block_tokens` tokens.
     pub fn kv_layout(&self, block_tokens: u32) -> KvLayout {
         KvLayout {
-            num_layers: self.num_layers,
+            num_layers: self.attention_layers(),
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
             dtype: self.kv_cache.dtype,
@@ -459,10 +487,14 @@ pub fn load_model_config_with(
         detail,
     };
 
+    // `text` is `text_config` when the top level has one (P7 S-1); `architectures[0]` is the
+    // top level's when it names the family, else `text_config`'s.
     let (family, text) = resolve(&top)?;
-    let hf_architecture = text["architectures"][0]
-        .as_str()
-        .expect("resolve matched a string")
+    let hf_architecture = [&top, text]
+        .into_iter()
+        .filter_map(|v| v["architectures"][0].as_str())
+        .find(|name| family.hf_architectures().contains(name))
+        .expect("resolve matched a registered name")
         .to_string();
     let raw = RawConfig::deserialize(text).map_err(|e| invalid(format!("invalid JSON: {e}")))?;
     let weight_format = WeightFormatRef(detect(&top)?);
@@ -603,7 +635,7 @@ pub fn load_model_config_with(
     };
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
-    Ok(ModelArchConfig {
+    let mut cfg = ModelArchConfig {
         family: FamilyRef(family),
         hf_architecture,
         num_layers: raw.num_hidden_layers,
@@ -624,7 +656,20 @@ pub fn load_model_config_with(
         qk_norm_per_head: family_cfg.qk_norm_per_head,
         weight_format,
         kv_cache: crate::kv_scales::KvCache::bf16(),
-    })
+        layer_kinds: Vec::new(),
+        state: StateLayout::default(),
+    };
+    cfg.layer_kinds = family.layer_kinds(&cfg);
+    if cfg.layer_kinds.len() != cfg.num_layers as usize {
+        return Err(invalid(format!(
+            "family {} reports {} layer kinds for num_hidden_layers {}",
+            family.name(),
+            cfg.layer_kinds.len(),
+            cfg.num_layers
+        )));
+    }
+    cfg.state = family.state_layout(&cfg);
+    Ok(cfg)
 }
 
 /// transformers 5's `rope_parameters` split into its `rope_theta` and its scaling entry: the
