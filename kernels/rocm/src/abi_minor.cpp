@@ -20,7 +20,10 @@
 // every other decode path rotates first with the rope kernels). v2.13 adds no
 // symbol: turbine_hip_fp8_wmma takes BF16 activations with an FP8 act_quant on
 // small decode calls and quantizes them in the kernel (qgemm_fp8_wmma.hip;
-// turbine_qgemm_desc.act_static_scale).
+// turbine_qgemm_desc.act_static_scale). v2.14 adds no symbol: vllm_wvsplitk
+// takes the SwiGLU input of turbine_gemm_desc (a_silu_mul / a_up_offset) and
+// stages silu_mul(gate, up) as its activations (gemm_wvsplitk.hip); hipblaslt
+// refuses it.
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)

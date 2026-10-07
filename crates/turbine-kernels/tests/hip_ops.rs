@@ -408,6 +408,197 @@ fn gemv_matches_cpu() {
     }
 }
 
+/// Stage B of the fused batch-1 GEMV (kernel ABI v2.14): the GEMV's SwiGLU input — the down
+/// projection staging `silu_mul(gate, up)` from the gate/up row as it loads its activations —
+/// returns the bits of the `silu_mul` op into a buffer followed by the GEMV, on Llama-3.2-3B's
+/// down shape and a small one, on three runs; in a prefill step it falls back to `silu_mul` in
+/// place over the gate columns then hipBLASLt (bit-equal to the bound `hipblaslt` on the
+/// `silu_mul` output). Only single-row decode calls take the form; hipBLASLt never does. Breaks
+/// if the fused SiLU rounds differently from `elementwise.hip`'s (a numerics-class change), the
+/// up offset is misapplied, or the fallback or gating regresses.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_silu_mul_matches_unfused() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(53);
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let blaslt = bound_gemm(&p, "hipblaslt");
+    let gemm = gemv.hip.gemm().expect("hip gemm");
+    let silu = p.hip.activation().expect("hip silu_mul");
+    for (n, inter) in [(HIDDEN, INTERMEDIATE), (256, 1024)] {
+        let cfg = GemmConfig {
+            gemv: true,
+            ..gemm_config(n, inter, DType::BF16)
+        };
+        assert!(gemm.fuses_silu_mul(&cfg, 1, false), "n={n} k={inter}");
+        assert!(!gemm.fuses_silu_mul(&cfg, 1, true), "n={n} k={inter}");
+        assert!(!gemm.fuses_silu_mul(&cfg, 2, false), "n={n} k={inter}");
+        assert!(
+            !blaslt
+                .hip
+                .gemm()
+                .expect("hip gemm")
+                .fuses_silu_mul(&cfg, 1, false),
+            "n={n} k={inter}"
+        );
+        // Gate values over SiLU's whole curve (both tails, the knee), up of either sign.
+        let gate_up_vals = rng.normal(2 * inter, 3.0);
+        let w = on_hip(
+            &p,
+            &[n, inter],
+            DType::BF16,
+            &rng.normal(n * inter, 1.0 / (inter as f32).sqrt()),
+        );
+        let gate_up = on_hip(&p, &[1, 2 * inter], DType::BF16, &gate_up_vals);
+        let part = |t, off| row_part(t, off, inter);
+        let act = zeros_on_hip(&p, &[1, inter], DType::BF16);
+        silu.execute(&mut ActivationContext {
+            gate: part(&gate_up, 0),
+            up: part(&gate_up, inter),
+            out: act.view(),
+        })
+        .expect("silu_mul");
+        let fused = |gate_up: &Tensor, prefill: bool| {
+            let c = zeros_on_hip(&p, &[1, n], DType::BF16);
+            gemm.execute_silu_mul(
+                &mut GemmContext {
+                    prefill,
+                    ..decode_ctx(row_part(gate_up, 0, inter), &w, &c)
+                },
+                row_part(gate_up, inter, inter),
+            )
+            .expect("fused gemm");
+            read(&c).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        };
+        let want = gemm_row_bits(&gemv, &act, &w, DType::BF16, false);
+        for run in 0..3 {
+            assert!(
+                fused(&gate_up, false) == want,
+                "n={n} k={inter}: fused run {run} differs from silu_mul + GEMV"
+            );
+        }
+        // The prefill fallback overwrites the gate columns with the operand.
+        let scratch = on_hip(&p, &[1, 2 * inter], DType::BF16, &gate_up_vals);
+        let want_prefill = gemm_row_bits(&blaslt, &act, &w, DType::BF16, true);
+        assert!(
+            fused(&scratch, true) == want_prefill,
+            "n={n} k={inter}: the prefill fallback is not silu_mul + hipBLASLt"
+        );
+        assert_eq!(
+            read(&scratch)[..inter],
+            read(&act)[..],
+            "n={n} k={inter}: the fallback's gate columns are not silu_mul's output"
+        );
+        println!("gemv_silu_mul_matches_unfused n={n} k={inter}: ok");
+    }
+}
+
+/// Columns `off..off + k` of the one-row tensor `t` as `[1, k]`.
+fn row_part(t: &Tensor, off: usize, k: usize) -> TensorView<'_> {
+    TensorView::contiguous(t.storage.whole(), off, &[1, k], DType::BF16)
+}
+
+/// `c = a · bᵀ` of a decode step (alpha 1, beta 0).
+fn decode_ctx<'a>(a: TensorView<'a>, b: &'a Tensor, c: &'a Tensor) -> GemmContext<'a> {
+    GemmContext {
+        a,
+        b: b.view(),
+        c: c.view(),
+        trans_b: true,
+        alpha: 1.0,
+        beta: 0.0,
+        prefill: false,
+    }
+}
+
+/// Lab microbenchmark (stage B): Llama-3.2-3B's down projection with the SwiGLU input against
+/// `silu_mul` + the GEMV (two graph nodes), timed as `gemv_timings` times (one captured graph of
+/// ≥ 112 calls, weights cycled over ≥ 512 MB); prints µs per layer and asserts the fused call is
+/// not slower. Run with `scripts/lab-test.sh novanas -- --release -p turbine-kernels --test
+/// hip_ops -- gemv_silu_mul_timings --nocapture` (GPU 0 for comparable numbers).
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn gemv_silu_mul_timings() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(59);
+    const ITERS: u32 = 15;
+    const GRAPH_CALLS: usize = 112;
+    let (n, inter) = (HIDDEN, INTERMEDIATE);
+    let gemv = bound_gemm(&p, GEMV_IMPL);
+    let gemm = gemv.hip.gemm().expect("hip gemm");
+    let silu = p.hip.activation().expect("hip silu_mul");
+    let bytes = n * inter * 2;
+    let raw = encode(
+        DType::BF16,
+        &pattern(&mut rng, n * inter, 1.0 / (inter as f32).sqrt()),
+    );
+    let copies = (512usize << 20).div_ceil(bytes).max(2);
+    let ws: Vec<Tensor> = (0..copies)
+        .map(|_| raw_on_hip(&p, &[n, inter], DType::BF16, &raw))
+        .collect();
+    let gate_up = on_hip(
+        &p,
+        &[1, 2 * inter],
+        DType::BF16,
+        &pattern(&mut rng, 2 * inter, 3.0),
+    );
+    let part = |off| TensorView::contiguous(gate_up.storage.whole(), off, &[1, inter], DType::BF16);
+    let act = zeros_on_hip(&p, &[1, inter], DType::BF16);
+    let c = zeros_on_hip(&p, &[1, n], DType::BF16);
+    let unfused = |w: &Tensor| {
+        silu.execute(&mut ActivationContext {
+            gate: part(0),
+            up: part(inter),
+            out: act.view(),
+        })
+        .expect("silu_mul");
+        gemm.execute(&mut decode_ctx(act.view(), w, &c))
+            .expect("gemm");
+    };
+    let fused = |w: &Tensor| {
+        gemm.execute_silu_mul(&mut decode_ctx(part(0), w, &c), part(inter))
+            .expect("fused gemm");
+    };
+    let calls = copies.max(GRAPH_CALLS);
+    let mut us = [0.0f64; 2];
+    for (i, call) in [&unfused as &dyn Fn(&Tensor), &fused]
+        .into_iter()
+        .enumerate()
+    {
+        call(&ws[0]);
+        p.hip_mem.synchronize().expect("synchronize");
+        p.ctx.graph_begin().expect("graph begin");
+        for j in 0..calls {
+            call(&ws[j % copies]);
+        }
+        let graph = p.ctx.graph_end().expect("graph end");
+        us[i] = time_us(&p, ITERS, || {
+            p.ctx.graph_launch(&graph).expect("graph launch");
+        }) / calls as f64;
+    }
+    println!(
+        "gemv_silu_mul_timings down n={n} k={inter}: silu_mul+{GEMV_IMPL}={:.1} us  fused={:.1} us  \
+         saved={:.1} us/layer",
+        us[0],
+        us[1],
+        us[0] - us[1]
+    );
+    assert!(
+        us[1] <= us[0],
+        "the fused down ({:.1} us) is slower than silu_mul + GEMV ({:.1} us)",
+        us[1],
+        us[0]
+    );
+}
+
 /// Lab microbenchmark: the single-row GEMV against hipBLASLt (the bound implementations, a
 /// decode step) on every Llama-3.2-3B decode shape, each call one node of a captured graph of
 /// ≥ 112 calls (as the served decode graph runs them), weights cycled over ≥ 512 MB so they never
@@ -5915,6 +6106,7 @@ fn implementations_enumerated() {
         ("turbine_hip_mixed", "turbine_hip", false),
     ];
     let paged_decode = vec![
+        ("turbine_hip_b1_decode", "turbine_hip", false),
         ("ck_tile_fmha_splitkv", "ck", false),
         ("ck_tile_fmha_pagedkv", "ck", false),
         ("turbine_hip", "turbine_hip", false),

@@ -12,7 +12,10 @@
 // block per CU looping over weight rows) and the host helper mindiv. Changed
 // (Turbine, 2026-10-06): a trailing template parameter out_t types the output,
 // and the two output stores call turbine_store<out_t> (round to nearest even
-// for BF16, unrounded for F32: the LM head's logits); nothing else. The
+// for BF16, unrounded for F32: the LM head's logits); a trailing template
+// parameter GLU and argument UpOff make the LDS staging loop store
+// turbine_silu_mul_chunk(A[k..], A[k + UpOff..]) instead of A[k..] (the
+// SwiGLU input of kernel ABI v2.14, 5p GEMV stage B); nothing else. The
 // launcher below is Turbine's, written after vLLM's wvSplitK() host code for
 // N = 1 on gfx1x (not gfx1151): YTILE 1 / UNRL 4 when the rows fit one round
 // of 4 per CU, else YTILE 2 / UNRL 2; 16 waves of 32 lanes per block, one
@@ -50,7 +53,32 @@
 #include <string>
 #include <type_traits>
 
+#include "bf16.hpp"
 #include "turbine_hip.hpp"
+
+// Turbine: the SwiGLU input of one 8-element chunk, element by element exactly
+// as elementwise.hip's silu_mul kernels compute it (SiLU in F32, rounded to
+// BF16, times up in F32, rounded to BF16), so the staged operand equals the
+// silu_mul op's output bit for bit.
+template <typename chunk_t>
+__device__ __forceinline__ chunk_t turbine_silu_mul_chunk(const chunk_t &g,
+                                                          const chunk_t &u) {
+  using turbine_hip::Bf16;
+  chunk_t o;
+  constexpr int kElems = sizeof(o.h) / sizeof(o.h[0]);
+#pragma unroll
+  for (int i = 0; i < kElems; ++i) {
+    const float gf =
+        turbine_hip::bf16_to_f32(__builtin_bit_cast(Bf16, g.h[i]));
+    const float uf =
+        turbine_hip::bf16_to_f32(__builtin_bit_cast(Bf16, u.h[i]));
+    const float silu = gf / (1.0f + expf(-gf));
+    o.h[i] = __builtin_bit_cast(
+        __hip_bfloat16,
+        turbine_hip::f32_to_bf16(turbine_hip::round_bf16(silu) * uf));
+  }
+  return o;
+}
 
 // Turbine: the output conversion of the vendored kernel's stores.
 template <typename out_t>
@@ -132,13 +160,13 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, typename out_t>
+          int UNRL, int N, typename out_t, bool GLU>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap, const int M,
                      const int Bx, const int By, const scalar_t* B,
                      const scalar_t* __restrict__ A,
                      const scalar_t* __restrict__ BIAS, out_t* C,
-                     const int _WvPrGrp, const int CuCount) {
+                     const int _WvPrGrp, const int CuCount, const int UpOff) {
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
   constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
@@ -181,7 +209,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   #if defined(__gfx950__)
     __builtin_amdgcn_global_load_lds((int*)(&A[k]), (int*)(&s[k]), 16, 0, 0);
   #else
-    *((bigType*)(&s[k])) = *((bigType*)(&A[k]));
+    if constexpr (GLU)  // Turbine (stage B): the SwiGLU input
+      *((bigType*)(&s[k])) = turbine_silu_mul_chunk(
+          *((const bigType*)(&A[k])), *((const bigType*)(&A[k + UpOff])));
+    else
+      *((bigType*)(&s[k])) = *((bigType*)(&A[k]));
   #endif
   }
   __syncthreads();
@@ -354,13 +386,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 }
 #else
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, typename out_t>
+          int UNRL, int N, typename out_t, bool GLU>
 __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
                                  const int M, const int Bx, const int By,
                                  const scalar_t* B,
                                  const scalar_t* __restrict__ A,
                                  const scalar_t* __restrict__ BIAS, out_t* C,
-                                 const int _WvPrGrp, const int CuCount) {
+                                 const int _WvPrGrp, const int CuCount,
+                                 const int UpOff) {
   UNREACHABLE_CODE
 }
 #endif
@@ -409,37 +442,82 @@ bool kernel_shape(const turbine_gemm_desc *d) {
   return d->n * d->ldb < (int64_t{1} << 32);
 }
 
-template <typename out_t, int YTILE, int UNRL>
+template <typename out_t, bool GLU, int YTILE, int UNRL>
 void launch(turbine_ctx *ctx, const turbine_gemm_desc *d, int cu) {
   const int n = static_cast<int>(d->n);
   const int k = static_cast<int>(d->k);
   const int wv = mindiv(n, cu * YTILE, kWaves);
   // The kernel's arguments: K, the weight row stride, the activation row
   // stride (one row: k), M = weight rows, the bias dims, weights,
-  // activations, bias, out, waves per block in use, CUs.
+  // activations, bias, out, waves per block in use, CUs, the up columns'
+  // offset from the gate columns (GLU).
   wvSplitK_hf_sml_<__hip_bfloat16, kThreads, YTILE, kWaves, kChunk, UNRL, 1,
-                   out_t><<<dim3(cu), dim3(kThreads, kWaves), 0, ctx->stream>>>(
-      k, static_cast<int>(d->ldb), k, n, 1, 1,
-      static_cast<const __hip_bfloat16 *>(d->b),
-      static_cast<const __hip_bfloat16 *>(d->a), nullptr,
-      static_cast<out_t *>(d->c), wv, cu);
+                   out_t, GLU>
+      <<<dim3(cu), dim3(kThreads, kWaves), 0, ctx->stream>>>(
+          k, static_cast<int>(d->ldb), k, n, 1, 1,
+          static_cast<const __hip_bfloat16 *>(d->b),
+          static_cast<const __hip_bfloat16 *>(d->a), nullptr,
+          static_cast<out_t *>(d->c), wv, cu,
+          GLU ? static_cast<int>(d->a_up_offset) : 0);
 }
 
 // vLLM's gfx1x tile choice for one activation row.
-template <typename out_t>
+template <typename out_t, bool GLU>
 void launch_tiled(turbine_ctx *ctx, const turbine_gemm_desc *d, int cu) {
   const int64_t round_rows = int64_t{cu} * 4;
   if ((d->n + round_rows - 1) / round_rows <= 1)
-    launch<out_t, 1, 4>(ctx, d, cu);
+    launch<out_t, GLU, 1, 4>(ctx, d, cu);
   else
-    launch<out_t, 2, 2>(ctx, d, cu);
+    launch<out_t, GLU, 2, 2>(ctx, d, cu);
 }
 
 } // namespace
 
 bool gemm_wvsplitk_supports(const turbine_gemm_desc *d) {
-  return turbine_gemm_supported(d) == 1 && d->m == 1 && kernel_shape(d);
+  if (d == nullptr || d->a_silu_mul == 0)
+    return turbine_gemm_supported(d) == 1 && d->m == 1 && kernel_shape(d);
+  // The SwiGLU input (ABI v2.14): the plain call's shapes, alpha 1 and beta 0
+  // (the forms the kernel computes; hipblaslt serves its other fallbacks after
+  // an in-place silu_mul), and up columns whole 16-byte loads away from the
+  // gate columns, not overlapping them, within 32-bit offsets.
+  turbine_gemm_desc plain = *d;
+  plain.a_silu_mul = 0;
+  plain.a_up_offset = 0;
+  return gemm_wvsplitk_supports(&plain) && d->alpha == 1.0f &&
+         d->beta == 0.0f && d->a_up_offset % kChunk == 0 &&
+         (d->a_up_offset >= d->k || d->a_up_offset <= -d->k) &&
+         d->a_up_offset < (int64_t{1} << 31) - d->k &&
+         d->a_up_offset > -(int64_t{1} << 31);
 }
+
+namespace {
+
+// The SwiGLU input's fallback (a prefill step, an unaligned operand or a
+// non-wave32 device): silu_mul(gate, up) written over the gate columns of a,
+// then hipblaslt on them, bit for bit silu_mul into a buffer then
+// turbine_gemm.
+int32_t silu_mul_in_place_then_gemm(turbine_ctx *ctx,
+                                    const turbine_gemm_desc *d) {
+  turbine_silu_mul_desc s{};
+  s.gate = d->a;
+  s.up = static_cast<const __hip_bfloat16 *>(d->a) + d->a_up_offset;
+  s.out = const_cast<void *>(d->a);
+  s.rows = d->m;
+  s.cols = d->k;
+  s.gate_stride_row = d->lda;
+  s.up_stride_row = d->lda;
+  s.out_stride_row = d->lda;
+  s.dtype = d->a_dtype;
+  const int32_t rc = turbine_silu_mul(ctx, &s);
+  if (rc != TURBINE_OK)
+    return rc;
+  turbine_gemm_desc plain = *d;
+  plain.a_silu_mul = 0;
+  plain.a_up_offset = 0;
+  return turbine_gemm(ctx, &plain);
+}
+
+} // namespace
 
 int32_t gemm_wvsplitk_run(turbine_ctx *ctx, const turbine_gemm_desc *d) {
   if (ctx == nullptr)
@@ -447,9 +525,14 @@ int32_t gemm_wvsplitk_run(turbine_ctx *ctx, const turbine_gemm_desc *d) {
   if (!gemm_wvsplitk_supports(d))
     return fail(ctx, TURBINE_E_UNSUPPORTED,
                 "vllm_wvsplitk: unsupported gemm configuration");
+  const bool glu = d->a_silu_mul != 0;
+  const bool up_aligned =
+      !glu || aligned16(static_cast<const __hip_bfloat16 *>(d->a) +
+                        d->a_up_offset);
   if (ctx->gemm_prefill || d->alpha != 1.0f || d->beta != 0.0f ||
-      !aligned16(d->a) || !aligned16(d->b) || ctx->wave_size != kThreads)
-    return turbine_gemm(ctx, d);
+      !aligned16(d->a) || !up_aligned || !aligned16(d->b) ||
+      ctx->wave_size != kThreads)
+    return glu ? silu_mul_in_place_then_gemm(ctx, d) : turbine_gemm(ctx, d);
   if (ctx->cu_count == 0) {
     int cu = 0;
     const int32_t rc = check_hip(
@@ -461,10 +544,15 @@ int32_t gemm_wvsplitk_run(turbine_ctx *ctx, const turbine_gemm_desc *d) {
       return rc;
     ctx->cu_count = cu;
   }
-  if (d->c_dtype == TURBINE_DTYPE_F32)
-    launch_tiled<float>(ctx, d, ctx->cu_count);
+  const bool f32 = d->c_dtype == TURBINE_DTYPE_F32;
+  if (f32 && glu)
+    launch_tiled<float, true>(ctx, d, ctx->cu_count);
+  else if (f32)
+    launch_tiled<float, false>(ctx, d, ctx->cu_count);
+  else if (glu)
+    launch_tiled<__hip_bfloat16, true>(ctx, d, ctx->cu_count);
   else
-    launch_tiled<__hip_bfloat16>(ctx, d, ctx->cu_count);
+    launch_tiled<__hip_bfloat16, false>(ctx, d, ctx->cu_count);
   return check_hip(ctx, hipGetLastError(), "vllm_wvsplitk launch");
 }
 

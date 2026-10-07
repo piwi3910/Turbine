@@ -4069,3 +4069,10 @@ slice order in the gate-up kernel itself (diagnostic non-bitwise builds), not k 
   weight-traffic effect unmeasured), bitwise tiers kept
 
 **Decision (user, 2026-10-06): B.**
+
+**Result (2026-10-06, `p5p-moetile` 4bcb35d3):** no tile shape won; nothing landed. The residual is not the slice
+order: the unsliced chain on one B register stage times the same as the sliced kernel (2,783 vs 2,800 µs at 16,384
+rows); the unsliced kernel's edge is its second B stage, which the sliced kernel cannot hold (accumulators + totals
+
+- two B stages + A exceed 256 VGPRs). Two-wave splits free registers but double the block's weight loads (+4 to
+  +32 %). The ~100 µs/layer stays as the price of bitwise MoE tiers; c16 TTFT is at target (128.7 ms).

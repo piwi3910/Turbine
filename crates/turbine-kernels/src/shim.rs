@@ -1467,6 +1467,24 @@ fn gemm_probe(cfg: &GemmConfig, rows: Option<u32>) -> GemmDesc {
         c_dtype: cfg.c_dtype.abi_code(),
         alpha: 1.0,
         beta: 0.0,
+        a_up_offset: 0,
+        a_silu_mul: 0,
+    }
+}
+
+/// The ABI minor whose `turbine_gemm_desc` carries the SwiGLU input (`a_silu_mul`, v2.14).
+const GEMM_SILU_MUL_MINOR: u32 = 14;
+
+/// [`gemm_probe`] in the SwiGLU-input form (kernel ABI v2.14): `a` holds `[rows, 2·k]` gate then
+/// up columns, as the decoder's fused gate/up buffer does.
+fn gemm_silu_mul_probe(cfg: &GemmConfig, rows: usize) -> GemmDesc {
+    let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+    let d = gemm_probe(cfg, Some(rows));
+    GemmDesc {
+        lda: 2 * d.k,
+        a_up_offset: d.k,
+        a_silu_mul: 1,
+        ..d
     }
 }
 
@@ -2542,11 +2560,88 @@ impl GemmKernel for ShimProvider {
             c_dtype: ctx.c.dtype.abi_code(),
             alpha: ctx.alpha,
             beta: ctx.beta,
+            a_up_offset: 0,
+            a_silu_mul: 0,
         };
         self.ctx.gemm_step(ctx.prefill)?;
         // The row count picks the bound row tier (the card's single-row GEMV tier).
         let rows = ctx.a.shape.first().copied().unwrap_or(0);
         self.run(OpKind::Gemm, &self.syms().gemm, &d, rows)
+    }
+
+    fn fuses_silu_mul(&self, cfg: &GemmConfig, rows: usize, prefill: bool) -> bool {
+        // A prefill step keeps GEMM + silu_mul: its rows must equal the invariant prefill
+        // solution's, which the fused implementations do not compute.
+        if prefill || self.ctx.lib.abi_minor() < GEMM_SILU_MUL_MINOR {
+            return false;
+        }
+        let d = gemm_silu_mul_probe(cfg, rows);
+        // The implementation this provider runs at `rows`: the bound one (its tier's), else the
+        // library's own choice (whose default, hipBLASLt, refuses the form).
+        match self.bound.as_ref().filter(|b| b.op == OpKind::Gemm) {
+            Some(bound) => {
+                self.ctx
+                    .lib
+                    .impl_supports(OpKind::Gemm, bound.choice.index_for(rows), &d)
+            }
+            None => Self::supported(&self.syms().gemm, &d),
+        }
+    }
+
+    fn execute_silu_mul(
+        &self,
+        ctx: &mut GemmContext<'_>,
+        up: TensorView<'_>,
+    ) -> Result<(), KernelError> {
+        if self.ctx.lib.abi_minor() < GEMM_SILU_MUL_MINOR {
+            return Err(self.ctx.lib.lacks("the SwiGLU GEMM input (ABI v2.14)"));
+        }
+        let (m, k) = (
+            ctx.a.shape.first().copied().unwrap_or(0),
+            ctx.a.shape.get(1).copied().unwrap_or(0),
+        );
+        if up.shape != ctx.a.shape || up.dtype != ctx.a.dtype {
+            return Err(invalid(format!(
+                "silu_mul GEMM input: up {:?} {:?} differs from gate {:?} {:?}",
+                up.shape, up.dtype, ctx.a.shape, ctx.a.dtype
+            )));
+        }
+        let lda = row_stride("a", &ctx.a, 2)?;
+        if m > 1 && row_stride("up", &up, 2)? != lda {
+            return Err(invalid(
+                "silu_mul GEMM input: gate and up must share one row stride".into(),
+            ));
+        }
+        let gate_ptr = self.ctx.device_ptr("a", &ctx.a)?;
+        let up_ptr = self.ctx.device_ptr("up", &up)?;
+        let elem = ctx.a.dtype.size_bytes() as i64;
+        let delta = (up_ptr.addr() as i64).wrapping_sub(gate_ptr.addr() as i64);
+        if elem == 0 || delta % elem != 0 {
+            return Err(invalid(
+                "silu_mul GEMM input: up is not a whole number of elements from gate".into(),
+            ));
+        }
+        let d = GemmDesc {
+            a: gate_ptr,
+            b: self.ctx.device_ptr("b", &ctx.b)?,
+            c: self.ctx.device_ptr("c", &ctx.c)?,
+            m: to_i64("m", m)?,
+            n: to_i64("n", ctx.c.shape.get(1).copied().unwrap_or(0))?,
+            k: to_i64("k", k)?,
+            lda,
+            ldb: row_stride("b", &ctx.b, 2)?,
+            ldc: row_stride("c", &ctx.c, 2)?,
+            trans_b: i32::from(ctx.trans_b),
+            a_dtype: ctx.a.dtype.abi_code(),
+            b_dtype: ctx.b.dtype.abi_code(),
+            c_dtype: ctx.c.dtype.abi_code(),
+            alpha: ctx.alpha,
+            beta: ctx.beta,
+            a_up_offset: delta / elem,
+            a_silu_mul: 1,
+        };
+        self.ctx.gemm_step(ctx.prefill)?;
+        self.run(OpKind::Gemm, &self.syms().gemm, &d, m)
     }
 }
 

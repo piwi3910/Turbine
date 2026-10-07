@@ -28,6 +28,10 @@ constexpr const char *kImpl = "hipblaslt";
 bool supported(const turbine_gemm_desc *d) {
   if (d == nullptr)
     return false;
+  // The SwiGLU input (ABI v2.14) is an implementation's own form
+  // (vllm_wvsplitk), never hipBLASLt's.
+  if (d->a_silu_mul != 0)
+    return false;
   if (d->a_dtype != TURBINE_DTYPE_BF16 || d->b_dtype != TURBINE_DTYPE_BF16) {
     return false;
   }
