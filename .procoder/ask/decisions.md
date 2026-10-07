@@ -4252,3 +4252,17 @@ family starts, without asking again; anything else still needs the user. (2) Pha
 lab-cluster two-GPU scenarios, vLLM-ROCm serve jobs (including newer rocm/vllm tags) — run under the Phase 1–5p
 novanas rules without asking each time: our runs only, stop and ask when a GPU is held by another workload, always
 clean up; the exit tier and the soak are announced.
+
+## Phase 7 Task 9: where the two-card vLLM-ROCm baseline runs (2026-10-08)
+
+The plan's `lab-cluster.sh` family scenario runs vLLM-ROCm "on the same pod" as Turbine, but the cluster pod
+(`novanas-cluster-job.yaml`, `rust:1.97-trixie`, `amd.com/gpu: 2`) has no vLLM, and a second container cannot share
+the pod's two GPUs (GPUs are per container).
+- A) Two Jobs in sequence inside `lab-cluster.sh`: the Turbine GPU Job, then a two-GPU `rocm/vllm` Job on :18100;
+  eval-compare and the ratio line assembled on the workstation.
+- B) The family scenario runs the Turbine legs only (golden c1/c16 batched, GSM8K eval, c16 bench); the vLLM baseline
+  comes from the existing `lab-serve.sh --vllm <slug> --gpus 2 --vllm-arg …` plus `lab-perf.sh` extended to two-card
+  placements (Turbine then vLLM on the same cards, as Phase 2c does on one), which prints the S-13 ratio verdict.
+- C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
+  unverified).
+Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
