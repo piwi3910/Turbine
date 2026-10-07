@@ -3,7 +3,7 @@ use turbine_tensor::TensorView;
 
 use super::{CpuReference, expect_rank, expect_shape, is_float, load, math, round_to, store};
 use crate::KernelError;
-use crate::ops::{GemmConfig, GemmContext, GemmKernel};
+use crate::ops::{GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel};
 
 impl GemmKernel for CpuReference {
     fn supports(&self, cfg: &GemmConfig) -> bool {
@@ -55,6 +55,70 @@ impl GemmKernel for CpuReference {
             .collect();
         gemm_on(ctx, &a, m, n, k)
     }
+
+    /// Every fused form (kernel ABI v2.14 / v2.15) on the same calls as
+    /// [`Self::fuses_silu_mul`], the RMSNorm input not with the SwiGLU one.
+    fn fuses(&self, cfg: &GemmConfig, rows: usize, prefill: bool, fusion: GemmFusion) -> bool {
+        !(fusion.silu_mul && fusion.rmsnorm)
+            && fusion != GemmFusion::default()
+            && self.fuses_silu_mul(cfg, rows, prefill)
+    }
+
+    /// The unfused ops' numbers: the operand as `silu_mul` or `rmsnorm` stores it, the product
+    /// rounded to `c`'s dtype, then the residual added and rounded again (the `add` op).
+    fn execute_fused(
+        &self,
+        ctx: &mut GemmContext<'_>,
+        f: GemmFused<'_>,
+    ) -> Result<(), KernelError> {
+        expect_rank("a", &ctx.a, 2)?;
+        expect_rank("c", &ctx.c, 2)?;
+        let (m, k) = (ctx.a.shape[0], ctx.a.shape[1]);
+        let n = ctx.c.shape[1];
+        expect_shape("c", &ctx.c, &[m, n])?;
+        expect_shape("b", &ctx.b, &if ctx.trans_b { [n, k] } else { [k, n] })?;
+        let dt = ctx.a.dtype;
+        // Read before the product overwrites it (the residual may be `c` itself).
+        let residual = match &f.residual {
+            Some(r) => {
+                expect_shape("residual", r, &[m, n])?;
+                Some(load(r)?)
+            }
+            None => None,
+        };
+        let a = match (&f.up, &f.norm) {
+            (Some(_), Some(_)) => {
+                return Err(KernelError::Unsupported {
+                    message: "the SwiGLU and RMSNorm GEMM inputs do not combine".into(),
+                });
+            }
+            (Some(up), None) => {
+                expect_shape("up", up, &[m, k])?;
+                let (gate, up) = (load(&ctx.a)?, load(up)?);
+                gate.iter()
+                    .zip(&up)
+                    .map(|(&g, &u)| round_to(dt, round_to(dt, math::silu(g)) * u))
+                    .collect()
+            }
+            (None, Some((w, eps))) => {
+                expect_shape("norm weight", w, &[k])?;
+                let round = |v| round_to(dt, v);
+                math::rmsnorm(&load(&ctx.a)?, &load(w)?, k, *eps, round, round)
+            }
+            (None, None) => load(&ctx.a)?,
+        };
+        gemm_on(ctx, &a, m, n, k)?;
+        if let Some(r) = residual {
+            let out_dt = ctx.c.dtype;
+            let c: Vec<f32> = load(&ctx.c)?
+                .iter()
+                .zip(&r)
+                .map(|(&c, &r)| round_to(out_dt, c + r))
+                .collect();
+            store(&ctx.c, &c)?;
+        }
+        Ok(())
+    }
 }
 
 /// `c = alpha · a · b(ᵀ) + beta · c` for the loaded operand `a` (`[m, k]`).
@@ -85,6 +149,7 @@ fn gemm_on(
 mod tests {
     use crate::cpu::test_util::*;
     use crate::cpu::*;
+    use crate::ops::{GemmFused, GemmFusion};
 
     /// The fused SwiGLU input (gate and up columns of one `[1, 2·k]` row) gives the bits of
     /// `silu_mul` into a buffer and the GEMM on it, and only single-row decode calls of a `gemv`
@@ -140,5 +205,89 @@ mod tests {
         assert!(!gemm.fuses_silu_mul(&cfg, 1, true));
         assert!(!gemm.fuses_silu_mul(&cfg, 2, false));
         assert!(!gemm.fuses_silu_mul(&GemmConfig { gemv: false, ..cfg }, 1, false));
+    }
+
+    /// The v2.15 forms on the reference: the RMSNorm input gives the bits of `rmsnorm` into a
+    /// buffer and the GEMM on it, and the residual epilogue written in place over the residual
+    /// the bits of the GEMM then `add`; the SwiGLU and RMSNorm inputs do not combine. Breaks if
+    /// the reference's fused path drifts from its unfused ops (host decode runs take it).
+    #[test]
+    fn norm_input_and_residual_epilogue_match_the_unfused_ops() {
+        let mem = host();
+        let (n, k) = (6, 16);
+        let x = tensor(&mem, &[1, k], DType::BF16, &seeded(5, k));
+        let g = tensor(&mem, &[k], DType::BF16, &seeded(6, k));
+        let w = tensor(&mem, &[n, k], DType::BF16, &seeded(7, n * k));
+        let res = seeded(8, n);
+        let gemm = CpuReference.gemm().expect("gemm family");
+        let ctx = |a, c| GemmContext {
+            a,
+            b: w.view(),
+            c,
+            trans_b: true,
+            alpha: 1.0,
+            beta: 0.0,
+            prefill: false,
+        };
+        let h = Tensor::empty(&mem, &[1, k], DType::BF16).expect("alloc");
+        CpuReference
+            .norm()
+            .expect("norm family")
+            .execute(&mut NormContext {
+                x: x.view(),
+                weight: g.view(),
+                out: h.view(),
+                eps: 1e-5,
+            })
+            .expect("rmsnorm");
+        let proj = Tensor::empty(&mem, &[1, n], DType::BF16).expect("alloc");
+        gemm.execute(&mut ctx(h.view(), proj.view())).expect("gemm");
+        let want = tensor(&mem, &[1, n], DType::BF16, &res);
+        CpuReference
+            .elementwise()
+            .expect("elementwise family")
+            .execute(&mut ElementwiseContext {
+                a: want.view(),
+                b: proj.view(),
+                out: want.view(),
+            })
+            .expect("add");
+        let got = tensor(&mem, &[1, n], DType::BF16, &res);
+        gemm.execute_fused(
+            &mut ctx(x.view(), got.view()),
+            GemmFused {
+                norm: Some((g.view(), 1e-5)),
+                residual: Some(got.view()),
+                ..GemmFused::default()
+            },
+        )
+        .expect("fused");
+        assert_eq!(
+            load(&got.view()).expect("load"),
+            load(&want.view()).expect("load")
+        );
+        let cfg = GemmConfig {
+            n: n as u64,
+            k: k as u64,
+            trans_b: true,
+            a_dtype: DType::BF16,
+            b_dtype: DType::BF16,
+            c_dtype: DType::BF16,
+            gemv: true,
+        };
+        let norm_res = GemmFusion {
+            rmsnorm: true,
+            residual: true,
+            ..GemmFusion::default()
+        };
+        assert!(gemm.fuses(&cfg, 1, false, norm_res));
+        assert!(!gemm.fuses(&cfg, 1, true, norm_res));
+        assert!(!gemm.fuses(&cfg, 2, false, norm_res));
+        let both = GemmFusion {
+            silu_mul: true,
+            ..norm_res
+        };
+        assert!(!gemm.fuses(&cfg, 1, false, both));
+        assert!(!gemm.fuses(&cfg, 1, false, GemmFusion::default()));
     }
 }

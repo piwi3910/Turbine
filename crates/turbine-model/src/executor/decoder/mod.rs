@@ -59,9 +59,9 @@ use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
     AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
     ElementwiseContext, EmbeddingConfig, EmbeddingContext, FusedRope, GemmConfig, GemmContext,
-    KernelError, KernelRegistry, NormConfig, NormContext, OpConfig, OpRequirement,
-    PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext, RopeConfig, RopeContext,
-    TqPaged,
+    GemmFused, GemmFusion, KernelError, KernelRegistry, NormConfig, NormContext, OpConfig,
+    OpRequirement, PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext,
+    RopeConfig, RopeContext, TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -414,6 +414,22 @@ pub trait FfnHook: Send + Sync {
     /// The block on `run.tokens` rows: reads [`LayerRun::normed`], writes
     /// [`LayerRun::ffn_out`].
     fn forward(&self, run: &LayerRun<'_>, w: &HookWeights) -> Result<(), ModelError>;
+    /// Whether [`Self::forward`] with these weights takes the fused decode form (P5p GEMV stage
+    /// C, kernel ABI v2.15): it reads its input only through [`LayerRun::linear_normed`] (one
+    /// GEMV that normalises `x` as it loads it; [`LayerRun::normed_input`] otherwise) and writes
+    /// its output only through [`LayerRun::linear_silu_mul`], which then adds it into the
+    /// residual stream; the hook checks that `registry`'s GEMMs fuse its single-row calls
+    /// ([`GemmKernel::fuses`]). False by default (the input is in [`LayerRun::normed`]).
+    fn fuses_norm_residual(
+        &self,
+        d: &DecoderDims,
+        registry: &KernelRegistry,
+        w: &HookWeights,
+        opts: ExecutorOptions,
+    ) -> bool {
+        let _ = (d, registry, w, opts);
+        false
+    }
     /// Whether a decode batch of `rows` tokens may be captured into a decode graph (no host
     /// round trip mid-forward).
     fn graph_capturable(&self, d: &DecoderDims, registry: &KernelRegistry, rows: usize) -> bool {
@@ -443,6 +459,10 @@ pub struct LayerRun<'a> {
     pub opts: ExecutorOptions,
     /// The FFN hook's buffers ([`FfnHook::alloc`]).
     pub ffn_buffers: &'a HookBuffers,
+    /// The fused decode form ([`FfnHook::fuses_norm_residual`]): the post-attention norm weight
+    /// the FFN input is still to be normalised with (from the residual stream `x`; `h` is not
+    /// written), and the down projection adds into `x`.
+    pending_norm: Option<&'a Tensor>,
     exec: &'a DecoderExecutor,
 }
 
@@ -490,7 +510,43 @@ impl LayerRun<'_> {
         w: impl Into<LinearView<'w>>,
         c: TensorView<'_>,
     ) -> Result<bool, ModelError> {
-        self.exec.gemm_silu_mul(gate, up, w.into(), c)
+        match self.pending_norm {
+            // The fused decode form: the output goes into the residual stream instead of `c`.
+            Some(_) => {
+                let x = self.exec.bufs.x.view().rows(self.row0, self.tokens);
+                self.exec
+                    .gemm_fused(gate, w.into(), x.clone(), Some(up), None, Some(x))?;
+                Ok(true)
+            }
+            None => self.exec.gemm_silu_mul(gate, up, w.into(), c),
+        }
+    }
+
+    /// `c = normed · wᵀ` for the FFN input: in the fused decode form one GEMV that normalises
+    /// the residual stream as it loads it (kernel ABI v2.15), else [`Self::linear`] on
+    /// [`Self::normed`].
+    pub fn linear_normed<'w>(
+        &self,
+        w: impl Into<LinearView<'w>>,
+        c: TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        match self.pending_norm {
+            Some(g) => {
+                let x = self.exec.bufs.x.view().rows(self.row0, self.tokens);
+                self.exec.gemm_fused(x, w.into(), c, None, Some(g), None)
+            }
+            None => self.linear(self.normed(), w, c),
+        }
+    }
+
+    /// [`Self::normed`], first written from the residual stream in the fused decode form (for a
+    /// hook path that reads its input more than once).
+    pub fn normed_input(&self) -> Result<TensorView<'_>, ModelError> {
+        if let Some(g) = self.pending_norm {
+            let x = self.exec.bufs.x.view().rows(self.row0, self.tokens);
+            self.rmsnorm(x, g, self.normed())?;
+        }
+        Ok(self.normed())
     }
 
     /// RMSNorm of `x` with weight `w` over rows of `w.len()` elements into `out` (may be `x`).
@@ -1630,6 +1686,91 @@ impl DecoderExecutor {
         Ok(true)
     }
 
+    /// One GEMM with the fused forms (kernel ABI v2.14 / v2.15) of the fused decode form
+    /// ([`Self::fuses_norm_residual`] checked them): the SwiGLU input `up`, the RMSNorm input
+    /// `norm`, the residual epilogue `residual` (may be `c`).
+    fn gemm_fused(
+        &self,
+        a: TensorView<'_>,
+        w: LinearView<'_>,
+        c: TensorView<'_>,
+        up: Option<TensorView<'_>>,
+        norm: Option<&Tensor>,
+        residual: Option<TensorView<'_>>,
+    ) -> Result<(), ModelError> {
+        if w.q.is_some() {
+            return Err(invalid("a fused GEMM on quantized weights".into()));
+        }
+        let cfg = self.dims.gemm(w.w.shape[0], w.w.shape[1], c.dtype);
+        let kernel = self.registry.gemm(&cfg);
+        // Profiled under the GEMM's config (its implementation name).
+        self.op(OpConfig::Gemm(cfg), || {
+            kernel.execute_fused(
+                &mut GemmContext {
+                    a,
+                    b: w.w,
+                    c,
+                    trans_b: true,
+                    alpha: 1.0,
+                    beta: 0.0,
+                    prefill: false,
+                },
+                GemmFused {
+                    up,
+                    norm: norm.map(|g| (g.view(), self.dims.eps)),
+                    residual,
+                },
+            )
+        })
+    }
+
+    /// Whether this step runs the fused decode form (P5p GEMV stage C, user decision B,
+    /// staged): one decode row on one device, BF16 weights, tracing off, the `add_rmsnorm`
+    /// layout with a fused qkv weight and an FFN hook that takes it, and the card's GEMV fusing
+    /// the residual add into o_proj and down and the RMSNorm into qkv and the FFN input. Each
+    /// layer's input norm then runs in its qkv GEMV and the post-attention norm in the FFN's
+    /// first GEMV (the norm's sum of squares in the GEMV's order: the operand may differ from
+    /// the `rmsnorm` op's in its last bit); `h` is not written.
+    fn fuses_norm_residual(&self, rows: usize) -> bool {
+        if rows != 1
+            || self.step_prefill.load(Ordering::Relaxed)
+            || self.trace.is_on()
+            || self.tp.is_some()
+            || self.pp.is_some()
+            || !self.add_norm
+            || !self.qkv.fused
+        {
+            return false;
+        }
+        let Some(l) = self.layers.first() else {
+            return false;
+        };
+        if l.w_qkv.view().q.is_some()
+            || l.wo.view().q.is_some()
+            || !self
+                .spec
+                .ffn
+                .fuses_norm_residual(&self.dims, &self.registry, &l.ffn, self.opts)
+        {
+            return false;
+        }
+        let d = &self.dims;
+        let fuses = |w: &Linear, fusion: GemmFusion| {
+            let w = w.view();
+            let cfg = d.gemm(w.w.shape[0], w.w.shape[1], d.act);
+            self.registry.gemm(&cfg).fuses(&cfg, rows, false, fusion)
+        };
+        let norm = GemmFusion {
+            rmsnorm: true,
+            ..GemmFusion::default()
+        };
+        let residual = GemmFusion {
+            residual: true,
+            ..GemmFusion::default()
+        };
+        fuses(&l.w_qkv, norm) && fuses(&l.wo, residual)
+    }
+
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
     /// on the rank's stream; nothing on one device.
     fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
@@ -1851,7 +1992,17 @@ impl DecoderExecutor {
     /// `h` (the embedding's norm, or the previous layer's last op); ends with the next layer's
     /// input norm in `h`, if there is a next layer. Attention appends to and reads layer `i` of
     /// `kv`.
-    fn layer(&self, i: usize, p: &Packed, kv: &KvPoolView<'_>) -> Result<(), ModelError> {
+    ///
+    /// With `fused` ([`Self::fuses_norm_residual`]) the layer's input norm is not in `h`: the
+    /// qkv GEMV normalises `x` as it loads it, o_proj and the FFN's down projection add into `x`
+    /// in their epilogues, and the FFN's first GEMV normalises `x` with the post-attention norm.
+    fn layer(
+        &self,
+        i: usize,
+        p: &Packed,
+        kv: &KvPoolView<'_>,
+        fused: bool,
+    ) -> Result<(), ModelError> {
         let w = Part {
             r0: 0,
             p,
@@ -1860,7 +2011,12 @@ impl DecoderExecutor {
         let b = &self.bufs;
         let t = p.total_q;
         let li = Some(i);
-        self.attention_part(i, &w, kv)?;
+        if fused {
+            self.attention_part(i, &w, kv, true)?;
+            self.ffn_part(i, &w, Some(&self.layers[i].post_norm))?;
+            return Ok(());
+        }
+        self.attention_part(i, &w, kv, false)?;
         self.all_reduce(&rows(&b.proj, t))?;
         self.record(li, "o_proj", rows(&b.proj, t))?;
         self.residual_add_norm_at(&w, Some(&self.layers[i].post_norm))?;
@@ -1868,7 +2024,7 @@ impl DecoderExecutor {
 
         // FFN block.
         self.record(li, "mlp_norm", rows(&b.h, t))?;
-        self.ffn_part(i, &w)?;
+        self.ffn_part(i, &w, None)?;
         self.all_reduce(&rows(&b.proj, t))?;
         let next_norm = self.layers.get(i + 1).map(|next| &next.input_norm);
         self.residual_add_norm_at(&w, next_norm)?;
@@ -1882,6 +2038,7 @@ impl DecoderExecutor {
         i: usize,
         w: &Part<'_>,
         kv: &KvPoolView<'_>,
+        fused: bool,
     ) -> Result<(), ModelError> {
         let l = &self.layers[i];
         let b = &self.bufs;
@@ -1899,7 +2056,18 @@ impl DecoderExecutor {
         );
 
         self.record(li, "attn_norm", at(&b.h))?;
-        if self.qkv.fused {
+        if fused {
+            // The fused decode form: the input norm runs in the qkv GEMV.
+            let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
+            self.gemm_fused(
+                at(&b.x),
+                l.w_qkv.view(),
+                whole,
+                None,
+                Some(&l.input_norm),
+                None,
+            )?;
+        } else if self.qkv.fused {
             let wq = l.w_qkv.view();
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.linear(at(&b.h), wq, whole)?;
@@ -2004,18 +2172,38 @@ impl DecoderExecutor {
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;
+        if fused {
+            // The fused decode form: the residual add runs in the o_proj GEMV's epilogue.
+            return self.gemm_fused(
+                at(&b.attn),
+                l.wo.view(),
+                at(&b.x),
+                None,
+                None,
+                Some(at(&b.x)),
+            );
+        }
         self.linear(at(&b.attn), l.wo.view(), at(&b.proj))
     }
 
     /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the
     /// (not yet all-reduced) output in `proj`.
-    fn ffn_part(&self, i: usize, w: &Part<'_>) -> Result<(), ModelError> {
-        let run = self.layer_run(i, w);
+    fn ffn_part(
+        &self,
+        i: usize,
+        w: &Part<'_>,
+        pending_norm: Option<&Tensor>,
+    ) -> Result<(), ModelError> {
+        let run = LayerRun {
+            pending_norm,
+            ..self.layer_run(i, w)
+        };
         self.spec.ffn.forward(&run, &self.layers[i].ffn)
     }
 
     fn layer_run<'s>(&'s self, i: usize, w: &Part<'_>) -> LayerRun<'s> {
         LayerRun {
+            pending_norm: None,
             layer: i,
             dims: &self.dims,
             registry: &self.registry,
@@ -2079,13 +2267,13 @@ impl DecoderExecutor {
                     fence(mark)?;
                     self.residual_add_norm_at(w, Some(&self.layers[i].input_norm))?;
                 }
-                self.attention_part(i, w, kv)?;
+                self.attention_part(i, w, kv, false)?;
                 attn_marks[h] = reduce(w)?;
             }
             for (h, w) in parts.iter().enumerate() {
                 fence(attn_marks[h])?;
                 self.residual_add_norm_at(w, Some(&self.layers[i].post_norm))?;
-                self.ffn_part(i, w)?;
+                self.ffn_part(i, w, None)?;
                 ffn_marks[h] = Some(reduce(w)?);
             }
         }
@@ -2175,7 +2363,8 @@ impl DecoderExecutor {
             self.all_reduce(&rows(&b.x, t))?;
             self.record(None, "embed", rows(&b.x, t))?;
         }
-        if let Some(first) = self.layers.first() {
+        let fused = halves.is_none() && self.fuses_norm_residual(t);
+        if let Some(first) = self.layers.first().filter(|_| !fused) {
             self.rmsnorm(rows(&b.x, t), &first.input_norm, rows(&b.h, t))?;
         }
         match (halves, self.overlap.as_ref()) {
@@ -2189,7 +2378,7 @@ impl DecoderExecutor {
             }
             _ => {
                 for i in 0..self.layers.len() {
-                    self.layer(i, p, kv)?;
+                    self.layer(i, p, kv, fused)?;
                 }
             }
         }

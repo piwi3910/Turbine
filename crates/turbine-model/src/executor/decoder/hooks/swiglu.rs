@@ -8,7 +8,7 @@
 //! the same buffer.
 use std::sync::Arc;
 
-use turbine_kernels::{ActivationConfig, ActivationContext, OpConfig};
+use turbine_kernels::{ActivationConfig, ActivationContext, GemmFusion, KernelRegistry, OpConfig};
 use turbine_tensor::{DeviceMemory, Tensor};
 
 use crate::ModelError;
@@ -106,6 +106,36 @@ impl FfnHook for SwiGlu {
         ))
     }
 
+    /// The fused gate/up projection normalises its input as it loads it and the down projection
+    /// takes SiLU·up and adds into the residual (kernel ABI v2.15): BF16 weights and the card's
+    /// GEMV fusing both single-row calls.
+    fn fuses_norm_residual(
+        &self,
+        d: &DecoderDims,
+        registry: &KernelRegistry,
+        w: &HookWeights,
+        opts: ExecutorOptions,
+    ) -> bool {
+        let (gate_up, down) = (w.1[GATE_UP].view(), w.1[DOWN].view());
+        if !split(d, opts).fused || gate_up.q.is_some() || down.q.is_some() {
+            return false;
+        }
+        let fuses = |n, k, fusion| {
+            let cfg = d.gemm(n, k, d.act);
+            registry.gemm(&cfg).fuses(&cfg, 1, false, fusion)
+        };
+        let norm = GemmFusion {
+            rmsnorm: true,
+            ..GemmFusion::default()
+        };
+        let silu_residual = GemmFusion {
+            silu_mul: true,
+            residual: true,
+            ..GemmFusion::default()
+        };
+        fuses(2 * d.inter, d.hidden, norm) && fuses(d.hidden, d.inter, silu_residual)
+    }
+
     fn forward(&self, run: &LayerRun<'_>, w: &HookWeights) -> Result<(), ModelError> {
         let d = run.dims;
         let t = run.tokens;
@@ -117,11 +147,12 @@ impl FfnHook for SwiGlu {
         let gate = || split.part(gate_up, 0, t, &[d.inter]);
         let up = || split.part(gate_up, 1, t, &[d.inter]);
         if split.fused {
-            run.linear(run.normed(), w.1[GATE_UP].view(), split.whole(gate_up, t))?;
+            run.linear_normed(w.1[GATE_UP].view(), split.whole(gate_up, t))?;
         } else {
             let w = |r| w.1[GATE_UP].view().rows(r, d.inter);
-            run.linear(run.normed(), w(0), gate())?;
-            run.linear(run.normed(), w(d.inter), up())?;
+            let normed = run.normed_input()?;
+            run.linear(normed.clone(), w(0), gate())?;
+            run.linear(normed, w(d.inter), up())?;
         }
         run.trace("gate", &gate())?;
         run.trace("up", &up())?;

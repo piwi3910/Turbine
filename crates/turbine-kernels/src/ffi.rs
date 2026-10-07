@@ -41,6 +41,12 @@ pub(crate) struct GemmDesc {
     pub a_up_offset: i64,
     /// v2.14: 1 when the left operand is `silu_mul(gate, up)` read from `a`.
     pub a_silu_mul: i32,
+    /// v2.15: non-null, the residual added to the rounded output (`[m, n]` at `ldc`).
+    pub c_residual: *const c_void,
+    /// v2.15: non-null, the RMSNorm weight of the left operand (`k` elements).
+    pub a_norm_weight: *const c_void,
+    /// v2.15: the RMSNorm input's eps.
+    pub a_norm_eps: f32,
 }
 
 /// `turbine_attention_desc` (prefill and decode share it).

@@ -55,13 +55,13 @@ use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmKernel, ImplChoice, ImplInfo, KernelProvider,
-    KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig, KvTranscodeContext,
-    KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel, KvTranscodeTables,
-    LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel, MoeExpertsConfig,
-    MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
-    NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext, QGemmKernel,
-    QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
+    EmbeddingKernel, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel, ImplChoice,
+    ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig,
+    KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel,
+    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
+    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
+    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext,
+    QGemmKernel, QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
     RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext,
     ShardedNormKernel,
 };
@@ -1469,21 +1469,37 @@ fn gemm_probe(cfg: &GemmConfig, rows: Option<u32>) -> GemmDesc {
         beta: 0.0,
         a_up_offset: 0,
         a_silu_mul: 0,
+        c_residual: null(),
+        a_norm_weight: null(),
+        a_norm_eps: 0.0,
     }
 }
 
 /// The ABI minor whose `turbine_gemm_desc` carries the SwiGLU input (`a_silu_mul`, v2.14).
 const GEMM_SILU_MUL_MINOR: u32 = 14;
 
-/// [`gemm_probe`] in the SwiGLU-input form (kernel ABI v2.14): `a` holds `[rows, 2·k]` gate then
-/// up columns, as the decoder's fused gate/up buffer does.
-fn gemm_silu_mul_probe(cfg: &GemmConfig, rows: usize) -> GemmDesc {
+/// The ABI minor whose `turbine_gemm_desc` carries the residual epilogue and the RMSNorm input
+/// (`c_residual`, `a_norm_weight`, v2.15).
+const GEMM_NORM_RESIDUAL_MINOR: u32 = 15;
+
+/// A non-null, 16-byte aligned stand-in for a probe's v2.15 operands: `supports` reads the
+/// pointers' presence and alignment only, never the memory.
+const PROBE_OPERAND: *const c_void = std::ptr::without_provenance(16);
+
+/// [`gemm_probe`] in the fused forms of `fusion` (kernel ABI v2.14 / v2.15): with the SwiGLU
+/// input `a` holds `[rows, 2·k]` gate then up columns, as the decoder's fused gate/up buffer
+/// does.
+fn gemm_fused_probe(cfg: &GemmConfig, rows: usize, fusion: GemmFusion) -> GemmDesc {
     let rows = u32::try_from(rows).unwrap_or(u32::MAX);
     let d = gemm_probe(cfg, Some(rows));
+    let operand = |on: bool| if on { PROBE_OPERAND } else { null() };
     GemmDesc {
-        lda: 2 * d.k,
-        a_up_offset: d.k,
-        a_silu_mul: 1,
+        lda: if fusion.silu_mul { 2 * d.k } else { d.lda },
+        a_up_offset: if fusion.silu_mul { d.k } else { 0 },
+        a_silu_mul: i32::from(fusion.silu_mul),
+        c_residual: operand(fusion.residual),
+        a_norm_weight: operand(fusion.rmsnorm),
+        a_norm_eps: if fusion.rmsnorm { 1e-5 } else { 0.0 },
         ..d
     }
 }
@@ -2562,6 +2578,9 @@ impl GemmKernel for ShimProvider {
             beta: ctx.beta,
             a_up_offset: 0,
             a_silu_mul: 0,
+            c_residual: null(),
+            a_norm_weight: null(),
+            a_norm_eps: 0.0,
         };
         self.ctx.gemm_step(ctx.prefill)?;
         // The row count picks the bound row tier (the card's single-row GEMV tier).
@@ -2570,14 +2589,41 @@ impl GemmKernel for ShimProvider {
     }
 
     fn fuses_silu_mul(&self, cfg: &GemmConfig, rows: usize, prefill: bool) -> bool {
-        // A prefill step keeps GEMM + silu_mul: its rows must equal the invariant prefill
+        let silu = GemmFusion {
+            silu_mul: true,
+            ..GemmFusion::default()
+        };
+        self.fuses(cfg, rows, prefill, silu)
+    }
+
+    fn execute_silu_mul(
+        &self,
+        ctx: &mut GemmContext<'_>,
+        up: TensorView<'_>,
+    ) -> Result<(), KernelError> {
+        self.execute_fused(
+            ctx,
+            GemmFused {
+                up: Some(up),
+                ..GemmFused::default()
+            },
+        )
+    }
+
+    fn fuses(&self, cfg: &GemmConfig, rows: usize, prefill: bool, fusion: GemmFusion) -> bool {
+        // A prefill step keeps the unfused ops: its rows must equal the invariant prefill
         // solution's, which the fused implementations do not compute.
-        if prefill || self.ctx.lib.abi_minor() < GEMM_SILU_MUL_MINOR {
+        let minor = if fusion.rmsnorm || fusion.residual {
+            GEMM_NORM_RESIDUAL_MINOR
+        } else {
+            GEMM_SILU_MUL_MINOR
+        };
+        if prefill || fusion == GemmFusion::default() || self.ctx.lib.abi_minor() < minor {
             return false;
         }
-        let d = gemm_silu_mul_probe(cfg, rows);
+        let d = gemm_fused_probe(cfg, rows, fusion);
         // The implementation this provider runs at `rows`: the bound one (its tier's), else the
-        // library's own choice (whose default, hipBLASLt, refuses the form).
+        // library's own choice (whose default, hipBLASLt, refuses the forms).
         match self.bound.as_ref().filter(|b| b.op == OpKind::Gemm) {
             Some(bound) => {
                 self.ctx
@@ -2588,57 +2634,104 @@ impl GemmKernel for ShimProvider {
         }
     }
 
-    fn execute_silu_mul(
+    fn execute_fused(
         &self,
         ctx: &mut GemmContext<'_>,
-        up: TensorView<'_>,
+        f: GemmFused<'_>,
     ) -> Result<(), KernelError> {
-        if self.ctx.lib.abi_minor() < GEMM_SILU_MUL_MINOR {
+        let fusion = f.fusion();
+        if fusion.silu_mul && self.ctx.lib.abi_minor() < GEMM_SILU_MUL_MINOR {
             return Err(self.ctx.lib.lacks("the SwiGLU GEMM input (ABI v2.14)"));
+        }
+        if (fusion.rmsnorm || fusion.residual)
+            && self.ctx.lib.abi_minor() < GEMM_NORM_RESIDUAL_MINOR
+        {
+            return Err(self
+                .ctx
+                .lib
+                .lacks("the GEMM residual epilogue and RMSNorm input (ABI v2.15)"));
         }
         let (m, k) = (
             ctx.a.shape.first().copied().unwrap_or(0),
             ctx.a.shape.get(1).copied().unwrap_or(0),
         );
-        if up.shape != ctx.a.shape || up.dtype != ctx.a.dtype {
-            return Err(invalid(format!(
-                "silu_mul GEMM input: up {:?} {:?} differs from gate {:?} {:?}",
-                up.shape, up.dtype, ctx.a.shape, ctx.a.dtype
-            )));
-        }
+        let n = ctx.c.shape.get(1).copied().unwrap_or(0);
         let lda = row_stride("a", &ctx.a, 2)?;
-        if m > 1 && row_stride("up", &up, 2)? != lda {
-            return Err(invalid(
-                "silu_mul GEMM input: gate and up must share one row stride".into(),
-            ));
-        }
         let gate_ptr = self.ctx.device_ptr("a", &ctx.a)?;
-        let up_ptr = self.ctx.device_ptr("up", &up)?;
         let elem = ctx.a.dtype.size_bytes() as i64;
-        let delta = (up_ptr.addr() as i64).wrapping_sub(gate_ptr.addr() as i64);
-        if elem == 0 || delta % elem != 0 {
-            return Err(invalid(
-                "silu_mul GEMM input: up is not a whole number of elements from gate".into(),
-            ));
+        let mut a_up_offset = 0;
+        if let Some(up) = &f.up {
+            if up.shape != ctx.a.shape || up.dtype != ctx.a.dtype {
+                return Err(invalid(format!(
+                    "silu_mul GEMM input: up {:?} {:?} differs from gate {:?} {:?}",
+                    up.shape, up.dtype, ctx.a.shape, ctx.a.dtype
+                )));
+            }
+            if m > 1 && row_stride("up", up, 2)? != lda {
+                return Err(invalid(
+                    "silu_mul GEMM input: gate and up must share one row stride".into(),
+                ));
+            }
+            let up_ptr = self.ctx.device_ptr("up", up)?;
+            let delta = (up_ptr.addr() as i64).wrapping_sub(gate_ptr.addr() as i64);
+            if elem == 0 || delta % elem != 0 {
+                return Err(invalid(
+                    "silu_mul GEMM input: up is not a whole number of elements from gate".into(),
+                ));
+            }
+            a_up_offset = delta / elem;
         }
+        let ldc = row_stride("c", &ctx.c, 2)?;
+        let c_residual = match &f.residual {
+            Some(r) => {
+                if r.shape != ctx.c.shape || r.dtype != ctx.c.dtype {
+                    return Err(invalid(format!(
+                        "GEMM residual {:?} {:?} differs from c {:?} {:?}",
+                        r.shape, r.dtype, ctx.c.shape, ctx.c.dtype
+                    )));
+                }
+                if m > 1 && row_stride("residual", r, 2)? != ldc {
+                    return Err(invalid(
+                        "GEMM residual: residual and c must share one row stride".into(),
+                    ));
+                }
+                self.ctx.device_ptr("residual", r)?.cast_const()
+            }
+            None => null(),
+        };
+        let (a_norm_weight, a_norm_eps) = match &f.norm {
+            Some((w, eps)) => {
+                if w.shape[..] != [k] || w.dtype != ctx.a.dtype {
+                    return Err(invalid(format!(
+                        "GEMM RMSNorm input: weight {:?} {:?}, expected [{k}] {:?}",
+                        w.shape, w.dtype, ctx.a.dtype
+                    )));
+                }
+                (self.ctx.device_ptr("norm weight", w)?.cast_const(), *eps)
+            }
+            None => (std::ptr::null(), 0.0),
+        };
         let d = GemmDesc {
             a: gate_ptr,
             b: self.ctx.device_ptr("b", &ctx.b)?,
             c: self.ctx.device_ptr("c", &ctx.c)?,
             m: to_i64("m", m)?,
-            n: to_i64("n", ctx.c.shape.get(1).copied().unwrap_or(0))?,
+            n: to_i64("n", n)?,
             k: to_i64("k", k)?,
             lda,
             ldb: row_stride("b", &ctx.b, 2)?,
-            ldc: row_stride("c", &ctx.c, 2)?,
+            ldc,
             trans_b: i32::from(ctx.trans_b),
             a_dtype: ctx.a.dtype.abi_code(),
             b_dtype: ctx.b.dtype.abi_code(),
             c_dtype: ctx.c.dtype.abi_code(),
             alpha: ctx.alpha,
             beta: ctx.beta,
-            a_up_offset: delta / elem,
-            a_silu_mul: 1,
+            a_up_offset,
+            a_silu_mul: i32::from(fusion.silu_mul),
+            c_residual,
+            a_norm_weight,
+            a_norm_eps,
         };
         self.ctx.gemm_step(ctx.prefill)?;
         self.run(OpKind::Gemm, &self.syms().gemm, &d, m)

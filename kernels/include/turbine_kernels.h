@@ -136,6 +136,24 @@ typedef struct turbine_gemm_desc {
    * earlier minor): a is the operand. */
   int64_t a_up_offset;
   int32_t a_silu_mul;
+  /* v2.15 (Phase 5p), read only by a library reporting minor >= 15: the
+   * residual-add epilogue and the RMSNorm input. Non-null c_residual ([m, n],
+   * row stride ldc, may equal c): each element of c is the product rounded to
+   * c_dtype, plus the residual element in F32, rounded again: bit for bit this
+   * call into a buffer followed by turbine_add(residual, buffer). Non-null
+   * a_norm_weight (k a_dtype elements): the left operand is
+   * round(round(x * inv_rms) * weight) of each row x of a, inv_rms =
+   * 1 / sqrt(sum(x^2) / k + a_norm_eps) with the sum in F32 in the
+   * implementation's order (turbine_rmsnorm's numerics up to that order: the
+   * operand may differ from turbine_rmsnorm's output in the last bit).
+   * Only an implementation whose turbine_impl_supports accepts the
+   * descriptor takes them (turbine_gemm's own default refuses both), and only
+   * in a step that is not TURBINE_OPTION_GEMM_PREFILL: a prefill step fails
+   * TURBINE_E_UNSUPPORTED with nothing written. Null (every earlier minor):
+   * neither. */
+  const void *c_residual;
+  const void *a_norm_weight;
+  float a_norm_eps;
 } turbine_gemm_desc;
 
 /* Contiguous per-sequence KV. Query i sits at absolute position q_start + i;
@@ -501,8 +519,10 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * (the rope_* fields of turbine_attention_paged_desc; no new symbol); v2.13
  * unquantized activations into an FP8 W8A8 qgemm (turbine_qgemm_desc's
  * act_static_scale; no new symbol); v2.14 the SwiGLU input of a GEMM
- * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol). */
-#define TURBINE_ABI_MINOR 14u
+ * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol); v2.15 the
+ * residual-add epilogue and RMSNorm input of a GEMM (turbine_gemm_desc's
+ * c_residual / a_norm_weight / a_norm_eps; no new symbol). */
+#define TURBINE_ABI_MINOR 15u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

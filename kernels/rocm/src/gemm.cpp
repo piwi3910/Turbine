@@ -32,6 +32,9 @@ bool supported(const turbine_gemm_desc *d) {
   // (vllm_wvsplitk), never hipBLASLt's.
   if (d->a_silu_mul != 0)
     return false;
+  // So are the residual epilogue and the RMSNorm input (ABI v2.15).
+  if (d->c_residual != nullptr || d->a_norm_weight != nullptr)
+    return false;
   if (d->a_dtype != TURBINE_DTYPE_BF16 || d->b_dtype != TURBINE_DTYPE_BF16) {
     return false;
   }

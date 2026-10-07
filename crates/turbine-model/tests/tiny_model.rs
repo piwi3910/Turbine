@@ -1916,7 +1916,8 @@ impl AddRmsnormKernel for Probe {
 /// fused path on a provider without `add_rmsnorm` (the ABI v2 fallback: `add` then `rmsnorm`).
 /// The runs really take different op sequences: only fused projections need the
 /// `[q + 2·kv, hidden]` GEMM, and `fused_ops` launches `add_rmsnorm` 2·layers − 1 times per
-/// forward, the fallback never.
+/// forward, the fallback never (a dense Llama decode step with fused projections folds them
+/// into its GEMVs instead, 5p GEMV stage C).
 #[test]
 fn fused_ops_match_unfused() {
     const PROMPT: usize = 40;
@@ -1991,10 +1992,14 @@ fn fused_ops_match_unfused() {
                 rows.push(decode.expect("decode").data);
             }
             let per_forward = 2 * cfg.num_layers as usize - 1;
-            let want = if fused_ops && with_add_norm {
-                (1 + DECODE) * per_forward
-            } else {
-                0
+            // 5p GEMV stage C: a dense Llama decode step with fused projections and
+            // `add_rmsnorm` folds every norm and residual add into its GEMVs (the CPU
+            // reference fuses them too), so only the prefill launches `add_rmsnorm`.
+            let decode_folds = fused_projections && name == "LlamaForCausalLM";
+            let want = match (fused_ops && with_add_norm, decode_folds) {
+                (false, _) => 0,
+                (true, true) => per_forward,
+                (true, false) => (1 + DECODE) * per_forward,
             };
             let calls = probe.calls.load(Ordering::SeqCst);
             assert_eq!(calls, want, "{name} case {i}: {:?}", CASES[i]);

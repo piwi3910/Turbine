@@ -23,7 +23,9 @@
 // turbine_qgemm_desc.act_static_scale). v2.14 adds no symbol: vllm_wvsplitk
 // takes the SwiGLU input of turbine_gemm_desc (a_silu_mul / a_up_offset) and
 // stages silu_mul(gate, up) as its activations (gemm_wvsplitk.hip); hipblaslt
-// refuses it.
+// refuses it. v2.15 adds no symbol: vllm_wvsplitk takes the residual-add
+// epilogue and the RMSNorm input of turbine_gemm_desc (c_residual,
+// a_norm_weight / a_norm_eps) in decode steps; hipblaslt refuses them.
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)
