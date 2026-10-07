@@ -4270,3 +4270,14 @@ Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts 
 **Decision (user, 2026-10-08): B** — `lab-cluster.sh` family scenarios run the Turbine legs only; `lab-perf.sh` gains
 two-card placements (Turbine, then vLLM-ROCm on the same two cards) and prints the S-13 ratio verdict; an unknown
 `--vllm` slug keeps exit 2.
+
+## Phase 7: Mixtral tool calls — its real chat template drops them (2026-10-08)
+
+From Task 8 (`p7-t8`, fb1ec3ce): Mixtral-8x7B-Instruct-v0.1's chat template (and the pinned RedHatAI FP8 revision's,
+identical) renders neither `tools` into the prompt nor an assistant turn's `tool_calls`, so spec S-18's "every family
+round-trips a tool call" cannot hold for Mixtral as is. The test currently asserts the template drops the call.
+- A) The `mistral` tool format renders tools and calls itself (`[AVAILABLE_TOOLS]` / `[TOOL_CALLS]`) when the
+  template does not.
+- B) Mixtral refuses requests carrying `tools` (400 with a reason code); S-18 amended to exclude Mixtral.
+- C) Mixtral uses a committed tool-aware Mistral template override (as vLLM does with
+  `tool_chat_template_mistral.jinja`), selected by the family when the checkpoint's template lacks tool support.
