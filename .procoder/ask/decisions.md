@@ -4284,3 +4284,15 @@ round-trips a tool call" cannot hold for Mixtral as is. The test currently asser
 
 **Decision (user, 2026-10-08): C** — the Mixtral family ships a committed tool-aware Mistral chat template and uses it
 when the checkpoint's template renders neither `tools` nor `tool_calls`; built in plan Task 21 (Mixtral).
+
+## Phase 7 Task 10: Qwen3 HIP-vs-CPU test bounds (2026-10-08)
+
+From `p7-t10` (a8631565, gate ok 522). Qwen3's per-head QK-norm on HIP runs the library's `turbine_rmsnorm` per head
+(no new kernel). Measured on novanas: the tiny Qwen3 (head_dim 128) greedy run's max |Δ logit| is 0.1285 against the
+Llama bound 0.12 (decision 1A, 2026-10-07): one `k_norm` element rounds 1 BF16 ulp differently in prefill, so the
+difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identical. Qwen3-4B golden trace: norms within
+2 ulps (one element of 14 336 at 2 ulps, |Δ| 4.9e-4, the norm rounds to BF16 twice); top-5 order matches every step.
+- A) Accept: `HIP_QWEN3_MAX_ABS_LOGIT_DIFF = 0.16` (Llama keeps 0.12) and a 2-ulp norm bound for Qwen3.
+- B) Make the per-head norm round once (a fused per-head QK-norm that matches the CPU's single rounding), then keep
+  Qwen3 at Llama's 0.12 and 1 ulp — a new kernel path with its own reference and invariance tests.
+- C) Accept A now and do B as a later perf/numerics follow-up.
