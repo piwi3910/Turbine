@@ -44,8 +44,8 @@ use turbine_model::kv_scales::{KvCache, TqKv};
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
-    TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
-    write_tiny_olmoe_with_head_dim, write_tiny_quantized,
+    TinyOptions, TinySpec, write_tiny_family, write_tiny_llama, write_tiny_llama_with,
+    write_tiny_olmoe, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
 };
 use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
 use turbine_model::tp;
@@ -4944,6 +4944,91 @@ fn tp2_matches_tp1_on_host() {
                 "tp2_matches_tp1_on_host {what}: worst top-k |Δ logprob| / golden bound {worst:.3}"
             );
         }
+    }
+}
+
+/// P7 S-6: the tiny Mistral (the Llama layer under `MistralForCausalLM`) at tp 1 and 2 over
+/// the host collective on the cpu-reference provider gives one device's greedy tokens, with
+/// every row's top-5 logprobs within the strict golden bounds (a group of one bitwise). Breaks
+/// if `Mistral::tp_decoder_spec` is missing (tp refused naming the family) or its hooks differ
+/// from the one-device decoder's.
+#[test]
+fn mistral_tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-mistral-tp");
+    let spec = write_tiny_family(&tmp.path().join("mistral"), "mistral", SEED);
+    assert_eq!(spec.config.family.0.name(), "mistral");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = cpu_model(&spec, &host, 64);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&host, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    // tp 1 and 2 (the gated placements). Not tp 4: on these random weights sequence 0's decode
+    // step 11 is a 0.006-nat near-tie (one device), which tp 4's summation order flips.
+    for world in [1u32, 2] {
+        let ranks = tp_group(&spec, world, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let what = format!("mistral tp {world}");
+        let bound = if world == 1 { TpBound::Bitwise } else { golden };
+        let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+        println!("mistral_tp2_matches_tp1_on_host {what}: worst |Δ logprob| / bound {worst:.3}");
+    }
+}
+
+/// P7 S-6 edge case: Mistral's Hugging Face repositories ship `consolidated.safetensors` (the
+/// mistral-inference layout, other tensor names) beside the HF shards. With both present the
+/// HF checkpoint is loaded and `consolidated.safetensors` is never opened (a garbage one
+/// changes nothing: the greedy run equals the plain tiny run bitwise); with only
+/// `consolidated.safetensors` (here a valid safetensors file) opening fails `ModelError::Io`
+/// naming `model.safetensors.index.json` and the skipped file. Breaks if the loader reads
+/// `consolidated.safetensors` or accepts it as the checkpoint.
+#[test]
+fn mistral_shards_preferred_over_consolidated() {
+    let tmp = TempDir::new("tiny-model-mistral-consolidated");
+    let dir = tmp.path().join("mistral");
+    let spec = write_tiny_family(&dir, "mistral", SEED);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let run = |spec: &TinySpec| {
+        let mut exec = cpu_model(spec, &host, 64);
+        let storage = pool(&host, &layout, 4);
+        greedy_pair(exec.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab)
+    };
+    let plain = run(&spec);
+    std::fs::write(
+        dir.join("consolidated.safetensors"),
+        b"not a safetensors file",
+    )
+    .expect("write consolidated");
+    let with_consolidated = run(&spec);
+    assert_eq!(plain.0, with_consolidated.0, "greedy tokens");
+    let bits = |rows: &[Vec<f32>]| -> Vec<Vec<u32>> {
+        rows.iter()
+            .map(|r| r.iter().map(|v| v.to_bits()).collect())
+            .collect()
+    };
+    assert!(
+        bits(&plain.1) == bits(&with_consolidated.1),
+        "logits differ with consolidated.safetensors present"
+    );
+
+    let only = tmp.path().join("consolidated-only");
+    std::fs::create_dir_all(&only).expect("mkdir");
+    std::fs::copy(
+        dir.join("model.safetensors"),
+        only.join("consolidated.safetensors"),
+    )
+    .expect("copy weights");
+    std::fs::copy(dir.join("config.json"), only.join("config.json")).expect("copy config");
+    match SafetensorsIndex::open(&only) {
+        Err(ModelError::Io { path, detail }) => {
+            assert_eq!(path, only);
+            assert!(detail.contains("model.safetensors.index.json"), "{detail}");
+            assert!(detail.contains("consolidated.safetensors"), "{detail}");
+        }
+        other => panic!("consolidated-only directory: {other:?}"),
     }
 }
 

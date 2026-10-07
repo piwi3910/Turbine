@@ -796,6 +796,127 @@ fn tools_and_json_schema() {
     );
 }
 
+/// The `host:port` of `TURBINE_LAB_URL` (`http://<host>:<port>`, an already running lab
+/// server); panics when it is unset or not of that shape (a lab test never skips).
+fn lab_url_addr() -> SocketAddr {
+    let url = std::env::var("TURBINE_LAB_URL").unwrap_or_else(|_| {
+        panic!("TURBINE_LAB_URL is not set; point it at the served model, e.g. http://192.168.10.203:18000")
+    });
+    let rest = url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("TURBINE_LAB_URL={url}: only http:// URLs"));
+    rest.trim_end_matches('/')
+        .parse()
+        .unwrap_or_else(|e| panic!("TURBINE_LAB_URL={url}: not http://<ip>:<port> ({e})"))
+}
+
+/// One chat completion against `addr`; the response JSON (panics on a non-200 answer).
+fn lab_chat(addr: SocketAddr, body: &Value) -> Value {
+    let (status, text) = request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&body.to_string()),
+    );
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("response is not JSON ({e}): {text}"))
+}
+
+/// P7 S-6: the `mistral` tool round trip on a served Mistral-7B-Instruct-v0.3
+/// (`scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-mistral-7b.yaml`, then
+/// `TURBINE_LAB_URL=http://192.168.10.203:18000 scripts/remote-cargo.sh test -p turbine-server
+/// --test lab_openai mistral_tool_call_round_trip -- --ignored`). A `tools` request with
+/// `tool_choice: "required"` returns exactly one call, `get_weather`, whose arguments are a JSON
+/// object with a `location`; sending that call back as the assistant turn plus a `tool` result
+/// (the call's id: the v0.3 template refuses any id that is not 9 characters) yields a
+/// non-empty assistant `content`. Breaks if the format's grammar, parser or call ids, or the
+/// rendering of `tool_calls` and `tool` messages through Mistral's template, are wrong.
+#[test]
+#[ignore = "lab: needs a served Mistral-7B-Instruct-v0.3 at TURBINE_LAB_URL"]
+fn mistral_tool_call_round_trip() {
+    let addr = lab_url_addr();
+    let (status, models) = request(addr, "GET", "/v1/models", None);
+    assert_eq!(status, 200, "{models}");
+    let models: Value = serde_json::from_str(&models).expect("models JSON");
+    let model = models["data"][0]["id"]
+        .as_str()
+        .expect("a served model")
+        .to_string();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city, e.g. Paris"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["location"]
+            }
+        }
+    }]);
+    let user = json!({"role": "user", "content": "What is the weather like in Paris today?"});
+    let first = lab_chat(
+        addr,
+        &json!({
+            "model": model, "messages": [user], "tools": tools, "tool_choice": "required",
+            "temperature": 0.0, "max_tokens": 128
+        }),
+    );
+    println!("first: {first}");
+    let choice = &first["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{first}");
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool_calls: {first}"));
+    assert_eq!(calls.len(), 1, "{first}");
+    let call = &calls[0];
+    assert_eq!(call["type"], "function", "{call}");
+    assert_eq!(call["function"]["name"], "get_weather", "{call}");
+    let arguments: Value = serde_json::from_str(
+        call["function"]["arguments"]
+            .as_str()
+            .expect("arguments string"),
+    )
+    .unwrap_or_else(|e| panic!("arguments are not JSON ({e}): {call}"));
+    assert!(
+        arguments["location"]
+            .as_str()
+            .is_some_and(|l| !l.is_empty()),
+        "arguments without a location: {arguments}"
+    );
+    let id = call["id"].as_str().expect("call id");
+
+    let second = lab_chat(
+        addr,
+        &json!({
+            "model": model,
+            "messages": [
+                user,
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": id,
+                 "content": "{\"temperature\": 18, \"unit\": \"celsius\", \"sky\": \"sunny\"}"}
+            ],
+            "tools": tools, "temperature": 0.0, "max_tokens": 128
+        }),
+    );
+    println!("second: {second}");
+    let message = &second["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or("");
+    assert!(
+        !content.trim().is_empty(),
+        "no assistant content after the tool result: {second}"
+    );
+    assert!(
+        message["tool_calls"]
+            .as_array()
+            .is_none_or(|c| c.is_empty()),
+        "{second}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Always-run checks of the fixture and of the response checks.
 

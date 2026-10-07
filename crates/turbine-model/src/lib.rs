@@ -55,7 +55,9 @@ pub use structured::{
     json_options, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
-pub use tools::{ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar};
+pub use tools::{
+    ToolCallParser, ToolChoice, ToolParse, new_call_id, new_mistral_call_id, tool_call_grammar,
+};
 pub use tp::TpContext;
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or

@@ -135,30 +135,45 @@ pub(crate) fn named_call(
     Some((name, arguments.to_string()))
 }
 
-/// A parser's source of call ids.
-pub(crate) struct CallIds(Mutex<ChaCha8Rng>);
+/// A parser's source of call ids: a random stream and the id shape drawn from it
+/// ([`new_call_id`] unless [`CallIds::with_shape`] says otherwise).
+pub(crate) struct CallIds {
+    rng: Mutex<ChaCha8Rng>,
+    shape: fn(&mut ChaCha8Rng) -> String,
+}
 
 impl CallIds {
     /// OS-seeded.
     pub(crate) fn new() -> CallIds {
-        CallIds(Mutex::new(ChaCha8Rng::from_os_rng()))
+        CallIds {
+            rng: Mutex::new(ChaCha8Rng::from_os_rng()),
+            shape: new_call_id,
+        }
     }
 
     /// Reproducible (tests, simulations).
     pub(crate) fn seeded(seed: u64) -> CallIds {
-        CallIds(Mutex::new(ChaCha8Rng::seed_from_u64(seed)))
+        CallIds {
+            rng: Mutex::new(ChaCha8Rng::seed_from_u64(seed)),
+            shape: new_call_id,
+        }
+    }
+
+    /// The same stream drawing ids of another shape (a format whose template constrains ids).
+    pub(crate) fn with_shape(self, shape: fn(&mut ChaCha8Rng) -> String) -> CallIds {
+        CallIds { shape, ..self }
     }
 
     /// `found` calls as [`ToolCallOut`]s indexed in order, with fresh ids.
     pub(crate) fn assign(&self, found: Vec<(String, String)>) -> Vec<ToolCallOut> {
         // A poisoned lock only means another parse panicked mid-draw; the stream is still valid.
-        let mut rng = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut rng = self.rng.lock().unwrap_or_else(|p| p.into_inner());
         found
             .into_iter()
             .zip(0u32..)
             .map(|((name, arguments), index)| ToolCallOut {
                 index,
-                id: new_call_id(&mut *rng),
+                id: (self.shape)(&mut rng),
                 name,
                 arguments,
             })

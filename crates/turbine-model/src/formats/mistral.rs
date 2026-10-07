@@ -13,7 +13,7 @@ use turbine_core::registry::Module;
 use super::envelope::{CallIds, allowed_tools, call_rules, named_call, text_not_starting_with, ws};
 use super::{BoundTokens, ConstraintSpec, Opening, SpecialToken, ToolFormat};
 use crate::ModelError;
-use crate::tools::{ToolCallParser, ToolChoice, ToolParse};
+use crate::tools::{ToolCallParser, ToolChoice, ToolParse, new_mistral_call_id};
 
 /// The format's registry name (and the `parser` label of `turbine_tool_calls_total`).
 pub const MISTRAL: &str = "mistral";
@@ -126,14 +126,14 @@ impl MistralParser {
     /// A parser whose call ids come from an OS-seeded stream.
     pub fn new() -> MistralParser {
         MistralParser {
-            ids: CallIds::new(),
+            ids: CallIds::new().with_shape(new_mistral_call_id),
         }
     }
 
     /// A parser with reproducible call ids (tests, simulations).
     pub fn seeded(seed: u64) -> MistralParser {
         MistralParser {
-            ids: CallIds::seeded(seed),
+            ids: CallIds::seeded(seed).with_shape(new_mistral_call_id),
         }
     }
 }

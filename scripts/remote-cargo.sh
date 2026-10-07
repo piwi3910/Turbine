@@ -13,7 +13,7 @@
 #
 # Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas), TURBINE_REMOTE_TOOLCHAIN
 # (default 1.97), TURBINE_REMOTE_JOBS (cargo build jobs, default 4), TURBINE_REMOTE_CPUS (cores
-# cargo and the tests it runs may use, default 12-15).
+# cargo and the tests it runs may use, default 12-15); TURBINE_LAB_URL is passed to cargo when set.
 # Only builds and host-side tests run here: GPU tests stay #[ignore]d and run through lab-test.sh.
 # Builds are CPU work and never wait for the GPU queue (bench.lock; coordinator 2026-09-29: a gate
 # queued behind hours of one-at-a-time GPU jobs): they run at nice 19 pinned to cores 12-15, like
@@ -57,6 +57,12 @@ args=""
 for a in "$@"; do
 	args+=" $(printf '%q' "$a")"
 done
+# A lab test against an already running server (e.g. lab_openai mistral_tool_call_round_trip)
+# reads its URL from TURBINE_LAB_URL: forwarded when set.
+lab_url=""
+if [[ -n ${TURBINE_LAB_URL:-} ]]; then
+	lab_url="TURBINE_LAB_URL=$(printf '%q' "$TURBINE_LAB_URL")"
+fi
 exec ssh -o BatchMode=yes "$host" \
 	"cd '$remote/src' && env CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
-   CARGO_TERM_COLOR=never nice -n 19 taskset -c $cpus \$HOME/.cargo/bin/cargo +$toolchain$args"
+   CARGO_TERM_COLOR=never $lab_url nice -n 19 taskset -c $cpus \$HOME/.cargo/bin/cargo +$toolchain$args"

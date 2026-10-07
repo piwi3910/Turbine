@@ -101,7 +101,7 @@ fn stage_spec(cfg: &ModelArchConfig) -> Result<DecoderSpec, ModelError> {
                 "> 1 ({} has no decoder hooks for pipeline stages)",
                 cfg.family.0.name()
             ),
-            "a family on the shared decoder skeleton (llama, olmoe)",
+            "a family on the shared decoder skeleton (llama, mistral, olmoe)",
         )
     })
 }
