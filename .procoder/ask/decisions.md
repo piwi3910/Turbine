@@ -4171,3 +4171,24 @@ cases: overlap off + jump 4.20 s, overlap on + jump 4.37 s. Not fixable by code 
 running.
 
 As built (2026-10-07, 03584a5c): `turn_overlap` completes the iteration in flight serially when it holds a row of a jump-forward-eligible constrained choice (`jump_forward_running`: jump-forward on, constrained, choice 0, not finished), counted as `turbine_overlap_serial_turns_total{reason="jump_forward_eligible"}` beside `jump_forward_step`, `unstarted_admitted`, `request_ended`; the one-ahead extension of a5b3e3b2 is removed (unreachable). Lab `lab_openai json_schema_jump_forward_matches` at the default (overlap on): steps on/off 133/148 = 0.899×, accepted 3/4/8/0, wall 4.32 s vs 4.45 s.
+
+## Phase 7 spec: order, exit bar, checkpoints, disk, GDN kernel, carry-over (2026-10-07)
+
+Inputs: the umbrella `phase-6-8-expansion` S-8 and the research briefing (lead, 2026-10-07: novanas 117 GB free disk,
+no Phase 7 checkpoints present; per-family candidates and kernel providers).
+
+1. Family order — A) Qwen3 dense → Qwen3-MoE → Mistral → Mixtral → gpt-oss-20b → Qwen3.5/3.6 hybrids; B) gpt-oss
+   early; C) hybrids early.
+2. Row bar for `supported` — A) golden c1/c16 vs transformers + GSM8K vs vLLM-ROCm on the same checkpoint (≤ 0.01;
+   quantized rows the 6a per-format drop) + c16 throughput ≥ 0.75× vLLM-ROCm; B) golden + eval only; C) A plus
+   c1 ≥ 0.85× of the 640 GB/s roofline.
+3. Checkpoints — A) Qwen3-4B-Instruct-2507 BF16 (1 GPU); Qwen3-30B-A3B-Instruct-2507-FP8 (TP2); openai/gpt-oss-20b
+   MXFP4 (1 GPU); Qwen3.5-9B BF16 (1 GPU); Qwen3.6-35B-A3B-FP8 (TP2); Mistral-7B-Instruct-v0.3 BF16 (1 GPU);
+   RedHatAI Mixtral-8x7B-Instruct FP8 (TP2, tight KV) — ~170 GB; B) drop Qwen3.6 and Mixtral; C) Qwen3.5-4B.
+4. Disk on novanas — A) the user frees space; B) download per family, delete after close; C) fixtures on cpuhost.
+5. Gated DeltaNet kernel — A) evaluate llama.cpp ggml `gated_delta_net`/`ssm_conv` (decode) + AMD AITER HIP
+   chunk-state (prefill), own kernel only where both fail or are slower; B) llama.cpp only; C) own kernel.
+6. Carry-over into Phase 7 (multi-select) — OLMoE EP×TP drift; MXFP4 p05 trace + `mxfp4_a4`; OLMoE FP8 KV; L0 `tq4`.
+
+**Decision (user, 2026-10-07): 1 A, 2 A, 3 A, 5 A, 6 all four.** 4: none of the options — "add an iSCSI volume
+from our TrueNAS and offload older, no longer needed models there" (details below).
