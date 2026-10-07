@@ -618,3 +618,122 @@ fn openings_of_hermes_and_mistral() {
         );
     }
 }
+
+/// The chat-template fixture (`tests/fixtures/<dir>/tokenizer_config.json`, the checkpoint's
+/// own template) of a family whose default tool format is checked against its real template;
+/// `None` for Llama and OLMoE (covered by Phase 2's tool tests).
+fn family_template_fixture(family: &str) -> Option<&'static str> {
+    match family {
+        "qwen3" => Some("qwen3-0.6b"),
+        // The template of the pinned Qwen3-30B-A3B-Instruct-2507-FP8 revision
+        // (`scripts/lab/phase7-checkpoints.tsv`).
+        "qwen3_moe" => Some("qwen3-30b-a3b"),
+        "mistral" => Some("mistral-7b-instruct-v0.3"),
+        "mixtral" => Some("mixtral-8x7b-instruct-v0.1"),
+        _ => None,
+    }
+}
+
+/// Each family's default tool format, and the special tokens of its tokenizer that decode to
+/// no text (skipped by the detokenizer, so a parser never sees them).
+fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'static str]) {
+    match family {
+        "llama" => (Some(llama3_json::LLAMA3_JSON), &[]),
+        "olmoe" => (None, &[]),
+        "qwen3" | "qwen3_moe" => (Some(hermes::HERMES), &["<|im_end|>"]),
+        "mistral" | "mixtral" => (Some(mistral::MISTRAL), &[mistral::TOOL_CALLS, "</s>"]),
+        other => panic!("family {other} has no expected default tool format"),
+    }
+}
+
+/// S-18 (part 1): an assistant turn carrying one `get_weather` call, rendered by the family's
+/// real chat template, parses back through the family's default format into that call. The
+/// assistant text is what the template renders after the generation prompt, with the
+/// tokenizer's no-text special tokens removed and the family's reasoning split off first, as
+/// the server does.
+#[test]
+fn family_default_tool_calls_round_trip() {
+    let arguments = json!({"location": "Oslo", "unit": "celsius"});
+    let tools = weather_tools();
+    let user = json!({"role": "user", "content": "What is the weather in Oslo?"});
+    let assistant = json!({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": arguments.clone()}
+    }]});
+    let mut checked = 0;
+    for family in crate::families::registry().iter() {
+        let (default, no_text) = family_tool_expectations(family.name());
+        assert_eq!(
+            family.default_tool_format(),
+            default,
+            "family {} default tool format",
+            family.name()
+        );
+        let Some(dir) = family_template_fixture(family.name()) else {
+            continue;
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir)
+            .join("tokenizer_config.json");
+        let template = crate::ChatTemplate::load(&path)
+            .unwrap_or_else(|e| panic!("{}: {dir} template: {e}", family.name()));
+        let kwargs = serde_json::Map::new();
+        let prompt = template
+            .render(std::slice::from_ref(&user), Some(&tools), true, &kwargs)
+            .unwrap_or_else(|e| panic!("{}: prompt: {e}", family.name()));
+        let turn = template
+            .render(
+                &[user.clone(), assistant.clone()],
+                Some(&tools),
+                false,
+                &kwargs,
+            )
+            .unwrap_or_else(|e| panic!("{}: assistant turn: {e}", family.name()));
+        let mut text = turn
+            .strip_prefix(&prompt)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: the assistant turn does not extend the generation prompt:\n{prompt:?}\n{turn:?}",
+                    family.name()
+                )
+            })
+            .to_string();
+        for token in no_text {
+            text = text.replace(token, "");
+        }
+        if let Some(name) = family.default_reasoning_parser() {
+            let parser = crate::reasoning::registry()
+                .get(name)
+                .unwrap_or_else(|| panic!("reasoning parser {name}"));
+            let mut stream = parser.start(&prompt);
+            let mut split = stream.push(&text);
+            split.append(stream.finish());
+            assert_eq!(split.reasoning.trim(), "", "{}: {text:?}", family.name());
+            text = split.content;
+        }
+        let format = registry()
+            .get(default.expect("a family with a template fixture has a default format"))
+            .expect("registered default format");
+        if family.name() == "mixtral" {
+            // Mixtral-8x7B-Instruct-v0.1's template (also the pinned RedHatAI FP8 revision's)
+            // renders an assistant turn's `content` only: it drops `tool_calls`, so no call can
+            // round-trip through it. Kept as an explicit case so a template that starts
+            // rendering calls is noticed.
+            assert!(!text.contains("get_weather"), "mixtral: {text:?}");
+            checked += 1;
+            continue;
+        }
+        let calls = names_and_args(format.parser().parse(&text));
+        assert_eq!(calls.len(), 1, "{}: {text:?}", family.name());
+        assert_eq!(calls[0].0, "get_weather", "{}: {text:?}", family.name());
+        let parsed: Value = serde_json::from_str(&calls[0].1).expect("arguments are JSON");
+        assert_eq!(parsed, arguments, "{}: {text:?}", family.name());
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 4,
+        "qwen3, qwen3_moe, mistral and mixtral have template fixtures"
+    );
+}
