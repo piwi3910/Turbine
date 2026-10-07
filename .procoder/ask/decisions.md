@@ -4169,3 +4169,5 @@ cases: overlap off + jump 4.20 s, overlap on + jump 4.37 s. Not fixable by code 
 
 **Decision (user, 2026-10-07): A** — iterations complete serially while a jump-forward-eligible constrained choice is
 running.
+
+As built (2026-10-07, 03584a5c): `turn_overlap` completes the iteration in flight serially when it holds a row of a jump-forward-eligible constrained choice (`jump_forward_running`: jump-forward on, constrained, choice 0, not finished), counted as `turbine_overlap_serial_turns_total{reason="jump_forward_eligible"}` beside `jump_forward_step`, `unstarted_admitted`, `request_ended`; the one-ahead extension of a5b3e3b2 is removed (unreachable). Lab `lab_openai json_schema_jump_forward_matches` at the default (overlap on): steps on/off 133/148 = 0.899×, accepted 3/4/8/0, wall 4.32 s vs 4.45 s.
