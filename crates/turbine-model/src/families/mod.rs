@@ -251,6 +251,9 @@ mod tests {
     use crate::testing::TempDir;
     use crate::testing::tiny::{write_tiny_llama, write_tiny_olmoe};
 
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
     fn config_json(dir: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap()
     }
@@ -301,7 +304,7 @@ mod tests {
             assert_eq!(resolve(&nested).unwrap().0.name(), name);
         }
 
-        let err = resolve(&json!({"architectures": ["GptOssForCausalLM"]}))
+        let err = resolve(&json!({"architectures": [UNREGISTERED_ARCH]}))
             .unwrap_err()
             .to_string();
         assert!(
@@ -312,7 +315,7 @@ mod tests {
             ),
             "{err}"
         );
-        assert!(err.contains("GptOssForCausalLM"), "{err}");
+        assert!(err.contains(UNREGISTERED_ARCH), "{err}");
         let err = resolve(&json!({})).unwrap_err().to_string();
         assert!(
             err.starts_with("unsupported architectures = <missing>;"),

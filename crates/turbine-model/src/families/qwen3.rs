@@ -2,9 +2,10 @@
 //! Llama layer plus an RMSNorm over each Q and K head (`self_attn.q_norm` / `k_norm` of
 //! `[head_dim]`) before RoPE, as the [`QK_NORM_PER_HEAD`] attention hook, which keeps the
 //! Q/K/V projections unfused (gate/up still fuse). Its keys: `use_sliding_window` must not be
-//! true (sliding windows are refused, an open Phase 8 decision; `sliding_window` itself is then
-//! unused). Tool calls default to `hermes`. CPU backend only: the support matrix refuses it on
-//! GPU vendors until its Phase 8 track closes.
+//! true (no executor implements a sliding window, so it is refused; `sliding_window` itself is
+//! then unused). Tool calls default to `hermes`. CPU backend only: the support matrix refuses it
+//! on GPU vendors until its row closes in Phase 7 model families (track
+//! phase-7-model-families).
 
 use std::sync::Arc;
 

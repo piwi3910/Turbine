@@ -5,7 +5,8 @@
 //! transformers' `Qwen3MoeConfig`); every layer must be sparse (`decoder_sparse_step` 1, no
 //! `mlp_only_layers`), and `use_sliding_window` must not be true. Checkpoint names are OLMoE's
 //! (`mlp.gate`, `mlp.experts.<e>.{gate,up,down}_proj`). Tool calls default to `hermes`. CPU
-//! backend only: the support matrix refuses it on GPU vendors until its Phase 8 track closes.
+//! backend only: the support matrix refuses it on GPU vendors until its row closes in Phase 7
+//! model families (track phase-7-model-families).
 
 use std::sync::Arc;
 

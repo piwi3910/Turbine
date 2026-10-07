@@ -5,7 +5,8 @@
 //! Mistral's (null or covering every position). Its checkpoint names
 //! (`block_sparse_moe.gate`, experts `w1` / `w3` / `w2`) are mapped onto the MoE hook's
 //! parameters by [`mixtral_slots`]. Tool calls default to `mistral`. CPU backend only: the
-//! support matrix refuses it on GPU vendors until its Phase 8 track closes.
+//! support matrix refuses it on GPU vendors until its row closes in Phase 7 model families
+//! (track phase-7-model-families).
 
 use std::sync::Arc;
 

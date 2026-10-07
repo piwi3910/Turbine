@@ -862,6 +862,9 @@ mod tests {
     use crate::testing::TempDir;
     use crate::testing::tiny::write_tiny_llama;
 
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
     fn fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llama-3.2-3b-instruct")
     }
@@ -1217,14 +1220,14 @@ mod tests {
 
     #[test]
     fn rejects_unsupported() {
-        let dir = edited_config("gpt-oss", |v| {
-            v["architectures"] = serde_json::json!(["GptOssForCausalLM"]);
+        let dir = edited_config("unregistered", |v| {
+            v["architectures"] = serde_json::json!([UNREGISTERED_ARCH]);
         });
         let err = load_model_config(&dir).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported architectures = GptOssForCausalLM; supported: registered families: \
-             llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
+            "unsupported architectures = ExampleUnregisteredForCausalLM; supported: registered \
+             families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
              qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
              (MixtralForCausalLM)"
         );
@@ -1935,8 +1938,8 @@ mod tests {
         );
     }
 
-    /// Features no executor implements are refused naming the key (open Phase 8 decisions,
-    /// kept as the run-ahead has them): sliding windows (Mistral, Mixtral, Qwen3), partially
+    /// Features no executor implements are refused naming the key (kept as the run-ahead
+    /// has them): sliding windows (Mistral, Mixtral, Qwen3), partially
     /// dense Qwen3-MoE layers; missing expert keys are malformed.
     #[test]
     fn rejects_unsupported_family_features() {

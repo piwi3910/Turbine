@@ -43,6 +43,8 @@ use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
 
+/// An architecture no family registers.
+const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
 const POLL: Duration = Duration::from_millis(20);
 const READY_LIMIT: Duration = Duration::from_secs(60);
 /// Launches of one test server before a lost port race fails the test.
@@ -1983,14 +1985,14 @@ fn startup_failures_exit_1() {
     assert_exit_1(&config_yaml(&pickle, addr, ""), addr, "pickle");
 
     // Unsupported architecture (no registered family).
-    let unknown = dir.path().join("gpt-oss");
+    let unknown = dir.path().join("unregistered");
     write_tiny_llama(&unknown, 7);
     let mut cfg: Value =
         serde_json::from_slice(&std::fs::read(unknown.join("config.json")).unwrap()).unwrap();
-    cfg["architectures"] = json!(["GptOssForCausalLM"]);
+    cfg["architectures"] = json!([UNREGISTERED_ARCH]);
     std::fs::write(unknown.join("config.json"), cfg.to_string()).unwrap();
     let addr = free_addr();
-    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, "GptOssForCausalLM");
+    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, UNREGISTERED_ARCH);
 
     // hip with a kernel library that does not exist.
     let tiny = dir.path().join("tiny");

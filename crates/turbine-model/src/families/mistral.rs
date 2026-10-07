@@ -1,9 +1,9 @@
 //! The Mistral family (`mistral`, `MistralForCausalLM`; Phase 8 run-ahead, Phase 2m S-11): the
 //! Llama layer as is ([`PLAIN_ATTENTION`], [`SWIGLU`], Llama's weight slots). Its key:
 //! `sliding_window` must be null or at least `max_position_embeddings` (it then never limits
-//! attention); a real window is refused (an open Phase 8 decision). Tool calls default to
-//! `mistral`. CPU backend only: the support matrix refuses it on GPU vendors until its Phase 8
-//! track closes.
+//! attention); a real window is refused (no executor implements a sliding window). Tool calls
+//! default to `mistral`. CPU backend only: the support matrix refuses it on GPU vendors until
+//! its row closes in Phase 7 model families (track phase-7-model-families).
 
 use std::sync::Arc;
 

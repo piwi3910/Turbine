@@ -364,6 +364,9 @@ mod tests {
     use turbine_core::types::{DeviceId, MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
 
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
     /// A per-test directory under the system temp dir, removed on drop.
     struct TempDir(PathBuf);
 
@@ -794,11 +797,11 @@ mod tests {
         );
         let unknown = model_dir(
             "unknown",
-            serde_json::json!({"architectures": ["GptOssForCausalLM"]}),
+            serde_json::json!({"architectures": [UNREGISTERED_ARCH]}),
         );
         assert_eq!(
             read_architecture(unknown.path()).as_deref(),
-            Some("GptOssForCausalLM")
+            Some(UNREGISTERED_ARCH)
         );
     }
 }

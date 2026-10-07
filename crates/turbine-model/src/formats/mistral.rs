@@ -4,8 +4,8 @@
 //! A call is an optional `[TOOL_CALLS]` control token, then one JSON array of
 //! `{"name": …, "arguments": {…}}` objects (an `id` string key is accepted and ignored).
 //! `[TOOL_CALLS]` is a special token that decodes to no text; the grammar leaves it out, so it
-//! compiles on any tokenizer, and the parser accepts calls without it (an open Phase 8 decision,
-//! kept as the run-ahead has it). In `auto` mode an output opens like a call when its first
+//! compiles on any tokenizer, and the parser accepts calls without it (kept as the run-ahead
+//! has it). In `auto` mode an output opens like a call when its first
 //! token is `[TOOL_CALLS]` or its first non-whitespace character is `[`.
 use serde_json::Value;
 use turbine_core::registry::Module;
