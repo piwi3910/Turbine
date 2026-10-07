@@ -223,6 +223,9 @@ pub(crate) struct EngineLoop {
     late_finished: Vec<(SeqId, FinishReason)>,
     /// Iterations launched while the previous one was still in flight.
     overlapped: u64,
+    /// Overlap scheduling: a request ended since the last turn began (its client may send the
+    /// next one while the iteration in flight runs).
+    ended_since_turn: bool,
     kv: KvOrchestrator,
     /// Submissions waiting for their prefix (Phase 4): promotions in flight, or another request
     /// computing it (`attach_again`). Their admission answer is sent once they enter the
@@ -416,6 +419,7 @@ impl EngineLoop {
             in_flight: None,
             late_finished: Vec::new(),
             overlapped: 0,
+            ended_since_turn: false,
             kv: p.kv,
             held: HashMap::new(),
             kv_done: Vec::new(),
@@ -2229,7 +2233,8 @@ impl EngineLoop {
     /// iteration is computed and dropped. A batch that needs a token the device did not choose
     /// (a constrained, seeded-draw, `top_k` or full-row choice, a fork's first token) waits for
     /// the iteration in flight first, so it runs as the serial loop does; so does every turn
-    /// that finds an admitted request waiting for its first prefill chunk (P5p S-3).
+    /// that finds an admitted request waiting for its first prefill chunk, and the turn after a
+    /// request ended (P5p S-3).
     fn turn_overlap(&mut self) -> Result<Turn, String> {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
@@ -2240,9 +2245,10 @@ impl EngineLoop {
         self.stages.mark(Stage::Emit);
         self.detect_disconnects();
         self.expire_deadlines();
+        let ended = std::mem::take(&mut self.ended_since_turn);
         if let Some(prev) = self.in_flight.take() {
             let forced = prev.launched && prev.rows.iter().any(|r| r.forced.is_some());
-            if forced || self.sched.has_unstarted_admitted() {
+            if forced || ended || self.sched.has_unstarted_admitted() {
                 // The iteration in flight completes serially and nothing is launched ahead:
                 // - a jump-forward step's (P5p S-10): its verification decides the appended
                 //   tokens and any rollback, so the host work runs before the scheduler
@@ -2250,7 +2256,12 @@ impl EngineLoop {
                 // - while an admitted request waits for its first prefill chunk (P5p S-3): the
                 //   plan below then starts it knowing every finish of the iteration before it
                 //   (no dropped extra rows beside it, their slots and blocks already free),
-                //   and its first token is not held behind a launch-ahead.
+                //   and its first token is not held behind a launch-ahead;
+                // - the turn after a request ended (P5p S-3, decision "5p Task 4" B): its
+                //   client's next request, sent on the final event, reaches the channel during
+                //   this device wait and starts in the plan below, as on the serial loop (left
+                //   to the next plan, a closed loop's waves bunch up behind the prefill budget:
+                //   c16 TTFT p50 1.7×).
                 self.finish_serial(prev)?;
                 // Requests that reached the channel while the turn waited for the device start
                 // in the plan below, as on the serial loop, whose plan follows its device wait
@@ -3079,6 +3090,7 @@ impl EngineLoop {
             // tokens and table are read by `kv_commits` below (P5p S-5; a request that ended
             // at its prefill committed nothing before).
             self.retire_later.push(id);
+            self.ended_since_turn = true;
         }
     }
 
@@ -4862,6 +4874,83 @@ mod tests {
             first_turn.get(&c.id),
             first_turn.get(&b.id),
             "c, arrived during that turn's device wait, starts beside b"
+        );
+        let got: Vec<Vec<ChoiceStream>> = streams.into_iter().map(|s| vec![s.1]).collect();
+        assert_eq!(got, serial);
+    }
+
+    /// P5p S-3 follow-up: under overlap scheduling, the turn after a request ended completes
+    /// the iteration in flight serially, so the client's next request `b`, sent on the final
+    /// event and reaching the channel while that iteration runs, starts in the plan after it,
+    /// as on the serial loop. Breaks if that turn launches ahead: `b` then misses the plan
+    /// made while the iteration ran and waits a whole further iteration (in a closed loop at
+    /// c16 the requests of a wave bunch up behind the prefill budget, TTFT p50 1.7×). Every
+    /// stream equals the serial run's.
+    #[test]
+    fn overlap_admits_resubmissions_in_the_next_plan() {
+        let (_dir, spec, tokenizer) = tiny();
+        let long = request(&[256, 72, 101, 108, 108, 111], 16);
+        let a = request(&[256, 79], 3);
+        let b = request(&[256, 80, 81], 4);
+        let (serial, _) = run_streams(
+            &spec,
+            &tokenizer,
+            &[long.clone(), a.clone(), b.clone()],
+            false,
+        );
+
+        let tx_slot = Arc::new(std::sync::Mutex::new(None));
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = ArriveOnCollect {
+            inner: tiny_reducing_executor(&spec, 8),
+            tx: Arc::clone(&tx_slot),
+            arrivals: Arc::clone(&arrivals),
+        };
+        let t = engine_with(Box::new(exec), Arc::clone(&tokenizer), params(4, 8), true);
+        assert!(t.engine.overlap);
+        *tx_slot.lock().unwrap() = Some(t.tx.clone());
+        let mut engine = t.engine;
+        let mut acks = Vec::new();
+        let mut streams = Vec::new();
+        for r in [&long, &a] {
+            let (rx, ack) = submit(&t.tx, r.clone());
+            acks.push(ack);
+            streams.push((rx, ChoiceStream::default(), false));
+        }
+        let mut a_ended = None;
+        let mut b_first = None;
+        for turn in 0..200 {
+            assert!(matches!(engine.turn_overlap(), Ok(Turn::Continue)));
+            if b_first.is_none() && engine.iteration_requests.contains(&b.id) {
+                b_first = Some(turn);
+            }
+            for (rx, stream, done) in &mut streams {
+                *done |= fold_events(stream, drain(rx));
+            }
+            if a_ended.is_none() && streams[1].2 {
+                // `a`'s client sends `b` on its final event; it reaches the channel while the
+                // next turn waits for the device.
+                a_ended = Some(turn);
+                assert!(engine.in_flight.as_ref().is_some_and(|f| f.launched));
+                let (events, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+                let (ack, admitted) = oneshot::channel();
+                acks.push(admitted);
+                arrivals.lock().unwrap().push(EngineCommand::Submit(
+                    Box::new(b.clone().into()),
+                    events,
+                    ack,
+                ));
+                streams.push((rx, ChoiceStream::default(), false));
+            }
+            if streams.len() == 3 && streams.iter().all(|s| s.2) {
+                break;
+            }
+        }
+        assert!(streams.iter().all(|s| s.2), "every stream finished");
+        assert_eq!(
+            b_first,
+            a_ended.map(|t| t + 1),
+            "b starts in the plan of the turn after a ended"
         );
         let got: Vec<Vec<ChoiceStream>> = streams.into_iter().map(|s| vec![s.1]).collect();
         assert_eq!(got, serial);
