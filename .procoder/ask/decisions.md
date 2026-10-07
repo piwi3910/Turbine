@@ -4131,3 +4131,13 @@ overlap on and are pinned to serial there:
 
 **Decision (user, 2026-10-07): 1 A, 2 B, 3 A** — merge the flip; jump-forward works under overlap before the 5p exit
 (test requires overlap jumps); the stage accounting adds up under overlap; the phase2c lab configs flip to `true`.
+
+As built (2 B, 3 A; branch `p5p-stage-acct`, 61831c73 and the lab-config commit): under overlap the scheduler
+document's `last_iteration` is the last completed iteration over its own window (plan to completion, two engine
+turns; the difference of two running stage totals), so `stages_ms` sums to `duration_ms`; the new
+`last_iteration.overlap_ms` is the part of the window after its launch returned that was not its own device wait
+(0 on the serial loop, whose numbers are unchanged). The `turbine_engine_iteration_seconds{stage}` histograms (and
+`turbine-bench stage-share`) stay per turn; under overlap `host_share` is the engine thread's host-work share, an
+upper bound on GPU idle. `tiny_server iteration_stage_breakdown` runs on the default overlap again, with a
+`_serial` leg. `scripts/lab/phase2c-novanas-{llama,olmoe}.yaml` set `overlap_scheduling: true` (earlier perf-log
+numbers from them are serial).
