@@ -4151,3 +4151,18 @@ turns; the difference of two running stage totals), so `stages_ms` sums to `dura
 upper bound on GPU idle. `tiny_server iteration_stage_breakdown` runs on the default overlap again, with a
 `_serial` leg. `scripts/lab/phase2c-novanas-{llama,olmoe}.yaml` set `overlap_scheduling: true` (earlier perf-log
 numbers from them are serial).
+
+## 5p exit: jump-forward under overlap on the real tokenizer (2026-10-07)
+
+The 5p exit tier's `lab_openai json_schema_jump_forward_matches` fails with overlap on (now the default): steps on/off
+147/148 = 0.993× against the S-10 bound 0.90×; accepted forced tokens (person/review/nested/capital) 0/1/0/0. With
+overlap off it is 133/148 = 0.899× and 3/4/8/0, the S-10 numbers (2026-10-05), so no other merge is involved. Cause:
+on Llama's tokenizer almost every forced run is exactly one token (e.g. the key after an opening `"`); under overlap
+the in-flight decode already yields that token (a5b3e3b2 drops it), leaving nothing to draft. Wall time c1, the four
+cases: overlap off + jump 4.20 s, overlap on + jump 4.37 s. Not fixable by code alone.
+
+- A) Serial turns while a jump-forward-eligible constrained choice is running (the iteration waits for its sample):
+  expected 0.899×, c1 faster (4.20 vs 4.37 s); a batch holding a JSON request loses overlap for all its sequences.
+- A') As A, but serial only when the grammar can force a token after the next one (narrower; a check per step).
+- B) Re-bound: keep the 0.90× bound on a leg pinned to `overlap_scheduling: false`; the overlap leg requires bit-exact
+  outputs and steps ≤ masked. Accepts that jump-forward gives little on Llama under overlap.
