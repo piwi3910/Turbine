@@ -4240,3 +4240,6 @@ plus a full snapshot, cutting the pool's block count ~12×.
 (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 - A) Keep closed checkpoints local (lab pods read them; local free space ~320 GB after the cache move).
 - B) Move them to iSCSI and bind-mount each back under `/home/piwi/turbine-models/<slug>`.
+
+**Decision (user, 2026-10-08): (1) B, (2) A** — a hybrid snapshot every `kv.hybrid_snapshot_interval_blocks` (default 8)
+full blocks plus the last full block of every finished sequence; closed Phase 7 checkpoints stay on local disk.
