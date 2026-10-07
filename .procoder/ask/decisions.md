@@ -4216,3 +4216,13 @@ models: `turbine-ci/remote` and `turbine-ci/cache/slots` move there and are bind
 `_netdev`); models stay on local disk (options were: all models bind-mounted from iSCSI; only old quants; caches).
 Local agent worktrees whose branch is merged into main and clean are removed so `lab-prune` reclaims their remote
 target dirs (user: yes, merged only).
+
+Phase 7 spec, third round (user, 2026-10-08):
+- Reasoning output — A) a registered reasoning parser per family (Qwen `<think>`, Harmony analysis channel) puts
+  reasoning in `reasoning_content`, streaming too; golden and GSM8K run with thinking off where the template allows,
+  plus one logged GSM8K run with thinking on; B) raw text inline. **Decision: A.**
+- MoE checkpoints over two cards — A) measure TP2 and EP2, gate both against the transformers reference (batched
+  bounds, c1 and c16), document the faster, keep the other if it passes, after the OLMoE EP×TP drift investigation;
+  B) TP2 only; C) EP2 only. **Decision: A.**
+- `mxfp4_a4` — A) keep experimental and close; B) `supported` if GSM8K holds the 6a 4-bit drop (≤ 0.04) and golden
+  passes a tolerance derived from transformers' self-spread; C) a Turbine-exact reference. **Decision: B.**
