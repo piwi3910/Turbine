@@ -13,6 +13,12 @@
 //! parsed output becomes one `ToolCalls` event and `finish_reason: "tool_calls"`; an output that
 //! does not parse is returned as content with its finish reason unchanged
 //! (`tool_call_parse_failed`).
+//!
+//! Reasoning (P7 S-10): a chat request on a model with a reasoning parser
+//! (`model.reasoning_parser`) runs each choice's text through its own
+//! [`turbine_model::reasoning::ReasoningStream`], started from the tail of the rendered prompt,
+//! before the tool-call rules: the reasoning becomes `Reasoning` events (`reasoning_content`),
+//! only the content reaches the `Token` events and the tool-call parser.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -26,6 +32,7 @@ use turbine_core::request::{
 };
 use turbine_core::types::SeqId;
 use turbine_model::formats::{BoundToolFormat, Opening};
+use turbine_model::reasoning::{ReasoningDelta, ReasoningParser, ReasoningStream};
 use turbine_model::{
     IncrementalDetokenizer, ModelError, ModelMetrics, SampledToken, Sampler, TokenMask,
     TokenMatcher, Tokenizer, ToolCallOutcome, ToolCallParser, ToolParse, step_mask,
@@ -63,6 +70,56 @@ pub(crate) struct Submission {
     pub tools: ToolOutput,
     /// Completions `echo`: the prompt text each choice's output starts with.
     pub echo_text: Option<String>,
+    /// The reasoning parser of a chat request (P7 S-10); `None` when off.
+    pub reasoning: Option<ReasoningStart>,
+}
+
+/// What starts each choice's reasoning stream.
+pub(crate) struct ReasoningStart {
+    pub parser: &'static dyn ReasoningParser,
+    /// The end of the rendered prompt ([`PROMPT_TAIL_BYTES`] at most, on a char boundary).
+    pub prompt_tail: String,
+}
+
+/// Bytes of the rendered prompt a reasoning parser sees.
+pub(crate) const PROMPT_TAIL_BYTES: usize = 64;
+
+impl ReasoningStart {
+    /// The parser started on the last [`PROMPT_TAIL_BYTES`] of `prompt` (less when that would
+    /// split a char).
+    pub fn new(parser: &'static dyn ReasoningParser, prompt: &str) -> ReasoningStart {
+        let mut start = prompt.len().saturating_sub(PROMPT_TAIL_BYTES);
+        while !prompt.is_char_boundary(start) {
+            start += 1;
+        }
+        ReasoningStart {
+            parser,
+            prompt_tail: prompt[start..].to_string(),
+        }
+    }
+}
+
+/// One choice's reasoning stream and the tokens not attributed yet.
+struct ChoiceReasoning {
+    stream: Box<dyn ReasoningStream>,
+    /// Tokens since the last delta that decided anything (their text was held back).
+    pending_tokens: u64,
+}
+
+impl ChoiceReasoning {
+    /// Accounts one token's delta: the tokens up to a delta with reasoning are reasoning tokens
+    /// (returned), those up to a content-only delta are not.
+    fn attribute(&mut self, delta: &ReasoningDelta) -> u64 {
+        self.pending_tokens += 1;
+        if !delta.reasoning.is_empty() {
+            std::mem::take(&mut self.pending_tokens)
+        } else {
+            if !delta.content.is_empty() {
+                self.pending_tokens = 0;
+            }
+            0
+        }
+    }
 }
 
 impl From<GenerationRequest> for Submission {
@@ -73,6 +130,7 @@ impl From<GenerationRequest> for Submission {
             matchers: Vec::new(),
             tools: ToolOutput::None,
             echo_text: None,
+            reasoning: None,
         }
     }
 }
@@ -80,7 +138,8 @@ impl From<GenerationRequest> for Submission {
 /// The events one sampled token produces and whether it ended its choice.
 #[derive(Debug)]
 pub(crate) struct Step {
-    /// A `Token` event, then a `ToolCalls` event when the finished output parsed as calls.
+    /// A `Reasoning` event when the token's text held reasoning (P7 S-10), a `Token` event,
+    /// then a `ToolCalls` event when the finished output parsed as calls.
     pub events: SmallVec<[GenerationEvent; 2]>,
     pub finish: Option<FinishReason>,
     /// Time of the step after sampling: detokenisation, the stop-string search, tool-call
@@ -163,6 +222,7 @@ impl ActiveRequest {
             matchers,
             tools,
             echo_text,
+            reasoning,
         } = submission;
         let end_ids = end_ids(&request.stop);
         let mut matchers = matchers.into_iter();
@@ -186,6 +246,10 @@ impl ActiveRequest {
                     ToolOutput::Auto(_) => ToolText::Undecided(String::new()),
                     ToolOutput::Constrained(_) => ToolText::Holding(String::new()),
                 },
+                reasoning: reasoning.as_ref().map(|r| ChoiceReasoning {
+                    stream: r.parser.start(&r.prompt_tail),
+                    pending_tokens: 0,
+                }),
                 generated: Vec::new(),
                 finish: None,
                 last_token_at: None,
@@ -415,6 +479,26 @@ impl ActiveRequest {
             (text, None)
         };
 
+        // Reasoning: split off before the tool-call rules see the text.
+        let mut reasoning = String::new();
+        let text = match c.reasoning.as_mut() {
+            None => text,
+            Some(r) => {
+                let mut delta = r.stream.push(&text);
+                if finish.is_some() {
+                    delta.append(r.stream.finish());
+                }
+                let tokens = r.attribute(&delta);
+                if tokens > 0
+                    && let Some(m) = metrics
+                {
+                    m.record_reasoning_tokens(tokens);
+                }
+                reasoning = delta.reasoning;
+                delta.content
+            }
+        };
+
         // Tool calls: hold what may be a call, parse it at the finish.
         let parser = match &self.tools {
             ToolOutput::None => None,
@@ -460,6 +544,12 @@ impl ActiveRequest {
         }
         c.finish = finish;
         let mut events = SmallVec::new();
+        if !reasoning.is_empty() {
+            events.push(GenerationEvent::Reasoning {
+                choice: c.index,
+                text: reasoning,
+            });
+        }
         events.push(GenerationEvent::Token {
             choice: c.index,
             text,
@@ -513,19 +603,23 @@ impl ActiveRequest {
         let mut finished = None;
         for (j, row) in rows.into_iter().enumerate() {
             let step = self.step(choice, row, max_seq_len, metrics)?;
-            let sampled = match &step.events[0] {
-                GenerationEvent::Token {
-                    token_id,
-                    logprob,
-                    top_logprobs,
-                    ..
-                } => SampledToken {
-                    token: *token_id,
-                    logprob: *logprob,
-                    top_logprobs: top_logprobs.clone(),
-                },
-                _ => unreachable!("a step's first event is its Token"),
-            };
+            let sampled = step
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    GenerationEvent::Token {
+                        token_id,
+                        logprob,
+                        top_logprobs,
+                        ..
+                    } => Some(SampledToken {
+                        token: *token_id,
+                        logprob: *logprob,
+                        top_logprobs: top_logprobs.clone(),
+                    }),
+                    _ => None,
+                })
+                .expect("a step carries its Token event");
             let agree = j < forced.len() && sampled.token == forced[j];
             steps.push(step);
             if agree && steps.last().is_some_and(|s| s.finish.is_none()) {
@@ -612,6 +706,8 @@ pub(crate) struct Choice {
     /// `echo` text not yet sent (it prefixes the choice's first token event).
     echo: Option<String>,
     tool_text: ToolText,
+    /// The reasoning stream (P7 S-10), when the request has a reasoning parser.
+    reasoning: Option<ChoiceReasoning>,
     /// Generated tokens in order, EOS included.
     pub generated: Vec<u32>,
     pub finish: Option<FinishReason>,
@@ -914,6 +1010,64 @@ mod tests {
         let s = r.step(0, &mut row(last, vocab), 512, None).expect("step");
         streamed.push_str(token_text(&s.events[0]));
         (streamed, s)
+    }
+
+    /// P7 S-10: with a reasoning parser each choice splits its text — reasoning into
+    /// `Reasoning` events before the token's `Token` event, content into the `Token` text — and
+    /// a choice of `n` = 2 keeps its own stream. Breaks if reasoning leaks into the content,
+    /// the marker is output, or the choices share parser state.
+    #[test]
+    fn reasoning_split_per_choice() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-reasoning");
+        let vocab = tokenizer.vocab_size() as usize;
+        let mut req = request(&[256], 64, &[]);
+        req.n = 2;
+        let parser = turbine_model::reasoning::registry()
+            .get("qwen_think")
+            .expect("registered");
+        let (tx, _rx) = mpsc::channel(64);
+        let mut r = ActiveRequest::new(
+            Submission {
+                reasoning: Some(ReasoningStart::new(
+                    parser,
+                    "<|im_start|>assistant\n<think>\n",
+                )),
+                ..req.into()
+            },
+            tx,
+            &[SeqId(1), SeqId(2)],
+            &tokenizer,
+        );
+        let mut split = [
+            (String::new(), String::new()),
+            (String::new(), String::new()),
+        ];
+        // Choice 0 closes its reasoning, choice 1 never does.
+        for (choice, text) in [(0, "ab</think>cd"), (1, "xy")] {
+            for b in text.bytes() {
+                let s = r
+                    .step(choice, &mut row(u32::from(b), vocab), 512, None)
+                    .expect("step");
+                for event in &s.events {
+                    match event {
+                        GenerationEvent::Reasoning { choice: c, text } => {
+                            assert_eq!(*c as usize, choice);
+                            split[choice].0.push_str(text);
+                        }
+                        GenerationEvent::Token { text, .. } => split[choice].1.push_str(text),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(split[0], ("ab".to_string(), "cd".to_string()));
+        assert_eq!(split[1], ("xy".to_string(), String::new()));
+
+        // The tail is the prompt's last bytes, cut on a char boundary.
+        let long = format!("{}é<think>\n", "x".repeat(PROMPT_TAIL_BYTES));
+        let start = ReasoningStart::new(parser, &long);
+        assert!(start.prompt_tail.len() <= PROMPT_TAIL_BYTES);
+        assert!(long.ends_with(&start.prompt_tail));
     }
 
     #[test]

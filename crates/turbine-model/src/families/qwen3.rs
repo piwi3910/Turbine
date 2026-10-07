@@ -88,6 +88,10 @@ impl ModelFamily for Qwen3 {
         Some(HERMES)
     }
 
+    fn default_reasoning_parser(&self) -> Option<&'static str> {
+        Some("qwen_think")
+    }
+
     /// The family's tiny checkpoint (`testing::tiny`).
     fn write_tiny(&self, dir: &std::path::Path, seed: u64) -> crate::testing::tiny::TinySpec {
         crate::testing::tiny::write_tiny_family(dir, self.name(), seed)

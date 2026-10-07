@@ -37,6 +37,7 @@ use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::kv_scales::KvCache;
 use turbine_model::loader::LoadedWeights;
 use turbine_model::pp;
+use turbine_model::reasoning::ReasoningParser;
 use turbine_model::tp::{self, ShardSpec};
 use turbine_model::{
     ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES, ModelArchConfig,
@@ -505,6 +506,8 @@ pub struct PreparedModel {
     /// The resolved `model.tool_call_parser`: a registered tool format bound to the tokenizer,
     /// or `None` (off).
     pub tool_format: Option<Arc<BoundToolFormat>>,
+    /// The resolved `model.reasoning_parser` (P7 S-10), or `None` (off).
+    pub reasoning_parser: Option<&'static dyn ReasoningParser>,
     /// The module picked at each extension point (`/turbine/v1/status` `modules`).
     pub modules: ModuleChoices,
     pub served_name: String,
@@ -925,9 +928,14 @@ fn prepare_with(
         tool_call_parser = tool_format_name.unwrap_or("none"),
         "structured output ready"
     );
+    let reasoning_parser = crate::modules::resolve_reasoning_parser(
+        config.model.reasoning_parser.as_str(),
+        arch.family.0,
+    );
     let modules = ModuleChoices {
         family: arch.family.0.name().to_string(),
         tool_format: tool_format_name.map(str::to_string),
+        reasoning_parser: reasoning_parser.map(|p| p.name().to_string()),
         weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
         card_profile: provider.opened.card.map(|card| card.name.to_string()),
@@ -971,6 +979,7 @@ fn prepare_with(
         grammar,
         structured_output: config.structured_output.clone(),
         tool_format,
+        reasoning_parser,
         modules,
         served_name,
         budget,

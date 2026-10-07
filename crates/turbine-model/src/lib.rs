@@ -19,6 +19,7 @@ pub mod kv_scales;
 pub mod loader;
 pub mod metrics;
 pub mod pp;
+pub mod reasoning;
 pub mod registries;
 pub mod safetensors;
 pub mod sampling;

@@ -23,6 +23,9 @@ model:
   # A registered tool-call format (llama3_json) or none; null: llama3_json for LlamaForCausalLM
   # whose chat template renders tools, else none.
   tool_call_parser: null
+  # A registered reasoning parser (qwen_think), none, or auto: the family's default (qwen_think
+  # for Qwen3 and Qwen3-MoE); it fills reasoning_content in chat responses.
+  reasoning_parser: auto
 kv:
   # Tokens per KV page. On HIP, a multiple of 128 runs paged attention on Composable Kernel
   # fmha_fwd_pagedkv; any other size falls back to the slower Turbine kernel.

@@ -56,6 +56,11 @@ pub trait ModelFamily: Module {
     /// The tool-call format a null `model.tool_call_parser` resolves to (when the chat template
     /// renders tools).
     fn default_tool_format(&self) -> Option<&'static str>;
+    /// The reasoning parser `model.reasoning_parser: auto` resolves to (Phase 7 S-10); `None`
+    /// for a family without marked reasoning.
+    fn default_reasoning_parser(&self) -> Option<&'static str> {
+        None
+    }
     /// The family's executor over `weights` for batches within `limits`; `registry` must have
     /// been built from [`ModelFamily::requirements`] of the same `cfg`, block size and `opts`.
     fn build_executor(

@@ -866,7 +866,8 @@ fn status_reports_modules_and_kernels() {
     let status = server.get("/turbine/v1/status").json();
     assert_eq!(
         status["modules"],
-        json!({"family": "llama", "tool_format": "llama3_json", "weight_format": "bf16",
+        json!({"family": "llama", "tool_format": "llama3_json", "reasoning_parser": null,
+               "weight_format": "bf16",
                "backend": "cpu", "card_profile": null, "scheduling_policy": "default",
                "eviction_policy": "cost_aware"}),
         "{status}"
@@ -3696,6 +3697,113 @@ fn qwen3_tiny_generates_on_cpu() {
         child.wait().ok();
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert_eq!(choice_token_ids(&resp.json()["choices"][0]), expected);
+        return;
+    }
+    panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
+}
+
+/// A Qwen3-style test template: the generation prompt opens `<think>\n` unless
+/// `enable_thinking` is false, which renders the empty `<think>\n\n</think>\n\n` block.
+const THINKING_TEMPLATE: &str = "{%- for message in messages %}<|im_start|>{{ message.role }}\n\
+{{ message.content }}<|im_end|>\n{% endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n\
+{% if enable_thinking is defined and not enable_thinking %}<think>\n\n</think>\n\n{% else %}<think>\n\
+{% endif %}{%- endif %}";
+
+/// The chat text of choice 0: `content` and `reasoning_content` concatenated over the stream's
+/// deltas (`None` for a field no delta carried).
+fn streamed_fields(chunks: &[Value]) -> (String, Option<String>) {
+    let mut content = String::new();
+    let mut reasoning: Option<String> = None;
+    for chunk in chunks {
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            content.push_str(text);
+        }
+        if let Some(text) = delta["reasoning_content"].as_str() {
+            reasoning.get_or_insert_with(String::new).push_str(text);
+        }
+    }
+    (content, reasoning)
+}
+
+/// Phase 7 S-10: the tiny Qwen3 resolves `model.reasoning_parser: auto` to `qwen_think`
+/// (`/turbine/v1/status` `modules.reasoning_parser`). With thinking on (the generation prompt
+/// ends `<think>\n`) a greedy 8-token answer is all reasoning: non-empty
+/// `message.reasoning_content`, `turbine_reasoning_tokens_total` 8, and the streamed
+/// `delta.reasoning_content` concatenates to the same text. With
+/// `chat_template_kwargs: {"enable_thinking": false}` the field is absent and `content` holds
+/// the text. Breaks if the parser is not wired, the prompt tail is not passed, the kwargs do not
+/// reach the template or the stream and the full body disagree.
+#[test]
+fn reasoning_content_follows_enable_thinking() {
+    let dir = TempDir::new("turbine-tiny-qwen3-reasoning");
+    let model_dir = dir.path().join("tiny-qwen3");
+    write_tiny_family(&model_dir, "qwen3", 3);
+    std::fs::write(model_dir.join("chat_template.jinja"), THINKING_TEMPLATE).unwrap();
+
+    let config = dir.path().join("config.yaml");
+    for _ in 0..LAUNCH_ATTEMPTS {
+        let addr = free_addr();
+        std::fs::write(&config, config_yaml(&model_dir, addr, "")).unwrap();
+        let mut child = spawn(&config);
+        let logs = drain_stderr(&mut child);
+        match wait_until_ready(&mut child, addr, &logs) {
+            Ready::PortTaken => continue,
+            Ready::Serving => {}
+        }
+        let status = request(addr, "GET", "/turbine/v1/status", None).json();
+        assert_eq!(
+            status["modules"]["reasoning_parser"], "qwen_think",
+            "{status}"
+        );
+
+        let body = json!({"model": "tiny-qwen3", "max_tokens": 8, "temperature": 0,
+                          "ignore_eos": true,
+                          "messages": [{"role": "user", "content": "Hello"}]});
+        let resp = request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&body.to_string()),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let message = resp.json()["choices"][0]["message"].clone();
+        let reasoning = message["reasoning_content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no reasoning_content: {message}"))
+            .to_string();
+        assert!(!reasoning.is_empty(), "{message}");
+        let metrics = request(addr, "GET", "/metrics", None).body;
+        assert_eq!(
+            sample(&metrics, "turbine_reasoning_tokens_total"),
+            Some(8.0),
+            "{metrics}"
+        );
+
+        let mut streaming = body.clone();
+        streaming["stream"] = json!(true);
+        let resp = request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&streaming.to_string()),
+        );
+        let (content, streamed) = streamed_fields(&stream_chunks(&resp));
+        assert_eq!(streamed.as_deref(), Some(reasoning.as_str()));
+        assert_eq!(content, message["content"].as_str().unwrap_or(""));
+
+        let mut off = body.clone();
+        off["chat_template_kwargs"] = json!({"enable_thinking": false});
+        let resp = request(addr, "POST", "/v1/chat/completions", Some(&off.to_string()));
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let message = &resp.json()["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none(), "{message}");
+        assert!(
+            !message["content"].as_str().unwrap_or("").is_empty(),
+            "{message}"
+        );
         return;
     }
     panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");

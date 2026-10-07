@@ -257,6 +257,9 @@ pub(crate) fn total_usage<'a>(choices: impl IntoIterator<Item = &'a ChoiceState>
 struct CollectedChoice {
     state: ChoiceState,
     text: String,
+    /// `message.reasoning_content` (P7 S-10): `None` until a `Reasoning` event arrives, and
+    /// then omitted from the message.
+    reasoning: Option<String>,
     tool_calls: Vec<ToolCallOut>,
 }
 
@@ -292,6 +295,12 @@ pub(crate) async fn collect(
                 c.state.entries.extend(entry);
                 c.text.push_str(&text);
             }
+            GenerationEvent::Reasoning { choice, text } => {
+                choices[choice_index(choice, n)?]
+                    .reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(&text);
+            }
             GenerationEvent::ToolCalls { choice, calls } => {
                 choices[choice_index(choice, n)?].tool_calls.extend(calls);
             }
@@ -326,6 +335,9 @@ fn full_body(ctx: &ResponseContext, choices: &mut [CollectedChoice]) -> Value {
             let finish_reason = c.state.finish.map_or(Value::Null, |r| r.as_str().into());
             if ctx.chat() {
                 let mut message = json!({"role": "assistant", "content": c.text});
+                if let Some(reasoning) = &c.reasoning {
+                    message["reasoning_content"] = reasoning.as_str().into();
+                }
                 if !c.tool_calls.is_empty() {
                     c.tool_calls.sort_by_key(|call| call.index);
                     if c.text.is_empty() {

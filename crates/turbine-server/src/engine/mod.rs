@@ -58,7 +58,7 @@ use crate::reliability::{self as rel, EngineLedgerProbe, ReliabilityInputs};
 
 pub(crate) use deadlines::Timeouts;
 pub(crate) use r#loop::{EngineLoop, EngineParts};
-pub(crate) use requests::{Submission, ToolOutput, ToolParser};
+pub(crate) use requests::{ReasoningStart, Submission, ToolOutput, ToolParser};
 
 /// Events buffered per request between the engine and the HTTP response (P2 S-7); one slot
 /// of it stays reserved for the error event that ends a stream the engine closes on a slow

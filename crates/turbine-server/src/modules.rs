@@ -9,10 +9,16 @@ use std::sync::{LazyLock, OnceLock};
 
 use serde::Serialize;
 use turbine_core::config::ModuleNames;
+use turbine_model::ModelFamily;
+use turbine_model::reasoning::ReasoningParser;
 
 /// Tool-call formats (`tool_format`): the names of `turbine_model::formats::registry`.
 pub static TOOL_FORMATS: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_model::formats::registry().names());
+/// Reasoning parsers (`reasoning_parser`, Phase 7): the names of
+/// `turbine_model::reasoning::registry`.
+pub static REASONING_PARSERS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_model::reasoning::registry().names());
 /// Execution backends (`execution_backend`): the names of `turbine_kernels::backends::registry()`.
 pub fn backends() -> &'static [&'static str] {
     static NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -54,6 +60,7 @@ pub static KV_FORMATS: LazyLock<Vec<&'static str>> =
 pub fn known_module_names() -> ModuleNames<'static> {
     ModuleNames {
         tool_formats: &TOOL_FORMATS,
+        reasoning_parsers: &REASONING_PARSERS,
         backends: backends(),
         card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,
@@ -71,6 +78,8 @@ pub struct ModuleChoices {
     pub family: String,
     /// `None` when tool calling is off.
     pub tool_format: Option<String>,
+    /// `model.reasoning_parser` resolved (Phase 7 S-10); `None` when off.
+    pub reasoning_parser: Option<String>,
     pub weight_format: String,
     pub backend: String,
     /// `None` on a backend without card profiles (`cpu`).
@@ -97,6 +106,11 @@ impl ModuleChoices {
             "model.tool_call_parser, else the family default",
         );
         log_selected(
+            "reasoning_parser",
+            self.reasoning_parser.as_deref().unwrap_or("none"),
+            "model.reasoning_parser, auto: the family default",
+        );
+        log_selected(
             "weight_format",
             &self.weight_format,
             "config.json dtype and quantization_config",
@@ -105,6 +119,22 @@ impl ModuleChoices {
             log_selected("card_profile", "none", "the backend has no card profiles");
         }
     }
+}
+
+/// `model.reasoning_parser` as a parser of the reasoning registry
+/// ([`turbine_model::reasoning::registry`]) or `None` (off): `auto` is the family's
+/// [`ModelFamily::default_reasoning_parser`] (`qwen_think` for Qwen3 and Qwen3-MoE), `none` is
+/// off; a name `Config::validate_modules` would have refused resolves to none.
+pub fn resolve_reasoning_parser(
+    configured: &str,
+    family: &dyn ModelFamily,
+) -> Option<&'static dyn ReasoningParser> {
+    let name = match configured {
+        "none" => return None,
+        "auto" => family.default_reasoning_parser()?,
+        name => name,
+    };
+    turbine_model::reasoning::registry().get(name)
 }
 
 #[cfg(test)]
@@ -117,6 +147,7 @@ mod tests {
         let known = known_module_names();
         for names in [
             known.tool_formats,
+            known.reasoning_parsers,
             known.backends,
             known.card_profiles,
             known.scheduling_policies,
@@ -134,5 +165,22 @@ mod tests {
         assert!(known.eviction_policies.contains(&"cost_aware"));
         assert!(known.rank_transports.contains(&"tcp"));
         assert!(known.router_policies.contains(&"prefix_affinity"));
+        assert!(known.reasoning_parsers.contains(&"qwen_think"));
+    }
+
+    /// `auto` follows the family default, `none` is off, a name is taken as given. Breaks if
+    /// Llama gains a reasoning parser or Qwen3 loses its default.
+    #[test]
+    fn reasoning_parser_resolution() {
+        use turbine_model::families::{Llama, Qwen3, Qwen3Moe};
+        let name = |configured, family: &dyn ModelFamily| {
+            resolve_reasoning_parser(configured, family).map(|p| p.name())
+        };
+        assert_eq!(name("auto", &Qwen3), Some("qwen_think"));
+        assert_eq!(name("auto", &Qwen3Moe), Some("qwen_think"));
+        assert_eq!(name("auto", &Llama), None);
+        assert_eq!(name("none", &Qwen3), None);
+        assert_eq!(name("qwen_think", &Llama), Some("qwen_think"));
+        assert_eq!(name("nope", &Qwen3), None);
     }
 }

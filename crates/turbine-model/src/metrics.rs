@@ -97,6 +97,8 @@ pub struct ModelMetrics {
     pub token_mask_seconds: Histogram,
     /// Tool-call parser results by parser and outcome (P2 S-18).
     pub tool_calls: Family<ToolCallLabels, Counter>,
+    /// Generated tokens attributed to reasoning by the reasoning parser (Phase 7 S-10).
+    pub reasoning_tokens: Counter,
     /// `turbine_weight_format_info{format,packaging}` = 1 for the loaded checkpoint (Phase 6a
     /// S-19).
     pub weight_format_info: Family<WeightFormatInfoLabels, Gauge>,
@@ -149,6 +151,12 @@ impl ModelMetrics {
                 "Tool-call parser results by parser and outcome",
                 Family::default(),
             ),
+            reasoning_tokens: reg.register(
+                // prometheus-client appends `_total` to counters
+                "turbine_reasoning_tokens",
+                "Generated tokens attributed to reasoning by the reasoning parser",
+                Counter::default(),
+            ),
             weight_format_info: reg.register(
                 "turbine_weight_format_info",
                 "The loaded checkpoint's weight format and packaging; 1 for the loaded one",
@@ -172,6 +180,11 @@ impl ModelMetrics {
                 outcome: outcome.as_str(),
             })
             .inc();
+    }
+
+    /// Counts `tokens` generated tokens attributed to reasoning.
+    pub fn record_reasoning_tokens(&self, tokens: u64) {
+        self.reasoning_tokens.inc_by(tokens);
     }
 
     /// Records a finished model load: its duration and the weight bytes in `format`.
