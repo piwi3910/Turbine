@@ -243,6 +243,7 @@ impl Ledger {
             pool,
             bytes,
             committed: 0,
+            state_bytes: 0,
             members: Vec::new(),
         })
     }
@@ -360,6 +361,9 @@ pub struct Reservation {
     pool: PoolKind,
     bytes: u64,
     committed: u64,
+    /// The part of `bytes` that holds the request's per-sequence state (P7 S-1); the rest is
+    /// its KV blocks. Released with the guard like the KV part.
+    state_bytes: u64,
     members: Vec<Reservation>,
 }
 
@@ -408,6 +412,19 @@ impl Reservation {
 
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// This reservation with `state` of its bytes marked as per-sequence state (P7 S-1),
+    /// capped at its total; the members of a group reservation keep their own marks.
+    pub fn with_state_bytes(mut self, state: u64) -> Reservation {
+        self.state_bytes = state.min(self.bytes);
+        self
+    }
+
+    /// The part of [`Reservation::bytes`] that holds per-sequence state (0 for families
+    /// without state).
+    pub fn state_bytes(&self) -> u64 {
+        self.state_bytes
     }
 
     pub fn committed(&self) -> u64 {

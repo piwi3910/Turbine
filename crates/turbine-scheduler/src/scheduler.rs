@@ -48,7 +48,7 @@ use smallvec::SmallVec;
 use turbine_core::clock::Clock;
 use turbine_core::config::Config;
 use turbine_core::request::FinishReason;
-use turbine_core::types::{BlockId, PressureState, RequestId, SeqId};
+use turbine_core::types::{BlockId, PressureState, RequestId, SeqId, StateLayout};
 use turbine_kv::hierarchy::PrefixAttach;
 use turbine_kv::{BlockPool, BlockTable, PoolError, blocks_for_tokens};
 use turbine_reliability::admission::RejectionReason;
@@ -501,6 +501,9 @@ pub struct Scheduler {
     busy: HashMap<RequestId, u64>,
     /// Plans with work that may be in flight at once (`parallel.pipeline.micro_batches`).
     micro_batches: u32,
+    /// The model's per-sequence state (P7 S-1): every request's worst-case reservation holds
+    /// it beside the KV blocks (`ResourceEstimate::state_bytes`).
+    state_bytes: u64,
     iteration: u64,
     admissions: u64,
     preemptions_total: u64,
@@ -532,6 +535,7 @@ impl Scheduler {
             in_flight: BTreeMap::new(),
             busy: HashMap::new(),
             micro_batches: 1,
+            state_bytes: 0,
             iteration: 0,
             admissions: 0,
             preemptions_total: 0,
@@ -606,6 +610,25 @@ impl Scheduler {
         self.micro_batches
     }
 
+    /// The model's per-sequence state (P7 S-1): each submitted request's estimate carries
+    /// `state.bytes_per_sequence()`, so its worst-case reservation holds the state beside its
+    /// KV blocks and releases both together (finish, cancel, preemption).
+    pub fn with_state_layout(mut self, state: StateLayout) -> Scheduler {
+        self.state_bytes = state.bytes_per_sequence();
+        self
+    }
+
+    /// The per-sequence state bytes each request reserves (0 for families without state).
+    pub fn state_bytes(&self) -> u64 {
+        self.state_bytes
+    }
+
+    /// The worst-case reservation an admitted request holds (`None` without a gate, or once it
+    /// left the scheduler).
+    pub fn reservation(&self, id: RequestId) -> Option<&Reservation> {
+        self.requests.get(&id)?.reservation.as_ref()
+    }
+
     /// Plans with work that were planned and not completed yet.
     pub fn micro_batches_in_flight(&self) -> usize {
         self.in_flight.values().filter(|f| f.executes).count()
@@ -637,6 +660,7 @@ impl Scheduler {
             self.count_rejection(r.id, e);
             return Err(e);
         }
+        r.estimate.state_bytes = self.state_bytes;
         let block_tokens = self.params.block_tokens;
         let submit_no = self.queue.next_order();
         let window = self.params.cache_aware_window;
@@ -687,6 +711,7 @@ impl Scheduler {
         pool_total_blocks: u32,
     ) -> Result<(), SubmitError> {
         self.check_submission(&r, pool_total_blocks)?;
+        r.estimate.state_bytes = self.state_bytes;
         let block_tokens = self.params.block_tokens;
         let reservation = match self.gate.as_ref() {
             Some(gate) => {
@@ -727,6 +752,7 @@ impl Scheduler {
             prompt_tokens: r.estimate.prompt_tokens,
             cached_prefix_tokens: r.estimate.cached_prefix_tokens,
             window,
+            state_bytes: r.estimate.state_bytes,
         }
     }
 

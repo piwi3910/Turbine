@@ -44,6 +44,9 @@ pub struct AdmissionInfo {
     pub cached_prefix_tokens: u32,
     /// The `cache_aware` window (`scheduler.cache_aware_window`).
     pub window: Duration,
+    /// The model's per-sequence state the request reserves beside its KV (P7 S-1); 0 for
+    /// families without state.
+    pub state_bytes: u64,
 }
 
 /// Admission order of the waiting queue: the smallest key is admitted first. The queue
@@ -116,6 +119,7 @@ mod tests {
             prompt_tokens: 0,
             cached_prefix_tokens: 0,
             window: Duration::from_secs(1),
+            state_bytes: 0,
         }
     }
 
@@ -268,6 +272,7 @@ mod tests {
             prompt_tokens: 512,
             cached_prefix_tokens: prefix,
             window,
+            state_bytes: 0,
         }
     }
 

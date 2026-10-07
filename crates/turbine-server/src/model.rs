@@ -890,6 +890,7 @@ fn prepare_with(
         layout,
         budget.pool(PoolKind::Kv),
         scheduler.max_running_requests,
+        arch.state.bytes_per_sequence(),
     )?;
     tracing::info!(
         event = "memory_budget",
@@ -1044,6 +1045,7 @@ impl PreparedModel {
             layout,
             self.budget.pool(PoolKind::Kv),
             self.scheduler.max_running_requests,
+            self.arch.state.bytes_per_sequence(),
         )?;
         tracing::info!(
             event = "device_shared",
@@ -1129,16 +1131,25 @@ fn log_backend_note(note: &BackendNote, block_tokens: u32) {
 
 /// The L0 pool: as many blocks as the budget's `kv` pool (`bytes`: the budget remainder after
 /// weights, workspace, runtime overhead and the emergency reserve, capped by
-/// `kv.gpu.max_bytes`) holds. At least one block per running request.
+/// `kv.gpu.max_bytes`) holds once every running sequence's state is set aside
+/// (`max_running × state_bytes`, P7 S-1: the admission ledger's `kv` pool reserves each
+/// request's state beside its blocks). At least one block per running request.
 pub(crate) fn kv_pool_config(
     layout: KvLayout,
     bytes: u64,
     max_running: u32,
+    state_bytes: u64,
 ) -> Result<BlockPoolConfig, StartupError> {
-    let pool = BlockPoolConfig::for_bytes(layout, bytes);
+    let state = u64::from(max_running).saturating_mul(state_bytes);
+    let pool = BlockPoolConfig::for_bytes(layout, bytes.saturating_sub(state));
     if pool.num_blocks < max_running {
+        let state = if state == 0 {
+            String::new()
+        } else {
+            format!(" after the state of {max_running} running sequences ({state} B)")
+        };
         return Err(StartupError::new(format!(
-            "the kv pool of {bytes} B holds {} KV blocks of {} B; at least one block per \
+            "the kv pool of {bytes} B holds {} KV blocks of {} B{state}; at least one block per \
              running request (scheduler.max_running_requests = {max_running}) is required",
             pool.num_blocks,
             pool.layout.block_bytes()
@@ -1462,6 +1473,7 @@ pub(crate) fn pool_blocks(
         prepared.pool.layout,
         budget.pool(PoolKind::Kv),
         prepared.scheduler.max_running_requests,
+        prepared.arch.state.bytes_per_sequence(),
     )?;
     Ok(measured.num_blocks.min(prepared.pool.num_blocks))
 }
