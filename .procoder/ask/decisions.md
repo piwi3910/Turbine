@@ -4226,3 +4226,17 @@ Phase 7 spec, third round (user, 2026-10-08):
   B) TP2 only; C) EP2 only. **Decision: A.**
 - `mxfp4_a4` — A) keep experimental and close; B) `supported` if GSM8K holds the 6a 4-bit drop (≤ 0.04) and golden
   passes a tolerance derived from transformers' self-spread; C) a Turbine-exact reference. **Decision: B.**
+
+## Phase 7 plan: hybrid snapshot cost and closed checkpoints (2026-10-08)
+
+From the Phase 7 plan (5395d31b). (1) Qwen3.5-9B's recurrent + conv state is ~48 MiB per sequence against ~4 MiB of
+KV per 128-token block; a snapshot at every full-block boundary (spec S-12 as decided) charges each hybrid block its KV
+plus a full snapshot, cutting the pool's block count ~12×.
+- A) Keep: a snapshot at every full block (finest reuse, smallest pool).
+- B) A snapshot every N full blocks (`kv.hybrid_snapshot_interval_blocks`, default 8 = 1024 tokens) plus the last full
+  block of every finished sequence (the multi-turn hit point); a hit restores the nearest snapshot at or before the
+  match and recomputes the rest.
+- C) Only the last full block of every finished sequence.
+(2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
+- A) Keep closed checkpoints local (lab pods read them; local free space ~320 GB after the cache move).
+- B) Move them to iSCSI and bind-mount each back under `/home/piwi/turbine-models/<slug>`.
