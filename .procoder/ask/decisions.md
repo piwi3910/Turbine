@@ -4266,3 +4266,7 @@ the pod's two GPUs (GPUs are per container).
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
 Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
+
+**Decision (user, 2026-10-08): B** — `lab-cluster.sh` family scenarios run the Turbine legs only; `lab-perf.sh` gains
+two-card placements (Turbine, then vLLM-ROCm on the same two cards) and prints the S-13 ratio verdict; an unknown
+`--vllm` slug keeps exit 2.
