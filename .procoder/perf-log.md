@@ -1976,3 +1976,19 @@ Llama c1 ITL 11.238 → 11.138 ms (−0.10 ms, 0.991×; prediction −0.087); at
 read per step (10.05 ms) that is 0.894× → **0.902×** of peak. c16 unchanged (the first stage C run followed its golden
 c16 pass; the second pair is 856.0 vs 856.4); OLMoE unchanged (never folds). Lab: hip_ops `gemv_` (all pass),
 tiny_model 41/41 on the GPU, gate ok.
+
+## 5p exit tiers (2026-10-07, `p6b-stack` a2478b63, plan Task 19)
+
+- Gate: `scripts/gate.sh --full` → `gate: ok crates=all passed=1018 failed=0`.
+- Lab one-GPU full tier (`lab-test.sh novanas --tier full`, run 1007161634-023726aa): 1131 passed, 1 failed —
+  `hip_qgemm_mxfp4 qgemm_mxfp4_prefill_within_hipblaslt_bound` (`3b.qkv: 1.452` over the 1.45 bound, the known
+  MXFP4 flake); rerun alone: 3b.qkv m=2048 ratio 1.443, 1 passed. Classified a flake.
+- Lab two-GPU leg (`lab-test.sh novanas --gpus 2 --features fault-injection --tier full`, run 1007174701-1703873b):
+  27 passed, 0 failed.
+- Bench (`lab-bench.sh --golden16`; phase2c configs now run overlap on, so these are new baselines):
+  - `BENCH p5p-exit llama commit=a2478b63 gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=local weight_format=bf16 kv=bf16 conc=16 host_share=0.0211 ok=200 failed=0 tok/s=864.0 itl_p50=15.3 ttft_p50=207 decode_fwd_ms=14.9`
+  - `BENCH p5p-exit olmoe commit=a2478b63 gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=local weight_format=bf16 kv=bf16 conc=16 host_share=0.0136 ok=200 failed=0 tok/s=636.1 itl_p50=23.2 ttft_p50=128 decode_fwd_ms=22.6`
+- Soak (`overload-soak.sh novanas --duration 10m`, `target/soak/novanas-20261007T180501Z/verdict.json`): **pass**,
+  all eight checks true (no restart, only 503 overload codes, streams complete, ITL p99 208.1 ms vs calibration
+  172.8 ms within 2×, reached ORANGE, GREEN 0 s after cool-down, KV idle, reserve held); 200: 4750, 429: 101
+  (`queue_full` 101, `queue_timeout` 3585), 0 client drops.
