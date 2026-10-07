@@ -20,6 +20,21 @@ use crate::executor::TraceTensor;
 use crate::executor::rope::inv_freq;
 use crate::safetensors::Dtype;
 
+/// One token's routing at one MoE layer, recorded by
+/// [`DecoderExecutor::set_routing_trace`](crate::executor::DecoderExecutor::set_routing_trace)
+/// (P7 Task 12): the top-k expert ids in the router's order, their gates (the routing weights
+/// the experts' outputs are scaled by) and the margin of the choice — the smallest selected
+/// router logit minus the largest unselected one, on the logits the router selects on (BF16-
+/// rounded for a BF16 model); `+inf` when every expert is selected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingRow {
+    pub layer: u32,
+    pub position: u32,
+    pub topk_ids: Vec<u32>,
+    pub topk_gates: Vec<f32>,
+    pub margin: f32,
+}
+
 /// Reads the BF16 tensor `name` of a checkpoint as f32 values (a positioned read of its byte
 /// range; no caching). Panics when it is missing, not BF16 or unreadable (a test utility).
 pub fn read_bf16_weight(index: &SafetensorsIndex, name: &str) -> Vec<f32> {

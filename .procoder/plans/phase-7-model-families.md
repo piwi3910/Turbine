@@ -268,17 +268,17 @@ Interfaces:
 
 ## Task 12: OLMoE EP×TP drift — the per-position routing trace (S-3, investigate)
 
-Files: `crates/turbine-model/src/executor/decoder/moe.rs` or the MoE hook (a routing trace sink: per layer and position the top-k ids, gate values and the margin to the k+1-th logit), `crates/turbine-model/src/testing/trace.rs` (`RoutingTrace` rows in the existing trace), `crates/turbine-server/tests/lab_cluster.rs` (new; lab test `olmoe_routing_trace_ep2_tp2`, `#[ignore]`), `scripts/lab-cluster.sh` (`ep2-novanas` leg `trace` that runs it), `.procoder/perf-log.md` (section "P7 OLMoE EP×TP drift")
+Files: `crates/turbine-model/src/executor/decoder/moe.rs` or the MoE hook (a routing trace sink: per layer and position the top-k ids, gate values and the margin to the k+1-th logit), `crates/turbine-model/src/testing/trace.rs` (`RoutingTrace` rows in the existing trace), `crates/turbine-model/tests/olmoe_ep_tp_lab.rs` (new; lab test `olmoe_routing_trace_ep2_tp2`, `#[ignore]`, in-process groups so the trace is readable; amended 2026-10-08: the routing trace needs the executors, which a served ep2-novanas leg cannot expose), `scripts/lab-test.sh` (`TWO_GPU_TESTS` gains it; run by `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test olmoe_ep_tp_lab -- olmoe_routing_trace`), `.procoder/perf-log.md` (section "P7 OLMoE EP×TP drift")
 Interfaces:
 
 - `turbine_model::testing::trace::RoutingRow { layer: u32, position: u32, topk_ids: Vec<u32>, topk_gates: Vec<f32>, margin: f32 }`; `DecoderExecutor::set_routing_trace(&mut self, on: bool)`; `take_routing_trace() -> Vec<RoutingRow>`
-- `lab_cluster olmoe_routing_trace_ep2_tp2`: one-GPU vs ep2×tp2 (the refusal bypassed with the test-only `parallel.allow_refused_for_diagnosis: true`, accepted only in a `cfg(test)`/`fault-injection` build) on prompts p08 and p10; prints, per position where the greedy token differs or any top-k set differs, the layer, both id sets and the one-GPU margin
+- `olmoe_ep_tp_lab olmoe_routing_trace_ep2_tp2`: one GPU vs tp 2, ep 2 and ep2×tp2 (in-process executors over RCCL on both R9700s; the refusal is a server startup check, so no bypass key is needed) teacher-forced on the reference tokens of prompts p08 and p10; prints, per position where the argmax differs or any top-k set differs, the layer, both id sets and the one-GPU margin, the router-logit |Δ| distribution, the golden |Δ logprob| per token and whether the ranks route identically
   Covers: S-3 (trace and cause)
   Depends on: Task 9
 
 - [ ] Write failing host test `tiny_model routing_trace_records_topk_and_margin` (tiny OLMoE, CPU: trace rows count = layers × positions, margins ≥ 0, ids match `turbine_kernels::cpu::topk` on the logged logits). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model routing_trace_records_topk_and_margin` — expect FAIL with "no method named `set_routing_trace`"
 - [ ] Implement the trace sink (off by default; zero cost when off) — run, expect PASS.
-- [ ] Write the lab test and the `ep2-novanas` `trace` leg; lab: `scripts/lab-cluster.sh ep2-novanas` (background, both R9700s) — expect the trace table in the log.
+- [ ] Write the lab test; lab: `scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test olmoe_ep_tp_lab -- olmoe_routing_trace` (background, both R9700s) — expect the trace table in the log.
 - [ ] Record in perf-log "P7 OLMoE EP×TP drift": the p08 and p10 tables, whether every first divergence sits on a margin below the TP partial-sum rounding (|Δ| measured), and the stated cause. If the cause is not the near-tie hypothesis, record the evidence and the next hypothesis before Task 13.
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(olmoe): per-position routing trace for one GPU vs ep2×tp2`

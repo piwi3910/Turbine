@@ -263,6 +263,12 @@ impl FfnHook for Moe {
                 expert_offsets: offsets.clone(),
             })
         })?;
+        run.trace_routing(
+            &rows(&b[ROUTER_LOGITS], t),
+            &rows(&b[TOPK_IDS], t),
+            &rows(&b[TOPK_WEIGHTS], t),
+            route.bf16_logits,
+        )?;
         if d.ep.is_some() {
             run.trace("topk_ids", &rows(&b[TOPK_IDS], t))?;
             run.trace("topk_weights", &rows(&b[TOPK_WEIGHTS], t))?;
