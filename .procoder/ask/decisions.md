@@ -4209,3 +4209,10 @@ Phase 7 spec, second round (user, 2026-10-07):
 - No vLLM-ROCm baseline for a family — A) try a newer rocm/vllm tag, else the row needs golden + eval only and the
   throughput is logged with the reason; B) llama.cpp HIP baseline at 0.75×; C) c1 ≥ 0.80× roofline. **Decision: A.**
 - Disk: the user created the iSCSI volume as **10 TB** (not 500 GB), 2026-10-07.
+
+Disk, third round (user, 2026-10-07): the iSCSI volume (10 TB, ext4, `/mnt/turbine-iscsi`, open-iscsi automatic
+login to `iqn.2005-10.org.freenas.ctl:novanas-turbine` on 192.168.10.253 only) holds the **build caches**, not the
+models: `turbine-ci/remote` and `turbine-ci/cache/slots` move there and are bind-mounted back in place (fstab,
+`_netdev`); models stay on local disk (options were: all models bind-mounted from iSCSI; only old quants; caches).
+Local agent worktrees whose branch is merged into main and clean are removed so `lab-prune` reclaims their remote
+target dirs (user: yes, merged only).
