@@ -4104,3 +4104,5 @@ TTFT p50 1.83× (Llama) / 1.69× (OLMoE).
   of off on both models) is met.
 - B) Approve the rule, keep the default `false` (overlap opt-in; +0.8–3.6 % tok/s left on the table).
 - C) Reject the rule (overlap stays as before: c16 TTFT p50 1.7–1.8×, default `false`).
+
+**Decision (user, 2026-10-07): A** — approve the rule and flip `execution.overlap_scheduling` to `true` by default.
