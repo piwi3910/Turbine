@@ -4106,3 +4106,25 @@ TTFT p50 1.83× (Llama) / 1.69× (OLMoE).
 - C) Reject the rule (overlap stays as before: c16 TTFT p50 1.7–1.8×, default `false`).
 
 **Decision (user, 2026-10-07): A** — approve the rule and flip `execution.overlap_scheduling` to `true` by default.
+
+## 5p overlap default: side effects found by the flip (2026-10-07)
+
+From the default flip (branch `p5p-overlap-default`, d23c4e06, gate ok 1016). Two tiny_server tests failed with
+overlap on and are pinned to serial there:
+
+1. **Jump-forward (S-10) is inert under overlap**: `jump_forward_matches_token_by_token` saw
+   `turbine_jump_forward_tokens_total{outcome="accepted"}` stay 0 with overlap on. Output stays correct (the masked
+   path), but structured output loses the jump-forward speedup by default. `jump_forward_overlap_matches_serial` only
+   checks serial + overlap steps summed, so it missed this.
+   - A) Merge the flip now; a builder makes jump-forward work under overlap (and tightens the test to require
+     overlap steps > 0) before the 5p exit.
+   - B) Merge the flip; overlap completes serially while a jump-forward-eligible constrained choice is running.
+   - C) Hold the flip until jump-forward works under overlap.
+2. **Stage breakdown**: under overlap `/turbine/v1/scheduler` `last_iteration.stages_ms` no longer sums to
+   `duration_ms` (0.74 vs 0.028 ms in the test), since host stages overlap the next launch.
+   - A) Document it: under overlap the stages are host-side times and need not sum to the iteration.
+   - B) Fix the accounting so they add up under overlap (separate overlapped device time).
+3. **Lab configs**: `scripts/lab/phase2c-novanas-{llama,olmoe}.yaml` pin `overlap_scheduling: false`, so
+   `lab-bench` keeps benching serial.
+   - A) Flip them to `true` so benches track the shipped default (new baselines from here on).
+   - B) Keep `false` (baselines comparable with history; pass `--set` to bench overlap).
