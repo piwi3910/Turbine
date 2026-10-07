@@ -2727,14 +2727,11 @@ fn response_format_json_schema() {
 #[test]
 fn jump_forward_matches_token_by_token() {
     // The tool-call prompt (the tools rendered into the chat template) is past the tiny
-    // checkpoint's 512 positions, so both servers patch them to the long horizon.
-    // Serial loop on both servers (`execution.overlap_scheduling` is on by default since user
-    // decision 2026-10-07 A): this test counts the jump-forward's accepted tokens, which the
-    // serial path takes; the overlapped path is `engine::r#loop`'s
-    // `jump_forward_overlap_matches_serial`.
+    // checkpoint's 512 positions, so both servers patch them to the long horizon. Both run
+    // the default engine loop, overlap scheduling (user decision 2026-10-07 1A: the
+    // jump-forward accepts forced tokens under it).
     let long = |extra| {
         TinyServer::launch(&Setup {
-            execution_extra: SERIAL,
             extra,
             max_positions: Some(LONG_POSITIONS),
             ..Setup::default()
@@ -2833,10 +2830,13 @@ fn jump_forward_matches_token_by_token() {
         rolled < accepted.unwrap_or(0.0),
         "mostly accepted: {metrics}"
     );
+    // 16 jump steps on the serial loop, 14 under overlap: there the decode in flight when a
+    // run is asked for takes its first forced token itself, so a run of one forced token (or
+    // one `max_tokens` leaves no room past that decode for, `max_tokens_cut`) is not a jump.
     assert_eq!(
         sample(&metrics, "turbine_jump_forward_steps_total"),
-        Some(16.0),
-        "every constrained request jumped"
+        Some(14.0),
+        "every constrained request jumped: {metrics}"
     );
     let metrics = off.metrics();
     assert_eq!(

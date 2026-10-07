@@ -1827,6 +1827,17 @@ impl EngineLoop {
             // history feeds it); a decode item retires the snapshot (the plan dropped the
             // extension and the choice decodes).
             let forced = match item.kind {
+                // An extension asked for while the decode before it was in flight (overlap
+                // scheduling, P5p S-10): it starts at the token `prev` samples, so its batch
+                // waits for that sample. The snapshot stays: it is the pending-run guard of
+                // `request_forced`, and the rebuild without `prev` takes this item's draft.
+                BatchKind::Prefill { start, .. }
+                    if !item.draft.is_empty()
+                        && prev.is_some_and(|p| p.yielders.contains(&item.seq))
+                        && start == r.prompt_len() + r.choices[choice].generated.len() as u32 =>
+                {
+                    return Ok(Build::NeedsHost);
+                }
                 // The plan may have capped the extension below the asked-for run (the
                 // request's own ceiling): the draft truncates with it.
                 BatchKind::Prefill { start, .. }
@@ -2843,7 +2854,19 @@ impl EngineLoop {
         {
             return;
         }
-        let generated = c.generated.len() as u32;
+        // Overlap scheduling (P5p S-10, user decision 2026-10-07 1A): the plan after the
+        // iteration just sampled may already be launched with this choice's decode, which
+        // feeds the token just sampled and yields the next one before this host work ends.
+        // The extension then starts one token later, at that next token: the grammar's
+        // first forced token is what that decode yields (the mask allows nothing else), so
+        // the draft is the run past it. The verification still checks every token, so a
+        // draft the in-flight token contradicts only rolls back.
+        let unfed = r.prompt_len() + c.generated.len() as u32 - 1;
+        let ahead = match self.sched.seq_tokens(seq).map(|t| t.checked_sub(unfed)) {
+            Some(Some(a @ (0 | 1))) => a,
+            _ => return,
+        };
+        let generated = c.generated.len() as u32 + ahead;
         let max = self
             .jump_forward_max_tokens
             // The step always yields one token beyond the run: leave room for it under
@@ -2856,10 +2879,11 @@ impl EngineLoop {
         if max == 0 {
             return;
         }
-        let run = r.forced_tokens(choice, max);
-        if run.is_empty() {
+        let mut run = r.forced_tokens(choice, max + ahead as usize);
+        if run.len() <= ahead as usize {
             return;
         }
+        run.drain(..ahead as usize);
         let seq = r.choices[choice].seq;
         self.jump_drafts.insert(seq, run.clone());
         if let Err(e) = self.sched.extend(seq, run) {
@@ -4426,14 +4450,20 @@ mod tests {
             "jump on matches the masked path (overlap)"
         );
         assert_eq!(serial_on, overlap_on, "overlap matches serial");
-        let series = |reg: &MetricsRegistry, name: &str| metric(reg, name);
-        let metrics = reg.render().unwrap();
-        assert!(
-            series(&reg, "turbine_jump_forward_steps_total")
-                + series(&reg_overlap, "turbine_jump_forward_steps_total")
-                > 0.0,
-            "the constrained choices jumped: {metrics}"
-        );
+        // Each loop jumps on its own and keeps forced tokens (user decision 2026-10-07 1A:
+        // under overlap the run was asked for behind the in-flight decode and never accepted).
+        let accepted = r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#;
+        for (label, reg) in [("serial", &reg), ("overlap", &reg_overlap)] {
+            let metrics = reg.render().unwrap();
+            assert!(
+                metric(reg, "turbine_jump_forward_steps_total") > 0.0,
+                "{label}: the constrained choice jumped: {metrics}"
+            );
+            assert!(
+                metric(reg, accepted) > 0.0,
+                "{label}: forced tokens were accepted: {metrics}"
+            );
+        }
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is

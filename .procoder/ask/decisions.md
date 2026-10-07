@@ -4131,3 +4131,14 @@ overlap on and are pinned to serial there:
 
 **Decision (user, 2026-10-07): 1 A, 2 B, 3 A** — merge the flip; jump-forward works under overlap before the 5p exit
 (test requires overlap jumps); the stage accounting adds up under overlap; the phase2c lab configs flip to `true`.
+
+**As built, 1 A (2026-10-07, branch `p5p-jf-overlap`):** root cause — under overlap the host samples iteration N
+only after iteration N+1 (that choice's plain decode) is already launched, so `request_forced` asked for a run
+computed after token N while the scheduler's next extension starts at token N+1: the draft was one token stale,
+every verification rejected it at row 0, nothing was accepted (output stayed correct through the rollback). Fix:
+`Scheduler::seq_tokens` exposes the fed positions; `request_forced` sees the choice one token ahead and drops the
+run's first forced token (the in-flight decode's only mask-allowed token), bounding the run one token tighter; a
+one-ahead extension item makes `build_batch` wait for that sample (`NeedsHost`) and keeps its snapshot as the
+pending-run guard. A draft the in-flight token contradicts (a non-canonical split) only rolls back. Tests:
+`jump_forward_overlap_matches_serial` requires steps and accepted tokens on each loop; `jump_forward_matches_token_by_token`
+runs under the default (overlap) — 14 jump steps there vs 16 serial (a one-token run is taken by the in-flight decode).

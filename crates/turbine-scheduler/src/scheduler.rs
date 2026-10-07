@@ -1056,6 +1056,13 @@ impl Scheduler {
         self.seqs.get(&seq).map(|e| e.state)
     }
 
+    /// Positions of `seq` the plans so far feed (its block table's `tokens`): one past the
+    /// host's last sampled token while an iteration planned after that sample still has to
+    /// be completed (overlap scheduling launches it before the host samples; P5p S-10).
+    pub fn seq_tokens(&self, seq: SeqId) -> Option<u32> {
+        self.seqs.get(&seq).map(|e| e.table.tokens)
+    }
+
     /// Positions `seq`'s current prefill must reach; `Some` only while it prefills. A prefill
     /// item ending at this position completes the prefill and yields a token.
     pub fn prefill_target(&self, seq: SeqId) -> Option<u32> {
