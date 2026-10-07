@@ -4281,3 +4281,6 @@ round-trips a tool call" cannot hold for Mixtral as is. The test currently asser
 - B) Mixtral refuses requests carrying `tools` (400 with a reason code); S-18 amended to exclude Mixtral.
 - C) Mixtral uses a committed tool-aware Mistral template override (as vLLM does with
   `tool_chat_template_mistral.jinja`), selected by the family when the checkpoint's template lacks tool support.
+
+**Decision (user, 2026-10-08): C** — the Mixtral family ships a committed tool-aware Mistral chat template and uses it
+when the checkpoint's template renders neither `tools` nor `tool_calls`; built in plan Task 21 (Mixtral).
