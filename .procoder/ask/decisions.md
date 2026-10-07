@@ -4243,3 +4243,12 @@ plus a full snapshot, cutting the pool's block count ~12×.
 
 **Decision (user, 2026-10-08): (1) B, (2) A** — a hybrid snapshot every `kv.hybrid_snapshot_interval_blocks` (default 8)
 full blocks plus the last full block of every finished sequence; closed Phase 7 checkpoints stay on local disk.
+
+## Phase 7 standing approvals (2026-10-08)
+
+**Decision (user, 2026-10-08):** (1) each of the seven Phase 7 checkpoints named in the spec may be downloaded on
+novanas (pinned revision, `hf download` with the host's existing login; the token is never read or passed) when its
+family starts, without asking again; anything else still needs the user. (2) Phase 7 lab runs — lab-test, lab-bench,
+lab-cluster two-GPU scenarios, vLLM-ROCm serve jobs (including newer rocm/vllm tags) — run under the Phase 1–5p
+novanas rules without asking each time: our runs only, stop and ask when a GPU is held by another workload, always
+clean up; the exit tier and the soak are announced.
