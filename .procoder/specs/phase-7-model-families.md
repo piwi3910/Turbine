@@ -70,7 +70,7 @@ own gate (S-13).
   decisions.md). The expert ABI gains bias and activation variants (gpt-oss's clamped `x·σ(1.702x)` with `(up+1)` and
   interleaved gate/up) and a shared expert with a sigmoid gate (Qwen3.5/3.6 MoE). `quant_moe_phase7` is removed for
   every combination with a `supported` or `experimental` row.
-- [S-5] **Qwen3-MoE**: `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` over both cards, TP2 and EP2 both gated (decision: MoE over
+- [S-5] **Qwen3 MoE** (`Qwen3MoeForCausalLM`): `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` over both cards, TP2 and EP2 both gated (decision: MoE over
   two cards A); `norm_topk_prob` routing; the faster placement is the documented lab config.
 - [S-6] **Mistral**: `mistralai/Mistral-7B-Instruct-v0.3` BF16 (HF shards only, not the consolidated single-file copy), one
   GPU, `mistral` tool format; TP2 allowed through a `tp_decoder_spec`.
@@ -94,7 +94,7 @@ own gate (S-13).
   EP2 gated). Text only: the vision tower and the `mtp.*` layer are skipped at load (logged). Layers: Gated DeltaNet
   linear attention (causal conv1d k=4, recurrent state per head in F32) interleaved 3:1 with full attention (head_dim
   256, attention output gate, partial rotary 0.25, 1-D RoPE for text), the (1+w) RMSNorm form, MoE with a shared expert
-  (S-4). GDN kernels per the decision (GDN A): evaluate llama.cpp `ggml_gated_delta_net` + `ssm_conv` (decode, short
+  (S-4). The AMD linear-attention kernel provider (HIP, decision GDN A): evaluate llama.cpp `ggml_gated_delta_net` + `ssm_conv` (decode, short
   prefill) and AMD AITER's gfx12 `chunk_gated_delta_rule_fwd_h` (long prefill); write our own only where both fail or
   are measurably slower; record it in decisions.md. CK d256 attention instances.
 - [S-12] **Hybrid state and prefix reuse** (decision: hybrid cache A): per-sequence state slots sized by `StateLayout`,
