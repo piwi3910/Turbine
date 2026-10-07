@@ -1082,6 +1082,41 @@ fn kv_dtype_tq2_exits_2_before_bind() {
     }
 }
 
+/// P7 S-1: a model whose `config.json` sets a real sliding window (Mistral-7B v0.3 with
+/// `sliding_window: 4096`) is refused before the port is bound: exit 2 printing the reason
+/// code `sliding_window_unsupported`, under `--check-config` too. Breaks if the refusal
+/// waits for the model load (exit 1) or loses its reason code.
+#[test]
+fn sliding_window_config_exits_2_before_bind() {
+    let dir = TempDir::new("turbine-server-sliding-window");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../turbine-model/tests/fixtures/mistral-7b-instruct-v0.3/config.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+    v["sliding_window"] = serde_json::json!(4096);
+    std::fs::write(dir.path().join("config.json"), v.to_string()).unwrap();
+    let port = free_port();
+    let cfg = TempConfig::new(
+        "sliding-window",
+        &format!("server:\n  listen: 127.0.0.1:{port}\nexecution:\n  backend: cpu\n"),
+    );
+    let model = format!("model.path={}", dir.path().display());
+    for check in [true, false] {
+        let mut args = vec!["--set", model.as_str()];
+        if check {
+            args.insert(0, "--check-config");
+        }
+        let out = wait_with_timeout(spawn_server(&args, &cfg.path), Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("sliding_window_unsupported"),
+            "{args:?}: stderr: {stderr}"
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
+    }
+}
+
 /// P6b S-7 / S-9: the L0 compression ladder starts once per-class block addressing landed
 /// (the Task 17 refusal is lifted): `--check-config --set kv.dtype=tq4 --set
 /// kv.cpu.format=tq4 --set kv.ladder.enabled=true` exits 0 printing the resolved row and

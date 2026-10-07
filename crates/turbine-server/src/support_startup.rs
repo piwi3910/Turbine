@@ -109,6 +109,22 @@ pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
     support::check(key_before_discovery(cfg, weight, kv))
 }
 
+/// Model features no executor implements, refused before discovery (P7 S-1): a
+/// `config.json` whose sliding window would limit attention (`use_sliding_window: true`, or a
+/// `sliding_window` below `max_position_embeddings`) is a configuration error (exit 2,
+/// before any port is bound, also under `--check-config`) whose reason starts with
+/// `sliding_window_unsupported:` and names the key and value. Every other outcome of reading
+/// the model config is left to the later stages that report it today (a missing or
+/// unregistered model passes here).
+pub fn model_feature_refusal(model_dir: &Path) -> Result<(), ConfigError> {
+    match turbine_model::config::load_model_config(model_dir) {
+        Err(e) if e.reason_code() == Some(turbine_model::config::SLIDING_WINDOW_UNSUPPORTED) => {
+            Err(invalid("model.path", e.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
 /// the enabled tiers, from L1 down, and, with the ladder on, `kv.ladder.max_format` (the
 /// lossiest format a tier can reach).
@@ -813,5 +829,38 @@ mod tests {
             read_architecture(unknown.path()).as_deref(),
             Some(UNREGISTERED_ARCH)
         );
+    }
+
+    /// P7 S-1: a real sliding window is refused before discovery with its reason code and
+    /// the key it came from (a configuration error, exit 2); `sliding_window: null` passes.
+    #[test]
+    fn sliding_window_refused() {
+        let fixture = |slug: &str| -> serde_json::Value {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../turbine-model/tests/fixtures")
+                .join(slug)
+                .join("config.json");
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let mut qwen3 = fixture("qwen3-0.6b");
+        qwen3["use_sliding_window"] = serde_json::json!(true);
+        let mut mistral = fixture("mistral-7b-instruct-v0.3");
+        mistral["sliding_window"] = serde_json::json!(4096);
+        for (name, edited, key) in [
+            ("sw-qwen3", qwen3, "use_sliding_window"),
+            ("sw-mistral", mistral, "sliding_window"),
+        ] {
+            let dir = model_dir(name, edited);
+            let err = model_feature_refusal(dir.path()).unwrap_err();
+            assert_eq!(err.key(), Some("model.path"), "{err}");
+            let ConfigError::Invalid { reason, .. } = &err else {
+                panic!("expected Invalid, got {err:?}");
+            };
+            let code = reason.split(':').next().unwrap();
+            assert_eq!(code, "sliding_window_unsupported", "{err}");
+            assert!(reason.contains(key), "{err}");
+        }
+        let unedited = model_dir("sw-none", fixture("mistral-7b-instruct-v0.3"));
+        assert!(model_feature_refusal(unedited.path()).is_ok());
     }
 }

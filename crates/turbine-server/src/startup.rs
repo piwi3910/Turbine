@@ -130,6 +130,12 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Config;
         }
     };
+    // P7 S-1: model features no executor implements (a sliding window), exit 2 before
+    // discovery and before binding, also under --check-config.
+    if let Err(e) = support_startup::model_feature_refusal(&config.model.path) {
+        eprintln!("turbine-server: invalid configuration: {e}");
+        return ExitCode::Config;
+    }
     // The support-matrix row before discovery (device arch unknown): an unsupported row is a
     // configuration error, exit 2, also under --check-config.
     let support = support_startup::before_discovery(&config);

@@ -437,6 +437,21 @@ struct RawLlama3Scaling {
     original_max_position_embeddings: u32,
 }
 
+/// The reason code of a refused sliding window (P7 S-1).
+pub const SLIDING_WINDOW_UNSUPPORTED: &str = "sliding_window_unsupported";
+
+/// The reason code of a [`ModelError::Unsupported`] refusal of `field`, when it has one: the
+/// sliding-window keys (`sliding_window`, `use_sliding_window`) carry
+/// [`SLIDING_WINDOW_UNSUPPORTED`].
+pub(crate) fn reason_code(field: &str) -> Option<&'static str> {
+    matches!(field, "sliding_window" | "use_sliding_window").then_some(SLIDING_WINDOW_UNSUPPORTED)
+}
+
+/// `"<code>: "` for a refusal with a reason code, else empty (the head of its message).
+pub(crate) fn reason_prefix(field: &str) -> String {
+    reason_code(field).map_or_else(String::new, |code| format!("{code}: "))
+}
+
 pub(crate) fn unsupported(field: &str, value: impl Into<String>, supported: &str) -> ModelError {
     ModelError::Unsupported {
         field: field.to_string(),
