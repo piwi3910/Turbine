@@ -107,6 +107,7 @@ mod tests {
             prompt_tokens: 0,
             cached_prefix_tokens: 0,
             window: Duration::from_secs(1),
+            state_bytes: 0,
         });
         q.push(id(n), key);
     }

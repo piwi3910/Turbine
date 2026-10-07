@@ -1862,7 +1862,8 @@ mod tests {
         });
         let scheduler = turbine_scheduler::Scheduler::new(prepared.scheduler, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
-            .with_gate(parts.gate);
+            .with_gate(parts.gate)
+            .with_state_layout(prepared.arch.state);
         let (tx, commands) = tokio::sync::mpsc::channel(64);
         let shared = Arc::new(crate::engine::EngineShared::default());
         let engine = crate::engine::EngineLoop::new(crate::engine::EngineParts {

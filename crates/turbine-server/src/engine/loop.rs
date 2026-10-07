@@ -4417,8 +4417,9 @@ mod tests {
         let cfg = &spec.config;
         let mem = mem();
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
-        let weights =
-            WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
+        // The family's own slots (the tiny Llama's are `llama_slots`).
+        let slots = cfg.family.0.weight_slots(cfg);
+        let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load");
         let provider = cpu_reference_provider();
         let order = [provider.id()];
         let mut reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
@@ -4677,8 +4678,9 @@ mod tests {
         finish: Option<(FinishReason, u32)>,
     }
 
-    /// Runs `requests` (all queued before the engine starts) on a fresh engine over the tiny
-    /// Llama with the device reduction, with overlap scheduling on or off, and returns every
+    /// Runs `requests` (all queued before the engine starts) on a fresh engine over `spec`'s
+    /// tiny checkpoint (the tiny Llama unless a family test passes another) with the device
+    /// reduction, with overlap scheduling on or off, and returns every
     /// request's choices and how many iterations launched ahead of one in flight.
     fn run_streams(
         spec: &TinySpec,
@@ -4825,6 +4827,50 @@ mod tests {
         assert!(serial[3][0].logprobs.iter().all(Option::is_some));
         assert_eq!(serial[5].len(), 2);
         assert_eq!(serial[6][0].finish, Some((FinishReason::Length, 1)));
+    }
+
+    /// P7 S-1 constraint: overlap scheduling (the default) stays bit-exact against serial for
+    /// every registered family — on each family's tiny checkpoint on the CPU backend, 4
+    /// concurrent greedy requests with logprobs produce the same token and logprob streams with
+    /// overlap on as with it off, and iterations did launch ahead. Iterates the registry, so a
+    /// family registered later is covered. Breaks if a family's executor feeds a different
+    /// token on the device, or its decode under overlap differs from the serial loop.
+    #[test]
+    fn overlap_matches_serial_every_family() {
+        let prompts: [&[u32]; 4] = [
+            &[256, 72, 101, 108, 108, 111],
+            &[256, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107],
+            &[256, 79],
+            &[256, 1, 2, 3],
+        ];
+        for family in turbine_model::families::registry().iter() {
+            let dir = TempDir::new("turbine-engine-loop-family");
+            let spec = family.write_tiny(dir.path(), 7);
+            let tokenizer =
+                Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+            let requests: Vec<GenerationRequest> = prompts
+                .iter()
+                .zip([10, 7, 12, 5])
+                .map(|(p, max)| {
+                    let mut r = request(p, max);
+                    r.sampling.logprobs = Some(2);
+                    r
+                })
+                .collect();
+            let (serial, none) = run_streams(&spec, &tokenizer, &requests, false);
+            assert_eq!(none, 0, "{}", family.name());
+            let (overlapped, ahead) = run_streams(&spec, &tokenizer, &requests, true);
+            assert!(ahead > 0, "{}: no iteration launched ahead", family.name());
+            assert_eq!(overlapped, serial, "{}", family.name());
+            for (choices, max) in serial.iter().zip([10, 7, 12, 5]) {
+                assert_eq!(choices[0].tokens.len(), max, "{}", family.name());
+                assert!(
+                    choices[0].logprobs.iter().all(Option::is_some),
+                    "{}",
+                    family.name()
+                );
+            }
+        }
     }
 
     /// Folds `events` into `stream`; true once it holds the choice's `Finished`.

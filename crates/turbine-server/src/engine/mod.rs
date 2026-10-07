@@ -429,6 +429,7 @@ pub fn spawn(
                 let (sampler, latest) = TelemetrySampler::spawn_core(core);
 
                 let PreparedModel {
+                    arch,
                     tokenizer,
                     max_seq_len,
                     scheduler: params,
@@ -441,7 +442,8 @@ pub fn spawn(
                     .with_policy(policy)
                     .with_metrics(metrics.scheduler.clone())
                     .with_gate(parts.gate)
-                    .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches));
+                    .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches))
+                    .with_state_layout(arch.state);
                 let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
                 let stop = Arc::new(AtomicBool::new(false));
                 if let Err(e) = rel::spawn_controller(

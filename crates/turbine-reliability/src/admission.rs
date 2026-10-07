@@ -3,7 +3,7 @@
 use crate::budget::PoolKind;
 use crate::ledger::{Ledger, LedgerError, PoolUsage, Reservation};
 use crate::metrics::{DecisionLabels, ReliabilityMetrics};
-use crate::multi_device::{GroupReservation, try_reserve_group};
+use crate::multi_device::{GroupReservation, try_reserve_group_with_state};
 use crate::signals::SignalThresholds;
 use serde::Serialize;
 use std::sync::Arc;
@@ -162,9 +162,10 @@ impl Admission {
 
     /// Admission for a tensor-parallel group (P5 S-8, user decision "P5: KV admission across
     /// tensor-parallel ranks" B): `workers` are the other ranks' devices and ledgers. Each
-    /// admission then reserves its worst-case KV on every rank's ledger through
-    /// [`try_reserve_group`], all or nothing, and the decision checks capacity, availability
-    /// and headroom on every rank (the tightest decides). No workers: one device, unchanged.
+    /// admission then reserves its worst-case KV (and state) on every rank's ledger through
+    /// [`try_reserve_group_with_state`], all or nothing, and the decision checks capacity,
+    /// availability and headroom on every rank (the tightest decides). No workers: one device,
+    /// unchanged.
     pub fn with_group_ledgers(mut self, workers: Vec<(DeviceId, Arc<Ledger>)>) -> Self {
         self.group = if workers.is_empty() {
             Vec::new()
@@ -305,8 +306,11 @@ impl Admission {
         self.decide_inner(est, PressureState::Green, state, circuit, 0)
     }
 
-    fn kv_bytes(&self, est: &ResourceEstimate) -> u64 {
-        est.projected_kv_blocks as u64 * self.params.block_bytes
+    /// The worst-case reservation of `est`: its KV blocks plus its per-sequence state (P7 S-1).
+    pub fn reservation_bytes(&self, est: &ResourceEstimate) -> u64 {
+        u64::from(est.projected_kv_blocks)
+            .saturating_mul(self.params.block_bytes)
+            .saturating_add(est.state_bytes)
     }
 
     /// An admitted request that had not started goes back to the queue (SURVIVAL, option A):
@@ -376,7 +380,7 @@ impl Admission {
         circuit: CircuitState,
         queue_len: usize,
     ) -> AdmissionDecision {
-        let need = self.kv_bytes(est);
+        let need = self.reservation_bytes(est);
         let capacity = self.kv_usages().map(|u| u.capacity).min().unwrap_or(0);
         if need > capacity {
             return AdmissionDecision::Reject {
@@ -452,19 +456,26 @@ impl Admission {
         })
     }
 
-    /// Takes the worst-case KV reservation of an admitted request. In a tensor-parallel group
-    /// it holds on every rank's ledger (rank 0's guard carrying the others as members) or on
-    /// none: a rank that cannot hold it releases what the earlier ranks took.
+    /// Takes the worst-case reservation of an admitted request (its KV and its per-sequence
+    /// state, [`Admission::reservation_bytes`]). In a tensor-parallel group it holds on every
+    /// rank's ledger (rank 0's guard carrying the others as members) or on none: a rank that
+    /// cannot hold it releases what the earlier ranks took.
     pub fn reserve_kv(&self, est: &ResourceEstimate) -> Result<Reservation, LedgerError> {
         if self.group.is_empty() {
             return self
                 .ledger
-                .reserve(self.params.device, PoolKind::Kv, self.kv_bytes(est));
+                .reserve(
+                    self.params.device,
+                    PoolKind::Kv,
+                    self.reservation_bytes(est),
+                )
+                .map(|r| r.with_state_bytes(est.state_bytes));
         }
-        let taken = try_reserve_group(
+        let taken = try_reserve_group_with_state(
             &self.group,
             est.projected_kv_blocks,
             self.params.block_bytes,
+            est.state_bytes,
         )
         .map_err(|(_, e)| e)?;
         Ok(GroupReservation::from(taken)

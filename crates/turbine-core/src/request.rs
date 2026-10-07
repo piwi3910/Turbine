@@ -266,6 +266,11 @@ pub struct ResourceEstimate {
     pub max_output_tokens: u32,
     /// KV blocks the request holds at completion.
     pub projected_kv_blocks: u32,
+    /// The model's per-sequence state the request holds while it runs
+    /// ([`crate::types::StateLayout::bytes_per_sequence`], P7 S-1): reserved beside its KV
+    /// blocks. 0 for attention-only families.
+    #[serde(default)]
+    pub state_bytes: u64,
     pub workspace_bytes: u64,
     pub est_prefill_seconds: f64,
     pub est_decode_seconds: f64,
@@ -285,6 +290,7 @@ impl ResourceEstimate {
             new_prefill_tokens: prompt,
             max_output_tokens: max_output,
             projected_kv_blocks: u32::try_from(blocks).unwrap_or(u32::MAX),
+            state_bytes: 0,
             workspace_bytes: 0,
             est_prefill_seconds: 0.0,
             est_decode_seconds: 0.0,
