@@ -24,7 +24,8 @@
 # novanas --vllm <slug>: the Phase 2 baseline. Applies scripts/lab/novanas-vllm-job.yaml as
 #   turbine-lab-vllm-<run id> (upstream rocm/vllm at a pinned tag, one R9700, host network)
 #   serving /home/piwi/turbine-models/<slug> read-only on port 18100 under the model id
-#   Turbine's lab config uses; <slug> is llama-3.2-3b-instruct or olmoe-1b-7b-0125-instruct.
+#   Turbine's lab config uses; <slug> is llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, a
+#   Phase 6a proof checkpoint or a Phase 7 checkpoint (scripts/lab/phase7-checkpoints.tsv).
 #   Nothing is uploaded. Refuses to start while something answers on port 18100, streams the pod
 #   log until http://192.168.10.203:18100/v1/models answers 200 and exits 0 leaving vLLM running;
 #   when vLLM fails to start or serve (e.g. on gfx1201) it prints the pod log and exits 1.
@@ -170,8 +171,39 @@ case "$2" in
 		SERVED_NAME=unsloth/Llama-3.2-3B-Instruct-FP8-Block
 		MAX_MODEL_LEN=32768
 		;;
+	# Phase 7 families (plan Task 9): served under the checkpoint's repo id, as the
+	# scripts/lab/phase7-novanas-*.yaml served_name and scripts/lab/phase7-checkpoints.tsv; every
+	# one's max_position_embeddings is >= 32768.
+	qwen3-4b-instruct-2507)
+		SERVED_NAME=Qwen/Qwen3-4B-Instruct-2507
+		MAX_MODEL_LEN=32768
+		;;
+	qwen3-30b-a3b-instruct-2507-fp8)
+		SERVED_NAME=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+		MAX_MODEL_LEN=32768
+		;;
+	mistral-7b-instruct-v0.3)
+		SERVED_NAME=mistralai/Mistral-7B-Instruct-v0.3
+		MAX_MODEL_LEN=32768
+		;;
+	mixtral-8x7b-instruct-v0.1-fp8)
+		SERVED_NAME=RedHatAI/Mixtral-8x7B-Instruct-v0.1-FP8
+		MAX_MODEL_LEN=32768
+		;;
+	gpt-oss-20b)
+		SERVED_NAME=openai/gpt-oss-20b
+		MAX_MODEL_LEN=32768
+		;;
+	qwen3.5-9b)
+		SERVED_NAME=Qwen/Qwen3.5-9B
+		MAX_MODEL_LEN=32768
+		;;
+	qwen3.6-35b-a3b-fp8)
+		SERVED_NAME=Qwen/Qwen3.6-35B-A3B-FP8
+		MAX_MODEL_LEN=32768
+		;;
 	*)
-		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-gptq-own, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8 or llama-3.2-3b-instruct-fp8-block)" >&2
+		echo "lab-serve: ${HOST}: unknown model slug for --vllm: ${SLUG} (llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, llama-3.1-8b-instruct, llama-3.1-8b-instruct-mxfp4a16, llama-3.2-3b-mxfp4-a4, llama-3.1-8b-instruct-mxfp4-a4, llama-3.2-3b-instruct-awq, llama-3.2-3b-instruct-gptq, llama-3.2-3b-instruct-gptq-own, llama-3.2-3b-instruct-fp8-dynamic, llama-3.2-3b-instruct-fp8, llama-3.2-3b-instruct-fp8-block, qwen3-4b-instruct-2507, qwen3-30b-a3b-instruct-2507-fp8, mistral-7b-instruct-v0.3, mixtral-8x7b-instruct-v0.1-fp8, gpt-oss-20b, qwen3.5-9b or qwen3.6-35b-a3b-fp8)" >&2
 		usage
 		;;
 	esac

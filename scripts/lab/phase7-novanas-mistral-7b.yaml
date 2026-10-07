@@ -1,0 +1,36 @@
+# turbine-server configuration for the Phase 7 one-card gate of Mistral-7B-Instruct-v0.3 (BF16, ~15 GB) on novanas:
+#   scripts/lab-bench.sh --model mistral-7b [--golden16]
+#   scripts/lab-perf.sh novanas mistral-7b
+#   scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-mistral-7b.yaml [--set <k>=<v>]...
+# Weights: /home/piwi/turbine-models/mistral-7b-instruct-v0.3 on the host, mounted read-only at /models by
+# scripts/lab/novanas-serve-job.yaml (lab-bench.sh serves natively and overrides model.path).
+# The served id is the checkpoint's repo id, as `lab-serve.sh --vllm mistral-7b-instruct-v0.3` serves vLLM-ROCm.
+# Execution, scheduler and KV keys as scripts/lab/phase2c-novanas-llama.yaml.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/mistral-7b-instruct-v0.3
+  served_name: mistralai/Mistral-7B-Instruct-v0.3
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: true
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 8GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s
