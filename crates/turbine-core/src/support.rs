@@ -257,8 +257,9 @@ const TQ_KV_REASON: &str =
 pub const TQ2_L0_REASON: &str = "kv_tq2_l0_refused: TurboQuant 2-bit L0 pages fail the quality gate \
      (shared-prefix GSM8K 0.15-0.20 on Llama and OLMoE); use kv.dtype tq4, or tq2 as a lower-tier \
      format (kv.cpu.format, kv.nvme.format, kv.ladder.max_format)";
-const FAMILY_REASON: &str =
-    "this model family is not validated on this vendor yet (track phase-7-model-families)";
+/// Why a Phase 7 row on `amd` is `experimental`: its S-13 gate has not closed yet. Shown as the
+/// row's reason by `--support-matrix` (an `experimental` status carries no reason of its own).
+pub const P7_PENDING_REASON: &str = "gate pending (track phase-7-model-families)";
 /// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
 pub const NVIDIA_REASON: &str =
     "NVIDIA execution is deferred (phase-2b-nvidia, on hold until the user lifts it)";
@@ -277,18 +278,19 @@ pub fn deferred_vendor(vendor: &str) -> Option<&'static str> {
         .map(|(_, reason)| *reason)
 }
 
-/// The Phase 7 families on the AMD GPU vendor, BF16: refused until the track closes (Task 10 of
-/// the umbrella plan flips each validated row to `supported`). The CPU reference provider serves
-/// them through its `experimental` row.
-const fn family_row(vendor: &'static str, architecture: &'static str) -> SupportRow {
+/// A Phase 7 family on the AMD GPU vendor in one weight format (BF16 KV): `experimental` with
+/// [`P7_PENDING_REASON`] until its S-13 gate closes (a `- P7 closed:` perf-log line, checked by
+/// `support::tests::phase7_rows`). The CPU reference provider serves the families through its
+/// own `experimental` row.
+const fn family_row(architecture: &'static str, weight: WeightFormatColumn) -> SupportRow {
     row(
-        Some(vendor),
+        Some("amd"),
         None,
         Some(architecture),
-        BF16,
+        Some(weight),
         KV_BF16,
         NO_SPEC,
-        unsupported(FAMILY_REASON),
+        SupportStatus::Experimental,
     )
 }
 
@@ -533,11 +535,20 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         SupportStatus::Experimental,
     ),
-    // Reserved for the tracks; each track replaces its refusal with validated rows.
-    family_row("amd", "Qwen3ForCausalLM"),
-    family_row("amd", "Qwen3MoeForCausalLM"),
-    family_row("amd", "MistralForCausalLM"),
-    family_row("amd", "MixtralForCausalLM"),
+    // Phase 7 model families (S-13): `experimental` (P7_PENDING_REASON) until each row's gate
+    // closes; `PHASE7_ROWS` lists the gated placements.
+    family_row("Qwen3ForCausalLM", WeightFormatColumn::Bf16),
+    family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Bf16),
+    family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Fp8Block),
+    family_row("MistralForCausalLM", WeightFormatColumn::Bf16),
+    family_row("MixtralForCausalLM", WeightFormatColumn::Bf16),
+    family_row("MixtralForCausalLM", WeightFormatColumn::Fp8),
+    family_row("GptOssForCausalLM", WeightFormatColumn::Mxfp4),
+    family_row("Qwen3_5ForConditionalGeneration", WeightFormatColumn::Bf16),
+    family_row(
+        "Qwen3_5MoeForConditionalGeneration",
+        WeightFormatColumn::Fp8Block,
+    ),
     // Phase 6a weight formats: each row turns `supported` for its proven combination only.
     format_row(WeightFormatColumn::Fp8, QUANT_REASON),
     format_row(WeightFormatColumn::Fp8Block, QUANT_REASON),
@@ -830,7 +841,19 @@ impl SupportDecision {
             kv_format: self.key.kv_format.as_str().to_string(),
             speculative: self.key.speculative.as_str().to_string(),
             status: self.status.as_str(),
-            reason: self.status.reason().map(str::to_string),
+            reason: self
+                .status
+                .reason()
+                .or_else(|| {
+                    pending_reason(
+                        &self.status,
+                        Some(&self.key.vendor),
+                        Some(&self.key.architecture),
+                        Some(self.key.weight_format),
+                        Some(self.key.kv_format),
+                    )
+                })
+                .map(str::to_string),
         }
     }
 }
@@ -868,9 +891,168 @@ impl SupportRow {
             kv_format: s(self.key.kv_format.map(KvFormatColumn::as_str)),
             speculative: s(self.key.speculative.map(SpeculativeColumn::as_str)),
             status: self.status.as_str(),
-            reason: self.status.reason().map(str::to_string),
+            reason: self
+                .status
+                .reason()
+                .or_else(|| {
+                    pending_reason(
+                        &self.status,
+                        self.key.vendor,
+                        self.key.architecture,
+                        self.key.weight_format,
+                        self.key.kv_format,
+                    )
+                })
+                .map(str::to_string),
         }
     }
+}
+
+/// The architectures Phase 7 adds on `amd` (S-13); every `experimental` `amd` row of one of them
+/// is pending its gate.
+pub const PHASE7_ARCHITECTURES: [&str; 7] = [
+    "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM",
+    "MistralForCausalLM",
+    "MixtralForCausalLM",
+    "GptOssForCausalLM",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+];
+
+/// [`P7_PENDING_REASON`] for an `experimental` `amd` row or key of a [`PHASE7_ARCHITECTURES`]
+/// family or of a carry-over [`PHASE7_ROWS`] entry (any placement), `None` otherwise.
+fn pending_reason(
+    status: &SupportStatus,
+    vendor: Option<&str>,
+    architecture: Option<&str>,
+    weight: Option<WeightFormatColumn>,
+    kv: Option<KvFormatColumn>,
+) -> Option<&'static str> {
+    let phase7 = architecture.is_some_and(|a| PHASE7_ARCHITECTURES.contains(&a))
+        || PHASE7_ROWS.iter().any(|r| {
+            architecture == Some(r.architecture)
+                && weight.map(WeightFormatColumn::as_str) == Some(r.weight)
+                && kv.map(KvFormatColumn::as_str) == Some(r.kv)
+        });
+    let pending = *status == SupportStatus::Experimental && vendor == Some("amd") && phase7;
+    pending.then_some(P7_PENDING_REASON)
+}
+
+/// Where a Phase 7 row is gated (S-13): one card, two cards tensor-parallel, or two cards
+/// expert-parallel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Placement {
+    Tp1,
+    Tp2,
+    Ep2,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::Tp1 => "tp1",
+            Placement::Tp2 => "tp2",
+            Placement::Ep2 => "ep2",
+        }
+    }
+
+    /// `(tensor_parallel_size, expert_parallel_size)` of the placement.
+    pub fn sizes(self) -> (u32, u32) {
+        match self {
+            Placement::Tp1 => (1, 1),
+            Placement::Tp2 => (2, 1),
+            Placement::Ep2 => (1, 2),
+        }
+    }
+}
+
+/// One Phase 7 gate row: an architecture, its weight and KV columns, and its placement. The id
+/// `<architecture>/<weight>/<kv>/<placement>` is what a `- P7 closed:` / `- P7 open:` line of
+/// `.procoder/perf-log.md` names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Phase7Row {
+    pub architecture: &'static str,
+    pub weight: &'static str,
+    pub kv: &'static str,
+    pub placement: Placement,
+}
+
+const fn p7(
+    architecture: &'static str,
+    weight: &'static str,
+    kv: &'static str,
+    placement: Placement,
+) -> Phase7Row {
+    Phase7Row {
+        architecture,
+        weight,
+        kv,
+        placement,
+    }
+}
+
+/// The rows Phase 7 gates (S-13): the seven architectures and the carry-over rows (S-14 mxfp4,
+/// S-15 OLMoE FP8 KV, S-16 L0 `tq4`). Each turns `supported` in [`SUPPORT_MATRIX`] only with
+/// its `- P7 closed:` perf-log line (`support::tests::phase7_rows`).
+pub static PHASE7_ROWS: &[Phase7Row] = &[
+    p7("Qwen3ForCausalLM", "bf16", "bf16", Placement::Tp1),
+    p7("Qwen3MoeForCausalLM", "fp8_block", "bf16", Placement::Tp2),
+    p7("Qwen3MoeForCausalLM", "fp8_block", "bf16", Placement::Ep2),
+    p7("MistralForCausalLM", "bf16", "bf16", Placement::Tp1),
+    p7("MixtralForCausalLM", "fp8", "bf16", Placement::Tp2),
+    p7("MixtralForCausalLM", "fp8", "bf16", Placement::Ep2),
+    p7("GptOssForCausalLM", "mxfp4", "bf16", Placement::Tp1),
+    p7(
+        "Qwen3_5ForConditionalGeneration",
+        "bf16",
+        "bf16",
+        Placement::Tp1,
+    ),
+    p7(
+        "Qwen3_5MoeForConditionalGeneration",
+        "fp8_block",
+        "bf16",
+        Placement::Tp2,
+    ),
+    p7(
+        "Qwen3_5MoeForConditionalGeneration",
+        "fp8_block",
+        "bf16",
+        Placement::Ep2,
+    ),
+    // Carry-over rows.
+    p7("LlamaForCausalLM", "mxfp4", "bf16", Placement::Tp1),
+    p7("LlamaForCausalLM", "mxfp4_a4", "bf16", Placement::Tp1),
+    p7("OlmoeForCausalLM", "bf16", "fp8_e4m3", Placement::Tp1),
+    p7("LlamaForCausalLM", "bf16", "tq4", Placement::Tp1),
+    p7("OlmoeForCausalLM", "bf16", "tq4", Placement::Tp1),
+];
+
+/// The status of `row` on gfx1201: its [`SUPPORT_MATRIX`] status, or `unsupported` when a weight
+/// or KV column names no format or [`parallel_refusal`] refuses its placement.
+pub fn placement_status(row: &Phase7Row) -> SupportStatus {
+    let weight = WeightFormatColumn::ALL
+        .into_iter()
+        .find(|w| w.as_str() == row.weight);
+    let kv = KvFormatColumn::ALL
+        .into_iter()
+        .find(|k| k.as_str() == row.kv);
+    let (Some(weight_format), Some(kv_format)) = (weight, kv) else {
+        return unsupported(NO_ROW);
+    };
+    let (tp, ep) = row.placement.sizes();
+    if let Some(refusal) = parallel_refusal(row.architecture, tp, ep) {
+        return unsupported(refusal.reason);
+    }
+    resolve(&SupportKey {
+        vendor: "amd".to_string(),
+        arch: "gfx1201".to_string(),
+        architecture: row.architecture.to_string(),
+        weight_format,
+        kv_format,
+        speculative: SpeculativeColumn::None,
+    })
 }
 
 /// Parallel-mode combinations a model architecture is refused in (`unsupported`, exit 2 at
@@ -1395,25 +1577,53 @@ mod tests {
                 .contains("phase-8-speculative-decoding"),
             "{status:?}"
         );
-        // Phase 7 families: refused on AMD (any arch), experimental on the CPU reference.
-        for architecture in [
-            "Qwen3ForCausalLM",
-            "Qwen3MoeForCausalLM",
-            "MistralForCausalLM",
-            "MixtralForCausalLM",
+        // Phase 7 families (S-13): experimental on AMD (any arch) until their gate closes, the
+        // row view naming the pending gate; experimental on the CPU reference; another weight
+        // format stays refused by its format row.
+        for (architecture, w) in [
+            ("Qwen3ForCausalLM", W::Bf16),
+            ("Qwen3MoeForCausalLM", W::Bf16),
+            ("Qwen3MoeForCausalLM", W::Fp8Block),
+            ("MistralForCausalLM", W::Bf16),
+            ("MixtralForCausalLM", W::Bf16),
+            ("MixtralForCausalLM", W::Fp8),
+            ("GptOssForCausalLM", W::Mxfp4),
+            ("Qwen3_5ForConditionalGeneration", W::Bf16),
+            ("Qwen3_5MoeForConditionalGeneration", W::Fp8Block),
         ] {
             for arch in ["gfx1201", "gfx942"] {
-                let k = key("amd", arch, architecture, W::Bf16, K::Bf16, S::None);
-                let status = resolve(&k);
-                assert_eq!(status.as_str(), "unsupported", "{k}");
-                assert!(
-                    status.reason().unwrap().contains("phase-7-model-families"),
-                    "{k}: {status:?}"
-                );
+                let k = key("amd", arch, architecture, w, K::Bf16, S::None);
+                assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
             }
+            let row = SUPPORT_MATRIX
+                .iter()
+                .find(|r| {
+                    r.key.vendor == Some("amd")
+                        && r.key.architecture == Some(architecture)
+                        && r.key.weight_format == Some(w)
+                })
+                .expect("phase 7 row");
+            assert_eq!(row.view().reason.as_deref(), Some(P7_PENDING_REASON));
             let k = key("cpu", "cpu", architecture, W::Bf16, K::Bf16, S::None);
             assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+            let k = key("amd", "gfx1201", architecture, W::AwqInt4, K::Bf16, S::None);
+            let status = resolve(&k);
+            assert!(
+                status.reason().unwrap().contains("phase-6a-quantization"),
+                "{k}: {status:?}"
+            );
         }
+        // Rows outside Phase 7 carry no pending reason.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "LlamaForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        let decision = check(k).unwrap();
+        assert_eq!(decision.view().reason, None);
         for r in SUPPORT_MATRIX {
             let v = r.view();
             assert!(
@@ -1430,6 +1640,83 @@ mod tests {
         }
     }
 
+    /// Phase 7 S-13: every `PHASE7_ROWS` entry resolves to a real row (never `unsupported`), and an
+    /// entry is `supported` exactly when `.procoder/perf-log.md` has its `- P7 closed:` line —
+    /// so a row flipped without its gate evidence, or a gate line whose row was not flipped,
+    /// fails here. Breaks if a row is dropped from the matrix, a status is flipped by hand, or the
+    /// perf-log line format changes.
+    #[test]
+    fn phase7_rows() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.procoder/perf-log.md");
+        let log =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let closed: Vec<&str> = log
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("- P7 closed: "))
+            .map(|rest| rest.split_whitespace().next().unwrap_or(""))
+            .collect();
+        let id = |r: &Phase7Row| {
+            format!(
+                "{}/{}/{}/{}",
+                r.architecture,
+                r.weight,
+                r.kv,
+                r.placement.as_str()
+            )
+        };
+        for c in &closed {
+            assert!(
+                PHASE7_ROWS.iter().any(|r| id(r) == *c),
+                "perf-log closes {c:?}, which is no PHASE7_ROWS entry"
+            );
+        }
+        for r in PHASE7_ROWS {
+            let row = id(r);
+            assert!(
+                WeightFormatColumn::ALL
+                    .iter()
+                    .any(|w| w.as_str() == r.weight),
+                "{row}: weight column"
+            );
+            assert!(
+                KvFormatColumn::ALL.iter().any(|k| k.as_str() == r.kv),
+                "{row}: kv column"
+            );
+            let status = placement_status(r);
+            assert_ne!(status.as_str(), "unsupported", "{row}: {status:?}");
+            let is_closed = closed.contains(&row.as_str());
+            if is_closed {
+                assert_eq!(
+                    status,
+                    SupportStatus::Supported,
+                    "{row} is closed in perf-log"
+                );
+            }
+            if status == SupportStatus::Supported {
+                assert!(
+                    is_closed,
+                    "{row} is supported without a `- P7 closed:` line"
+                );
+            }
+            // S-14: `mxfp4_a4` turns `supported` only with its Task 28 gate line.
+            if r.weight == "mxfp4_a4" {
+                assert!(status != SupportStatus::Supported || is_closed, "{row}");
+            }
+        }
+        // The seven architectures and the five carry-over rows.
+        assert_eq!(PHASE7_ROWS.len(), 15);
+        for a in PHASE7_ARCHITECTURES {
+            assert!(PHASE7_ROWS.iter().any(|r| r.architecture == a), "{a}");
+        }
+        let unique: std::collections::HashSet<String> = PHASE7_ROWS.iter().map(id).collect();
+        assert_eq!(
+            unique.len(),
+            PHASE7_ROWS.len(),
+            "duplicate PHASE7_ROWS entry"
+        );
+    }
+
     /// Phase 2m: keys are built from the backend's vendor and the family's HF name; before
     /// discovery a device arch is unknown, a host backend's arch is its vendor word.
     #[test]
@@ -1441,12 +1728,25 @@ mod tests {
         assert!(k.is_partial());
         assert_eq!(check(k).unwrap().status, SupportStatus::Supported);
 
+        // A Phase 7 family is experimental on the GPU vendor (S-13), naming its pending gate;
+        // an architecture with no row is refused naming the checkpoint.
         let k = SupportKey::before_discovery("amd", Some("Qwen3ForCausalLM"), W::Bf16, K::Bf16);
+        let d = check(k).unwrap();
+        assert_eq!(d.status, SupportStatus::Experimental);
+        assert_eq!(d.view().reason.as_deref(), Some(P7_PENDING_REASON));
+        let k = SupportKey::before_discovery(
+            "amd",
+            Some("ExampleUnregisteredForCausalLM"),
+            W::Bf16,
+            K::Bf16,
+        );
         let err = check(k).unwrap_err();
-        assert_eq!(err.key(), Some("execution.backend"));
+        assert_eq!(err.key(), Some("model.path"));
         let msg = err.to_string();
         assert!(
-            msg.contains("support matrix: amd/*/Qwen3ForCausalLM/bf16/bf16/none is unsupported: "),
+            msg.contains(
+                "support matrix: amd/*/ExampleUnregisteredForCausalLM/bf16/bf16/none is unsupported: "
+            ),
             "{msg}"
         );
 
