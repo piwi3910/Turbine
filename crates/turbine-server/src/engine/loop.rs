@@ -176,6 +176,33 @@ enum Turn {
     Stop,
 }
 
+/// Why a turn under overlap scheduling completed its iteration in flight serially instead of
+/// launching the next one ahead ([`EngineLoop::turn_overlap`]); the reason label of
+/// `turbine_overlap_serial_turns_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SerialTurn {
+    /// The iteration in flight is a jump-forward step: its verification decides the tokens.
+    JumpForwardStep,
+    /// It holds a row of a jump-forward-eligible constrained choice (P5p S-10, decision
+    /// 2026-10-07 A): its forced run is asked for before the next plan.
+    JumpForwardEligible,
+    /// An admitted request waits for its first prefill chunk (P5p S-3).
+    UnstartedAdmitted,
+    /// A request ended since the last turn (P5p S-3, decision "5p Task 4" B).
+    RequestEnded,
+}
+
+impl SerialTurn {
+    fn as_str(self) -> &'static str {
+        match self {
+            SerialTurn::JumpForwardStep => "jump_forward_step",
+            SerialTurn::JumpForwardEligible => "jump_forward_eligible",
+            SerialTurn::UnstartedAdmitted => "unstarted_admitted",
+            SerialTurn::RequestEnded => "request_ended",
+        }
+    }
+}
+
 pub(crate) struct EngineLoop {
     exec: Box<dyn ModelExecutor>,
     pool: BlockPool,
@@ -1851,17 +1878,6 @@ impl EngineLoop {
             // history feeds it); a decode item retires the snapshot (the plan dropped the
             // extension and the choice decodes).
             let forced = match item.kind {
-                // An extension asked for while the decode before it was in flight (overlap
-                // scheduling, P5p S-10): it starts at the token `prev` samples, so its batch
-                // waits for that sample. The snapshot stays: it is the pending-run guard of
-                // `request_forced`, and the rebuild without `prev` takes this item's draft.
-                BatchKind::Prefill { start, .. }
-                    if !item.draft.is_empty()
-                        && prev.is_some_and(|p| p.yielders.contains(&item.seq))
-                        && start == r.prompt_len() + r.choices[choice].generated.len() as u32 =>
-                {
-                    return Ok(Build::NeedsHost);
-                }
                 // The plan may have capped the extension below the asked-for run (the
                 // request's own ceiling): the draft truncates with it.
                 BatchKind::Prefill { start, .. }
@@ -2270,8 +2286,10 @@ impl EngineLoop {
     /// iteration is computed and dropped. A batch that needs a token the device did not choose
     /// (a constrained, seeded-draw, `top_k` or full-row choice, a fork's first token) waits for
     /// the iteration in flight first, so it runs as the serial loop does; so does every turn
-    /// that finds an admitted request waiting for its first prefill chunk, and the turn after a
-    /// request ended (P5p S-3).
+    /// that finds an admitted request waiting for its first prefill chunk, the turn after a
+    /// request ended (P5p S-3), and every turn whose iteration in flight holds a row of a
+    /// jump-forward-eligible constrained choice (P5p S-10, [`EngineLoop::jump_forward_running`]).
+    /// Each such turn counts its [`SerialTurn`] reason.
     fn turn_overlap(&mut self) -> Result<Turn, String> {
         if !self.receive_commands() {
             return Ok(Turn::Stop);
@@ -2286,12 +2304,28 @@ impl EngineLoop {
         // The checks above close the time before the completion (the iteration windows).
         self.stages.mark(Stage::Schedule);
         if let Some(prev) = self.in_flight.take() {
-            let forced = prev.launched && prev.rows.iter().any(|r| r.forced.is_some());
-            if forced || ended || self.sched.has_unstarted_admitted() {
+            let serial = if prev.launched && prev.rows.iter().any(|r| r.forced.is_some()) {
+                Some(SerialTurn::JumpForwardStep)
+            } else if self.jump_forward_running(&prev) {
+                Some(SerialTurn::JumpForwardEligible)
+            } else if self.sched.has_unstarted_admitted() {
+                Some(SerialTurn::UnstartedAdmitted)
+            } else if ended {
+                Some(SerialTurn::RequestEnded)
+            } else {
+                None
+            };
+            if let Some(reason) = serial {
                 // The iteration in flight completes serially and nothing is launched ahead:
                 // - a jump-forward step's (P5p S-10): its verification decides the appended
                 //   tokens and any rollback, so the host work runs before the scheduler
                 //   completes it;
+                // - one with a row of a jump-forward-eligible constrained choice (P5p S-10,
+                //   user decision 2026-10-07 A, "5p exit: jump-forward under overlap on the
+                //   real tokenizer"): its sample asks the grammar for the forced run before the
+                //   plan below, which then extends the choice at once. Launched ahead, the
+                //   next decode already yields the run's first token — on Llama's tokenizer
+                //   almost every run is one token long, so the jump-forward kept nothing;
                 // - while an admitted request waits for its first prefill chunk (P5p S-3): the
                 //   plan below then starts it knowing every finish of the iteration before it
                 //   (no dropped extra rows beside it, their slots and blocks already free),
@@ -2301,6 +2335,14 @@ impl EngineLoop {
                 //   this device wait and starts in the plan below, as on the serial loop (left
                 //   to the next plan, a closed loop's waves bunch up behind the prefill budget:
                 //   c16 TTFT p50 1.7×).
+                // The turn's reason is counted (spec §21: `turbine_overlap_serial_turns_total`).
+                self.metrics.server.overlap_serial_turn(reason.as_str());
+                tracing::trace!(
+                    event = "overlap_serial_turn",
+                    reason = reason.as_str(),
+                    iteration = prev.plan.iteration,
+                    "overlap scheduling: the iteration in flight completes serially"
+                );
                 self.finish_serial(prev)?;
                 // Requests that reached the channel while the turn waited for the device start
                 // in the plan below, as on the serial loop, whose plan follows its device wait
@@ -2358,6 +2400,26 @@ impl EngineLoop {
         self.publish_stats();
         self.check_fatal()?;
         Ok(Turn::Continue)
+    }
+
+    /// The launched iteration `f` holds a row of a choice the jump-forward may extend once it
+    /// samples (P5p S-10, user decision 2026-10-07 A): the jump-forward is on and the choice is
+    /// choice 0 of a live request, constrained and not finished — the checks of
+    /// [`EngineLoop::request_forced`] that hold before the sample. Under overlap scheduling
+    /// such an iteration completes serially, so the forced run is asked for before the next
+    /// plan and starts at the token just sampled.
+    fn jump_forward_running(&self, f: &InFlight) -> bool {
+        self.jump_forward
+            && f.launched
+            && f.rows.iter().any(|row| {
+                self.seqs.get(&row.seq).is_some_and(|&(id, choice)| {
+                    choice == 0
+                        && self.requests.get(&id).is_some_and(|r| {
+                            let c = &r.choices[0];
+                            !r.done && c.finish.is_none() && c.is_constrained()
+                        })
+                })
+            })
     }
 
     /// The outcome of the launched iteration `f` before its tokens are known: one token per
@@ -2922,19 +2984,16 @@ impl EngineLoop {
         {
             return;
         }
-        // Overlap scheduling (P5p S-10, user decision 2026-10-07 1A): the plan after the
-        // iteration just sampled may already be launched with this choice's decode, which
-        // feeds the token just sampled and yields the next one before this host work ends.
-        // The extension then starts one token later, at that next token: the grammar's
-        // first forced token is what that decode yields (the mask allows nothing else), so
-        // the draft is the run past it. The verification still checks every token, so a
-        // draft the in-flight token contradicts only rolls back.
+        // The extension starts at the token just sampled, which no plan has fed yet. Under
+        // overlap scheduling an iteration holding this choice completes serially (user
+        // decision 2026-10-07 A, `EngineLoop::jump_forward_running`), so no decode of it was
+        // launched ahead of this sample; the guard keeps an extension from ever starting
+        // behind one (it would re-feed a position).
         let unfed = r.prompt_len() + c.generated.len() as u32 - 1;
-        let ahead = match self.sched.seq_tokens(seq).map(|t| t.checked_sub(unfed)) {
-            Some(Some(a @ (0 | 1))) => a,
-            _ => return,
-        };
-        let generated = c.generated.len() as u32 + ahead;
+        if self.sched.seq_tokens(seq) != Some(unfed) {
+            return;
+        }
+        let generated = c.generated.len() as u32;
         let max = self
             .jump_forward_max_tokens
             // The step always yields one token beyond the run: leave room for it under
@@ -2947,11 +3006,10 @@ impl EngineLoop {
         if max == 0 {
             return;
         }
-        let mut run = r.forced_tokens(choice, max + ahead as usize);
-        if run.len() <= ahead as usize {
+        let run = r.forced_tokens(choice, max);
+        if run.is_empty() {
             return;
         }
-        run.drain(..ahead as usize);
         let seq = r.choices[choice].seq;
         self.jump_drafts.insert(seq, run.clone());
         if let Err(e) = self.sched.extend(seq, run) {
@@ -4529,20 +4587,33 @@ mod tests {
             "jump on matches the masked path (overlap)"
         );
         assert_eq!(serial_on, overlap_on, "overlap matches serial");
-        // Each loop jumps on its own and keeps forced tokens (user decision 2026-10-07 1A:
-        // under overlap the run was asked for behind the in-flight decode and never accepted).
+        // Overlap jumps exactly as serial (user decision 2026-10-07 A: an iteration holding
+        // the eligible constrained choice completes serially, so each forced run is asked for
+        // before the next plan; launched ahead, the in-flight decode took the run's first
+        // token and a one-token run never jumped).
         let accepted = r#"turbine_jump_forward_tokens_total{outcome="accepted"}"#;
-        for (label, reg) in [("serial", &reg), ("overlap", &reg_overlap)] {
-            let metrics = reg.render().unwrap();
-            assert!(
-                metric(reg, "turbine_jump_forward_steps_total") > 0.0,
-                "{label}: the constrained choice jumped: {metrics}"
-            );
-            assert!(
-                metric(reg, accepted) > 0.0,
-                "{label}: forced tokens were accepted: {metrics}"
+        let rolled = r#"turbine_jump_forward_tokens_total{outcome="rolled_back"}"#;
+        let metrics = reg_overlap.render().unwrap();
+        assert!(
+            metric(&reg, "turbine_jump_forward_steps_total") > 0.0,
+            "the constrained choice jumped: {}",
+            reg.render().unwrap()
+        );
+        assert!(metric(&reg, accepted) > 0.0, "forced tokens were accepted");
+        for name in ["turbine_jump_forward_steps_total", accepted, rolled] {
+            assert_eq!(
+                metric(&reg_overlap, name),
+                metric(&reg, name),
+                "{name}: overlap equals serial: {metrics}"
             );
         }
+        assert!(
+            metric(
+                &reg_overlap,
+                r#"turbine_overlap_serial_turns_total{reason="jump_forward_eligible"}"#
+            ) > 0.0,
+            "the serial turns are counted: {metrics}"
+        );
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is

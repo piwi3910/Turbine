@@ -125,6 +125,11 @@ pub struct ServerMetrics {
     pub jump_forward_tokens: Family<JumpOutcomeLabels, Counter>,
     /// `turbine_jump_forward_steps_total`: forward steps that verified a forced run.
     pub jump_forward_steps: Counter,
+    /// `turbine_overlap_serial_turns_total{reason}`: turns under overlap scheduling that
+    /// completed the iteration in flight serially instead of launching the next one ahead
+    /// (`jump_forward_step`, `jump_forward_eligible`, `unstarted_admitted`, `request_ended`;
+    /// P5p S-3, S-10).
+    pub overlap_serial_turns: Family<ReasonLabels, Counter>,
 }
 
 impl ServerMetrics {
@@ -193,7 +198,19 @@ impl ServerMetrics {
                 "Forward steps that verified a grammar-forced token run",
                 Counter::default(),
             ),
+            overlap_serial_turns: reg.register(
+                "turbine_overlap_serial_turns",
+                "Overlap-scheduling turns that completed the iteration in flight serially, by reason",
+                Family::default(),
+            ),
         }
+    }
+
+    /// Counts one overlap-scheduling turn completed serially for `reason`.
+    pub fn overlap_serial_turn(&self, reason: &'static str) {
+        self.overlap_serial_turns
+            .get_or_create(&ReasonLabels { reason })
+            .inc();
     }
 
     /// Counts one verified jump-forward step: `accepted` confirmed forced tokens,

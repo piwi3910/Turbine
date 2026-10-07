@@ -2557,7 +2557,7 @@ pub struct CacheAwarePolicy;   // name "cache_aware"; key: tier 1, priority, arr
 
 `turbine-bench` (P5p S-1): subcommand `turbine-bench stage-share --before <file> --after <file> [--output text|json]` (`turbine_bench::stage_share::{StageShare { iterations, seconds, host_share }, stage_share(before, after), StageShareError}`; exit 0, 2 on a missing histogram or no iterations).
 
-Metrics (P5p S-12; labels from closed enums): `turbine_kv_partial_reuse_total{outcome}` (outcome ∈ `PartialOutcome`), `turbine_kv_partial_reused_tokens_total`, `turbine_kv_partial_entries` (gauge), `turbine_jump_forward_tokens_total{outcome}` (`accepted`, `rejected`), `turbine_jump_forward_steps_total`; `turbine_kv_evictions_total{reason}` gains `partial_l0_only`.
+Metrics (P5p S-12; labels from closed enums): `turbine_kv_partial_reuse_total{outcome}` (outcome ∈ `PartialOutcome`), `turbine_kv_partial_reused_tokens_total`, `turbine_kv_partial_entries` (gauge), `turbine_jump_forward_tokens_total{outcome}` (`accepted`, `rejected`), `turbine_jump_forward_steps_total`, `turbine_overlap_serial_turns_total{reason}` (`jump_forward_step`, `jump_forward_eligible`, `unstarted_admitted`, `request_ended`: an overlap-scheduling turn that completed the iteration in flight serially, S-3 and S-10); `turbine_kv_evictions_total{reason}` gains `partial_l0_only`.
 
 Log events: `kv_partial_reuse` (DEBUG), `jump_forward` (DEBUG; reason `all_accepted` | `model_disagreed` | `stopped`).
 

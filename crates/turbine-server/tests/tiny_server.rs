@@ -2830,12 +2830,12 @@ fn jump_forward_matches_token_by_token() {
         rolled < accepted.unwrap_or(0.0),
         "mostly accepted: {metrics}"
     );
-    // 16 jump steps on the serial loop, 14 under overlap: there the decode in flight when a
-    // run is asked for takes its first forced token itself, so a run of one forced token (or
-    // one `max_tokens` leaves no room past that decode for, `max_tokens_cut`) is not a jump.
+    // 16 jump steps, as on the serial loop: under overlap an iteration holding a
+    // jump-forward-eligible constrained choice completes serially (user decision 2026-10-07
+    // A), so every forced run is asked for before the next plan.
     assert_eq!(
         sample(&metrics, "turbine_jump_forward_steps_total"),
-        Some(14.0),
+        Some(16.0),
         "every constrained request jumped: {metrics}"
     );
     let metrics = off.metrics();
