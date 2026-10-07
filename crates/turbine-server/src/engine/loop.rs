@@ -2678,7 +2678,14 @@ impl EngineLoop {
     /// [`EngineLoop::finish`]'s device wait and host work; true when the iteration succeeded.
     fn collect_in_flight(&mut self, p: &mut InFlight) -> (bool, IterationOutcome) {
         if !p.launched {
-            return (false, IterationOutcome::default());
+            // A failed launch: the scheduler still matches the completion by its iteration.
+            return (
+                false,
+                IterationOutcome {
+                    iteration: p.plan.iteration,
+                    ..IterationOutcome::default()
+                },
+            );
         }
         let started = Instant::now();
         let collected = self.exec.collect();
