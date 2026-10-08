@@ -73,7 +73,14 @@ fn names_and_args(parse: ToolParse) -> Vec<(String, String)> {
                     i,
                 )| {
                     assert_eq!(index, i);
-                    assert!(id.starts_with("call_") && id.len() == 29, "{id}");
+                    // `call_` + 24 alphanumerics, or the 9 of the `mistral` format.
+                    let alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+                    assert!(
+                        id.strip_prefix("call_")
+                            .is_some_and(|rest| rest.len() == 24 && alnum(rest))
+                            || (id.len() == 9 && alnum(&id)),
+                        "{id}"
+                    );
                     (name, arguments)
                 },
             )
@@ -736,4 +743,63 @@ fn family_default_tool_calls_round_trip() {
         checked, 4,
         "qwen3, qwen3_moe, mistral and mixtral have template fixtures"
     );
+}
+
+/// P7 S-6: the `mistral` parser's call ids are 9 alphanumerics, so a parsed call sent back as
+/// an assistant `tool_calls` turn plus its `tool` result renders through Mistral-7B-Instruct-
+/// v0.3's real template (which raises on any other id length) with the call and the result in
+/// the prompt. Breaks if the format draws `call_` + 24 ids (the template refuses the turn).
+#[test]
+fn mistral_call_ids_render_through_the_v03_template() {
+    let parser = mistral::MistralParser::seeded(7);
+    let text = r#"[{"name": "get_weather", "arguments": {"location": "Oslo"}}, {"name": "get_time", "arguments": {}}]"#;
+    let ToolParse::Calls(calls) = parser.parse(text) else {
+        panic!("expected calls");
+    };
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert!(
+            call.id.len() == crate::tools::MISTRAL_CALL_ID_LEN
+                && call.id.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "{}",
+            call.id
+        );
+    }
+    assert_ne!(calls[0].id, calls[1].id);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mistral-7b-instruct-v0.3/tokenizer_config.json");
+    let template = crate::ChatTemplate::load(&path).expect("mistral template");
+    let call = &calls[0];
+    let arguments: Value = serde_json::from_str(&call.arguments).expect("arguments JSON");
+    let messages = [
+        json!({"role": "user", "content": "What is the weather in Oslo?"}),
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": call.id, "type": "function",
+            "function": {"name": call.name, "arguments": arguments}
+        }]}),
+        json!({"role": "tool", "tool_call_id": call.id, "content": "{\"temperature\": 7}"}),
+    ];
+    let tools = weather_tools();
+    let kwargs = serde_json::Map::new();
+    let prompt = template
+        .render(&messages, Some(&tools), true, &kwargs)
+        .expect("the v0.3 template accepts the format's ids");
+    assert!(
+        prompt.contains(&format!("\"id\": \"{}\"", call.id)),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("\"call_id\": \"{}\"", call.id)),
+        "{prompt}"
+    );
+
+    let long =
+        json!({"role": "tool", "tool_call_id": "call_0123456789abcdefghijklmn", "content": "x"});
+    let refused = template.render(
+        &[messages[0].clone(), messages[1].clone(), long],
+        Some(&tools),
+        true,
+        &kwargs,
+    );
+    assert!(refused.is_err(), "the template refuses a call_ + 24 id");
 }

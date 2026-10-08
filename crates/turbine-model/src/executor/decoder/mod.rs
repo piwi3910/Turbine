@@ -78,6 +78,7 @@ use crate::config::{ModelArchConfig, MoeConfig};
 use crate::ep::{EpContext, EpDims};
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
 use crate::pp::PpContext;
+use crate::testing::trace::RoutingRow;
 use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
@@ -90,7 +91,7 @@ pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
 pub use tq_tables::TqDeviceTables;
 pub use trace::TraceTensor;
-use trace::Tracer;
+use trace::{RoutingTracer, Tracer};
 
 pub(crate) fn invalid(message: String) -> ModelError {
     ModelError::Kernel(KernelError::InvalidArgument { message })
@@ -576,6 +577,21 @@ impl LayerRun<'_> {
         self.exec.trace.record(Some(self.layer), name, view)
     }
 
+    /// Records the layer's MoE routing (router logits `[tokens, experts]` F32, top-k ids I32 and
+    /// gates F32 `[tokens, top_k]`) when the routing trace is on
+    /// ([`DecoderExecutor::set_routing_trace`]); `bf16_logits` as the route config.
+    pub fn trace_routing(
+        &self,
+        logits: &TensorView<'_>,
+        ids: &TensorView<'_>,
+        gates: &TensorView<'_>,
+        bf16_logits: bool,
+    ) -> Result<(), ModelError> {
+        self.exec
+            .routing
+            .record(self.layer, self.row0, logits, ids, gates, bf16_logits)
+    }
+
     /// Tensor parallelism: sums the contiguous `view` across the group's ranks in place (its
     /// dtype, BF16 or F32); nothing on one device.
     pub fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
@@ -859,6 +875,8 @@ pub struct DecoderExecutor {
     /// Timings of the last collected step ([`ModelExecutor::last_timings`]).
     timings: ForwardTimings,
     trace: Tracer,
+    /// The MoE routing trace ([`DecoderExecutor::set_routing_trace`]).
+    routing: RoutingTracer,
     profiler: Profiler,
     /// The batch being enqueued prefills prompt tokens (not decode-only): its GEMMs ask for
     /// rows independent of the batch ([`GemmContext::prefill`]), so a prefix-reused prefill of a
@@ -1341,6 +1359,7 @@ impl DecoderExecutor {
             launches: VecDeque::with_capacity(2),
             timings: ForwardTimings::default(),
             trace: Tracer::default(),
+            routing: RoutingTracer::default(),
             profiler: Profiler::default(),
             step_prefill: AtomicBool::new(false),
             overlap: None,
@@ -1397,6 +1416,22 @@ impl DecoderExecutor {
     /// when tracing is off.
     pub fn take_trace(&mut self) -> Vec<TraceTensor> {
         self.trace.take()
+    }
+
+    /// Diagnostics (P7 Task 12): while on, every MoE layer of every forward records, per token,
+    /// its top-k expert ids, their gates and the margin of the router's choice (the smallest
+    /// selected router logit minus the largest unselected one), read back after routing (three
+    /// blocking reads per layer; no decode graphs or split prefills meanwhile). Returned by
+    /// [`DecoderExecutor::take_routing_trace`]; off by default, one branch per MoE layer when
+    /// off.
+    pub fn set_routing_trace(&mut self, on: bool) {
+        self.routing.set(on);
+    }
+
+    /// The routing rows recorded since the trace was enabled or last taken, in execution order
+    /// (per forward: layer by layer, each layer's tokens in batch order); empty when off.
+    pub fn take_routing_trace(&mut self) -> Vec<RoutingRow> {
+        self.routing.take()
     }
 
     /// Diagnostics: while enabled every op of every forward is followed by a stream
@@ -1482,6 +1517,7 @@ impl DecoderExecutor {
                 .as_ref()
                 .is_some_and(|o| p.total_q < o.min_tokens.max(2))
             || self.trace.is_on()
+            || self.routing.is_on()
             || self.profiler.is_on()
         {
             return Ok(None);
@@ -2494,7 +2530,12 @@ impl ModelExecutor for DecoderExecutor {
         let graph_top_n = self
             .graphs
             .as_ref()
-            .filter(|g| g.is_enabled() && !self.profiler.is_on() && !self.trace.is_on())
+            .filter(|g| {
+                g.is_enabled()
+                    && !self.profiler.is_on()
+                    && !self.trace.is_on()
+                    && !self.routing.is_on()
+            })
             // E.g. a MoE provider reading the group sizes on the host copies them back
             // mid-forward.
             .filter(|_| {
@@ -2503,6 +2544,7 @@ impl ModelExecutor for DecoderExecutor {
                     .graph_capturable(&self.dims, &self.registry, batch.tokens.len())
             })
             .and_then(|_| self.head.graph_top_n());
+        self.routing.begin(batch.positions);
         let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);
         let (p, key) = self.profiler.step(
             self.mem.as_ref(),

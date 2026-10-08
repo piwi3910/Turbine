@@ -4241,6 +4241,9 @@ plus a full snapshot, cutting the pool's block count ~12×.
   match and recomputes the rest.
 - C) Only the last full block of every finished sequence.
   (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
+
+(2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
+
 - A) Keep closed checkpoints local (lab pods read them; local free space ~320 GB after the cache move).
 - B) Move them to iSCSI and bind-mount each back under `/home/piwi/turbine-models/<slug>`.
 
@@ -4270,6 +4273,8 @@ the pod's two GPUs (GPUs are per container).
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
   Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
+
+Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
 **Decision (user, 2026-10-08): B** — `lab-cluster.sh` family scenarios run the Turbine legs only; `lab-perf.sh` gains
 two-card placements (Turbine, then vLLM-ROCm on the same two cards) and prints the S-13 ratio verdict; an unknown
@@ -4332,3 +4337,137 @@ Phase 7 Task 23 evaluation (`p7-t23`), CK at the pinned commit `cd957402` (`gene
   `sliding_window = W` (gpt-oss 128) is `window_left = W − 1`. The gpt-oss tasks (24/26) must map it so.
 - Minor: the header says 17 although v2.16 (Task 15, experts) has not landed on `p7-stack`; the lead orders the two
   at merge.
+
+## Phase 7 Task 13: OLMoE EP×TP drift — cause found, fix is a gate trade (2026-10-08)
+
+From Task 12 (`p7-t12`, 0361db71; perf log "P7 OLMoE EP×TP drift"; teacher-forced routing trace on both cards,
+p08/p10). Cause: any change of summation order (TP partial sums, EP combine) moves router logits by ~0.02–0.03
+(p99 ~0.2); one GPU's own routing margins are 1 % exact BF16 ties and 10 % within one BF16 step, so experts flip and
+the flip cascades through later layers. Nothing is specific to EP×TP: tp2 alone has the same flips and passes p10 by
+0.004 (worst likely |Δ| 1.006 vs bound 1.01); ep2×tp2 reaches 1.056 at the same token (p10 token 17, the cascade
+starting at layer 5, expert 10 → 0, one-GPU margin 0.0024). ep2 alone: 0.301. The plan's Task 13 fix (route every
+rank on the same row) would change nothing — ranks already route identically. Applies to every MoE family run over
+two cards (Qwen3-MoE, Mixtral, Qwen3.6 in this phase).
+
+- A) Calibrate a multi-GPU bound per MoE slug from the measured placement spread (the self-spread method), gate
+  ep2×tp2 (and the Phase 7 MoE TP2/EP2 rows) at c1 and c16 against it, remove `olmoe_ep_tp_drift`. No speed cost;
+  a looser gate for multi-GPU MoE.
+- B) FP32 accumulation of the TP/EP partials (one BF16 rounding instead of two): expected ≤ ½ the router-logit noise,
+  2× all-reduce bytes, unmeasured; flips remain, so likely needs A too.
+- C) Keep the refusal (tp2 alone is also fragile on p10).
+
+**Decision (user, 2026-10-08): A** — a calibrated multi-GPU golden bound per MoE slug from the measured placement
+spread; ep2×tp2 OLMoE and the Phase 7 MoE two-card rows are gated against it at c1 and c16; `olmoe_ep_tp_drift` is
+removed. Task 13 is re-planned accordingly.
+
+## P7 Gated DeltaNet provider (2026-10-08)
+
+Owed by Phase 7 spec decision 5 A ("evaluate llama.cpp + AITER, own kernel only where both fail or are slower"), plan
+Task 29. Branch `p7-t29`. Harness `kernels/rocm/tools/gdn_eval/` (built against scratch clones of llama.cpp
+`bd4eeaa0` and ROCm/aiter `4bb520ba`, both MIT; nothing third-party committed): Qwen3.5-9B / Qwen3.6 GDN shapes
+(16 key heads × 128, 32 value heads × 128, F32 state; conv k = 4 over 8192 q|k|v channels), every candidate checked
+against an F64 host recurrence (transformers `torch_recurrent_gated_delta_rule`, q/k L2-normalized, BF16-representable
+inputs, non-zero initial state), median µs over 50 runs (10–20 at T = 16384), GPU 0, bench lock, one pass.
+
+| median µs (max abs Δ out / state)   | llama.cpp (F32)                        | AITER-based (BF16)                                               |
+| ----------------------------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| GDN decode B = 1                    | **24.8** (4e-9 / 7e-8), 169 GB/s state | — (Triton only)                                                  |
+| GDN decode B = 16                   | **101.8** (7e-9 / 1e-7), 660 GB/s‡     | — (Triton only)                                                  |
+| GDN decode B = 64                   | **1142.2** (9e-9 / 1e-7), 235 GB/s     | — (Triton only)                                                  |
+| GDN prefill T = 100 (partial chunk) | correct (9e-9 / 6e-8)                  | correct (4.7e-4 / 4.1e-3; rel 8e-3 / 6e-3)                       |
+| GDN prefill T = 128                 | **163.6** (1e-8 / 9e-8)                | 265.9 = own_prep 194.5 + chunk_h 17.9 + own_o 66.6 (5e-4 / 4e-3) |
+| GDN prefill T = 2048                | **2671.4** (1e-8 / 7e-8)               | 3468.0 = 2342.6 + 177.6 + 990.9 (6e-4 / 3e-3)                    |
+| GDN prefill T = 16384               | **21433.1** (2e-8 / 7e-8)              | 28628.3 = 18911.2 + 1302.6 + 7472.7 (7e-4 / 5e-3)                |
+| conv decode S = 1 / 16 / 64         | **8.2 / 9.4 / 15.0**† (rel 7e-8)       | `causal_conv1d_update` 8.6 / 23.6 / 21.1 (rel 2e-3, state exact) |
+| conv prefill T = 128 / 2048 / 16384 | 23.3 / 266.8 / **1925.0**† (rel 9e-8)  | `split_qkv` **23.8 / 85.8** / 2154.9 (rel 4–6e-3, state exact)   |
+
+AITER-based prefill = the FLA chunked pipeline: AITER `chunk_gated_delta_rule_fwd_h` (HIP, gfx12 wave64 WMMA) for the
+chunk-state stage, Turbine prototypes `own_prep` (cumsum, kkt, (I+A)^-1, w/u) and `own_o` for the rest; shown at
+AITER's own bv = 64 (bv 16 / 32 within 2 %). ‡ above the 640 GB/s peak: the 32 MB of B = 16 state stays in the 64 MB
+MALL across back-to-back runs, which a served step (one state per layer) will not see. † llama.cpp's conv reads a
+channel-major input with the state concatenated in front; that transpose + concat pass is not timed. AITER's errors are
+BF16 rounding (conv output is BF16; the chunk pipeline stores k/w/u and the h snapshots in BF16).
+
+Findings:
+
+- **llama.cpp** (`ggml-cuda/gated_delta_net.cu`, `ssm-conv.cu`; MIT): builds for gfx1201 through a 54-line ggml shim
+  and is exact against the reference everywhere. The recurrence is token-serial: no chunked prefill ("TODO: Add
+  chunked kernel"), so prefill is linear at 1.28–1.31 µs per token per layer (21.4 ms per GDN layer at 16k tokens).
+  F32 in and out only, and it maps value heads to key heads tiled (`h % 16`) where transformers repeats them
+  (`h / 2`): vendoring means adapting the loads to BF16 and the head index to `h / 2`. Decode at B = 1 is
+  latency-bound (169 GB/s), at B = 64 it reaches 235 GB/s of state traffic (ideal at 640 GB/s: ~400 µs, so ~0.7 ms
+  per step per GDN layer left on the table at B = 64). Because it is per-token sequential it is invariant to batch
+  composition and to where a chunked prefill splits, and the state after any token (Task 30's `boundary_states`)
+  falls out for free.
+- **AITER** (MIT): the only GDN HIP kernel is the chunk-state stage `chunk_gated_delta_rule_fwd_h` (gfx12 WMMA,
+  wave64 only, 128/128 head dims only; its own dispatch compiles 1,536 instantiations for > 10 min, so the harness
+  launches one). It is fast — 1.30 ms at 16k tokens, 6 % of llama.cpp's whole recurrence — but GDN decode
+  (`fused_recurrent`) and the other chunk stages (cumsum, kkt, solve_tril, w/u, chunk_o) are Triton / FlyDSL, unusable
+  under the no-Python rule. Its conv kernels are plain HIP: `causal_conv1d_update` (BF16, in-place state with slot
+  indices) and `causal_conv1d_fwd_split_qkv` (BF16, channel-last, q/k/v split fused, writes the conv state) — 3.1×
+  faster than llama.cpp at 2048 tokens, 12 % slower at 16384, slower at decode B ≥ 16.
+- **Own prototype stages** (`own_prep`, `own_o`): scalar FP32 in LDS, unoptimized; they are 92 % of the chunked
+  pipeline's time and make it 1.3–1.6× slower than llama.cpp at every length. The chunked pipeline beats the
+  sequential one only once those stages are rewritten (WMMA kkt / w/u / o and a blocked triangular solve); FLA's
+  stages are each of the order of the chunk-state stage, so ~4–6 ms at 16k (3.5–5× faster than llama.cpp) is an
+  estimate, not a measurement. The chunked pipeline also changes numerics: BF16 intermediates (rel ~6e-3 on output
+  and state vs 1.5e-7) and results that depend on where a chunked prefill splits a 64-token chunk.
+- **Weight in a step.** Decode B = 1: 24.8 µs per GDN layer, ~0.6 ms per step on the 9B (3 GDN layers per full
+  attention layer) against ~28 ms of BF16 weight reads — small. Prefill 16k: llama.cpp's 21.4 ms per GDN layer is
+  ~0.5 s for the 9B's GDN layers, a large share of a 16k-token prefill; at 2048 tokens 2.7 ms per layer.
+
+Options:
+
+- A) llama.cpp decode (adapted BF16 + `h / 2`) + the chunked prefill: AITER `chunk_h` vendored (one instantiation) +
+  own WMMA glue stages (prep / solve / w/u / o) to be written; AITER `split_qkv` / `conv1d_update` for conv. Fastest
+  long prefill once the glue is optimized (estimate 3.5–5× at 16k); today slower; adds 2–4 own kernels, BF16-rounded
+  prefill state, and a chunked-prefill split that is not bit-equal to the unsplit run unless splits land on 64-token
+  boundaries (the scheduler can align them, as the TP overlap split does at `kv.block_tokens`).
+- B) llama.cpp everywhere (decode and sequential prefill, `ssm_conv` for conv), adapted to BF16 loads and `h / 2`;
+  conv state read from the slot instead of a concatenated input. Exact (F32 state, rel 1e-7), batch- and
+  split-invariant, boundary snapshots trivial; prefill 1.3 µs/token/layer.
+- C) Own kernels where measurably faster: today none is (the own stages lose to llama.cpp everywhere); in practice C =
+  B now plus an own optimized chunked prefill (the A glue) and an own decode for B ≥ 16 when served numbers show them
+  slower.
+
+Builder recommendation: **B now, A's chunked prefill as a measured follow-up.** B is the only path that is both
+correct and fastest at every measured shape today and satisfies Task 30's split-equality and snapshot tests without
+scheduler alignment; it unblocks Tasks 30–32. For conv, take AITER `causal_conv1d_fwd_split_qkv` for prefill (fused
+split and state write, 3× faster at 2048) and llama.cpp `ssm_conv` for decode, if the per-mode split is acceptable;
+otherwise llama.cpp for both. Revisit A (AITER `chunk_h` + own WMMA glue) once Qwen3.5 serves and a 16k-token TTFT
+profile shows the GDN share; land it only if it measures faster served. Not decided here.
+
+**Decision (user, 2026-10-08), "P7 Gated DeltaNet provider": B** — llama.cpp's `gated_delta_net` vendored (BF16 loads,
+transformers' `h / 2` head pairing) for decode and prefill; conv: AITER `causal_conv1d_fwd_split_qkv` for prefill,
+llama.cpp `ssm_conv` for decode; a chunked prefill (option A) is a measured follow-up once Qwen3.5 serves.
+
+## Phase 7 review fix: state allocation for `n > 1` (2026-10-08, open)
+
+From the codex review of p7-stack (finding 3, verified) and the fix builder's plan (`p7-review-fixes`, handoff
+456040d1): a request's state charge must cover every sequence (`n` choices), and the API puts no upper bound on `n`.
+
+- A) The fixed state allocation covers `max_running_requests` sequences (not requests); a request whose
+  `n × state` exceeds the whole allocation is refused at submit with a reason code; one that only lacks free state now
+  waits in the queue.
+- B) The allocation covers `max_running_requests × max_n` (a new key `scheduler.max_n_per_request`, default 4) and
+  larger `n` is rejected 400 for hybrid families.
+- C) Hybrid families reject `n > 1` (400 with a reason code) until Phase 8.
+
+**Decision (user, 2026-10-08): A** — state slots per sequence; `n × state` above the whole allocation is refused with
+a reason code, otherwise the request waits for free state.
+
+## Phase 7 Task 11: Qwen3-4B golden misses (2026-10-08, open)
+
+From `p7-t11` (WIP 1c3f1b76; perf log "P7 Qwen3-4B gate"). Every prompt's greedy tokens equal the transformers
+reference, but the logprob bounds (Llama's, 0.15 likely / 0.56 tail) miss: c1 9/16 pass (likely up to 0.233, p14 tail
+0.92); c16 14/16 by count but FAIL (p10 0.31, p12 0.28 over the batched 0.25). Throughput passes (598.8 vs vLLM-ROCm
+630.5 tok/s, 0.95×); vLLM GSM8K 0.920, Turbine's GSM8K run not done yet.
+
+- A) Derive Qwen3's own bounds from a transformers self-spread run (`scripts/golden/self_spread.py`, the OLMoE method),
+  recorded in the slug README, and re-gate.
+- B) Build the fused single-rounding per-head QK-norm (deferred by Task 10's decision C) first, then re-gate on the
+  Llama-derived bounds.
+- C) A then B: gate on self-spread bounds now, the fused norm stays a follow-up.
+
+**Decision (user, 2026-10-08): C** — Qwen3's own bounds from a transformers self-spread run now (documented in the
+slug README), re-gate; the fused single-rounding QK-norm stays a follow-up.

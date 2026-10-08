@@ -44,7 +44,7 @@ use turbine_model::kv_scales::{KvCache, TqKv};
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
-    TinyOptions, TinySpec, write_tiny_family_with_head_dim, write_tiny_llama,
+    TinyOptions, TinySpec, write_tiny_family, write_tiny_family_with_head_dim, write_tiny_llama,
     write_tiny_llama_with, write_tiny_olmoe, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
 };
 use turbine_model::testing::trace::{
@@ -3570,6 +3570,101 @@ fn olmoe_trace_records_every_layer() {
     assert!(exec.take_trace().is_empty());
 }
 
+/// P7 Task 12: the routing trace of the tiny OLMoE on the CPU provider records, for a 5-token
+/// prefill and two decode steps, one row per MoE layer and token (layer by layer, the batch's
+/// tokens in order, each at its position) whose top-k ids are the set `torch_topk` picks on the
+/// layer's traced router logits (BF16-rounded, as the router selects), whose gates are the
+/// traced `topk_weights`-shaped choice (k of them, positive) and whose margin is ≥ 0; off by
+/// default, and the logits are bitwise those of the untraced run. Breaks if the sink records
+/// the wrong rows, positions or margin, or reading the routing back changes the forward.
+#[test]
+fn routing_trace_records_topk_and_margin() {
+    let tmp = TempDir::new("tiny-model-routing-trace");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("OLMoE has experts");
+    let (experts, k) = (moe.num_experts as usize, moe.experts_per_token as usize);
+    let layers = cfg.num_layers as usize;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let prompt5 = prompt(spec.vocab)[..5].to_vec();
+    let steps: Vec<(Vec<u32>, Vec<u32>)> = vec![
+        (prompt5.clone(), (0..5).collect()),
+        (vec![prompt5[1]], vec![5]),
+        (vec![prompt5[2]], vec![6]),
+    ];
+    let untraced: Vec<Vec<f32>> = steps
+        .iter()
+        .map(|(t, p)| {
+            kv.forward(&mut exec, t, p)
+                .expect("untraced")
+                .row(0)
+                .to_vec()
+        })
+        .collect();
+    assert!(exec.take_routing_trace().is_empty(), "off by default");
+
+    exec.set_routing_trace(true);
+    exec.set_trace(true);
+    for ((tokens, positions), want) in steps.iter().zip(&untraced) {
+        let got = kv
+            .forward(&mut exec, tokens, positions)
+            .expect("traced")
+            .row(0)
+            .to_vec();
+        assert!(&got == want, "the routing trace changes no logit");
+        let rows = exec.take_routing_trace();
+        let logits: Vec<_> = exec
+            .take_trace()
+            .into_iter()
+            .filter(|t| t.name == "router_logits")
+            .collect();
+        assert_eq!(logits.len(), layers);
+        assert_eq!(rows.len(), layers * tokens.len(), "layers x positions");
+        for (i, row) in rows.iter().enumerate() {
+            let (layer, t) = (i / tokens.len(), i % tokens.len());
+            assert_eq!(row.layer as usize, layer, "{row:?}");
+            assert_eq!(row.position, positions[t], "{row:?}");
+            assert_eq!(
+                (row.topk_ids.len(), row.topk_gates.len()),
+                (k, k),
+                "{row:?}"
+            );
+            assert!(row.topk_gates.iter().all(|&g| g > 0.0), "{row:?}");
+            assert!(row.margin >= 0.0, "{row:?}");
+            let traced = &logits[layer];
+            assert_eq!(traced.shape, [tokens.len(), experts]);
+            let rounded: Vec<f32> = traced.data[t * experts..(t + 1) * experts]
+                .iter()
+                .map(|&l| bf16::from_f32(l).to_f32())
+                .collect();
+            let mut want: Vec<u32> = torch_topk(&rounded, k)
+                .into_iter()
+                .map(|e| e as u32)
+                .collect();
+            let mut ids = row.topk_ids.clone();
+            want.sort_unstable();
+            ids.sort_unstable();
+            assert_eq!(ids, want, "{row:?}");
+            let low = row
+                .topk_ids
+                .iter()
+                .map(|&e| rounded[e as usize])
+                .fold(f32::INFINITY, f32::min);
+            let high = (0..experts)
+                .filter(|e| !row.topk_ids.contains(&(*e as u32)))
+                .map(|e| rounded[e])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(row.margin, low - high, "{row:?}");
+        }
+    }
+    exec.set_routing_trace(false);
+    kv.forward(&mut exec, &steps[1].0, &steps[1].1)
+        .expect("off");
+    assert!(exec.take_routing_trace().is_empty());
+}
+
 /// Lab diagnostic (precision investigation): HIP vs cpu-reference on the head_dim-128 tiny
 /// checkpoint op by op for the prefill and 3 decode steps (accumulated divergence), then every
 /// HIP op recomputed on the host from the HIP trace's own inputs (the error each op adds).
@@ -5092,6 +5187,91 @@ fn tp2_matches_tp1_on_host_every_tp_family() {
         ran.contains(&"qwen3"),
         "Qwen3 has no tp_decoder_spec (ran: {ran:?})"
     );
+}
+
+/// P7 S-6: the tiny Mistral (the Llama layer under `MistralForCausalLM`) at tp 1 and 2 over
+/// the host collective on the cpu-reference provider gives one device's greedy tokens, with
+/// every row's top-5 logprobs within the strict golden bounds (a group of one bitwise). Breaks
+/// if `Mistral::tp_decoder_spec` is missing (tp refused naming the family) or its hooks differ
+/// from the one-device decoder's.
+#[test]
+fn mistral_tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-mistral-tp");
+    let spec = write_tiny_family(&tmp.path().join("mistral"), "mistral", SEED);
+    assert_eq!(spec.config.family.0.name(), "mistral");
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = cpu_model(&spec, &host, 64);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&host, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    // tp 1 and 2 (the gated placements). Not tp 4: on these random weights sequence 0's decode
+    // step 11 is a 0.006-nat near-tie (one device), which tp 4's summation order flips.
+    for world in [1u32, 2] {
+        let ranks = tp_group(&spec, world, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let what = format!("mistral tp {world}");
+        let bound = if world == 1 { TpBound::Bitwise } else { golden };
+        let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+        println!("mistral_tp2_matches_tp1_on_host {what}: worst |Δ logprob| / bound {worst:.3}");
+    }
+}
+
+/// P7 S-6 edge case: Mistral's Hugging Face repositories ship `consolidated.safetensors` (the
+/// mistral-inference layout, other tensor names) beside the HF shards. With both present the
+/// HF checkpoint is loaded and `consolidated.safetensors` is never opened (a garbage one
+/// changes nothing: the greedy run equals the plain tiny run bitwise); with only
+/// `consolidated.safetensors` (here a valid safetensors file) opening fails `ModelError::Io`
+/// naming `model.safetensors.index.json` and the skipped file. Breaks if the loader reads
+/// `consolidated.safetensors` or accepts it as the checkpoint.
+#[test]
+fn mistral_shards_preferred_over_consolidated() {
+    let tmp = TempDir::new("tiny-model-mistral-consolidated");
+    let dir = tmp.path().join("mistral");
+    let spec = write_tiny_family(&dir, "mistral", SEED);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let run = |spec: &TinySpec| {
+        let mut exec = cpu_model(spec, &host, 64);
+        let storage = pool(&host, &layout, 4);
+        greedy_pair(exec.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab)
+    };
+    let plain = run(&spec);
+    std::fs::write(
+        dir.join("consolidated.safetensors"),
+        b"not a safetensors file",
+    )
+    .expect("write consolidated");
+    let with_consolidated = run(&spec);
+    assert_eq!(plain.0, with_consolidated.0, "greedy tokens");
+    let bits = |rows: &[Vec<f32>]| -> Vec<Vec<u32>> {
+        rows.iter()
+            .map(|r| r.iter().map(|v| v.to_bits()).collect())
+            .collect()
+    };
+    assert!(
+        bits(&plain.1) == bits(&with_consolidated.1),
+        "logits differ with consolidated.safetensors present"
+    );
+
+    let only = tmp.path().join("consolidated-only");
+    std::fs::create_dir_all(&only).expect("mkdir");
+    std::fs::copy(
+        dir.join("model.safetensors"),
+        only.join("consolidated.safetensors"),
+    )
+    .expect("copy weights");
+    std::fs::copy(dir.join("config.json"), only.join("config.json")).expect("copy config");
+    match SafetensorsIndex::open(&only) {
+        Err(ModelError::Io { path, detail }) => {
+            assert_eq!(path, only);
+            assert!(detail.contains("model.safetensors.index.json"), "{detail}");
+            assert!(detail.contains("consolidated.safetensors"), "{detail}");
+        }
+        other => panic!("consolidated-only directory: {other:?}"),
+    }
 }
 
 /// Phase 6a S-12: quantized dense layers under tensor parallelism on the CPU provider — each
