@@ -420,6 +420,10 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
     assert_eq!(env(&job, "TURBINE_TEST_BACKEND"), "hip");
     assert_eq!(env(&job, "TURBINE_TEST_MODEL_DIR"), MODEL_DIR);
     assert_eq!(env(&job, "TURBINE_TEST_MOE_MODEL_DIR"), MOE_MODEL_DIR);
+    assert_eq!(
+        env(&job, "TURBINE_TEST_QWEN3_MODEL_DIR"),
+        "/models/qwen3-4b-instruct-2507"
+    );
     assert_eq!(env(&job, "TURBINE_ROCM_PATH"), "/opt/rocm/rocm/core-7.14");
     assert_eq!(env(&job, "UV_CACHE_DIR"), format!("{CACHE}/uv"));
     // The slot, not the manifest, picks the target and kernel build dirs.

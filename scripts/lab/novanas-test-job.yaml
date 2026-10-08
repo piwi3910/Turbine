@@ -200,6 +200,10 @@ spec:
             # OLMoE-1B-7B weights for the Phase 2 MoE tests.
             - name: TURBINE_TEST_MOE_MODEL_DIR
               value: /models/olmoe-1b-7b-0125-instruct
+            # Qwen3-4B-Instruct-2507 weights for the Phase 7 Qwen3 trace (golden
+            # hip_trace_vs_cpu_qwen3, a release-build test).
+            - name: TURBINE_TEST_QWEN3_MODEL_DIR
+              value: /models/qwen3-4b-instruct-2507
             - name: UV_VERSION
               value: 0.11.2
             - name: UV_INSTALL_DIR

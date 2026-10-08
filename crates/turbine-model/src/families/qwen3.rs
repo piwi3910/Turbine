@@ -3,9 +3,10 @@
 //! `[head_dim]`) before RoPE, as the [`QK_NORM_PER_HEAD`] attention hook, which keeps the
 //! Q/K/V projections unfused (gate/up still fuse). Its keys: `use_sliding_window` must not be
 //! true (no executor implements a sliding window, so it is refused; `sliding_window` itself is
-//! then unused). Tool calls default to `hermes`. CPU backend only: the support matrix refuses it
-//! on GPU vendors until its row closes in Phase 7 model families (track
-//! phase-7-model-families).
+//! then unused). Tool calls default to `hermes`. On HIP the hook runs the library's
+//! `turbine_rmsnorm` over `[tokens · heads, head_dim]` rows of Q and of K (P7 S-2), and tensor
+//! parallelism runs the same hooks on each rank's heads ([`ModelFamily::tp_decoder_spec`]). The
+//! support matrix keeps the `amd` row unsupported until its gate closes (Phase 7 Task 11).
 
 use std::sync::Arc;
 
@@ -83,6 +84,13 @@ impl ModelFamily for Qwen3 {
 
     fn workspace_bytes(&self, cfg: &ModelArchConfig, limits: ExecutorLimits) -> u64 {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
+    }
+
+    /// Tensor parallelism (P7 S-2): the same hooks on the rank's shard. Heads and KV heads split
+    /// by `crate::tp` (Qwen3-4B: 32 / 8 over 2 ranks); the per-head norm needs no collective,
+    /// so its `[head_dim]` weights stay whole on every rank.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
     }
 
     fn default_tool_format(&self) -> Option<&'static str> {
