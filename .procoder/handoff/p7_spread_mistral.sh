@@ -11,7 +11,7 @@ if [ "${1:-}" = --locked ]; then
 	cd "$SRC/scripts/golden" || exit 1
 	echo "p7-spread-mistral: $(date "+%F %T") fixture.lock held"
 	env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 CUDA_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES= \
-		"$UV" run self_spread.py "$M" "$OUT/reference.jsonl" "$OUT/self_spread.json" >"$OUT/spread.log" 2>&1 </dev/null
+		"$UV" run self_spread.py "$M" "$OUT/reference.jsonl" "$OUT/self_spread.json" fp32-sdpa-incremental,fp32-sdpa-full,fp32-eager-incremental,fp32-eager-full,bf16-sdpa-full,bf16-eager-incremental >"$OUT/spread.log" 2>&1 </dev/null
 	exit $?
 fi
 {
