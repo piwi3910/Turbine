@@ -574,8 +574,8 @@ Interfaces:
   Covers: S-11 AC (decisions entry with timings)
   Depends on: nothing in this phase
 
-- [ ] Build and run the harness on novanas under `scripts/bench-lock.sh`: correctness against the F32 recurrence (max |Δ| on outputs and final state) and median µs per shape for each candidate.
-- [ ] Write the decisions.md entry "P7 Gated DeltaNet provider" with the timing table and options: A llama.cpp decode + AITER chunk-h prefill (+ own glue stages), B llama.cpp everywhere, C own kernels where measurably faster.
+- [x] Build and run the harness on novanas under `scripts/bench-lock.sh`: correctness against the F32 recurrence (max |Δ| on outputs and final state) and median µs per shape for each candidate.
+- [x] Write the decisions.md entry "P7 Gated DeltaNet provider" with the timing table and options: A llama.cpp decode + AITER chunk-h prefill (+ own glue stages), B llama.cpp everywhere, C own kernels where measurably faster.
 - [ ] ASK THE USER for the decision; record it under the entry.
 - [ ] Commit: `docs(decisions): P7 Gated DeltaNet provider evaluation`
 
