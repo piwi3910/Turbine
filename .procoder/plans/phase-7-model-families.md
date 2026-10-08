@@ -370,6 +370,21 @@ Interfaces:
   Covers: S-5 (code)
   Depends on: Tasks 13, 16, 10
 
+  As built (2026-10-09): the quantized tiny fixture is
+  `write_tiny_qwen3moe_quantized` (the FP8-block `qwen3moe_fp8_block` helper of tiny_model: 8
+  experts of `moe_intermediate_size` 256, so a tp pair holds whole 128 blocks; hidden 128,
+  head_dim 128); the tiny random weights make a greedy step a near-tie that the tp all-reduce
+  can flip, so the tests pin `QWEN3MOE_SEED` 12 (seed 7 flips step 9 by 0.012 nat). The lab
+  test reads `TURBINE_TEST_QWEN3MOE_MODEL_DIR` (the Job env, set to
+  `/models/qwen3-30b-a3b-instruct-2507-fp8`) and is in TWO_GPU_TESTS. It traces p01 through the
+  first 4 layers (prefill + 2 teacher-forced decodes) at tp 2 over the `hostmem` collective and
+  judges: both ranks' routing traces identical (the all-reduced hidden row), the router logits
+  within 0.05 of the cpu-reference (measured 0.034; a share of top-8 expert choices flips on
+  borderline router logits — 15 of 64 rows — without moving the top-5 logits, asserted as the
+  same set per step), and the replicated op traces (`resid_attn`, `router_logits`, `moe_out`,
+  `final_norm`) printed op by op. The expert choices cross ranks vs the cpu-reference through
+  `DecoderExecutor::set_routing_trace`, not the op trace (which does not carry `topk_ids`).
+
 - [ ] Write failing host tests `tiny_model qwen3moe_tp2_matches_tp1_on_host` and `qwen3moe_ep2_matches_tp1_on_host` (tiny FP8-block Qwen3-MoE with `norm_topk_prob: true`). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model qwen3moe_` — expect FAIL with "tensor parallel size 2 is not supported by Qwen3MoeForCausalLM"
 - [ ] Implement the spec and the EP registration — run, expect PASS; `tp2_matches_tp1_on_host_every_tp_family` now runs Qwen3-MoE too.
 - [ ] Lab (ask the user first): `scripts/fetch-checkpoint.sh novanas qwen3-30b-a3b-instruct-2507-fp8` — expect `ok`

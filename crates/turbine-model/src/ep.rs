@@ -231,7 +231,7 @@ fn refuse(cfg: &ModelArchConfig, s: EpShard, why: impl std::fmt::Display) -> Mod
         EP_KEY,
         format!("{} ({} {why})", s.world, cfg.family.0.name()),
         "a size dividing the routed experts of a mixture-of-experts family with a placement \
-         covering every MoE layer (olmoe), tp = 1 or tp = ep",
+         covering every MoE layer (olmoe, qwen3_moe), tp = 1 or tp = ep",
     )
 }
 

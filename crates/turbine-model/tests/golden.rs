@@ -14,6 +14,9 @@
 //!   log-probabilities of both providers against its reference, and the MXFP4-A16 8B's decode
 //!   steps against one prefill of the same tokens, op by op.
 //!
+//! - `hip_trace_vs_cpu_qwen3moe` (lab, two GPUs, release): Qwen3-30B-A3B FP8's first 4 layers at
+//!   tensor parallelism 2 on HIP against the cpu-reference executor, op by op (P7 S-5).
+//!
 //! The first three judge with the committed `tolerance.json` and the same rule as `turbine-golden compare`,
 //! re-implemented in [`compare_prompt`] because this crate cannot depend on `turbine-bench`
 //! (contract §1.2).
@@ -32,13 +35,15 @@ use turbine_kernels::{
     KernelMetrics, KernelProvider, KernelRegistry, cpu_reference_provider, shim_provider,
 };
 use turbine_model::executor::{
-    self, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SequenceKv,
+    self, DecoderExecutor, ExecutorLimits, ExecutorOptions, ModelExecutor, SequenceKv, TraceTensor,
 };
 use turbine_model::families;
 use turbine_model::generate::{GenerateOptions, generate};
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::write_tiny_llama;
-use turbine_model::testing::trace::{LocalChecker, compare_traces, read_bf16_weight, render};
+use turbine_model::testing::trace::{
+    LocalChecker, RoutingRow, compare_traces, read_bf16_weight, render,
+};
 use turbine_model::{
     ChatTemplate, MAX_STAGING_BYTES, SafetensorsIndex, Tokenizer, WeightLoader, llama_slots,
     load_model_config, load_model_config_with,
@@ -1530,4 +1535,340 @@ fn mxfp4_decode_vs_prefill_trace() {
         }
         println!("  C top-5 {:?}", top(&logits_c));
     }
+}
+
+// ------------------------------------------------------------------- Qwen3-MoE (P7 S-5)
+
+/// The traced tensors every tensor-parallel rank holds whole (identical rows on all ranks, the
+/// CPU executor's shapes): the residual after attention, the router's logits, the all-reduced
+/// expert output and the final norm. The router's choices themselves are compared through
+/// [`DecoderExecutor::set_routing_trace`] (the op trace does not carry them).
+const QWEN3MOE_REPLICATED_TRACES: [&str; 4] =
+    ["resid_attn", "router_logits", "moe_out", "final_norm"];
+
+/// One tensor-parallel rank's kept op traces, its per-step logits rows and its routing trace.
+struct RankRun {
+    steps: Vec<Vec<TraceTensor>>,
+    logits: Vec<Vec<f32>>,
+    routing: Vec<RoutingRow>,
+}
+
+/// Layers of Qwen3-30B-A3B the trace runs (the cpu-reference executor is scalar).
+const QWEN3MOE_TRACE_LAYERS: u32 = 4;
+
+/// Lab only (P7 S-5; two HIP devices, release build; needs `TURBINE_TEST_QWEN3MOE_MODEL_DIR` =
+/// Qwen3-30B-A3B-Instruct-2507-FP8, which the lab test Job sets to
+/// `/models/qwen3-30b-a3b-instruct-2507-fp8`, and `TURBINE_KERNEL_LIBRARY`; a no-op in a debug
+/// build). The checkpoint's first [`QWEN3MOE_TRACE_LAYERS`] layers run prompt p01 of
+/// `tests/golden/prompts.jsonl` (prefill and 2 teacher-forced decode steps, the cpu-reference's
+/// greedy tokens) on the cpu-reference executor (one device) and on a two-rank tensor-parallel
+/// group of HIP devices (the `hostmem` collective, FP8-block experts split column-wise per rank);
+/// both ranks' replicated tensors ([`QWEN3MOE_REPLICATED_TRACES`]) are compared with the
+/// cpu-reference's op by op and printed. Asserts the ranks end every step with equal logits and
+/// that the routers choose the cpu-reference's experts for all but a small share of the
+/// (token, layer) rows. Breaks if a rank loads the wrong shard of a quantized expert, routes on
+/// a partial hidden row, or the HIP FP8-block experts depart from the host reference.
+#[test]
+#[ignore = "needs two HIP devices, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_QWEN3MOE_MODEL_DIR, release"]
+fn hip_trace_vs_cpu_qwen3moe() {
+    use turbine_distributed::collective::{self as coll, CollectiveInit};
+    use turbine_model::executor::TraceTensor;
+    use turbine_model::tp::{self, ShardSpec, TpContext};
+
+    let _gpu = gpu_model_lock();
+    const TRACE_DECODE: usize = 2;
+    if cfg!(debug_assertions) {
+        println!("hip_trace_vs_cpu_qwen3moe: debug build, nothing traced (run it with --release)");
+        return;
+    }
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir =
+        turbine_kernels::test_support::require_env_dir("TURBINE_TEST_QWEN3MOE_MODEL_DIR");
+    let mut cfg = load_model_config(&model_dir).expect("config.json");
+    assert_eq!(
+        cfg.family.0.name(),
+        "qwen3_moe",
+        "TURBINE_TEST_QWEN3MOE_MODEL_DIR must hold a Qwen3-MoE checkpoint"
+    );
+    assert!(cfg.num_layers > QWEN3MOE_TRACE_LAYERS);
+    cfg.num_layers = QWEN3MOE_TRACE_LAYERS;
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let p01 = prompts.iter().find(|p| p.id == "p01").expect("prompt p01");
+    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    let template = ChatTemplate::resolve(&model_dir, None).expect("chat template");
+    let ids = prompt_token_ids(&tokenizer, &template, p01);
+    let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
+    let limits = ExecutorLimits {
+        block_tokens: BLOCK_TOKENS,
+        max_batch_tokens: max_seq_len,
+        max_seqs: 1,
+    };
+    let opts = ExecutorOptions::default();
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let keep = |trace: Vec<TraceTensor>| -> Vec<TraceTensor> {
+        trace
+            .into_iter()
+            .filter(|t| QWEN3MOE_REPLICATED_TRACES.contains(&t.name))
+            .collect()
+    };
+
+    // One device on the cpu-reference provider: the traces and the greedy tokens to force.
+    let (cpu_steps, forced, cpu_logits, _cpu_routing) = {
+        let provider = cpu_reference_provider();
+        let mem: Arc<dyn DeviceMemory> =
+            HostMemory::new(turbine_core::types::DeviceId(0), 32 << 30);
+        let slots = cfg.family.0.weight_slots(&cfg);
+        let weights = WeightLoader::load_format(
+            cfg.weight_format.get(),
+            &index,
+            &slots,
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load weights");
+        let reqs = executor::available_requirements(
+            &cfg,
+            BLOCK_TOKENS,
+            opts,
+            std::slice::from_ref(&provider),
+        );
+        let order = [provider.id()];
+        let card = provider.card_profile();
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+            .expect("every op has a provider");
+        let mut exec = DecoderExecutor::new(
+            &cfg,
+            families::qwen3_moe::decoder_spec(),
+            weights,
+            Arc::new(registry),
+            Arc::clone(&mem),
+            limits,
+            opts,
+        )
+        .expect("cpu executor");
+        let mut kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+        exec.set_trace(true);
+        exec.set_routing_trace(true);
+        let (mut steps, mut forced, mut logits, mut routing) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut batch = ids.clone();
+        let mut p0 = 0usize;
+        for _ in 0..=TRACE_DECODE {
+            let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+            let row = kv
+                .forward(&mut exec, &batch, &positions)
+                .expect("forward")
+                .row(0)
+                .to_vec();
+            let next = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+                .map(|(i, _)| i as u32)
+                .expect("a row");
+            steps.push(keep(exec.take_trace()));
+            routing.extend(exec.take_routing_trace());
+            logits.push(row);
+            forced.push(next);
+            p0 += batch.len();
+            batch = vec![next];
+        }
+        (steps, forced, logits, routing)
+    };
+
+    // Two HIP ranks, each its own device, the same batches in the same order.
+    let lib = coll::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load hostmem");
+    let unique_id = lib.unique_id().expect("id");
+    type RankTraces = Vec<RankRun>;
+    let ranks: RankTraces = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2u32)
+            .map(|rank| {
+                let (lib, cfg, index, ids, forced) =
+                    (Arc::clone(&lib), &cfg, &index, &ids, &forced);
+                scope.spawn(move || {
+                    let ctx = turbine_kernels::test_support::open_context_nth("hip", rank as usize);
+                    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                    let collective = lib
+                        .open(CollectiveInit {
+                            rank: rank as usize,
+                            world: 2,
+                            unique_id,
+                            init_timeout: std::time::Duration::from_secs(120),
+                            op_timeout: std::time::Duration::from_secs(120),
+                            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+                            metrics: None,
+                            memory: Some(Arc::clone(&mem)),
+                            route_max_bytes: Some(u64::MAX),
+                        })
+                        .expect("open hostmem");
+                    let s = ShardSpec { rank, world: 2 };
+                    let provider = shim_provider(ctx);
+                    let slots = tp::weight_slots(cfg, s).expect("shard slots");
+                    let mut rank_cfg = cfg.clone();
+                    turbine_model::weights::resolve_for_providers(
+                        &mut rank_cfg,
+                        &slots,
+                        std::slice::from_ref(&provider),
+                    );
+                    let weights = WeightLoader::load_format(
+                        rank_cfg.weight_format.get(),
+                        index,
+                        &slots,
+                        &mem,
+                        MAX_STAGING_BYTES,
+                    )
+                    .expect("load shard");
+                    let reqs = tp::available_requirements(
+                        &rank_cfg,
+                        s,
+                        BLOCK_TOKENS,
+                        opts,
+                        std::slice::from_ref(&provider),
+                    )
+                    .expect("requirements");
+                    let order = [provider.id()];
+                    let card = provider.card_profile();
+                    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+                    let registry =
+                        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+                            .expect("every op has a provider");
+                    let mut exec = DecoderExecutor::new_tp(
+                        &rank_cfg,
+                        families::qwen3_moe::decoder_spec(),
+                        weights,
+                        Arc::new(registry),
+                        Arc::clone(&mem),
+                        limits,
+                        opts,
+                        Some(TpContext {
+                            rank,
+                            world: 2,
+                            collective,
+                            stream: mem.compute_stream(),
+                        }),
+                    )
+                    .expect("rank executor");
+                    let layout = tp::kv_layout(cfg, s, BLOCK_TOKENS).expect("layout");
+                    let mut kv = SequenceKv::new(&mem, layout, max_seq_len).expect("kv");
+                    exec.set_trace(true);
+                    exec.set_routing_trace(true);
+                    let (mut steps, mut logits, mut rank_routing) =
+                        (Vec::new(), Vec::new(), Vec::new());
+                    let mut batch = ids.clone();
+                    let mut p0 = 0usize;
+                    for &next in forced.iter().take(TRACE_DECODE + 1) {
+                        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+                        let row = kv
+                            .forward(&mut exec, &batch, &positions)
+                            .expect("forward")
+                            .row(0)
+                            .to_vec();
+                        steps.push(keep(exec.take_trace()));
+                        rank_routing.extend(exec.take_routing_trace());
+                        logits.push(row);
+                        p0 += batch.len();
+                        batch = vec![next];
+                    }
+                    RankRun {
+                        steps,
+                        logits,
+                        routing: rank_routing,
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    });
+
+    assert!(
+        ranks[0].logits == ranks[1].logits,
+        "the ranks' logits differ from each other"
+    );
+    // The routers run on the all-reduced hidden row: the two ranks must choose identical experts
+    // for every row (the topk_gates too, they weigh the expert sums). Against the cpu-reference
+    // the choices are not compared: the router logits are F32 GEMMs over a BF16 hidden row and
+    // the all-reduce's rounding moves them by ~0.3 % relative (measured, layer 0: 3.4e-2 on a
+    // 10.2 logit), enough to flip a borderline top-k member of a row — observed on 15 of the
+    // 64 rows, without moving the top-5 logits (asserted below as the same set).
+    for (rank, r) in ranks.iter().enumerate() {
+        assert_eq!(
+            r.routing, ranks[0].routing,
+            "rank {rank}: routing differs from rank 0"
+        );
+    }
+    let choices = ranks[0].routing.len();
+    for (rank, r) in ranks.iter().enumerate() {
+        let mut rows = Vec::new();
+        for (step, (want, got)) in cpu_steps.iter().zip(&r.steps).enumerate() {
+            rows.extend(compare_traces(step, want, got));
+        }
+        println!(
+            "{}",
+            render(
+                &format!(
+                    "Qwen3-30B-A3B p01 ({QWEN3MOE_TRACE_LAYERS} layers) rank {rank}: HIP tp 2 vs cpu-reference"
+                ),
+                &rows
+            )
+        );
+    }
+    // The router logits stay close to the cpu-reference's, and every step's top-5 logits keep
+    // the cpu-reference's set (a near-tie may reorder them).
+    let mut worst_router = 0f32;
+    let mut router_rows = 0usize;
+    for r in &ranks {
+        for (step, (want, got)) in cpu_steps.iter().zip(&r.steps).enumerate() {
+            let find = |t: &[TraceTensor], name: &str| {
+                t.iter()
+                    .find(|e| e.name == name)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("step {step}: no {name} trace"))
+            };
+            let (w, g) = (find(want, "router_logits"), find(got, "router_logits"));
+            router_rows += w.data.len();
+            worst_router = worst_router.max(
+                w.data
+                    .iter()
+                    .zip(&g.data)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            );
+        }
+    }
+    println!(
+        "routing rows: {choices}; router logit |Δ| worst {worst_router:.4} over {router_rows} \
+         elements"
+    );
+    assert!(choices > 0, "no router choice was traced");
+    for (step, (c, h)) in cpu_logits.iter().zip(&ranks[0].logits).enumerate() {
+        let top = |row: &[f32]| {
+            let mut v: Vec<usize> = (0..row.len()).collect();
+            v.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+            v.truncate(5);
+            v.iter().map(|&i| i as u32).collect::<Vec<u32>>()
+        };
+        let mut want = top(c);
+        let mut got = top(h);
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(
+            want, got,
+            "step {step}: the top-5 logits are not the cpu-reference's set"
+        );
+    }
+    assert!(
+        worst_router <= 0.05,
+        "router logits depart from the cpu-reference by {worst_router:.4} (at most 0.05; the \
+         measured spread of the all-reduced row is 0.034)"
+    );
 }
