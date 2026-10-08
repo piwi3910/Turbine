@@ -860,9 +860,9 @@ scenario_ep2() {
 olmoe_capture_set() {
 	local dir="$1" prefix="$2" rot="$3" i pids=()
 	echo "lab-step: turbine-golden capture ${prefix}c1"
-	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl 		--out "${dir}/${prefix}c1.jsonl" || job_fail "turbine-golden capture ${prefix}c1 failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl --out "${dir}/${prefix}c1.jsonl" || job_fail "turbine-golden capture ${prefix}c1 failed"
 	for i in $(seq 0 15); do
-		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" 			--out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" &
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" --out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" &
 		pids+=($!)
 	done
 	# Not a bare wait: the server is a child of this shell too.
@@ -1408,9 +1408,9 @@ run_scenario() {
 	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
-	if family_scenario "$SCENARIO"; then
+	if family_scenario "$SCENARIO" || [[ $SCENARIO == olmoe-spread-novanas ]]; then
 		# A dry run cannot stream the pod log: print the in-Job steps of the family scenario.
-		[[ $DRY_RUN -eq 0 ]] || family_dry_steps
+		[[ $DRY_RUN -eq 0 ]] || ! family_scenario "$SCENARIO" || family_dry_steps
 		# The GSM8K report (and the bench) outlive the run directory: copy them back first.
 		local results="${REPO_ROOT}/target/lab-cluster/${RUN_ID}/"
 		say "copying ${RUN_DIR}/results/ to ${results}"

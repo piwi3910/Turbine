@@ -9,7 +9,6 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_olmoe};
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
@@ -872,11 +871,8 @@ fn support_matrix_output() {
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("vendor "), "{text}");
-    assert_eq!(
-        text.lines().count(),
-        rows.len() + 1 + deferred.len() + refusals.len(),
-        "{text}"
-    );
+    let expected = rows.len() + 1 + deferred.len();
+    assert_eq!(text.lines().count(), expected, "{text}");
 
     // --support-matrix takes no configuration; --output needs --support-matrix.
     let out = run(&["--support-matrix", "--config", "/nonexistent.yaml"]);
