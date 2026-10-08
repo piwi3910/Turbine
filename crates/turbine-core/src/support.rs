@@ -1818,9 +1818,14 @@ mod tests {
         assert!(k.is_partial());
         assert_eq!(check(k).unwrap().status, SupportStatus::Supported);
 
-        // A Phase 7 family is experimental on the GPU vendor (S-13), naming its pending gate;
-        // an architecture with no row is refused naming the checkpoint.
+        // Qwen3 BF16 is supported since its gate closed (Task 11, 2026-10-08), before
+        // discovery too; another Phase 7 family is still experimental on the GPU vendor
+        // (S-13), naming its pending gate; an architecture with no row is refused naming
+        // the checkpoint.
         let k = SupportKey::before_discovery("amd", Some("Qwen3ForCausalLM"), W::Bf16, K::Bf16);
+        let d = check(k).unwrap();
+        assert_eq!(d.status, SupportStatus::Supported);
+        let k = SupportKey::before_discovery("amd", Some("Qwen3MoeForCausalLM"), W::Bf16, K::Bf16);
         let d = check(k).unwrap();
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(d.view().reason.as_deref(), Some(P7_PENDING_REASON));
