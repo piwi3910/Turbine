@@ -31,11 +31,12 @@ use std::sync::Arc;
 
 use turbine_core::types::DType;
 use turbine_kernels::{
-    ElementwiseContext, ExpertDtype, KernelRegistry, MoeExpertsConfig, MoeExpertsContext,
-    MoeExpertsExtra, MoeRouteConfig, MoeRouteContext, OpConfig,
+    ElementwiseContext, ExpertActivation, ExpertDtype, KernelRegistry, MoeExpertsConfig,
+    MoeExpertsContext, MoeExpertsExtra, MoeRouteConfig, MoeRouteContext, OpConfig, RouteMode,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, Tensor, TensorView};
 
+use super::attention_sinks_window::bf16_as_f32;
 use crate::ModelError;
 use crate::config::MoeConfig;
 use crate::executor::ExecutorOptions;
@@ -68,6 +69,19 @@ const S_UP: usize = 5;
 const S_DOWN: usize = 6;
 const ACT_GATE_UP: usize = 7;
 const ACT_DOWN: usize = 8;
+/// Parameter indices of [`HookWeights`] of a gpt-oss layer ([`Style::GptOss`]): the router
+/// `[experts, hidden]` (index 0 as above) and its F32 bias `[experts]`, then per fused
+/// projection its U8 MXFP4 data `[experts, n, k/2]`, E8M0 scales `[experts, n, k/32]` and bias
+/// `[experts, n]` (`n` = `2 · inter` for gate/up, `hidden` for down).
+const G_ROUTER_BIAS: usize = 1;
+const G_GATE_UP: usize = 2;
+const G_GATE_UP_SCALE: usize = 3;
+const G_GATE_UP_BIAS: usize = 4;
+const G_DOWN: usize = 5;
+const G_DOWN_SCALE: usize = 6;
+const G_DOWN_BIAS: usize = 7;
+/// The clamp of gpt-oss's activation (`swiglu_limit` of every released checkpoint).
+pub const GPT_OSS_SWIGLU_LIMIT: f32 = 7.0;
 /// Buffer indices of [`HookBuffers::tensors`]: zeros `[tokens, hidden]` (activation dtype;
 /// `zeros + zeros` resets the accumulator), router logits `[tokens, experts]` F32, top-k ids
 /// (I32) and weights (F32) `[tokens, top_k]`, sorted rows `[tokens · top_k]` I32 and expert
@@ -80,11 +94,43 @@ const SORTED_ROWS: usize = 4;
 const EXPERT_OFFSETS: usize = 5;
 const WORKSPACE: usize = 0;
 
-/// The sparse mixture of SwiGLU experts.
-pub struct Moe;
+/// Which expert block a [`Moe`] hook runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Style {
+    /// SwiGLU experts behind a softmax-then-top-k router (OLMoE, Qwen3-MoE, Mixtral), in the
+    /// decoder's weight format.
+    SwiGlu,
+    /// gpt-oss (P7 S-8): MXFP4 experts stored fused (`gate_up_proj_*` with interleaved gate and
+    /// up rows, `down_proj_*`), biases on both, the clamped gated activation, behind a router
+    /// with a bias that takes the top-k of the logits and then a softmax over those.
+    GptOss,
+}
 
-/// The [`Moe`] hook.
-pub const MOE: &dyn FfnHook = &Moe;
+/// The sparse mixture of experts.
+pub struct Moe {
+    style: Style,
+}
+
+/// The [`Moe`] hook: SwiGLU experts.
+pub const MOE: &dyn FfnHook = &Moe {
+    style: Style::SwiGlu,
+};
+
+/// The [`Moe`] hook of gpt-oss ([`Style::GptOss`]).
+pub const MOE_GPT_OSS: &dyn FfnHook = &Moe {
+    style: Style::GptOss,
+};
+
+impl Style {
+    /// The expert weight format of a decoder with `quant`: gpt-oss's experts are MXFP4
+    /// whatever its linear layers are; `Err` for a format without a kernel row.
+    fn weight_dtype(self, quant: Option<LinearQuant>) -> Result<ExpertDtype, ()> {
+        match self {
+            Style::SwiGlu => expert_dtype(quant),
+            Style::GptOss => Ok(ExpertDtype::Mxfp4),
+        }
+    }
+}
 
 /// The configuration's mixture of experts, or why it has none.
 fn moe_of(d: &DecoderDims) -> Result<MoeConfig, ModelError> {
@@ -121,19 +167,29 @@ pub fn experts_served(quant: &LinearQuant) -> bool {
     expert_dtype(Some(*quant)).is_ok()
 }
 
-fn route_cfg(d: &DecoderDims, moe: &MoeConfig) -> MoeRouteConfig {
+fn route_cfg(d: &DecoderDims, moe: &MoeConfig, style: Style) -> MoeRouteConfig {
     MoeRouteConfig {
         num_experts: moe.num_experts,
         top_k: moe.experts_per_token,
         renormalize: moe.norm_topk_prob,
         // transformers' router is a BF16 linear: its logits are BF16 before the F32 softmax.
         bf16_logits: d.act == Bf16::DTYPE,
-        ..Default::default()
+        mode: match style {
+            Style::SwiGlu => RouteMode::SoftmaxThenTopk,
+            Style::GptOss => RouteMode::TopkThenSoftmax,
+        },
+        bias: style == Style::GptOss,
     }
 }
 
 /// The `moe_experts` call over the local experts `[begin, end)`.
-fn experts_cfg(d: &DecoderDims, moe: &MoeConfig, (begin, end): (u32, u32)) -> MoeExpertsConfig {
+fn experts_cfg(
+    d: &DecoderDims,
+    moe: &MoeConfig,
+    (begin, end): (u32, u32),
+    style: Style,
+) -> MoeExpertsConfig {
+    let gpt_oss = style == Style::GptOss;
     MoeExpertsConfig {
         hidden: d.hidden as u32,
         inter: moe.expert_intermediate,
@@ -143,7 +199,16 @@ fn experts_cfg(d: &DecoderDims, moe: &MoeConfig, (begin, end): (u32, u32)) -> Mo
         expert_end: end,
         dtype: d.act,
         // A format without a row never gets here (`check_weight_format`).
-        weight_dtype: expert_dtype(d.quant).unwrap_or(ExpertDtype::Bf16),
+        weight_dtype: style.weight_dtype(d.quant).unwrap_or(ExpertDtype::Bf16),
+        activation: if gpt_oss {
+            ExpertActivation::GptOssClamp {
+                limit: GPT_OSS_SWIGLU_LIMIT,
+            }
+        } else {
+            ExpertActivation::SwiGlu
+        },
+        biases: gpt_oss,
+        gate_up_interleaved: gpt_oss,
         ..Default::default()
     }
 }
@@ -167,7 +232,7 @@ fn offset_slots(d: &DecoderDims) -> usize {
 /// (`tokens · top_k`) gathered with its gate, up, activation and down rows in the activation
 /// dtype (`2·hidden + 3·inter` elements), an 8-byte inverse-permutation entry per row, plus
 /// alignment slack.
-fn experts_workspace_bytes(d: &DecoderDims, moe: &MoeConfig, tokens: usize) -> u64 {
+fn experts_workspace_bytes(d: &DecoderDims, moe: &MoeConfig, tokens: usize, style: Style) -> u64 {
     let rows = (tokens * moe.experts_per_token as usize) as u64;
     let inter = moe.expert_intermediate as usize;
     let per_row = ((2 * d.hidden + 3 * inter) * d.act.size_bytes()) as u64 + 8;
@@ -175,8 +240,8 @@ fn experts_workspace_bytes(d: &DecoderDims, moe: &MoeConfig, tokens: usize) -> u
     // (2·hidden) and its FP8 copy (hidden), gate and up (4·inter), the activation (2·inter) and
     // its FP8 copy (inter), a dynamic scale (4) and the down output (2·hidden); an upper bound
     // over the three formats, 16 regions of alignment slack.
-    let quantized =
-        d.quant.is_some() && expert_dtype(d.quant).is_ok_and(|t| t != ExpertDtype::Bf16);
+    let quantized = style == Style::GptOss
+        || d.quant.is_some() && expert_dtype(d.quant).is_ok_and(|t| t != ExpertDtype::Bf16);
     if quantized {
         let per_row_quant = (8 + 5 * d.hidden + 7 * inter) as u64;
         return rows * per_row.max(per_row_quant) + 16 * 256;
@@ -324,6 +389,91 @@ fn upload_f32(mem: &Arc<dyn DeviceMemory>, values: &[f32]) -> Result<Tensor, Mod
     Ok(t)
 }
 
+/// A fused gpt-oss expert tensor `name` of the checkpoint's stored `shape` as the kernels take
+/// it: the same bytes, shaped `to` (`[experts, n, k/32, 16]` blocks as `[experts, n, k/2]`).
+fn take_fused(
+    weights: &mut LoadedWeights,
+    name: &str,
+    dtype: DType,
+    shape: &[usize],
+    to: &[usize],
+) -> Result<Tensor, ModelError> {
+    let mut t = weights.take(name)?;
+    if t.dtype != dtype || t.shape.as_slice() != shape {
+        return Err(invalid(format!(
+            "{name} is {:?} {}, expected {shape:?} {}",
+            t.shape.as_slice(),
+            t.dtype.as_str(),
+            dtype.as_str()
+        )));
+    }
+    // Row-major strides of `to`.
+    let mut strides = vec![1usize; to.len()];
+    for i in (0..to.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * to[i + 1];
+    }
+    t.shape = to.into();
+    t.strides = strides.as_slice().into();
+    Ok(t)
+}
+
+/// Layer `prefix`'s gpt-oss parameters (the [`Style::GptOss`] layout): the router and its F32
+/// bias, and the fused MXFP4 `gate_up_proj` and `down_proj` stacks with their biases, as the
+/// OpenAI checkpoint stores them (`model.layers.<i>.mlp.experts.<proj>_{blocks,scales,bias}`;
+/// row `2j` of `gate_up_proj` is gate column `j`, row `2j + 1` is up column `j`).
+fn load_gpt_oss(
+    d: &DecoderDims,
+    moe: &MoeConfig,
+    prefix: &str,
+    weights: &mut LoadedWeights,
+) -> Result<HookWeights, ModelError> {
+    if d.ep.is_some() {
+        return Err(invalid(
+            "gpt-oss experts are not implemented under expert parallelism".into(),
+        ));
+    }
+    let (e, h, inter) = (
+        moe.num_experts as usize,
+        d.hidden,
+        moe.expert_intermediate as usize,
+    );
+    let p = format!("{prefix}.mlp.experts");
+    let router_name = format!("{prefix}.mlp.router.weight");
+    let router = d.take_weight(weights, &router_name, &[e, h])?;
+    let bias_name = format!("{prefix}.mlp.router.bias");
+    let router_bias = bf16_as_f32(weights.take(&bias_name)?, &[e], &bias_name)?;
+    let mut proj = |name: &str, n: usize, k: usize| -> Result<[Tensor; 3], ModelError> {
+        let data = take_fused(
+            weights,
+            &format!("{p}.{name}_blocks"),
+            DType::U8,
+            &[e, n, k / 32, 16],
+            &[e, n, k / 2],
+        )?;
+        let scales = take_fused(
+            weights,
+            &format!("{p}.{name}_scales"),
+            DType::U8,
+            &[e, n, k / 32],
+            &[e, n, k / 32],
+        )?;
+        let bias = d.take_weight(weights, &format!("{p}.{name}_bias"), &[e, n])?;
+        Ok([data, scales, bias])
+    };
+    let [gu, gu_scale, gu_bias] = proj("gate_up_proj", 2 * inter, h)?;
+    let [down, down_scale, down_bias] = proj("down_proj", h, inter)?;
+    Ok(HookWeights::tensors(vec![
+        router,
+        router_bias,
+        gu,
+        gu_scale,
+        gu_bias,
+        down,
+        down_scale,
+        down_bias,
+    ]))
+}
+
 impl FfnHook for Moe {
     fn name(&self) -> &'static str {
         "moe"
@@ -341,11 +491,11 @@ impl FfnHook for Moe {
         };
         let mut ops = vec![
             OpConfig::Gemm(d.gemm(moe.num_experts as usize, d.hidden, DType::F32)),
-            OpConfig::MoeRoute(route_cfg(d, &moe)),
+            OpConfig::MoeRoute(route_cfg(d, &moe, self.style)),
         ];
         for layer in 0..d.layers {
             for run in local_runs(d, &moe, layer) {
-                let op = OpConfig::MoeExperts(experts_cfg(d, &moe, run));
+                let op = OpConfig::MoeExperts(experts_cfg(d, &moe, run, self.style));
                 if !ops.contains(&op) {
                     ops.push(op);
                 }
@@ -368,7 +518,7 @@ impl FfnHook for Moe {
             + (F32 * (experts + top_k)) as u64
             + (I32 * 2 * top_k) as u64;
         max_batch_tokens as u64 * per_token
-            + experts_workspace_bytes(d, &moe, max_batch_tokens)
+            + experts_workspace_bytes(d, &moe, max_batch_tokens, self.style)
             + (I32 * (experts + 1) * offset_slots(d)) as u64
     }
 
@@ -396,7 +546,7 @@ impl FfnHook for Moe {
             ],
             scratch: vec![DeviceBuffer::alloc(
                 mem,
-                experts_workspace_bytes(d, &moe, t) as usize,
+                experts_workspace_bytes(d, &moe, t, self.style) as usize,
             )?],
         })
     }
@@ -410,6 +560,9 @@ impl FfnHook for Moe {
         _opts: ExecutorOptions,
     ) -> Result<HookWeights, ModelError> {
         let moe = moe_of(d)?;
+        if self.style == Style::GptOss {
+            return load_gpt_oss(d, &moe, prefix, weights);
+        }
         let inter = moe.expert_intermediate as usize;
         let experts = local_runs(d, &moe, layer as usize)
             .iter()
@@ -461,7 +614,7 @@ impl FfnHook for Moe {
         let top_k = moe.experts_per_token as usize;
         run.linear(run.normed(), w.0[ROUTER].view(), rows(&b[ROUTER_LOGITS], t))?;
         run.trace("router_logits", &rows(&b[ROUTER_LOGITS], t))?;
-        let route = route_cfg(d, &moe);
+        let route = route_cfg(d, &moe, self.style);
         let slot = if d.ep.is_some() { run.layer } else { 0 };
         let offsets = TensorView::contiguous(
             b[EXPERT_OFFSETS].storage.whole(),
@@ -479,7 +632,7 @@ impl FfnHook for Moe {
                 topk_weights: rows(&b[TOPK_WEIGHTS], t),
                 sorted_rows: sorted_rows.clone(),
                 expert_offsets: offsets.clone(),
-                router_bias: None,
+                router_bias: (self.style == Style::GptOss).then(|| w.0[G_ROUTER_BIAS].view()),
             })
         })?;
         run.trace_routing(
@@ -488,13 +641,15 @@ impl FfnHook for Moe {
             &rows(&b[TOPK_WEIGHTS], t),
             route.bf16_logits,
         )?;
-        if d.ep.is_some() {
+        // gpt-oss's trace carries the routing too (the reference trace of the tiny checkpoint
+        // records the selected experts).
+        if d.ep.is_some() || self.style == Style::GptOss {
             run.trace("topk_ids", &rows(&b[TOPK_IDS], t))?;
             run.trace("topk_weights", &rows(&b[TOPK_WEIGHTS], t))?;
         }
         let calls: Vec<MoeExpertsConfig> = local_runs(d, &moe, run.layer)
             .into_iter()
-            .map(|r| experts_cfg(d, &moe, r))
+            .map(|r| experts_cfg(d, &moe, r, self.style))
             .collect();
         // The group sizes on the host (a blocking read of experts + 1 ints), only when the
         // provider of a call needs them for this many routed rows.
@@ -528,7 +683,7 @@ impl FfnHook for Moe {
                     out: run.ffn_out(),
                 })?)
         })?;
-        let workspace_len = experts_workspace_bytes(d, &moe, t) as usize;
+        let workspace_len = experts_workspace_bytes(d, &moe, t, self.style) as usize;
         // Each call adds its experts' weighted outputs in ascending expert order, so the calls
         // in ascending order add a token's experts in ascending order (one device's).
         let mut local = 0;
@@ -536,29 +691,51 @@ impl FfnHook for Moe {
             let n = experts.num_local_experts() as usize;
             let weight = |i: usize| w.0[i].view().rows(local, n);
             let quantized = |i: usize| w.0.get(i).map(|t| t.view().rows(local, n));
+            // gpt-oss: the fused gate/up stack stands for both (`w_up` is unused when the gate
+            // and up rows are interleaved).
+            let (w_gate, w_up, w_down, extra) = match self.style {
+                Style::SwiGlu => (
+                    weight(W_GATE),
+                    weight(W_UP),
+                    weight(W_DOWN),
+                    MoeExpertsExtra {
+                        w_gate_scale: quantized(S_GATE),
+                        w_up_scale: quantized(S_UP),
+                        w_down_scale: quantized(S_DOWN),
+                        act_static_scale: quantized(ACT_GATE_UP),
+                        act_static_scale_down: quantized(ACT_DOWN),
+                        ..Default::default()
+                    },
+                ),
+                Style::GptOss => (
+                    weight(G_GATE_UP),
+                    weight(G_GATE_UP),
+                    weight(G_DOWN),
+                    MoeExpertsExtra {
+                        w_gate_scale: Some(weight(G_GATE_UP_SCALE)),
+                        w_down_scale: Some(weight(G_DOWN_SCALE)),
+                        b_gate: Some(weight(G_GATE_UP_BIAS)),
+                        b_down: Some(weight(G_DOWN_BIAS)),
+                        ..Default::default()
+                    },
+                ),
+            };
             run.op(OpConfig::MoeExperts(experts), || {
                 run.registry
                     .moe_experts(&experts)
                     .experts(&mut MoeExpertsContext {
                         cfg: experts,
                         x: run.normed(),
-                        w_gate: weight(W_GATE),
-                        w_up: weight(W_UP),
-                        w_down: weight(W_DOWN),
+                        w_gate,
+                        w_up,
+                        w_down,
                         sorted_rows: sorted_rows.clone(),
                         expert_offsets: offsets.clone(),
                         topk_weights: rows(&b[TOPK_WEIGHTS], t),
                         host_expert_offsets: &host_offsets,
                         out: run.ffn_out(),
                         workspace: Some(run.ffn_buffers.scratch[WORKSPACE].slice(0, workspace_len)),
-                        extra: MoeExpertsExtra {
-                            w_gate_scale: quantized(S_GATE),
-                            w_up_scale: quantized(S_UP),
-                            w_down_scale: quantized(S_DOWN),
-                            act_static_scale: quantized(ACT_GATE_UP),
-                            act_static_scale_down: quantized(ACT_DOWN),
-                            ..Default::default()
-                        },
+                        extra,
                     })
             })?;
             local += n;
@@ -579,7 +756,7 @@ impl FfnHook for Moe {
         (0..d.layers)
             .flat_map(|layer| local_runs(d, &moe, layer))
             .all(|run| {
-                let c = experts_cfg(d, &moe, run);
+                let c = experts_cfg(d, &moe, run, self.style);
                 !registry
                     .moe_experts(&c)
                     .needs_host_offsets(&c, c.routed_rows(rows))

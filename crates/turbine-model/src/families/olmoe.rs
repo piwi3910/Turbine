@@ -71,6 +71,7 @@ impl ModelFamily for Olmoe {
             moe: Some(moe),
             qk_norm: true,
             qk_norm_per_head: false,
+            ..FamilyConfig::default()
         })
     }
 

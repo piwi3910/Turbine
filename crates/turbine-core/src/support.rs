@@ -555,6 +555,18 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     family_row("MixtralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Fp8),
     family_row("GptOssForCausalLM", WeightFormatColumn::Mxfp4),
+    // A BF16 `GptOssForCausalLM` checkpoint does not exist: the experts are always stored
+    // fused MXFP4 (`mlp.experts.<proj>_blocks`), so the Bf16 weights column is refused with
+    // that reason instead of "no support-matrix row".
+    row(
+        Some("amd"),
+        None,
+        Some("GptOssForCausalLM"),
+        BF16,
+        KV_BF16,
+        NO_SPEC,
+        unsupported("gpt-oss experts are always stored fused MXFP4; there is no BF16 checkpoint"),
+    ),
     family_row("Qwen3_5ForConditionalGeneration", WeightFormatColumn::Bf16),
     family_row(
         "Qwen3_5MoeForConditionalGeneration",
