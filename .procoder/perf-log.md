@@ -2055,3 +2055,13 @@ Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36 -- --se
 | p16    | 12/32            | 0.582                                         | 0.424 / 1.404       |
 
 Per-position |Δ| was not collected: no bound is exceeded, so the misses carry no position to explain. The reference is the wrong yardstick for calibrated scales (it quantizes K with scale 1.0 and V with 1.0; the served run now uses the table above), so the next step is a reference regenerated with `quant_reference.py --kv-quant fp8_e4m3` using these per-layer scales, a CPU fixture job under `fixture.lock`, plus the full-GSM8K OLMoE pair (BF16 KV 0.6603, unit-scale FP8 KV 0.6459) with the calibrated scales. The `OlmoeForCausalLM` fp8_e4m3 row stays `experimental`.
+## Phase 7 Task 23 — attention ABI v2.17 (window, sinks, d64 / d256), 2026-10-08
+
+Lab-bench `--quick` (64 requests, concurrency 16, client on novanas, GPU 0) on d4542e81, both golden c1 PASS. The d128 plain path's arguments are unchanged; the rows sit +2.5 % and +2.9 % above the last full rows (p5p-exit, 200 requests, local client), which is the quick tier's client and sample difference, not a change of the path.
+
+- `BENCH p7t23 llama commit=d4542e81 gpu=0 tests=skipped golden1=PASS: golden16=SKIP quick=1 client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0388 ok=64 failed=0 tok/s=886.0 itl_p50=15.3 ttft_p50=244 decode_fwd_ms=15.0` (p5p-exit: 864.0, decode_fwd 14.9)
+- `BENCH p7t23 olmoe commit=d4542e81 gpu=0 tests=skipped golden1=PASS: golden16=SKIP quick=1 client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0219 ok=64 failed=0 tok/s=654.4 itl_p50=23.1 ttft_p50=135 decode_fwd_ms=22.7` (p5p-exit: 636.1, decode_fwd 22.6)
+
+### P7 quantized experts on HIP — OLMoE BF16 unchanged (plan Task 16, branch `p7-t16`, 2026-10-08)
+
+`scripts/lab-bench.sh --quick --model olmoe --label p7t16` (GPU 0, 64 requests, c16): `BENCH p7t16 olmoe commit=d11161ed golden1=PASS tok/s=650.3 itl_p50=23.3 ttft_p50=135 decode_fwd_ms=22.9`, against 636.1 tok/s at `p5p-exit` (a2478b63): +2.2 %, so the BF16 expert paths (only `experts_supported` restructured, a sixth impl entry added) did not regress. Quantized experts: stage ratios under the 6a bound (worst 0.95, qgemm FP8 block at 64 rows), chained output 0.58 of 4x the bound, in `hip_moe_quant`.

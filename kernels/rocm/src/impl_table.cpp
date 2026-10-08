@@ -18,14 +18,18 @@
 //                                  ck_tile_fmha_pagedkv_mixed_staged [ck]
 //                                  (multiple of 128), 5
 //                                  turbine_hip_mixed_staged, 6
-//                                  turbine_hip_mixed
+//                                  turbine_hip_mixed; head_dim 64 / 256
+//                                  (v2.17): 7 ck_tile_fmha_splitkv [ck]
+//                                  (pages of a multiple of 128 tokens)
 //   attention_decode_paged       0 turbine_hip_b1_decode [turbine_hip]
 //                                  (decode of grouped query heads, group
 //                                  <= 8, BF16 flat pages, any page size;
 //                                  from 4 sequences it runs CK splitkv
 //                                  when CK serves the page size),
 //                                  1 ck_tile_fmha_splitkv [ck] (grouped query
-//                                  heads, pages of a multiple of 128 tokens),
+//                                  heads at head_dim 128, every head layout
+//                                  at 64 / 256; pages of a multiple of 128
+//                                  tokens),
 //                                  2 ck_tile_fmha_pagedkv [ck], 3 turbine_hip
 //                                  (BF16 pages); FP8 pages: 4
 //                                  turbine_hip_fp8_decode, 5 turbine_hip_fp8;
@@ -38,7 +42,9 @@
 //                                  of 256), 2 turbine_hip_moe_wmma
 //                                  (multiples of 64), 3 hipblaslt_grouped
 //                                  (only when hipBLASLt has a grouped
-//                                  solution), 4 hipblaslt_per_expert; 3 and 4
+//                                  solution), 4 hipblaslt_per_expert, 5
+//                                  turbine_hip_moe_quant (the v2.16 quantized
+//                                  experts: per-expert qgemm loop); 3, 4 and 5
 //                                  read host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
@@ -238,6 +244,10 @@ const ImplEntry kPrefillPagedImpls[] = {
         "turbine_hip_mixed_staged", kTurbine),
     entry<Paged<kPrefillPaged, PagedPath::TurbineMixed>>("turbine_hip_mixed",
                                                          kTurbine),
+    // Last, so every earlier index keeps its implementation: it serves only
+    // the head dims fmha_fwd_pagedkv has no gfx12 instance of (ABI v2.17).
+    entry<Paged<kPrefillPaged, PagedPath::CkSplitkv>>(
+        "ck_tile_fmha_splitkv", kCk, 0, page_multiple_allows),
 };
 const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::TurbineB1>>("turbine_hip_b1_decode",
@@ -272,6 +282,8 @@ const ImplEntry kMoeExperts[] = {
                                      TURBINE_IMPL_NEEDS_HOST_OFFSETS),
     entry<Experts<MoePath::PerExpert>>("hipblaslt_per_expert", kHipblaslt,
                                        TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    entry<Experts<MoePath::Quant>>("turbine_hip_moe_quant", kTurbine,
+                                   TURBINE_IMPL_NEEDS_HOST_OFFSETS),
 };
 const ImplEntry kAddRmsnorm[] = {
     entry<AddNorm<true>>("ck_tile_rmsnorm2d", kCk),

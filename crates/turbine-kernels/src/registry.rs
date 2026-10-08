@@ -844,6 +844,8 @@ mod tests {
             dtype: DType::BF16,
             block_tokens: None,
             causal: true,
+            window: None,
+            sinks: false,
         }
     }
 

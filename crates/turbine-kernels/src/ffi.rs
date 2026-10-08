@@ -225,6 +225,11 @@ pub(crate) struct AttentionPagedDesc {
     pub rope_inv_freq: *const f32,
     pub rope_rotary_dim: i32,
     pub rope_attn_factor: f32,
+    /// v2.17 (Phase 7 S-8): sliding window, keys `p − window_left ..= p` of query position `p`;
+    /// -1 = none (read only by a library of minor ≥ 17, so set only for one).
+    pub window_left: i32,
+    /// v2.17: device F32 `[num_q_heads]` sink logits; NULL = none.
+    pub sinks: *const f32,
 }
 
 /// `turbine_kv_page_class` (v2.11): one page class besides the base.

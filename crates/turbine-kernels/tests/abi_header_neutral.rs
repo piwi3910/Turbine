@@ -641,8 +641,7 @@ fn header_declares_the_v212_fused_rope_fields() {
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let attn = "int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
                 const int32_t *rope_positions; const float *rope_inv_freq; \
-                int32_t rope_rotary_dim; float rope_attn_factor; \
-                } turbine_attention_paged_desc;";
+                int32_t rope_rotary_dim; float rope_attn_factor;";
     let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(&attn),

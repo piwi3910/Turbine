@@ -687,7 +687,8 @@ fn moe_rows_are_batch_invariant() {
         let mut first: Option<(String, Vec<f32>)> = None;
         for info in impls
             .iter()
-            .filter(|i| i.name.starts_with("turbine_hip_moe_"))
+            // `turbine_hip_moe_quant` serves quantized experts only (tests/hip_moe_quant.rs).
+            .filter(|i| i.name.starts_with("turbine_hip_moe_") && i.name != "turbine_hip_moe_quant")
         {
             let Some(bound) = h.provider.bind(&spec, &ImplChoice::Single(info.index)) else {
                 continue;
@@ -797,6 +798,8 @@ fn paged_run_heads(
         dtype: DType::BF16,
         block_tokens: Some(BLOCK_TOKENS as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let kernel = h.provider.attention().expect("hip attention");
     assert!(kernel.supports(&cfg), "{cfg}");
@@ -879,6 +882,7 @@ fn paged_run_heads(
             classes: None,
             tq: None,
             rope: None,
+            sinks: None,
         })
         .expect("paged attention");
     let out = read(&o);

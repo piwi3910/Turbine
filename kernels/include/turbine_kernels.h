@@ -371,6 +371,18 @@ typedef struct turbine_attention_paged_desc {
   const float *rope_inv_freq;
   int32_t rope_rotary_dim;
   float rope_attn_factor;
+  /* v2.17 (Phase 7 S-8), read only by a library reporting minor >= 17 (a
+   * caller never sets them for an older one): a sliding window -- query
+   * position p attends keys p - window_left <= j <= p (with causal = 1);
+   * -1 = no window (every key <= p) -- and learned sink logits: sinks, device
+   * F32 [num_q_heads] in the scaled score domain (compared with scale * q.k),
+   * joins each row of head h as one more logit of the softmax that has no
+   * value: probabilities exp(s_j - m) / (sum_k exp(s_k - m) + exp(sinks[h] -
+   * m)) with m = max(max_k s_k, sinks[h]). NULL = no sinks. A zeroed
+   * descriptor must set window_left = -1. _supported reads sinks for its
+   * presence only. */
+  int32_t window_left;
+  const float *sinks;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -575,9 +587,10 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * c_residual / a_norm_weight / a_norm_eps; no new symbol); v2.16 the expert
  * weight dtypes, biases, activation variants and shared expert of
  * turbine_moe_experts_desc and TURBINE_ROUTE_TOPK_THEN_SOFTMAX / router_bias
- * of turbine_moe_route_desc (no new symbol); v2.18 Gated DeltaNet and the
- * causal conv1d (below; v2.17 is added by another task of the same phase and
- * carries no symbol of this group). */
+ * of turbine_moe_route_desc (no new symbol); v2.17 the sliding window and sink
+ * logits of paged attention (turbine_attention_paged_desc's window_left /
+ * sinks; no new symbol) and head_dim 64 and 256 on its CK paths; v2.18 Gated
+ * DeltaNet and the causal conv1d (below). */
 #define TURBINE_ABI_MINOR 18u
 uint32_t turbine_abi_minor(void);
 

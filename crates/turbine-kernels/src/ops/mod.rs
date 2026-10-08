@@ -305,6 +305,15 @@ pub struct AttentionConfig {
     /// Phase 1.
     pub block_tokens: Option<u32>,
     pub causal: bool,
+    /// Phase 7 S-8 (kernel ABI v2.17), paged kinds only: a sliding window. Query position `p`
+    /// attends keys `p − w ..= p` for `Some(w)` (the C ABI's `window_left`); `None` = every key
+    /// `≤ p`. Needs `causal`.
+    pub window: Option<u32>,
+    /// Phase 7 S-8 (kernel ABI v2.17), paged kinds only: one learned sink logit per query head
+    /// ([`PagedAttentionContext::sinks`]) joins the softmax denominator (gpt-oss): the row's
+    /// probabilities are `exp(s_j − m) / (Σ exp(s_k − m) + exp(sink − m))` with
+    /// `m = max(max_k s_k, sink)`, and the sink adds nothing to the output.
+    pub sinks: bool,
 }
 
 impl AttentionConfig {
@@ -332,6 +341,12 @@ impl fmt::Display for AttentionConfig {
         )?;
         if let Some(block_tokens) = self.block_tokens {
             write!(f, " block_tokens={block_tokens}")?;
+        }
+        if let Some(window) = self.window {
+            write!(f, " window={window}")?;
+        }
+        if self.sinks {
+            write!(f, " sinks=1")?;
         }
         Ok(())
     }
@@ -1238,6 +1253,9 @@ pub struct PagedAttentionContext<'a> {
     /// to a kernel whose [`AttentionKernel::fuses_decode_rope`] holds; `None` = `q` and `k_new`
     /// are already rotated.
     pub rope: Option<FusedRope<'a>>,
+    /// Phase 7 S-8 (kernel ABI v2.17): `[num_q_heads]` F32 sink logits (already in the scaled
+    /// score domain, compared with `scale · q·k`), required exactly when `cfg.sinks`.
+    pub sinks: Option<TensorView<'a>>,
 }
 
 /// The RoPE operands of a fused decode call ([`PagedAttentionContext::rope`]): those of the
@@ -2082,6 +2100,8 @@ mod tests {
             dtype: DType::BF16,
             block_tokens: None,
             causal: true,
+            window: None,
+            sinks: false,
         };
         assert_eq!(
             attn.to_string(),

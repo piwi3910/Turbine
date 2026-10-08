@@ -23,6 +23,18 @@
 // max |logit diff|). With one split a row's result is also independent of the
 // batch it decodes in.
 //
+// ABI v2.17 (Phase 7 S-8, decision "P7 attention sinks/window instances"):
+// head_dim 64 and 256 (the pinned CK commit has gfx12 fmha_fwd_splitkv
+// instances of those but no fmha_fwd_pagedkv one), so this path also serves
+// their prefill -- seqstart_q = q_indptr with several rows per sequence, the
+// bottom-right causal mask -- and a sliding window (the local bottom-right
+// mask, window_size_left = window_left) and sink logits (sink_ptr) at every
+// head dim. A masked call (and every call with sinks) runs the masked
+// instances, without the head merge;
+// decode without a window keeps no_mask and the merge. With one split the F32
+// accumulators hold total_q rows per head: a prefill chunk's scratch is
+// total_q * num_q_heads * head_dim * 4 bytes.
+//
 // The scratch depends on num_seqs and the heads only, so a decode graph's
 // capture never needs more than the eager run of the same key before it; it
 // grows outside a capture only, and a replaced buffer stays allocated until
@@ -38,7 +50,9 @@ using turbine_hip::fail;
 
 namespace {
 
-constexpr int32_t kHeadDim = 128;
+// The head dim whose decode keeps the head-merged path only (grouped query
+// heads, one query per sequence).
+constexpr int32_t kHeadDim128 = 128;
 // The split count (see the header comment).
 constexpr int32_t kSplits = 1;
 
@@ -88,20 +102,25 @@ int32_t split_scratch(turbine_ctx *ctx, size_t bytes, void **out) {
 namespace turbine_hip {
 
 bool ck_splitkv_serves(const turbine_attention_paged_desc *d) {
-  // Decode (one query per sequence) of grouped query heads: the head merge
-  // is what this path adds over fmha_fwd_pagedkv, and it engages only when
-  // there are more query heads than KV heads.
-  return d->max_q_len <= 1 && d->total_q <= d->num_seqs &&
-         d->num_q_heads > d->num_kv_heads;
+  // head_dim 64 / 256: prefill and decode, any head layout (no pagedkv
+  // instance of theirs). head_dim 128: decode (one query per sequence) of
+  // grouped query heads -- the head merge is what this path adds over
+  // fmha_fwd_pagedkv, and it engages only when there are more query heads
+  // than KV heads.
+  if (d->head_dim == 64 || d->head_dim == 256)
+    return true;
+  return d->head_dim == kHeadDim128 && d->max_q_len <= 1 &&
+         d->total_q <= d->num_seqs && d->num_q_heads > d->num_kv_heads;
 }
 
 int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                        const std::string &entry) {
   const int32_t splits = kSplits;
+  const int32_t hdim = d->head_dim;
   const int64_t rows = static_cast<int64_t>(d->total_q);
   const int64_t lse_elems =
       static_cast<int64_t>(d->num_q_heads) * splits * rows;
-  const int64_t o_elems = lse_elems * kHeadDim;
+  const int64_t o_elems = lse_elems * hdim;
   void *scratch = nullptr;
   if (int32_t rc = split_scratch(
           ctx, static_cast<size_t>(lse_elems + o_elems) * sizeof(float),
@@ -112,20 +131,34 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   float *o_acc = static_cast<float *>(scratch);
   float *lse_acc = o_acc + o_elems;
 
+  // A single query sees every key, so decode without a window needs no mask
+  // (and gets the head merge); prefill rows and a window take the
+  // bottom-right causal mask, local with window_left. Sinks always take the
+  // masked instances: the head-merged kernel reads sink_ptr[i_nhead] with
+  // i_nhead the KV head of its merged tile, so every query head of a group
+  // would get the group's first sink (pinned CK commit; hip_ops
+  // attention_sinks_window_match_reference caught it). Without a causal
+  // flag the mask is unbounded on both sides (window_size_right -1).
+  const bool masked =
+      d->sinks != nullptr ||
+      (d->causal == 1 && (d->max_q_len > 1 || d->window_left >= 0));
+  const mask_enum mask =
+      masked ? mask_enum::mask_bottom_right : mask_enum::no_mask;
+
   fmha_fwd_splitkv_traits traits{};
-  traits.hdim_q = kHeadDim;
-  traits.hdim_v = kHeadDim;
+  traits.hdim_q = hdim;
+  traits.hdim_v = hdim;
   traits.data_type = "bf16";
   traits.is_group_mode = true;
   traits.is_v_rowmajor = true;
   traits.has_logits_soft_cap = false;
-  traits.mask_type = mask_enum::no_mask;
+  traits.mask_type = mask;
   traits.bias_type = bias_enum::no_bias;
   traits.has_lse = false;
   traits.do_fp8_static_quant = false;
-  traits.has_sink = false;
+  traits.has_sink = d->sinks != nullptr;
 
-  const int64_t token_elems = static_cast<int64_t>(d->num_kv_heads) * kHeadDim;
+  const int64_t token_elems = static_cast<int64_t>(d->num_kv_heads) * hdim;
   const auto page_stride =
       static_cast<ck_tile::index_t>(2 * d->block_tokens * token_elems);
   const auto *pool = static_cast<const uint16_t *>(d->kv_layer);
@@ -149,13 +182,13 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.seqstart_q_ptr = d->q_indptr;
   args.seqstart_k_ptr = d->q_indptr;
   args.seqlen_k_ptr = d->kv_lens;
-  args.sink_ptr = nullptr;
-  args.seqlen_q = 1;
+  args.sink_ptr = d->sinks;
+  args.seqlen_q = d->max_q_len;
   args.seqlen_k = d->max_kv_len;
   args.batch = d->num_seqs;
-  args.max_seqlen_q = 1;
-  args.hdim_q = kHeadDim;
-  args.hdim_v = kHeadDim;
+  args.max_seqlen_q = d->max_q_len;
+  args.hdim_q = hdim;
+  args.hdim_v = hdim;
   args.nhead_q = d->num_q_heads;
   args.nhead_k = d->num_kv_heads;
   args.num_splits = splits;
@@ -167,18 +200,17 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.stride_k = static_cast<ck_tile::index_t>(token_elems);
   args.stride_v = static_cast<ck_tile::index_t>(token_elems);
   args.stride_bias = 0;
-  args.stride_o_acc = kHeadDim;
+  args.stride_o_acc = hdim;
   args.stride_o = static_cast<ck_tile::index_t>(d->out_stride_token);
-  args.nhead_stride_q = kHeadDim;
-  args.nhead_stride_k = kHeadDim;
-  args.nhead_stride_v = kHeadDim;
+  args.nhead_stride_q = hdim;
+  args.nhead_stride_k = hdim;
+  args.nhead_stride_v = hdim;
   args.nhead_stride_bias = 0;
   args.nhead_stride_lse = 0;
-  // Accumulators [nhead_q, splits, total_q, (128)].
+  // Accumulators [nhead_q, splits, total_q, (head_dim)].
   args.nhead_stride_lse_acc = static_cast<ck_tile::index_t>(splits * rows);
-  args.nhead_stride_o_acc =
-      static_cast<ck_tile::index_t>(splits * rows * kHeadDim);
-  args.nhead_stride_o = kHeadDim;
+  args.nhead_stride_o_acc = static_cast<ck_tile::index_t>(splits * rows * hdim);
+  args.nhead_stride_o = hdim;
   args.batch_stride_q = 0;
   args.batch_stride_k = page_stride;
   args.batch_stride_v = page_stride;
@@ -188,11 +220,12 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.batch_stride_o_acc = 0;
   args.batch_stride_o = 0;
   args.split_stride_lse_acc = static_cast<ck_tile::index_t>(rows);
-  args.split_stride_o_acc = static_cast<ck_tile::index_t>(rows * kHeadDim);
-  args.window_size_left = -1;
-  args.window_size_right = -1;
+  args.split_stride_o_acc = static_cast<ck_tile::index_t>(rows * hdim);
+  args.window_size_left = masked ? d->window_left : -1;
+  args.window_size_right = masked && d->causal == 1 ? 0 : -1;
+  // CK's sink_size is StreamingLLM's kept-first-tokens, not the sink logits.
   args.sink_size = 0;
-  args.mask_type = static_cast<ck_tile::index_t>(mask_enum::no_mask);
+  args.mask_type = static_cast<ck_tile::index_t>(mask);
 
   const ck_tile::stream_config stream{ctx->stream};
   const float result = fmha_fwd_splitkv(traits, args, stream);
@@ -203,6 +236,10 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                     " heads=" + std::to_string(d->num_q_heads) + "/" +
                     std::to_string(d->num_kv_heads) +
                     " block_tokens=" + std::to_string(d->block_tokens) +
+                    " head_dim=" + std::to_string(hdim) +
+                    " max_q_len=" + std::to_string(d->max_q_len) +
+                    " window_left=" + std::to_string(d->window_left) +
+                    " sinks=" + (d->sinks != nullptr ? "1" : "0") +
                     " splits=" + std::to_string(splits));
   }
   return check_hip(ctx, hipGetLastError(), "fmha_fwd_splitkv launch");
