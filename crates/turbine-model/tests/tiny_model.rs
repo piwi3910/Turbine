@@ -3570,6 +3570,101 @@ fn olmoe_trace_records_every_layer() {
     assert!(exec.take_trace().is_empty());
 }
 
+/// P7 Task 12: the routing trace of the tiny OLMoE on the CPU provider records, for a 5-token
+/// prefill and two decode steps, one row per MoE layer and token (layer by layer, the batch's
+/// tokens in order, each at its position) whose top-k ids are the set `torch_topk` picks on the
+/// layer's traced router logits (BF16-rounded, as the router selects), whose gates are the
+/// traced `topk_weights`-shaped choice (k of them, positive) and whose margin is ≥ 0; off by
+/// default, and the logits are bitwise those of the untraced run. Breaks if the sink records
+/// the wrong rows, positions or margin, or reading the routing back changes the forward.
+#[test]
+fn routing_trace_records_topk_and_margin() {
+    let tmp = TempDir::new("tiny-model-routing-trace");
+    let spec = write_tiny_olmoe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("OLMoE has experts");
+    let (experts, k) = (moe.num_experts as usize, moe.experts_per_token as usize);
+    let layers = cfg.num_layers as usize;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let prompt5 = prompt(spec.vocab)[..5].to_vec();
+    let steps: Vec<(Vec<u32>, Vec<u32>)> = vec![
+        (prompt5.clone(), (0..5).collect()),
+        (vec![prompt5[1]], vec![5]),
+        (vec![prompt5[2]], vec![6]),
+    ];
+    let untraced: Vec<Vec<f32>> = steps
+        .iter()
+        .map(|(t, p)| {
+            kv.forward(&mut exec, t, p)
+                .expect("untraced")
+                .row(0)
+                .to_vec()
+        })
+        .collect();
+    assert!(exec.take_routing_trace().is_empty(), "off by default");
+
+    exec.set_routing_trace(true);
+    exec.set_trace(true);
+    for ((tokens, positions), want) in steps.iter().zip(&untraced) {
+        let got = kv
+            .forward(&mut exec, tokens, positions)
+            .expect("traced")
+            .row(0)
+            .to_vec();
+        assert!(&got == want, "the routing trace changes no logit");
+        let rows = exec.take_routing_trace();
+        let logits: Vec<_> = exec
+            .take_trace()
+            .into_iter()
+            .filter(|t| t.name == "router_logits")
+            .collect();
+        assert_eq!(logits.len(), layers);
+        assert_eq!(rows.len(), layers * tokens.len(), "layers x positions");
+        for (i, row) in rows.iter().enumerate() {
+            let (layer, t) = (i / tokens.len(), i % tokens.len());
+            assert_eq!(row.layer as usize, layer, "{row:?}");
+            assert_eq!(row.position, positions[t], "{row:?}");
+            assert_eq!(
+                (row.topk_ids.len(), row.topk_gates.len()),
+                (k, k),
+                "{row:?}"
+            );
+            assert!(row.topk_gates.iter().all(|&g| g > 0.0), "{row:?}");
+            assert!(row.margin >= 0.0, "{row:?}");
+            let traced = &logits[layer];
+            assert_eq!(traced.shape, [tokens.len(), experts]);
+            let rounded: Vec<f32> = traced.data[t * experts..(t + 1) * experts]
+                .iter()
+                .map(|&l| bf16::from_f32(l).to_f32())
+                .collect();
+            let mut want: Vec<u32> = torch_topk(&rounded, k)
+                .into_iter()
+                .map(|e| e as u32)
+                .collect();
+            let mut ids = row.topk_ids.clone();
+            want.sort_unstable();
+            ids.sort_unstable();
+            assert_eq!(ids, want, "{row:?}");
+            let low = row
+                .topk_ids
+                .iter()
+                .map(|&e| rounded[e as usize])
+                .fold(f32::INFINITY, f32::min);
+            let high = (0..experts)
+                .filter(|e| !row.topk_ids.contains(&(*e as u32)))
+                .map(|e| rounded[e])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(row.margin, low - high, "{row:?}");
+        }
+    }
+    exec.set_routing_trace(false);
+    kv.forward(&mut exec, &steps[1].0, &steps[1].1)
+        .expect("off");
+    assert!(exec.take_routing_trace().is_empty());
+}
+
 /// Lab diagnostic (precision investigation): HIP vs cpu-reference on the head_dim-128 tiny
 /// checkpoint op by op for the prefill and 3 decode steps (accumulated divergence), then every
 /// HIP op recomputed on the host from the HIP trace's own inputs (the error each op adds).

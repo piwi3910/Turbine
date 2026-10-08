@@ -64,6 +64,8 @@ TWO_GPU_TESTS=(
 	tp2_collective_failure_recovers_on_gpu
 	# crates/turbine-model/tests/perf.rs (P5 Task 32)
 	tp_forward_profile
+	# crates/turbine-model/tests/olmoe_ep_tp_lab.rs (P7 Task 12)
+	olmoe_routing_trace_ep2_tp2
 )
 
 # Lab tests whose expectation follows the Job's R9700 count (TURBINE_EXPECT_AMD = --gpus): they
