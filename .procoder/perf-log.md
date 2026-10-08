@@ -2004,18 +2004,23 @@ Every Phase 7 gate result (S-13) is one list line in this section, naming one `t
 
 ### P7 Qwen3-4B gate (Task 11, 2026-10-08, branch `p7-t11` on `p7-stack` 7d382541)
 
-- Golden (reference `tests/golden/qwen3-4b-instruct-2507/reference.jsonl`, Llama bounds unchanged):
+- Golden, first run (reference `tests/golden/qwen3-4b-instruct-2507/reference.jsonl`, Llama bounds):
   `BENCH p7-t11 qwen3-4b commit=7d382541 gpu=0 tests=skipped golden1=FAIL: golden16=FAIL: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0168 ok=200 failed=0 tok/s=623.0 itl_p50=21.4 ttft_p50=156 decode_fwd_ms=21.0`.
-  c1: 9/16 prompts (need 14); every prompt keeps 32/32 identical greedy tokens except p02 (excused at margin 0.074),
-  the misses are the likely bound (max |Δ| 0.162–0.233 vs 0.15; p14 tail 0.920 vs 0.56). c16 (batched 0.25/0.75):
-  reported FAIL with 14/16 (p10 likely 0.314, p12 likely 0.280).
+  c1: 9/16 prompts; every prompt keeps 32/32 identical greedy tokens except p02 (excused at margin 0.074), the misses
+  are the likely bound (max |Δ| 0.162–0.233 vs 0.15; p14 tail 0.920 vs 0.56). c16 (batched 0.25/0.75): 14/16
+  (p10 likely 0.314, p12 likely 0.280). All deviations sit inside the checkpoint's own self-spread
+  (`tests/golden/qwen3-4b-instruct-2507/README.md`: bounds 0.64/1.04 from the eight transformers variants, every
+  variant 16/16), so the tolerance was calibrated to them (Task 10 decision "Qwen3 bounds C", 2026-10-08).
+- Golden, re-gate on the self-spread bounds:
+  `BENCH p7-t11-qwen3-4b-2 qwen3-4b commit=7424ecae gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0196 ok=200 failed=0 tok/s=612.4 itl_p50=21.4 ttft_p50=297 decode_fwd_ms=21.1`
+  (labbook run `afd8537b-6afa-406e-9d56-78bb09e70bf9`).
 - Throughput (`scripts/lab-perf.sh novanas qwen3-4b --eval`, run 20261008T000756Z, GPU via serve Jobs, client on novanas):
   `lab-perf: qwen3-4b placement=tp1 turbine=598.8 vllm=630.5 ratio=0.95 target=0.75x verdict=PASS`
   (vLLM-ROCm image pinned in `scripts/lab/novanas-vllm-job.yaml`, vLLM 0.23.0, served it).
-- GSM8K-200 c16: vLLM-ROCm 0.920 (`tests/eval/qwen3-4b-instruct-2507/vllm.json`); Turbine not yet run (paused).
+- GSM8K-200 c16: vLLM-ROCm 0.920 (`tests/eval/qwen3-4b-instruct-2507/vllm.json`), Turbine 0.915
+  (`turbine.json`), drop 0.005 ≤ 0.01 — PASS.
 
-- P7 open: Qwen3ForCausalLM/bf16/bf16/tp1 golden c1 and c16 miss the Llama logprob bounds (tokens identical); Turbine GSM8K not run
-  \=======
+- P7 closed: Qwen3ForCausalLM/bf16/bf16/tp1 golden c1/c16 afd8537b-6afa-406e-9d56-78bb09e70bf9; GSM8K 0.915 vs 0.920; throughput 0.95x 20261008T000756Z
 
 ### P7 OLMoE EP×TP drift — the per-position routing trace (plan Task 12, branch `p7-t12`, 2026-10-08)
 
