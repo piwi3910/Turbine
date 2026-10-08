@@ -540,6 +540,17 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     family_row("Qwen3ForCausalLM", WeightFormatColumn::Bf16),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Bf16),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Fp8Block),
+    // Mistral BF16 closed its S-13 gate on gfx1201 (perf-log "P7 Mistral gate", 2026-10-08:
+    // throughput 0.99× vLLM, GSM8K +0.02, golden c1/c16 16/16); other amd archs stay pending.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("MistralForCausalLM"),
+        BF16,
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     family_row("MistralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Fp8),

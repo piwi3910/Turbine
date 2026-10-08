@@ -2039,3 +2039,17 @@ Lab-bench `--quick` (64 requests, concurrency 16, client on novanas, GPU 0) on d
 ### P7 quantized experts on HIP — OLMoE BF16 unchanged (plan Task 16, branch `p7-t16`, 2026-10-08)
 
 `scripts/lab-bench.sh --quick --model olmoe --label p7t16` (GPU 0, 64 requests, c16): `BENCH p7t16 olmoe commit=d11161ed golden1=PASS tok/s=650.3 itl_p50=23.3 ttft_p50=135 decode_fwd_ms=22.9`, against 636.1 tok/s at `p5p-exit` (a2478b63): +2.2 %, so the BF16 expert paths (only `experts_supported` restructured, a sixth impl entry added) did not regress. Quantized experts: stage ratios under the 6a bound (worst 0.95, qgemm FP8 block at 64 rows), chained output 0.58 of 4x the bound, in `hip_moe_quant`.
+
+### P7 Mistral gate — Mistral-7B-Instruct-v0.3 BF16 tp1 closes (plan Task 20, branch `p7-t20`, 2026-10-08)
+
+- Throughput (`scripts/lab-perf.sh novanas mistral-7b --eval`, run `20261008T064517Z`, 3 runs each, vLLM-ROCm on the
+  same card): Turbine 406.7 vs vLLM 410.3 tok/s, ratio 0.99 — PASS (≥ 0.75).
+- GSM8K c16 (`tests/eval/gsm8k-200.jsonl`, serve run `1008081232-21ea1365`): Turbine 0.550 vs vLLM 0.530,
+  `eval-compare --max-drop 0.01` PASS.
+- Golden (`tests/golden/mistral-7b-instruct-v0.3/`, tolerance from the transformers self-spread — see the slug
+  README; the Llama-3.2-3B bounds miss at 12/16 and 15/16): `BENCH p7-t20b mistral-7b commit=2fd0c84c gpu=0
+tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0173
+ok=200 failed=0 tok/s=413.5 itl_p50=30.4 ttft_p50=508 decode_fwd_ms=30.0` — c1 strict 16/16 (max likely 0.330,
+  max tail 0.544), c16 batched 16/16 (max likely 0.281, max tail 0.455).
+
+- P7 closed: MistralForCausalLM/bf16/bf16/tp1 20261008T064517Z 1008081232-21ea1365 p7-t20b
