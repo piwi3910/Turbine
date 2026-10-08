@@ -4316,3 +4316,7 @@ two cards (Qwen3-MoE, Mixtral, Qwen3.6 in this phase).
 - B) FP32 accumulation of the TP/EP partials (one BF16 rounding instead of two): expected ≤ ½ the router-logit noise,
   2× all-reduce bytes, unmeasured; flips remain, so likely needs A too.
 - C) Keep the refusal (tp2 alone is also fragile on p10).
+
+**Decision (user, 2026-10-08): A** — a calibrated multi-GPU golden bound per MoE slug from the measured placement
+spread; ep2×tp2 OLMoE and the Phase 7 MoE two-card rows are gated against it at c1 and c16; `olmoe_ep_tp_drift` is
+removed. Task 13 is re-planned accordingly.
