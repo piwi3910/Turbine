@@ -6631,6 +6631,8 @@ fn implementations_enumerated() {
         ("ck_tile_fmha_pagedkv_mixed_staged", "ck", false),
         ("turbine_hip_mixed_staged", "turbine_hip", false),
         ("turbine_hip_mixed", "turbine_hip", false),
+        // ABI v2.17: head_dim 64 / 256, which fmha_fwd_pagedkv has no gfx12 instance of.
+        ("ck_tile_fmha_splitkv", "ck", false),
     ];
     let paged_decode = vec![
         ("turbine_hip_b1_decode", "turbine_hip", false),
@@ -7169,6 +7171,11 @@ fn every_implementation_matches_cpu() {
         }
         for info in p.hip.implementations(op) {
             if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
+                continue;
+            }
+            // CK splitkv for prefill (ABI v2.17) serves head_dim 64 / 256 only, which no case
+            // of this harness uses; `attention_sinks_window_match_reference` runs it there.
+            if op == OpKind::AttentionPrefillPaged && info.name == "ck_tile_fmha_splitkv" {
                 continue;
             }
             // The quantized experts (ABI v2.16) are run against the CPU reference by their own

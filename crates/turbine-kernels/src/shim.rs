@@ -1618,6 +1618,13 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         i64::from(cfg.num_kv_heads),
         i64::from(cfg.head_dim),
     );
+    // A prefill call has several query rows per sequence: CK splitkv serves head_dim 128 only
+    // at one (ABI v2.17), so a one-row probe would enumerate it for a prefill it cannot run.
+    let q_len = if matches!(cfg.kind, AttentionKind::PrefillPaged) {
+        2
+    } else {
+        1
+    };
     AttentionPagedDesc {
         q: null(),
         k_new: null(),
@@ -1628,8 +1635,8 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         q_indptr: std::ptr::null(),
         kv_lens: std::ptr::null(),
         num_seqs: 1,
-        total_q: 1,
-        max_q_len: 1,
+        total_q: q_len,
+        max_q_len: q_len,
         max_kv_len: 1,
         max_blocks_per_seq: 1,
         num_blocks: 1,
