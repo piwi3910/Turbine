@@ -21,6 +21,7 @@ use crate::executor::{DecoderSpec, ExecutorLimits, ExecutorOptions, ModelExecuto
 use crate::loader::{LoadedWeights, WeightSlot};
 use crate::testing::tiny::TinySpec;
 
+pub mod gpt_oss;
 pub mod llama;
 pub mod mistral;
 pub mod mixtral;
@@ -28,6 +29,7 @@ pub mod olmoe;
 pub mod qwen3;
 pub mod qwen3_moe;
 
+pub use gpt_oss::GptOss;
 pub use llama::{Llama, llama_slots};
 pub use mistral::Mistral;
 pub use mixtral::{Mixtral, mixtral_slots};
@@ -89,6 +91,12 @@ pub trait ModelFamily: Module {
     fn layer_kinds(&self, cfg: &ModelArchConfig) -> Vec<LayerKind> {
         vec![LayerKind::FullAttention; cfg.num_layers as usize]
     }
+    /// Whether the family's checkpoints carry Q/K/V/O projection biases (`attention_bias:
+    /// true` in `config.json`): the shared config parser refuses `attention_bias: true` for a
+    /// family that does not (P7 S-8: gpt-oss does). The default: no.
+    fn attention_bias(&self) -> bool {
+        false
+    }
     /// The per-sequence state `cfg` keeps beside its paged KV (P7 S-1). The default: none.
     fn state_layout(&self, cfg: &ModelArchConfig) -> StateLayout {
         let _ = cfg;
@@ -122,6 +130,10 @@ pub struct FamilyConfig {
     pub qk_norm: bool,
     /// RMSNorm over each Q and K head before RoPE (Qwen3, Qwen3-MoE).
     pub qk_norm_per_head: bool,
+    /// The window of the family's sliding-attention layers ([`LayerKind::SlidingWindow`]):
+    /// `sliding_window` of `config.json`, read by a family whose layers alternate it with full
+    /// attention (gpt-oss); `None` for every other family.
+    pub sliding_window: Option<u32>,
 }
 
 /// A registered family as a value of `ModelArchConfig`: equal by name, printed as its name.
@@ -144,7 +156,9 @@ impl std::fmt::Debug for FamilyRef {
 
 static FAMILIES: Registry<dyn ModelFamily> = Registry::new(
     "model_family",
-    &[&Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral],
+    &[
+        &Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral, &GptOss,
+    ],
 );
 
 /// Every model family, in the order error messages list them.
@@ -318,6 +332,7 @@ mod tests {
             ("qwen3_moe", "Qwen3MoeForCausalLM"),
             ("mistral", "MistralForCausalLM"),
             ("mixtral", "MixtralForCausalLM"),
+            ("gpt_oss", "GptOssForCausalLM"),
         ] {
             assert_eq!(
                 resolve(&json!({"architectures": [hf]})).unwrap().0.name(),
@@ -334,7 +349,7 @@ mod tests {
             err.contains(
                 "registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 \
                  (Qwen3ForCausalLM), qwen3_moe (Qwen3MoeForCausalLM), mistral \
-                 (MistralForCausalLM), mixtral (MixtralForCausalLM)"
+                 (MistralForCausalLM), mixtral (MixtralForCausalLM), gpt_oss (GptOssForCausalLM)"
             ),
             "{err}"
         );

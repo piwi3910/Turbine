@@ -36,6 +36,23 @@ pub fn weights_suite(reg: &Registry<dyn WeightFormat>) -> Result<(), Vec<Conform
             for family in families::registry().iter() {
                 let dir = tmp.path().join(format!("{name}-{}", family.name()));
                 let spec = family.write_tiny(&dir, SEED);
+                // A family whose tiny checkpoint is already quantized (gpt-oss's fused MXFP4
+                // experts) only loads under the format its own config declares.
+                let top: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(dir.join("config.json")).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                if !top
+                    .get("quantization_config")
+                    .unwrap_or(&serde_json::Value::Null)
+                    .is_null()
+                    && detect(&top)
+                        .map_err(|e| format!("{}: {e}", family.name()))?
+                        .name()
+                        != name
+                {
+                    continue;
+                }
                 if !format
                     .write_tiny(&dir, None)
                     .map_err(|e| format!("{}: write_tiny: {e}", family.name()))?

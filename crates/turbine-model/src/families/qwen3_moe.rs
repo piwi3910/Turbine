@@ -85,6 +85,7 @@ impl ModelFamily for Qwen3Moe {
             moe: Some(moe),
             qk_norm: false,
             qk_norm_per_head: true,
+            ..FamilyConfig::default()
         })
     }
 

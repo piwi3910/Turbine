@@ -315,6 +315,80 @@ pub fn write_tiny_olmoe_quantized(
     }
 }
 
+/// Writes the tiny `GptOssForCausalLM` checkpoint into `dir` (Phase 7 S-8): 4 layers alternating
+/// a sliding window of `sliding_window` positions (layers 0 and 2) and full attention, hidden
+/// 64, 4 query / 2 KV heads of dimension 64 with biased projections and one sink logit per
+/// query head, YaRN (factor 4 over 128 positions), 4 MXFP4 experts of width 32 per layer with
+/// top-2 routing, biases and the clamped activation, a router bias, untied `lm_head`, the tiny
+/// tokenizer and [`PLAIN_CHAT_TEMPLATE`]. The tensors are the OpenAI checkpoint's, named and
+/// shaped as `openai/gpt-oss-20b` stores them (`mlp.experts.gate_up_proj_blocks` and so on).
+/// Same files and determinism as [`write_tiny_llama_with`].
+pub fn write_tiny_gpt_oss(dir: &Path, seed: u64, sliding_window: u32) -> TinySpec {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        head_dim: 64,
+        ..TinyOptions::default()
+    };
+    write_tiny(dir, seed, &gpt_oss_config_json(sliding_window), &opts)
+}
+
+/// `config.json` of [`write_tiny_gpt_oss`]: the keys of `openai/gpt-oss-20b` at tiny size.
+fn gpt_oss_config_json(sliding_window: u32) -> serde_json::Value {
+    json!({
+        "architectures": ["GptOssForCausalLM"],
+        "model_type": "gpt_oss",
+        "attention_bias": true,
+        "attention_dropout": 0.0,
+        "bos_token_id": BOS.1,
+        "eos_token_id": TINY_EOS,
+        "experts_per_token": 2,
+        "head_dim": 64,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "initial_context_length": 128,
+        "initializer_range": 0.02,
+        "intermediate_size": 32,
+        "layer_types": [
+            "sliding_attention", "full_attention", "sliding_attention", "full_attention"
+        ],
+        "max_position_embeddings": TINY_MAX_POSITIONS,
+        "num_attention_heads": 4,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 2,
+        "num_local_experts": 4,
+        "output_router_logits": false,
+        "pad_token_id": END_OF_TEXT.1,
+        "quantization_config": {
+            "modules_to_not_convert": [
+                "model.layers.*.self_attn",
+                "model.layers.*.mlp.router",
+                "model.embed_tokens",
+                "lm_head"
+            ],
+            "quant_method": "mxfp4"
+        },
+        "rms_norm_eps": 1e-5,
+        "rope_scaling": {
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "factor": 4.0,
+            "original_max_position_embeddings": 128,
+            "rope_type": "yarn",
+            "truncate": false
+        },
+        "rope_theta": 150000,
+        "router_aux_loss_coef": 0.9,
+        "sliding_window": sliding_window,
+        "swiglu_limit": 7.0,
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "use_cache": true,
+        "vocab_size": TINY_VOCAB,
+    })
+}
+
 /// The families [`write_tiny_family`] writes, by registry name.
 pub const TINY_PHASE8_FAMILIES: [&str; 4] = ["qwen3", "qwen3_moe", "mistral", "mixtral"];
 
@@ -647,28 +721,97 @@ fn random_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Vec<u8> {
     bytes
 }
 
+/// Random bytes of a U8 slot (the OpenAI MXFP4 expert tensors, [`gpt_oss_config_json`]): the
+/// E2M1 code bytes of a `_blocks` tensor are uniform; a `_scales` tensor holds E8M0 exponents
+/// 120..=122 (`2^-7 … 2^-5`), so the dequantized expert weights are about as large as the
+/// BF16 projections' (`≈ 0.02 … 0.09` rms).
+fn random_u8(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Vec<u8> {
+    let numel: usize = shape.iter().product();
+    (0..numel)
+        .map(|_| {
+            let r = rng.next_u32();
+            if name.ends_with("_scales") {
+                120 + (r >> 8) as u8 % 3
+            } else {
+                (r >> 8) as u8
+            }
+        })
+        .collect()
+}
+
+/// The BF16 bytes of a tensor with a name of its own (gpt-oss): a bias is `U(-0.1, 0.1)` (the
+/// gate/up bias has a few outliers past the activation's clamp of 7: every 16th gate column
+/// `+7.5`, every 16th up column `-7.5`, so the clamp binds), the attention sinks `U(-1, 1)`,
+/// and the router bias pairs the experts 40 apart (the top-k set is bias-decided, the two
+/// gates logit-driven), so a numerics difference between implementations cannot flip the
+/// selected experts.
+/// `None` for every other tensor.
+fn random_named_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Option<Vec<u8>> {
+    let is_bias = name.ends_with(".bias") || name.ends_with("_bias");
+    let is_router = name.ends_with("mlp.router.weight");
+    if !is_bias && !name.ends_with(".sinks") && !is_router {
+        return None;
+    }
+    let numel: usize = shape.iter().product();
+    if name.ends_with("mlp.router.bias") {
+        // Experts paired by bias (`40·(e/2) + e%2`): the top-k selection is decided by the
+        // bias (a pair gap of 40 dwarfs any logit), so a numerics difference between
+        // implementations cannot flip the selected set, while the within-pair gap of 1 keeps
+        // the two gates comparable and logit-driven.
+        let bytes: Vec<u8> = (0..numel)
+            .flat_map(|i| bf16::from_f32(40.0 * (i / 2) as f32 + (i % 2) as f32).to_le_bytes())
+            .collect();
+        return Some(bytes);
+    }
+    let scale = if is_bias { 0.1 } else { 1.0 };
+    let width = shape.last().copied().unwrap_or(1);
+    let mut bytes = Vec::with_capacity(numel * 2);
+    for i in 0..numel {
+        let mut v = scale * unit(rng);
+        if name.ends_with("gate_up_proj_bias") {
+            // Interleaved columns: even = gate, odd = up.
+            match (i % width, (i % width) / 2 % 16) {
+                (c, 3) if c % 2 == 0 => v = 7.5,
+                (c, 11) if c % 2 == 1 => v = -7.5,
+                _ => {}
+            }
+        }
+        bytes.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+    }
+    Some(bytes)
+}
+
 fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOptions) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+    let format = config.weight_format.get();
+    let mut tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
     for slot in config.family.0.weight_slots(config) {
-        let data = random_bf16(&mut rng, &slot.name, &slot.shape);
-        tensors.push((slot.name, slot.shape, data));
+        // A family whose checkpoint stores some tensors packed (gpt-oss's MXFP4 experts) names
+        // them U8 in its weight format.
+        let (dtype, data) = if format.slot_dtype(&slot) == turbine_core::types::DType::U8 {
+            (Dtype::U8, random_u8(&mut rng, &slot.name, &slot.shape))
+        } else {
+            let data = random_named_bf16(&mut rng, &slot.name, &slot.shape)
+                .unwrap_or_else(|| random_bf16(&mut rng, &slot.name, &slot.shape));
+            (Dtype::BF16, data)
+        };
+        tensors.push((slot.name, dtype, slot.shape, data));
     }
     if config.tie_word_embeddings && opts.ship_lm_head {
         let shape = vec![config.vocab_size as usize, config.hidden as usize];
         let data = random_bf16(&mut rng, "lm_head.weight", &shape);
-        tensors.push(("lm_head.weight".to_string(), shape, data));
+        tensors.push(("lm_head.weight".to_string(), Dtype::BF16, shape, data));
     }
     for name in &opts.extra {
         let shape = vec![config.hidden as usize];
         let data = random_bf16(&mut rng, name, &shape);
-        tensors.push((name.clone(), shape, data));
+        tensors.push((name.clone(), Dtype::BF16, shape, data));
     }
-    tensors.retain(|(name, _, _)| !opts.omit.contains(name));
+    tensors.retain(|(name, _, _, _)| !opts.omit.contains(name));
     let views: Vec<(String, TensorView<'_>)> = tensors
         .iter()
-        .map(|(name, shape, data)| {
-            let view = TensorView::new(Dtype::BF16, shape.clone(), data)
+        .map(|(name, dtype, shape, data)| {
+            let view = TensorView::new(*dtype, shape.clone(), data)
                 .unwrap_or_else(|e| panic!("tensor view {name}: {e}"));
             (name.clone(), view)
         })
