@@ -4407,3 +4407,36 @@ scheduler alignment; it unblocks Tasks 30–32. For conv, take AITER `causal_con
 split and state write, 3× faster at 2048) and llama.cpp `ssm_conv` for decode, if the per-mode split is acceptable;
 otherwise llama.cpp for both. Revisit A (AITER `chunk_h` + own WMMA glue) once Qwen3.5 serves and a 16k-token TTFT
 profile shows the GDN share; land it only if it measures faster served. Not decided here.
+
+**Decision (user, 2026-10-08), "P7 Gated DeltaNet provider": B** — llama.cpp's `gated_delta_net` vendored (BF16 loads,
+transformers' `h / 2` head pairing) for decode and prefill; conv: AITER `causal_conv1d_fwd_split_qkv` for prefill,
+llama.cpp `ssm_conv` for decode; a chunked prefill (option A) is a measured follow-up once Qwen3.5 serves.
+
+## Phase 7 review fix: state allocation for `n > 1` (2026-10-08, open)
+
+From the codex review of p7-stack (finding 3, verified) and the fix builder's plan (`p7-review-fixes`, handoff
+456040d1): a request's state charge must cover every sequence (`n` choices), and the API puts no upper bound on `n`.
+- A) The fixed state allocation covers `max_running_requests` sequences (not requests); a request whose
+  `n × state` exceeds the whole allocation is refused at submit with a reason code; one that only lacks free state now
+  waits in the queue.
+- B) The allocation covers `max_running_requests × max_n` (a new key `scheduler.max_n_per_request`, default 4) and
+  larger `n` is rejected 400 for hybrid families.
+- C) Hybrid families reject `n > 1` (400 with a reason code) until Phase 8.
+
+**Decision (user, 2026-10-08): A** — state slots per sequence; `n × state` above the whole allocation is refused with
+a reason code, otherwise the request waits for free state.
+
+## Phase 7 Task 11: Qwen3-4B golden misses (2026-10-08, open)
+
+From `p7-t11` (WIP 1c3f1b76; perf log "P7 Qwen3-4B gate"). Every prompt's greedy tokens equal the transformers
+reference, but the logprob bounds (Llama's, 0.15 likely / 0.56 tail) miss: c1 9/16 pass (likely up to 0.233, p14 tail
+0.92); c16 14/16 by count but FAIL (p10 0.31, p12 0.28 over the batched 0.25). Throughput passes (598.8 vs vLLM-ROCm
+630.5 tok/s, 0.95×); vLLM GSM8K 0.920, Turbine's GSM8K run not done yet.
+- A) Derive Qwen3's own bounds from a transformers self-spread run (`scripts/golden/self_spread.py`, the OLMoE method),
+  recorded in the slug README, and re-gate.
+- B) Build the fused single-rounding per-head QK-norm (deferred by Task 10's decision C) first, then re-gate on the
+  Llama-derived bounds.
+- C) A then B: gate on self-spread bounds now, the fused norm stays a follow-up.
+
+**Decision (user, 2026-10-08): C** — Qwen3's own bounds from a transformers self-spread run now (documented in the
+slug README), re-gate; the fused single-rounding QK-norm stays a follow-up.
