@@ -33,6 +33,9 @@ pub struct Mixtral;
 /// The HF class name, as error messages name it.
 const HF_NAME: &str = "MixtralForCausalLM";
 
+/// The tool-aware Mistral chat template Mixtral falls back to ([`ModelFamily::chat_template_override`]).
+const MIXTRAL_TOOLS_TEMPLATE: &str = include_str!("templates/mixtral_tools.jinja");
+
 /// Mixtral's checkpoint names: `block_sparse_moe`, with `w1` (gate), `w3` (up), `w2` (down).
 const MIXTRAL_NAMES: MoeNames = MoeNames {
     router: "block_sparse_moe.gate",
@@ -100,8 +103,23 @@ impl ModelFamily for Mixtral {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
     }
 
+    /// Tensor and expert parallelism (P7 S-7, [`crate::tp`], [`crate::ep`]): the same hooks on
+    /// the rank's shard — Mistral's attention heads and every expert's `w1` / `w3` rows and
+    /// `w2` columns split across ranks, the router replicated.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn default_tool_format(&self) -> Option<&'static str> {
         Some(MISTRAL)
+    }
+
+    /// Mixtral-8x7B-Instruct-v0.1's own chat template (also the pinned RedHatAI FP8 revision's)
+    /// renders neither `tools` nor an assistant turn's `tool_calls`: when the checkpoint's
+    /// template lacks both, this tool-aware Mistral template is used (user decision 2026-10-08
+    /// C), modelled on vLLM's `tool_chat_template_mistral.jinja`.
+    fn chat_template_override(&self) -> Option<(&'static str, &'static str)> {
+        Some(("mixtral_tools.jinja", MIXTRAL_TOOLS_TEMPLATE))
     }
 
     /// The family's tiny checkpoint (`testing::tiny`).

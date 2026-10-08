@@ -3983,6 +3983,40 @@ fn tp2_serves_tp1_tokens() {
     });
 }
 
+/// P7 S-7: the KV document reports every rank's headroom — `ranks` with one entry per rank of
+/// the placement (`rank`, `device`, `headroom_bytes`), each `headroom_bytes` > 0 and at most
+/// the L0 pool the engine runs (`blocks_total × block_bytes`; every rank of a group holds a
+/// pool of the same block count, so the group's headroom is one pool's). Breaks if the engine
+/// publishes no per-rank headroom, names the wrong rank or device, or reports a headroom above
+/// its pool.
+#[test]
+fn kv_document_reports_rank_headroom() {
+    let one = TinyServer::start("");
+    let kv = one.get("/turbine/v1/kv").json();
+    let ranks = kv["ranks"].as_array().expect("ranks in the KV document");
+    assert_eq!(ranks.len(), 1, "{kv}");
+    assert_eq!(ranks[0]["rank"], 0, "{kv}");
+    assert_eq!(ranks[0]["device"], 0, "{kv}");
+    assert!(ranks[0]["headroom_bytes"].as_u64().unwrap() > 0, "{kv}");
+
+    let two = TinyServer::start(TP2);
+    let kv = two.get("/turbine/v1/kv").json();
+    let ranks = kv["ranks"].as_array().expect("ranks at tp 2");
+    assert_eq!(ranks.len(), 2, "{kv}");
+    let tier = two.kv_tier();
+    let pool_bytes = tier["blocks_total"].as_u64().unwrap() * tier["block_bytes"].as_u64().unwrap();
+    for (rank, r) in ranks.iter().enumerate() {
+        assert_eq!(r["rank"], rank, "{kv}");
+        assert_eq!(r["device"], rank, "{kv}");
+        let headroom = r["headroom_bytes"].as_u64().unwrap();
+        assert!(headroom > 0, "ranks[{rank}]: {kv}");
+        assert!(
+            headroom <= pool_bytes,
+            "ranks[{rank}] headroom {headroom} over pool {pool_bytes}"
+        );
+    }
+}
+
 /// P5 S-6 edge case "cancellation mid-step in a TP group": at tp 2, dropping held streams
 /// frees their blocks promptly — the leader's block manager is the only one, so its pool
 /// returning the blocks frees them on every rank (worker pools are indexed by the leader's

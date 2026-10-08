@@ -682,9 +682,21 @@ fn prepare_with(
         .unwrap_or_else(|| dir.join("tokenizer.json"));
     let tokenizer =
         Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(|e| model_error("tokenizer", e))?);
-    let template = ChatTemplate::resolve(dir, config.model.chat_template.as_deref())
-        .map(Arc::new)
-        .map_err(|e| model_error("chat template", e))?;
+    let template =
+        ChatTemplate::resolve_for(dir, config.model.chat_template.as_deref(), arch.family.0)
+            .map(Arc::new)
+            .map_err(|e| model_error("chat template", e))?;
+    if let Some((name, _)) = arch.family.0.chat_template_override()
+        && template.source_name() == name
+    {
+        tracing::info!(
+            event = "chat_template_override",
+            template = name,
+            family = arch.family.0.name(),
+            "the checkpoint's chat template renders neither tools nor tool_calls; using the \
+             family's tool-aware template"
+        );
+    }
     let max_seq_len = resolve_max_seq_len(
         config.model.max_seq_len,
         arch.max_position_embeddings,

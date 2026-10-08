@@ -1080,7 +1080,8 @@ pub fn placement_status(row: &Phase7Row) -> SupportStatus {
 
 /// Parallel-mode combinations a model architecture is refused in (`unsupported`, exit 2 at
 /// startup with the reason code), on every vendor. `modes` names the combination: `ep+tp` is
-/// expert parallelism > 1 together with tensor parallelism > 1. Each mode on its own stays
+/// expert parallelism > 1 together with tensor parallelism > 1, `tp` is tensor parallelism > 1
+/// at any expert-parallel size. Each mode on its own stays
 /// supported.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct ParallelRefusal {
@@ -1093,19 +1094,53 @@ pub struct ParallelRefusal {
 /// 2026-09-28) until the Phase 7 investigation found no rank-dependent routing (any summation
 /// order flips near-tie experts) and replaced the refusal by a calibrated multi-GPU golden
 /// bound (decision 2026-10-08 A, `_multi_gpu` keys of `tests/golden/<slug>/tolerance.json`).
-/// The type stays for later refusals.
+/// The type stays for later refusals — a Phase 7 placement whose gate fails is recorded here
+/// with a `<family>_<placement>_gate` code (Task 22).
 pub static PARALLEL_REFUSALS: &[ParallelRefusal] = &[];
 
+/// Refusals the test-only [`with_parallel_refusals`] seam inserted (empty outside tests).
+static EXTRA_REFUSALS: std::sync::RwLock<Vec<&'static ParallelRefusal>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Test-only seam (`support_startup::tests::mixtral_placement_refusal`): makes `refusals`
+/// visible to [`parallel_refusal`] until the returned guard drops. Never call from production
+/// code; a test holds the guard for its whole body.
+#[doc(hidden)]
+pub fn with_parallel_refusals(refusals: &'static [ParallelRefusal]) -> impl Drop + use<> {
+    EXTRA_REFUSALS
+        .write()
+        .expect("extra refusals lock")
+        .extend(refusals.iter());
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            EXTRA_REFUSALS.write().expect("extra refusals lock").clear();
+        }
+    }
+    Guard
+}
+
 /// The refusal of `architecture` at tensor-parallel size `tp` and expert-parallel size `ep`,
-/// if [`PARALLEL_REFUSALS`] has one.
+/// if [`PARALLEL_REFUSALS`] or the test seam has one (the committed table first).
 pub fn parallel_refusal(architecture: &str, tp: u32, ep: u32) -> Option<&'static ParallelRefusal> {
-    PARALLEL_REFUSALS.iter().find(|r| {
+    let modes_match = |r: &ParallelRefusal| {
         r.architecture == architecture
             && match r.modes {
                 "ep+tp" => ep > 1 && tp > 1,
+                "tp" => tp > 1,
                 _ => false,
             }
-    })
+    };
+    PARALLEL_REFUSALS
+        .iter()
+        .chain(
+            EXTRA_REFUSALS
+                .read()
+                .expect("extra refusals lock")
+                .iter()
+                .copied(),
+        )
+        .find(|r| modes_match(r))
 }
 
 /// The status of a lower-tier KV format (`kv.cpu.format`, `kv.nvme.format`, the ladder's

@@ -16,7 +16,7 @@ pub mod table;
 pub mod tier;
 pub mod transfer;
 
-pub use document::{KvDocument, KvTierDocument};
+pub use document::{KvDocument, KvRankDocument, KvTierDocument};
 pub use metrics::KvMetrics;
 pub use pool::{BlockPool, BlockPoolConfig, PoolError};
 pub use reclaim::L0Reclaimer;

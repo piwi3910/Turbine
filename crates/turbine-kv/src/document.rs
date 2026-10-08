@@ -16,8 +16,23 @@ use crate::pool::BlockPool;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KvDocument {
     pub tiers: Vec<KvTierDocument>,
+    /// P7 S-7: the KV headroom of every rank of the placement, in rank order (empty until the
+    /// engine sets it: a pool outside a running server has no ranks).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ranks: Vec<KvRankDocument>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub summary: Option<KvSummary>,
+}
+
+/// One rank's KV headroom (`ranks[]` of the document, P7 S-7): the bytes of its device budget
+/// left for the L0 pool after the model's weights, the executor workspace, the collective and
+/// runtime reserves and the emergency reserve, never more than the L0 pool the engine runs
+/// (every rank of a group holds a pool of the same block count, the tightest rank sizes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KvRankDocument {
+    pub rank: u32,
+    pub device: u32,
+    pub headroom_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -142,6 +157,7 @@ impl KvDocument {
                 formats: BTreeMap::new(),
                 partial_entries: 0,
             }],
+            ranks: Vec::new(),
             summary: None,
         }
     }
