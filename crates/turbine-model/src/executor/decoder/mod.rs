@@ -702,7 +702,7 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
 /// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
 /// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
 /// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
-/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and pipeline
+/// experts of a format without a kernel row (`quant_moe_phase7`) and pipeline
 /// parallelism (`pipeline` set: not yet proven with quantized stages). Tensor parallelism is
 /// served (Phase 6a S-12): the loader refuses a shard that cuts a group or block
 /// (`quant_shard_misaligned`).
@@ -719,10 +719,14 @@ fn check_weight_format(cfg: &ModelArchConfig, pipeline: bool) -> Result<(), Mode
         return Ok(());
     };
     let refuse = |why: String| Err(invalid(format!("weight format {}: {why}", format.name())));
-    if cfg.moe.is_some() {
-        return refuse(
-            "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
-        );
+    // Quantized experts run on the Phase 7 per-expert kernels: FP8 block (W8A16), FP8 tensor
+    // with static activation scales (W8A8) and MXFP4 weights; any other format has no row.
+    if cfg.moe.is_some() && !hooks::experts_served(&quant) {
+        return refuse(format!(
+            "quant_moe_phase7: {} experts for {} have no supported row",
+            format.name(),
+            cfg.hf_architecture
+        ));
     }
     if pipeline {
         return refuse(
