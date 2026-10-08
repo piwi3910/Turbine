@@ -285,6 +285,30 @@ int32_t launch_moe_shared_combine(turbine_ctx *ctx, const void *x,
                                   int32_t tokens, int32_t hidden);
 // Largest num_experts / top_k the Turbine MoE kernels handle.
 constexpr int32_t kMoeMaxExperts = 256;
+// The grouped quantized-expert GEMM (moe_quant_grouped.hip,
+// turbine_moe_quant_grouped): out[pos - first, n] = a[pos - first, :] .
+// dequant(w)[n, :] for every row pos of the local experts, columns [0, n[0])
+// from w[0] and [n[0], n_total) from w[1]. a is BF16 (FP8 block, MXFP4) or
+// e4m3 codes (FP8 tensor, W8A8, with a_scale per expert or per row).
+struct MoeQuantGrouped {
+  const uint8_t *a;
+  int64_t lda; // elements
+  const uint8_t *w[2];
+  const uint8_t *s[2];
+  int32_t n[2];
+  int64_t code_stride[2], scale_stride[2]; // bytes per expert
+  const float *a_scale;
+  int32_t a_scale_vec;
+  const int32_t *offsets;
+  int32_t expert_begin, num_local, first;
+  int32_t k, n_total;
+  int64_t ldc;
+  void *out;
+};
+// n_total and k multiples of 64; wide: 128-row tiles (else 64).
+int32_t launch_moe_quant_grouped(turbine_ctx *ctx, int32_t weight_dtype,
+                                 const MoeQuantGrouped &p, int64_t rows,
+                                 bool wide);
 constexpr int32_t kMoeMaxTopK = 32;
 // The small-m path over d's rows: fills pos ([num_tokens * top_k]), act
 // ([num_tokens * top_k, inter] BF16) and down ([num_tokens * top_k, hidden]
@@ -448,7 +472,18 @@ bool b1_serves(const turbine_attention_paged_desc *d);
 int32_t run_b1_decode(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                       const std::string &entry);
 // moe.cpp: the six moe_experts paths (Quant: the v2.16 quantized experts).
-enum class MoePath { SmallM, WmmaPrefill, Wmma, Grouped, PerExpert, Quant };
+// QuantLoop / QuantGrouped force one path of the quantized experts (Quant
+// picks by routed rows and the formats the grouped kernel wins on).
+enum class MoePath {
+  SmallM,
+  WmmaPrefill,
+  Wmma,
+  Grouped,
+  PerExpert,
+  Quant,
+  QuantLoop,
+  QuantGrouped
+};
 // The implementation name of path (impl_table.cpp's).
 const char *moe_path_name(MoePath path);
 bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path);

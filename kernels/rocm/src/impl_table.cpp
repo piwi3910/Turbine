@@ -44,8 +44,14 @@
 //                                  (only when hipBLASLt has a grouped
 //                                  solution), 4 hipblaslt_per_expert, 5
 //                                  turbine_hip_moe_quant (the v2.16 quantized
-//                                  experts: per-expert qgemm loop); 3, 4 and 5
-//                                  read host_expert_offsets
+//                                  experts: per-expert qgemm loop below 64
+//                                  routed rows and for the formats the grouped
+//                                  kernel does not win on, else the grouped
+//                                  prefill kernel), 6
+//                                  turbine_hip_moe_quant_loop (the loop alone),
+//                                  7 turbine_hip_moe_quant_grouped (the grouped
+//                                  kernel alone); 3, 4, 5, 6 and 7 read
+//                                  host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
 //   row_sumsq, rmsnorm_sharded (v2.6)
@@ -284,6 +290,13 @@ const ImplEntry kMoeExperts[] = {
                                        TURBINE_IMPL_NEEDS_HOST_OFFSETS),
     entry<Experts<MoePath::Quant>>("turbine_hip_moe_quant", kTurbine,
                                    TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    // The two paths of turbine_hip_moe_quant, each alone (tests, the harness):
+    // the per-expert qgemm loop and the grouped prefill kernel.
+    entry<Experts<MoePath::QuantLoop>>("turbine_hip_moe_quant_loop", kTurbine,
+                                       TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    entry<Experts<MoePath::QuantGrouped>>("turbine_hip_moe_quant_grouped",
+                                          kTurbine,
+                                          TURBINE_IMPL_NEEDS_HOST_OFFSETS),
 };
 const ImplEntry kAddRmsnorm[] = {
     entry<AddNorm<true>>("ck_tile_rmsnorm2d", kCk),

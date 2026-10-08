@@ -42,6 +42,7 @@ use turbine_kernels::{
     MoeExpertsExtra, MoeRouteConfig, MoeRouteContext, QGemmConfig, QGemmContext, QuantizeActConfig,
     QuantizeActContext, RouteMode, cpu_reference_provider, shim_provider,
 };
+use turbine_kernels::{ImplChoice, OpConfig, OpKind};
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceMemory, Tensor, TensorView};
 
@@ -532,7 +533,30 @@ fn judge(what: &str, got: &[f32], want: &[f32], bound: Bound) {
     }
 }
 
-/// HIP against the CPU reference for `tokens` tokens of `host`'s layer, end to end.
+/// The two paths of `turbine_hip_moe_quant`, each forced through its own implementation (P7
+/// Task 16 step 2): the per-expert qgemm loop and the grouped prefill kernel. The default
+/// implementation runs the grouped kernel from 64 routed rows for the formats it wins on.
+const PATHS: [&str; 2] = [
+    "turbine_hip_moe_quant_loop",
+    "turbine_hip_moe_quant_grouped",
+];
+
+/// The HIP provider bound to the implementation `name` for `host`'s layer.
+fn forced(p: &Pair, host: &Host, name: &str) -> Arc<dyn KernelProvider> {
+    let cfg = host.config(0, host.spec.experts);
+    let index = p
+        .hip
+        .implementations(OpKind::MoeExperts)
+        .into_iter()
+        .find(|i| i.name == name)
+        .unwrap_or_else(|| panic!("the library has no {name}"))
+        .index;
+    p.hip
+        .bind(&OpConfig::MoeExperts(cfg), &ImplChoice::Single(index))
+        .unwrap_or_else(|| panic!("cannot bind {name}"))
+}
+
+/// HIP (each path) against the CPU reference for `tokens` tokens of `host`'s layer, end to end.
 fn match_case(
     p: &Pair,
     rng: &mut Rng,
@@ -546,15 +570,26 @@ fn match_case(
     let x = rng.normal(tokens * spec.hidden, 1.0);
     let out0 = rng.normal(tokens * spec.hidden, 0.1);
     let range = (0, spec.experts);
-    let got = run(&p.hip, &p.hip_mem, host, &sides.0, &x, &out0, &r, range);
     let want = run(&p.cpu, &p.cpu_mem, host, &sides.1, &x, &out0, &r, range);
     let moe = p.hip.moe().expect("hip moe");
     assert_eq!(
         moe.implementation_experts(&host.config(0, spec.experts)),
         "turbine_hip_moe_quant"
     );
+    for path in PATHS {
+        let prov = forced(p, host, path);
+        let got = run(&prov, &p.hip_mem, host, &sides.0, &x, &out0, &r, range);
+        judge(
+            &format!("chained {} {tag} tokens={tokens} {path}", spec.name),
+            &got,
+            &want,
+            BOUND_CHAINED,
+        );
+    }
+    // The default implementation: the same bits as the path it dispatches to.
+    let got = run(&p.hip, &p.hip_mem, host, &sides.0, &x, &out0, &r, range);
     judge(
-        &format!("chained {} {tag} tokens={tokens}", spec.name),
+        &format!("chained {} {tag} tokens={tokens} default", spec.name),
         &got,
         &want,
         BOUND_CHAINED,
@@ -749,40 +784,46 @@ fn quant_experts_batch_invariant() {
             }
         };
         let zeros = vec![0f32; max_tokens * h];
-        let full = run(
-            &p.hip,
-            &p.hip_mem,
-            &host,
-            &side,
-            &x,
-            &zeros,
-            &routing(max_tokens),
-            (0, spec.experts),
-        );
-        for tokens in [1usize, 2, 3, 7, 16, 33, 63] {
-            let got = run(
-                &p.hip,
+        for path in PATHS {
+            let prov = forced(&p, &host, path);
+            let full = run(
+                &prov,
                 &p.hip_mem,
                 &host,
                 &side,
-                &x[..tokens * h],
-                &zeros[..tokens * h],
-                &routing(tokens),
+                &x,
+                &zeros,
+                &routing(max_tokens),
                 (0, spec.experts),
             );
-            let differing = got
-                .iter()
-                .zip(&full[..tokens * h])
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            println!(
-                "invariance: moe_quant {} static_down={} batch={tokens} vs 64 differing={differing}/{}",
-                dt.as_str(),
-                var.static_down,
-                tokens * h
-            );
-            if differing != 0 {
-                failures.push(format!("{} batch {tokens}: {differing}", dt.as_str()));
+            for tokens in [1usize, 2, 3, 7, 16, 33, 63] {
+                let got = run(
+                    &prov,
+                    &p.hip_mem,
+                    &host,
+                    &side,
+                    &x[..tokens * h],
+                    &zeros[..tokens * h],
+                    &routing(tokens),
+                    (0, spec.experts),
+                );
+                let differing = got
+                    .iter()
+                    .zip(&full[..tokens * h])
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "invariance: moe_quant {path} {} static_down={} batch={tokens} vs 64 differing={differing}/{}",
+                    dt.as_str(),
+                    var.static_down,
+                    tokens * h
+                );
+                if differing != 0 {
+                    failures.push(format!(
+                        "{path} {} batch {tokens}: {differing}",
+                        dt.as_str()
+                    ));
+                }
             }
         }
     }
