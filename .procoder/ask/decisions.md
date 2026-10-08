@@ -4511,3 +4511,43 @@ MXFP4 and CK a16w4 as revisit items (W4A8 q8_1 fails the 6a bound; CK a16w4 need
 gpt-oss activation does not match). Re-measure CK at a later pin if gfx12 flatmm support lands upstream.
 
 **Decision (user, 2026-10-08): B, landed in C's order** — own grouped expert kernels; the per-expert loop stays at decode, the grouped kernel lands for prefill first, each step kept only after a measured gain.
+
+## P7 quantized expert test bound (Task 16, 2026-10-08)
+
+The HIP quantized experts (own per-expert loop over the 6a qgemm kernels) are compared with the CPU reference
+in `hip_moe_quant` under the 6a bound `|d| <= |ref|/256 + rms/128`. Two real reference mismatches were fixed
+(FP8-block weights staged as BF16, bias added after the BF16 qgemm output; `ce99a47f`), and the reference's
+expert scatter already mirrors the kernel and HF's BF16 `index_add_` (`6f5c75dc`). Still, 7 of 12 cases exceed
+the 6a bound (run `1008112147-0f4907dc`): qwen3 FP8-block 1.21 (16 tok) / 2.33 (256), qwen3 shared 1.21,
+mixtral W8A8 1.51 / 1.71 / static 1.46, gpt-oss 1.55 (256); every 1-token case passes, and batch invariance is
+exact. The residual is 1-2 BF16 ulp flips from FP32 accumulation order (WMMA tiles vs sequential CPU GEMM)
+compounding through three chained GEMMs plus activation and scatter. Under 4x the bound every case passes
+(worst 0.78).
+
+- A) A chained-expert bound for the end-to-end test only, 4x the 6a bound (`/64 + rms/32`), set from these
+  measurements and documented beside the test; the model-level golden and GSM8K gates stay the bar.
+- B) Make the reference emulate the kernel's WMMA k-chunked accumulation order so the 6a bound holds; ties the
+  reference to one kernel's tiling and must change with it.
+- C) Split the test: each stage (gate_up qgemm, activation, down qgemm, scatter) checked alone against the
+  reference on the same BF16 input under the 6a bound, and the chained end-to-end output under the 4x bound
+  of A (recommended: per-kernel correctness at the 6a bar, chaining measured and bounded).
+
+**Decision (user, 2026-10-08): C** — split the test: each stage under the 6a bound on the same BF16 input, the
+chained end-to-end output under 4x the 6a bound, documented beside the test.
+
+## P7 OLMoE FP8 KV golden reference (Task 36, 2026-10-08)
+
+Task 36 calibrates per-layer FP8 KV scales for the scale-less OLMoE checkpoint (absmax/448 over 32 prompts,
+cached). Golden against the committed emulated-KV reference (`tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/`,
+which quantizes K/V with scale 1.0 because the checkpoint ships none) is 10/16 at c1 and c16 (14 needed); every
+logprob bound holds, the six misses are token-rule divergences — the served run now uses different scales than
+the reference emulates. The plan says "the existing emulated-KV reference"; its README says the reference uses
+"the served scales".
+
+- A) Regenerate the reference with the calibrated scales (`quant_reference.py --kv-quant fp8_e4m3`, CPU fixture
+  job), re-run golden c1/c16 and the GSM8K OLMoE pair, flip the row to `supported` only if all pass.
+- B) Keep the scale-1.0 reference as the plan says; the row stays `experimental` and Task 36 is done.
+- C) Both: keep the scale-1.0 reference as a diagnostic, gate on the regenerated one.
+
+**Decision (user, 2026-10-08): A** — regenerate the emulated-KV reference with the calibrated (served) scales;
+re-run golden c1/c16 and the GSM8K OLMoE pair; the row flips to `supported` only if all pass.

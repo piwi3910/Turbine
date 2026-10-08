@@ -340,6 +340,8 @@ Interfaces:
 
 ## Task 16: HIP quantized experts and the quantized-MoE loader (S-4)
 
+> Amended 2026-10-08 (user decision C, "P7 quantized expert test bound"): `hip_moe_quant` checks each stage (gate_up qgemm, activation, down qgemm, scatter) alone against the CPU reference on the same BF16 input under the 6a bound `|ref|/256 + rms/128`, and the chained end-to-end expert output under 4x that bound (`|ref|/64 + rms/32`), documented beside the test with the measured ratios.
+
 Files: `kernels/rocm/src/moe_quant.hip` (new; own kernels per Task 14's decision, user 2026-10-08: B in C's order — the per-expert loop of `kernels/rocm/tools/moe_quant_eval/` lands first and serves decode and prefill, a grouped one-launch prefill kernel follows only after a measured gain), `kernels/rocm/src/moe.cpp` (dispatch on `weight_dtype`, activation, biases, shared expert), `kernels/rocm/src/abi_minor.cpp` (16), `kernels/rocm/CMakeLists.txt`, `crates/turbine-kernels/tests/hip_moe_quant.rs` (new), `crates/turbine-kernels/tests/hip_batch_invariance.rs` (`quant_experts_batch_invariant` lives in `hip_moe_quant.rs` with the same conventions), `crates/turbine-model/src/weights/mod.rs` and the `hf_fp8` / `ct_fp8` / `openai_mxfp4` modules (expert tensors repacked to the expert layout), `crates/turbine-model/src/executor/decoder/mod.rs` (`quant_moe_phase7` refusal narrowed), `crates/turbine-model/tests/tiny_model.rs`
 Interfaces:
 
@@ -705,6 +707,8 @@ Interfaces:
 - [ ] Commit: `test(qwen3.5): hybrid golden, GSM8K and throughput gates (Qwen3.5-9B, Qwen3.6-35B-A3B FP8)`
 
 ## Task 36: OLMoE FP8 KV — calibrated V scales (S-15)
+
+> Amended 2026-10-08 (user decision A, "P7 OLMoE FP8 KV golden reference"): the gate's emulated-KV reference is regenerated with the calibrated (served) scales (`uv run scripts/golden/quant_reference.py --kv-quant fp8_e4m3` with the cached scales, a CPU fixture job under `fixture.lock`) before golden c1/c16; "the existing emulated-KV reference" below means that regenerated file.
 
 Files: `crates/turbine-model/src/kv_scales.rs` (calibration for scale-less checkpoints: per-layer K and V absmax over a fixed calibration prompt set at load, scale = absmax / 448, cached beside the checkpoint's id in the server's cache dir), `crates/turbine-model/tests/fixtures/kv_calibration_prompts.jsonl` (new: 32 prompts, none from `tests/golden/prompts.jsonl` or GSM8K), `crates/turbine-model/tests/tiny_model.rs`, `crates/turbine-core/src/support.rs` (OLMoE `fp8_e4m3` row), `.procoder/perf-log.md` ("P7 OLMoE FP8 KV")
 Interfaces:
