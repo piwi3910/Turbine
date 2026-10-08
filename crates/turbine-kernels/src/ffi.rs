@@ -262,6 +262,9 @@ pub(crate) const MOE_ROUTE_RENORMALIZE: i32 = 1;
 /// `TURBINE_MOE_ROUTE_BF16_LOGITS`: `MoeRouteDesc::flags` bit rounding each logit to BF16 before
 /// the softmax (v2.2; a library of an earlier minor reports such a descriptor unsupported).
 pub(crate) const MOE_ROUTE_BF16_LOGITS: i32 = 2;
+/// `TURBINE_ROUTE_TOPK_THEN_SOFTMAX`: `MoeRouteDesc::flags` bit selecting the top `top_k` of the
+/// logits first and a softmax over those only (v2.16; read only by a library of minor >= 16).
+pub(crate) const ROUTE_TOPK_THEN_SOFTMAX: i32 = 4;
 
 /// `turbine_moe_route_desc` (v2; `flags` was `renormalize`, whose values 0 and 1 keep their
 /// meaning).
@@ -277,9 +280,13 @@ pub(crate) struct MoeRouteDesc {
     pub topk_weights: *mut f32,
     pub sorted_rows: *mut i32,
     pub expert_offsets: *mut i32,
+    /// v2.16 (read only by a library of minor >= 16): `[num_experts]` F32 added to the logits,
+    /// or null.
+    pub router_bias: *const c_void,
 }
 
-/// `turbine_moe_experts_desc` (v2). `host_expert_offsets` is a host array.
+/// `turbine_moe_experts_desc` (v2; the fields after `dtype` are v2.16 and read only by a
+/// library of minor >= 16, zero or null they describe the BF16 SwiGLU experts of v2). `host_expert_offsets` is a host array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeExpertsDesc {
@@ -302,6 +309,23 @@ pub(crate) struct MoeExpertsDesc {
     pub expert_begin: i32,
     pub expert_end: i32,
     pub dtype: i32,
+    pub weight_dtype: i32,
+    pub w_gate_scale: *const c_void,
+    pub w_up_scale: *const c_void,
+    pub w_down_scale: *const c_void,
+    pub act_static_scale: *const f32,
+    pub act_static_scale_down: *const f32,
+    pub b_gate: *const c_void,
+    pub b_up: *const c_void,
+    pub b_down: *const c_void,
+    pub activation: i32,
+    pub gate_up_interleaved: i32,
+    pub clamp_limit: f32,
+    pub shared_w_gate: *const c_void,
+    pub shared_w_up: *const c_void,
+    pub shared_w_down: *const c_void,
+    pub shared_gate_w: *const c_void,
+    pub shared_inter: i32,
 }
 
 /// Opaque `turbine_graph` (v2.1); only ever handled by pointer.

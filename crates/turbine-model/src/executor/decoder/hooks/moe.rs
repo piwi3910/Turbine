@@ -89,6 +89,7 @@ fn route_cfg(d: &DecoderDims, moe: &MoeConfig) -> MoeRouteConfig {
         renormalize: moe.norm_topk_prob,
         // transformers' router is a BF16 linear: its logits are BF16 before the F32 softmax.
         bf16_logits: d.act == Bf16::DTYPE,
+        ..Default::default()
     }
 }
 
@@ -102,6 +103,7 @@ fn experts_cfg(d: &DecoderDims, moe: &MoeConfig, (begin, end): (u32, u32)) -> Mo
         expert_begin: begin,
         expert_end: end,
         dtype: d.act,
+        ..Default::default()
     }
 }
 
@@ -261,6 +263,7 @@ impl FfnHook for Moe {
                 topk_weights: rows(&b[TOPK_WEIGHTS], t),
                 sorted_rows: sorted_rows.clone(),
                 expert_offsets: offsets.clone(),
+                router_bias: None,
             })
         })?;
         run.trace_routing(
@@ -331,6 +334,7 @@ impl FfnHook for Moe {
                         host_expert_offsets: &host_offsets,
                         out: run.ffn_out(),
                         workspace: Some(run.ffn_buffers.scratch[WORKSPACE].slice(0, workspace_len)),
+                        extra: Default::default(),
                     })
             })?;
             local += n;
