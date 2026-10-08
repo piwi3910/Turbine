@@ -80,12 +80,28 @@ bool route_supported(const turbine_moe_route_desc *d) {
   if ((d->flags &
        ~(TURBINE_MOE_ROUTE_RENORMALIZE | TURBINE_MOE_ROUTE_BF16_LOGITS)) != 0)
     return false;
+  // v2.16 router bias: not implemented here until P7 Task 16.
+  if (d->router_bias != nullptr)
+    return false;
   return d->num_tokens >= 0 &&
          static_cast<int64_t>(d->num_tokens) * d->top_k <= INT32_MAX;
 }
 
 bool experts_supported(const turbine_moe_experts_desc *d) {
   if (d == nullptr || d->dtype != TURBINE_DTYPE_BF16)
+    return false;
+  // The v2.16 variants (quantized weights, static activation scales, biases,
+  // the gpt-oss activation, interleaved gate_up, a shared expert) land in P7
+  // Task 16; until then this library runs only the BF16 SwiGLU experts.
+  if (d->weight_dtype != TURBINE_EXPERT_BF16 ||
+      d->activation != TURBINE_EXPERT_SWIGLU || d->gate_up_interleaved != 0 ||
+      d->w_gate_scale != nullptr || d->w_up_scale != nullptr ||
+      d->w_down_scale != nullptr || d->act_static_scale != nullptr ||
+      d->act_static_scale_down != nullptr || d->b_gate != nullptr ||
+      d->b_up != nullptr || d->b_down != nullptr ||
+      d->shared_w_gate != nullptr || d->shared_w_up != nullptr ||
+      d->shared_w_down != nullptr || d->shared_gate_w != nullptr ||
+      d->shared_inter != 0)
     return false;
   if (d->hidden < 1 || d->inter < 1 || d->num_tokens < 0)
     return false;

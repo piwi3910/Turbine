@@ -43,6 +43,8 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
+  // The v2.16 expert variants are refused by turbine_moe_*_supported until P7
+  // Task 16 implements them, so the library can report the header's minor.
   return TURBINE_ABI_MINOR;
 #endif
 }

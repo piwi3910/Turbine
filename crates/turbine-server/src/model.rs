@@ -83,7 +83,31 @@ pub(crate) fn model_error(context: &str, e: ModelError) -> StartupError {
     StartupError::new(format!("{context}: {e}"))
 }
 
+/// A kernel selection failure. A requirement no provider supports is `kernel_op_unavailable`
+/// (P7 S-4, the spec failure mode "kernel library without an op the family needs"): logged as
+/// the `kernel_capability` event and named by the ABI entry point and the config, e.g.
+/// `turbine_moe_experts (hidden=2880 … weight_dtype=mxfp4)`, so a library below the needed ABI
+/// minor is told apart from a broken one.
 fn kernel_error(context: &str, e: KernelError) -> StartupError {
+    if let KernelError::NoProvider { op, config, detail } = &e {
+        tracing::error!(
+            event = "kernel_capability",
+            reason = "kernel_op_unavailable",
+            op = %op,
+            config = %config,
+            detail = %detail,
+            "no kernel provider runs a configuration the model needs"
+        );
+        return StartupError::new(format!(
+            "kernel_op_unavailable: {context}: turbine_{op} ({config}) is not supported by any \
+             kernel provider{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            }
+        ));
+    }
     StartupError::new(format!("{context}: {e}"))
 }
 
@@ -1842,6 +1866,115 @@ mod tests {
         let mut both = old.clone();
         both.extend(cpu);
         assert!(check_rope_attn_factor(m, &requirements, &both).is_err());
+    }
+
+    /// A provider whose MoE ops run only the BF16 SwiGLU experts of kernel ABI v2, like a
+    /// library below minor 16.
+    struct OldMoe;
+
+    impl turbine_kernels::MoeKernel for OldMoe {
+        fn supports_route(&self, cfg: &turbine_kernels::MoeRouteConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn supports_experts(&self, cfg: &turbine_kernels::MoeExpertsConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn implementation_route(&self, _cfg: &turbine_kernels::MoeRouteConfig) -> String {
+            "old_moe_route".into()
+        }
+        fn implementation_experts(&self, _cfg: &turbine_kernels::MoeExpertsConfig) -> String {
+            "old_moe_experts".into()
+        }
+        fn route(
+            &self,
+            _ctx: &mut turbine_kernels::MoeRouteContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+        fn experts(
+            &self,
+            _ctx: &mut turbine_kernels::MoeExpertsContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+    }
+
+    impl KernelProvider for OldMoe {
+        fn id(&self) -> turbine_kernels::ProviderId {
+            turbine_kernels::ProviderId("old-moe")
+        }
+        fn gemm(&self) -> Option<&dyn turbine_kernels::GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn turbine_kernels::AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn turbine_kernels::NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn turbine_kernels::RopeKernel> {
+            None
+        }
+        fn activation(&self) -> Option<&dyn turbine_kernels::ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn turbine_kernels::EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn turbine_kernels::ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn turbine_kernels::KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn turbine_kernels::MoeKernel> {
+            Some(self)
+        }
+    }
+
+    /// P7 Task 15: a registry that cannot run `MoeExpertsConfig { weight_dtype: Mxfp4, .. }`
+    /// fails kernel selection as `kernel_op_unavailable`, naming `turbine_moe_experts` and the
+    /// config; the same experts in BF16 select fine. Breaks if a library below ABI minor 16
+    /// would be reported as a generic selection failure (or, worse, selected).
+    #[test]
+    fn kernel_op_unavailable_names_the_abi_entry_point() {
+        let experts = |weight_dtype| {
+            OpRequirement::from(OpConfig::MoeExperts(turbine_kernels::MoeExpertsConfig {
+                hidden: 2880,
+                inter: 2880,
+                num_experts: 32,
+                top_k: 4,
+                expert_begin: 0,
+                expert_end: 32,
+                dtype: DType::BF16,
+                weight_dtype,
+                ..Default::default()
+            }))
+        };
+        let providers: Vec<Arc<dyn KernelProvider>> = vec![Arc::new(OldMoe)];
+        let order = [turbine_kernels::ProviderId("old-moe")];
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        KernelRegistry::build(
+            providers.clone(),
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Bf16)],
+            &metrics,
+            None,
+        )
+        .expect("BF16 experts are supported");
+        let e = KernelRegistry::build(
+            providers,
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Mxfp4)],
+            &metrics,
+            None,
+        )
+        .err()
+        .expect("MXFP4 experts are refused");
+        let err = kernel_error("kernel selection", e).to_string();
+        assert!(err.starts_with("kernel_op_unavailable"), "{err}");
+        assert!(err.contains("turbine_moe_experts"), "{err}");
+        assert!(err.contains("weight_dtype=mxfp4"), "{err}");
     }
 
     #[test]

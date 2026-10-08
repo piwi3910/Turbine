@@ -578,6 +578,7 @@ fn moe_rows_are_batch_invariant() {
         top_k: TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     let cfg = MoeExpertsConfig {
         hidden: HIDDEN as u32,
@@ -587,6 +588,7 @@ fn moe_rows_are_batch_invariant() {
         expert_begin: 0,
         expert_end: EXPERTS as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let registry = h.registry(&[OpConfig::MoeRoute(route_cfg), OpConfig::MoeExperts(cfg)]);
     let (router, moe) = (registry.moe_route(&route_cfg), registry.moe_experts(&cfg));
@@ -633,6 +635,7 @@ fn moe_rows_are_batch_invariant() {
                 topk_weights: tw.view(),
                 sorted_rows: sorted.view(),
                 expert_offsets: offsets.view(),
+                router_bias: None,
             })
             .expect("moe_route");
         let host: Vec<i32> = if moe.needs_host_offsets(&cfg, rows) {
@@ -654,6 +657,7 @@ fn moe_rows_are_batch_invariant() {
             host_expert_offsets: &host,
             out: o.view(),
             workspace: None,
+            extra: Default::default(),
         })
         .expect("moe_experts");
         (
@@ -1120,6 +1124,7 @@ fn moe_decode_tier_timings() {
         top_k: TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     let cfg = MoeExpertsConfig {
         hidden: HIDDEN as u32,
@@ -1129,6 +1134,7 @@ fn moe_decode_tier_timings() {
         expert_begin: 0,
         expert_end: EXPERTS as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let registry = h.registry(&[OpConfig::MoeRoute(route_cfg)]);
     let router = registry.moe_route(&route_cfg);
@@ -1179,6 +1185,7 @@ fn moe_decode_tier_timings() {
                 topk_weights: tw.view(),
                 sorted_rows: sorted.view(),
                 expert_offsets: offsets.view(),
+                router_bias: None,
             })
             .expect("moe_route");
         let off = read(&offsets);
@@ -1200,6 +1207,7 @@ fn moe_decode_tier_timings() {
                     host_expert_offsets: &[],
                     out: o.view(),
                     workspace: None,
+                    extra: Default::default(),
                 })
                 .expect("moe_experts");
             };

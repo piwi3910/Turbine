@@ -1082,6 +1082,7 @@ mod tests {
             top_k: 2,
             renormalize: false,
             bf16_logits: false,
+            ..Default::default()
         };
         let moe = cpu.moe().expect("moe family");
         assert!(moe.supports_route(&route_cfg));
@@ -1103,6 +1104,7 @@ mod tests {
             topk_weights: topk_weights.view(),
             sorted_rows: sorted_rows.view(),
             expert_offsets: expert_offsets.view(),
+            router_bias: None,
         })
         .expect("route");
         assert_eq!(load_i32(&topk_ids.view()).expect("ids"), [0, 1, 3, 2]);
@@ -1132,6 +1134,7 @@ mod tests {
                 top_k: 1,
                 renormalize: false,
                 bf16_logits,
+                ..Default::default()
             };
             moe.route(&mut MoeRouteContext {
                 cfg,
@@ -1140,6 +1143,7 @@ mod tests {
                 topk_weights: weights.view(),
                 sorted_rows: rows.view(),
                 expert_offsets: expert_offsets.view(),
+                router_bias: None,
             })
             .expect("route");
             assert_eq!(load_i32(&ids.view()).expect("ids"), [want_id], "{cfg}");
