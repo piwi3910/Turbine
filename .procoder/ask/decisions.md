@@ -4411,3 +4411,14 @@ profile shows the GDN share; land it only if it measures faster served. Not deci
 **Decision (user, 2026-10-08), "P7 Gated DeltaNet provider": B** — llama.cpp's `gated_delta_net` vendored (BF16 loads,
 transformers' `h / 2` head pairing) for decode and prefill; conv: AITER `causal_conv1d_fwd_split_qkv` for prefill,
 llama.cpp `ssm_conv` for decode; a chunked prefill (option A) is a measured follow-up once Qwen3.5 serves.
+
+## Phase 7 review fix: state allocation for `n > 1` (2026-10-08, open)
+
+From the codex review of p7-stack (finding 3, verified) and the fix builder's plan (`p7-review-fixes`, handoff
+456040d1): a request's state charge must cover every sequence (`n` choices), and the API puts no upper bound on `n`.
+- A) The fixed state allocation covers `max_running_requests` sequences (not requests); a request whose
+  `n × state` exceeds the whole allocation is refused at submit with a reason code; one that only lacks free state now
+  waits in the queue.
+- B) The allocation covers `max_running_requests × max_n` (a new key `scheduler.max_n_per_request`, default 4) and
+  larger `n` is rejected 400 for hybrid families.
+- C) Hybrid families reject `n > 1` (400 with a reason code) until Phase 8.
