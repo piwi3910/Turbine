@@ -1482,6 +1482,10 @@ const GEMM_SILU_MUL_MINOR: u32 = 14;
 /// (`c_residual`, `a_norm_weight`, v2.15).
 const GEMM_NORM_RESIDUAL_MINOR: u32 = 15;
 
+/// The ABI minor whose `turbine_attention_paged_desc` carries the sliding window and the sink
+/// logits (`window_left`, `sinks`, v2.17; Phase 7 S-8).
+const ATTENTION_WINDOW_SINKS_MINOR: u32 = 17;
+
 /// A non-null, 16-byte aligned stand-in for a probe's v2.15 operands: `supports` reads the
 /// pointers' presence and alignment only, never the memory.
 const PROBE_OPERAND: *const c_void = std::ptr::without_provenance(16);
@@ -1638,6 +1642,16 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         rope_inv_freq: std::ptr::null(),
         rope_rotary_dim: 0,
         rope_attn_factor: 1.0,
+        window_left: cfg
+            .window
+            .map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX)),
+        // `_supported` reads no pointer but this one's presence: a dangling, never-read
+        // pointer stands for the config's sinks.
+        sinks: if cfg.sinks {
+            std::ptr::NonNull::<f32>::dangling().as_ptr().cast_const()
+        } else {
+            std::ptr::null()
+        },
     }
 }
 
@@ -2744,9 +2758,14 @@ impl AttentionKernel for ShimProvider {
             // TurboQuant pages need the v2.11 descriptor fields (P6b S-5).
             cfg.block_tokens.is_some_and(|b| b > 0)
                 && (cfg.dtype.tq_record_bytes().is_none() || self.ctx.lib.abi_minor() >= 11)
+                && (cfg.window.is_none() && !cfg.sinks
+                    || self.ctx.lib.abi_minor() >= ATTENTION_WINDOW_SINKS_MINOR)
                 && Self::supported(trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
-            cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
+            cfg.block_tokens.is_none()
+                && cfg.window.is_none()
+                && !cfg.sinks
+                && Self::supported(trio, &attention_probe(cfg))
         } else {
             false
         }
@@ -2821,6 +2840,38 @@ impl AttentionKernel for ShimProvider {
                 ),
             });
         }
+        // Phase 7 S-8: the window and the sinks travel in the ABI v2.17 fields, which a
+        // library below minor 17 would ignore.
+        if (cfg.window.is_some() || cfg.sinks)
+            && self.ctx.lib.abi_minor() < ATTENTION_WINDOW_SINKS_MINOR
+        {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "{} with a sliding window or sinks ({cfg}) needs a kernel library of ABI \
+                     minor {ATTENTION_WINDOW_SINKS_MINOR} (this one is {})",
+                    cfg.op(),
+                    self.ctx.lib.abi_minor()
+                ),
+            });
+        }
+        let window_left = match cfg.window {
+            Some(w) => to_i32("window", w)?,
+            None => -1,
+        };
+        let sinks = match (&ctx.sinks, cfg.sinks) {
+            (Some(v), true) => {
+                dense("sinks", v, &[cfg.num_q_heads as usize], DType::F32)?;
+                self.ctx.device_ptr("sinks", v)?.cast_const().cast()
+            }
+            (None, false) => std::ptr::null(),
+            _ => {
+                return Err(invalid(format!(
+                    "{}: the sinks tensor must be passed exactly when the config names sinks \
+                     ({cfg})",
+                    cfg.op()
+                )));
+            }
+        };
         let (hkv, d) = (cfg.num_kv_heads as usize, cfg.head_dim as usize);
         let new_stride_token = row_stride("k_new", &ctx.k_new, 3)?;
         if row_stride("v_new", &ctx.v_new, 3)? != new_stride_token {
@@ -3010,6 +3061,8 @@ impl AttentionKernel for ShimProvider {
             rope_inv_freq,
             rope_rotary_dim,
             rope_attn_factor,
+            window_left,
+            sinks,
         };
         if ctx.block_formats.is_some() && !self.bound_takes(cfg.op(), &d) {
             // A block table that may mix formats, and a bound implementation (chosen for pages
@@ -3825,6 +3878,8 @@ pub(crate) mod tests {
             dtype: DType::BF16,
             block_tokens: Some(16),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let attn = provider.attention().expect("attention family");
         assert!(!attn.supports(&paged));
@@ -3874,6 +3929,46 @@ pub(crate) mod tests {
             matches!(&err, KernelError::InvalidArgument { message } if message.contains("execute_paged")),
             "{err:?}"
         );
+        // Phase 7 S-8: a window or sinks need the ABI v2.17 fields; this v2.0 library would
+        // ignore them, so the call is refused before any FFI call.
+        let i32s = Tensor::empty(&mem, &[2], DType::I32).expect("i32");
+        let sink_t = Tensor::empty(&mem, &[16], DType::F32).expect("sinks");
+        for (window, sinks) in [(Some(128), false), (None, true)] {
+            let cfg = AttentionConfig {
+                window,
+                sinks,
+                ..paged
+            };
+            assert!(!attn.supports(&cfg), "{cfg}");
+            let err = attn
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg,
+                    q: t.view(),
+                    k_new: t.view(),
+                    v_new: t.view(),
+                    out: t.view(),
+                    kv_layer: t.view(),
+                    block_table: i32s.view(),
+                    q_indptr: i32s.view(),
+                    kv_lens: i32s.view(),
+                    max_q_len: 1,
+                    max_kv_len: 1,
+                    max_blocks_per_seq: 1,
+                    scale: 1.0,
+                    k_scale: 1.0,
+                    v_scale: 1.0,
+                    block_formats: None,
+                    classes: None,
+                    tq: None,
+                    rope: None,
+                    sinks: sinks.then(|| sink_t.view()),
+                })
+                .expect_err("window / sinks below minor 17");
+            assert!(
+                matches!(&err, KernelError::Unsupported { message } if message.contains("ABI minor 17")),
+                "{err:?}"
+            );
+        }
 
         let copy = KvCopyConfig {
             num_layers: 2,

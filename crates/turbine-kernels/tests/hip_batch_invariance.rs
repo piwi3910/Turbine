@@ -793,6 +793,8 @@ fn paged_run_heads(
         dtype: DType::BF16,
         block_tokens: Some(BLOCK_TOKENS as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let kernel = h.provider.attention().expect("hip attention");
     assert!(kernel.supports(&cfg), "{cfg}");
@@ -875,6 +877,7 @@ fn paged_run_heads(
             classes: None,
             tq: None,
             rope: None,
+            sinks: None,
         })
         .expect("paged attention");
     let out = read(&o);

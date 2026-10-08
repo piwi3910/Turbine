@@ -207,7 +207,7 @@ fn header_declares_the_v24_minor_revision() {
     );
     // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
     // v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -377,7 +377,7 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
         17,
@@ -402,7 +402,7 @@ fn header_declares_the_v29_quantization_group() {
     use turbine_core::types::DType;
     use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
     assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
     assert_eq!(OpKind::QGemm.abi_code(), 17);
@@ -474,7 +474,7 @@ fn header_declares_the_v29_quantization_group() {
 #[test]
 fn header_declares_the_v210_rope_attn_factor() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() == 10).count(),
         0,
@@ -500,7 +500,7 @@ fn header_declares_the_v211_kv_transcode_group() {
         KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KvTranscodeFormat,
     };
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     assert_eq!(define(&code, "TURBINE_OP_KV_TRANSCODE"), "19");
     assert_eq!(OpKind::KvTranscode.abi_code(), 19);
     assert_eq!(OpKind::KvTranscode.abi_minor(), 11);
@@ -641,8 +641,7 @@ fn header_declares_the_v212_fused_rope_fields() {
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let attn = "int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
                 const int32_t *rope_positions; const float *rope_inv_freq; \
-                int32_t rope_rotary_dim; float rope_attn_factor; \
-                } turbine_attention_paged_desc;";
+                int32_t rope_rotary_dim; float rope_attn_factor;";
     let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(&attn),
@@ -657,7 +656,7 @@ fn header_declares_the_v212_fused_rope_fields() {
 #[test]
 fn header_declares_the_v213_qgemm_act_static_scale() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let qgemm = "float alpha; int32_t prefill; float act_static_scale; } turbine_qgemm_desc;";
     assert!(
@@ -673,7 +672,7 @@ fn header_declares_the_v213_qgemm_act_static_scale() {
 #[test]
 fn header_declares_the_v214_gemm_silu_mul_input() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let gemm = "float alpha, beta; int64_t a_up_offset; int32_t a_silu_mul;";
     assert!(
@@ -689,12 +688,30 @@ fn header_declares_the_v214_gemm_silu_mul_input() {
 #[test]
 fn header_declares_the_v215_gemm_residual_and_norm_input() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let gemm = "int32_t a_silu_mul; const void *c_residual; const void *a_norm_weight; \
                 float a_norm_eps; } turbine_gemm_desc;";
     assert!(
         flat.contains(gemm),
         "turbine_kernels.h lacks the v2.15 gemm fields {gemm}"
+    );
+}
+
+/// Kernel ABI v2.17 (Phase 7 S-8): the paged attention descriptor ends with the sliding window
+/// and the sink logits, after the v2.12 fused RoPE fields, and the minor is 17. Breaks if the
+/// fields move (a library would read the RoPE factor as the window) or the minor is not raised
+/// (a v2.15 library must never be handed a window or sinks it would ignore).
+#[test]
+fn header_declares_the_v217_attention_window_and_sinks() {
+    let code = strip_comments(&header());
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "17u");
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let attn = "float rope_attn_factor; int32_t window_left; const float *sinks; \
+                } turbine_attention_paged_desc;";
+    let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&attn),
+        "turbine_kernels.h lacks the v2.17 attention fields {attn}"
     );
 }

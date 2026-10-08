@@ -371,6 +371,18 @@ typedef struct turbine_attention_paged_desc {
   const float *rope_inv_freq;
   int32_t rope_rotary_dim;
   float rope_attn_factor;
+  /* v2.17 (Phase 7 S-8), read only by a library reporting minor >= 17 (a
+   * caller never sets them for an older one): a sliding window -- query
+   * position p attends keys p - window_left <= j <= p (with causal = 1);
+   * -1 = no window (every key <= p) -- and learned sink logits: sinks, device
+   * F32 [num_q_heads] in the scaled score domain (compared with scale * q.k),
+   * joins each row of head h as one more logit of the softmax that has no
+   * value: probabilities exp(s_j - m) / (sum_k exp(s_k - m) + exp(sinks[h] -
+   * m)) with m = max(max_k s_k, sinks[h]). NULL = no sinks. A zeroed
+   * descriptor must set window_left = -1. _supported reads sinks for its
+   * presence only. */
+  int32_t window_left;
+  const float *sinks;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -521,8 +533,11 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * act_static_scale; no new symbol); v2.14 the SwiGLU input of a GEMM
  * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol); v2.15 the
  * residual-add epilogue and RMSNorm input of a GEMM (turbine_gemm_desc's
- * c_residual / a_norm_weight / a_norm_eps; no new symbol). */
-#define TURBINE_ABI_MINOR 15u
+ * c_residual / a_norm_weight / a_norm_eps; no new symbol); v2.16 (Phase 7,
+ * reserved for the quantized MoE experts); v2.17 the sliding window and sink
+ * logits of paged attention (turbine_attention_paged_desc's window_left /
+ * sinks; no new symbol) and head_dim 64 and 256 on its CK paths. */
+#define TURBINE_ABI_MINOR 17u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return

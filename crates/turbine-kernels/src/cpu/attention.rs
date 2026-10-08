@@ -24,6 +24,12 @@ impl AttentionKernel for CpuReference {
             } else {
                 cfg.block_tokens.is_none()
             }
+            // Phase 7 S-8: a window (causal only) and sinks over float or FP8 pages; the
+            // TurboQuant / mixed-format path keeps its own numerics without them.
+            && (cfg.window.is_none() && !cfg.sinks
+                || cfg.kind.is_paged()
+                    && cfg.dtype.tq_record_bytes().is_none()
+                    && (cfg.window.is_none() || cfg.causal))
     }
 
     fn implementation(&self, cfg: &AttentionConfig) -> String {
@@ -73,6 +79,7 @@ impl AttentionKernel for CpuReference {
             hkv,
             d,
             causal: ctx.cfg.causal,
+            window: None,
         };
         let dt = ctx.cfg.dtype;
         store(
@@ -167,6 +174,8 @@ mod tests {
             dtype: DType::F32,
             block_tokens: None,
             causal: true,
+            window: None,
+            sinks: false,
         };
         // token 0: both heads [1,0]; token 1: head 0 [1,0], head 1 [0,1].
         let q = tensor(
@@ -224,6 +233,8 @@ mod tests {
                 dtype,
                 block_tokens: None,
                 causal: true,
+                window: None,
+                sinks: false,
             };
             // Scores [0, −0.25] (all inputs exact in BF16); v = [0, 1].
             let q = tensor(&mem, &[1, 1, 1], dtype, &[-0.25]);
@@ -263,6 +274,8 @@ mod tests {
             dtype: DType::F32,
             block_tokens: None,
             causal: true,
+            window: None,
+            sinks: false,
         };
         // Capacity 4, rows [0, 2) valid; row 3 holds garbage that must not be read.
         let k = tensor(&mem, &[4, 1, 1], DType::F32, &[0.0, 0.0, 0.0, 1e9]);
