@@ -4422,3 +4422,15 @@ From the codex review of p7-stack (finding 3, verified) and the fix builder's pl
 - B) The allocation covers `max_running_requests × max_n` (a new key `scheduler.max_n_per_request`, default 4) and
   larger `n` is rejected 400 for hybrid families.
 - C) Hybrid families reject `n > 1` (400 with a reason code) until Phase 8.
+
+## Phase 7 Task 11: Qwen3-4B golden misses (2026-10-08, open)
+
+From `p7-t11` (WIP 1c3f1b76; perf log "P7 Qwen3-4B gate"). Every prompt's greedy tokens equal the transformers
+reference, but the logprob bounds (Llama's, 0.15 likely / 0.56 tail) miss: c1 9/16 pass (likely up to 0.233, p14 tail
+0.92); c16 14/16 by count but FAIL (p10 0.31, p12 0.28 over the batched 0.25). Throughput passes (598.8 vs vLLM-ROCm
+630.5 tok/s, 0.95×); vLLM GSM8K 0.920, Turbine's GSM8K run not done yet.
+- A) Derive Qwen3's own bounds from a transformers self-spread run (`scripts/golden/self_spread.py`, the OLMoE method),
+  recorded in the slug README, and re-gate.
+- B) Build the fused single-rounding per-head QK-norm (deferred by Task 10's decision C) first, then re-gate on the
+  Llama-derived bounds.
+- C) A then B: gate on self-spread bounds now, the fused norm stays a follow-up.
