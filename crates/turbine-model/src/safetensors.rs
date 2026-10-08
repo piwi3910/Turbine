@@ -21,6 +21,9 @@ use crate::ModelError;
 pub const SINGLE_FILE: &str = "model.safetensors";
 /// Sharded checkpoint index name.
 pub const INDEX_FILE: &str = "model.safetensors.index.json";
+/// Mistral's native (mistral-inference) weight file, shipped beside the HF shards: never
+/// loaded (P7 S-6); a directory holding only it is refused.
+pub const CONSOLIDATED_FILE: &str = "consolidated.safetensors";
 /// Headers larger than this are rejected from the 8-byte length prefix, before allocating.
 pub const MAX_HEADER_BYTES: u64 = 100 << 20;
 /// Largest index JSON read into memory (real indexes are tens of KiB).
@@ -57,7 +60,9 @@ pub struct SafetensorsIndex {
 impl SafetensorsIndex {
     /// Opens `<dir>/model.safetensors.index.json` (and every shard it lists), else
     /// `<dir>/model.safetensors`. A directory without either that holds a pickle file yields
-    /// `ModelError::Pickle` naming it; pickle files are never opened.
+    /// `ModelError::Pickle` naming it; pickle files are never opened. A
+    /// [`CONSOLIDATED_FILE`] is never opened either: beside the HF checkpoint it is skipped
+    /// (`event="weights_skipped"`), alone it yields `ModelError::Io` naming [`INDEX_FILE`].
     pub fn open(dir: &Path) -> Result<SafetensorsIndex, ModelError> {
         let meta = std::fs::metadata(dir).map_err(|e| io_err(dir, e))?;
         if !meta.is_dir() {
@@ -68,12 +73,22 @@ impl SafetensorsIndex {
         }
         let index_path = dir.join(INDEX_FILE);
         let single_path = dir.join(SINGLE_FILE);
+        let consolidated = exists(&dir.join(CONSOLIDATED_FILE));
         let entries = if exists(&index_path) {
             open_sharded(dir, &index_path)?
         } else if exists(&single_path) {
             let mut all = BTreeMap::new();
             read_header(&single_path, &mut all)?;
             all.into_values().collect()
+        } else if consolidated {
+            // Mistral's native layout (other tensor names): never the checkpoint (P7 S-6).
+            return Err(ModelError::Io {
+                path: dir.to_path_buf(),
+                detail: format!(
+                    "only {CONSOLIDATED_FILE} (the mistral-inference layout, not loaded): \
+                     the Hugging Face checkpoint needs {INDEX_FILE} or {SINGLE_FILE}"
+                ),
+            });
         } else {
             return Err(match find_pickle(dir)? {
                 Some(path) => ModelError::Pickle { path },
@@ -83,6 +98,13 @@ impl SafetensorsIndex {
                 },
             });
         };
+        if consolidated {
+            tracing::info!(
+                event = "weights_skipped",
+                file = CONSOLIDATED_FILE,
+                reason = "the Hugging Face checkpoint beside it is loaded",
+            );
+        }
         let by_name = entries
             .iter()
             .enumerate()

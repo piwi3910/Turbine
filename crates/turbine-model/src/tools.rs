@@ -12,6 +12,8 @@ use crate::formats::{Llama3Json, ToolFormat};
 
 /// Length of the random part of a call id (`call_` + 24 alphanumerics).
 const CALL_ID_RANDOM_LEN: usize = 24;
+/// Length of a Mistral call id ([`new_mistral_call_id`]).
+pub const MISTRAL_CALL_ID_LEN: usize = 9;
 
 const ALPHANUMERIC: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -53,13 +55,28 @@ impl ToolChoice {
 pub fn new_call_id(rng: &mut impl RngCore) -> String {
     let mut id = String::with_capacity(5 + CALL_ID_RANDOM_LEN);
     id.push_str("call_");
+    push_alphanumeric(rng, &mut id, CALL_ID_RANDOM_LEN);
+    id
+}
+
+/// A fresh Mistral call id: [`MISTRAL_CALL_ID_LEN`] characters drawn uniformly from
+/// `[A-Za-z0-9]`, the only shape the Mistral v0.3 chat template accepts when the call (or its
+/// tool result) is sent back (P7 S-6: it raises on `tool_call.id|length != 9`).
+pub fn new_mistral_call_id(rng: &mut impl RngCore) -> String {
+    let mut id = String::with_capacity(MISTRAL_CALL_ID_LEN);
+    push_alphanumeric(rng, &mut id, MISTRAL_CALL_ID_LEN);
+    id
+}
+
+/// Appends `len` characters drawn uniformly from `[A-Za-z0-9]` to `id`.
+fn push_alphanumeric(rng: &mut impl RngCore, id: &mut String, len: usize) {
     let mut drawn = 0;
     let mut bytes = [0u8; 32];
-    while drawn < CALL_ID_RANDOM_LEN {
+    while drawn < len {
         rng.fill_bytes(&mut bytes);
         // Rejection sampling: 248 = 4 × 62, so accepted bytes map uniformly onto the alphabet.
         for &b in bytes.iter().filter(|&&b| b < 248) {
-            if drawn == CALL_ID_RANDOM_LEN {
+            if drawn == len {
                 break;
             }
             id.push(char::from(
@@ -68,7 +85,6 @@ pub fn new_call_id(rng: &mut impl RngCore) -> String {
             drawn += 1;
         }
     }
-    id
 }
 
 /// One function tool of a request: its name and the JSON schema of its parameters.

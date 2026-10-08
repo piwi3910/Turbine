@@ -2015,3 +2015,29 @@ Every Phase 7 gate result (S-13) is one list line in this section, naming one `t
 - GSM8K-200 c16: vLLM-ROCm 0.920 (`tests/eval/qwen3-4b-instruct-2507/vllm.json`); Turbine not yet run (paused).
 
 - P7 open: Qwen3ForCausalLM/bf16/bf16/tp1 golden c1 and c16 miss the Llama logprob bounds (tokens identical); Turbine GSM8K not run
+  \=======
+
+### P7 OLMoE EP×TP drift — the per-position routing trace (plan Task 12, branch `p7-t12`, 2026-10-08)
+
+Lab run `turbine-lab-test-1007231205-1bd80117` (`scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test olmoe_ep_tp_lab -- olmoe_routing_trace`, both R9700s, on this commit's tree before its one-GPU summary-line fix, whose numbers here come from the per-token table). OLMoE-1B-7B-0125-Instruct teacher-forced on the transformers reference tokens of p08 and p10 (prompt prefilled, then one decode step per reference token), one GPU vs tp 2, ep 2 (attention replicated) and ep 2 × tp 2, in-process groups over RCCL. Routing trace: `DecoderExecutor::set_routing_trace` (per MoE layer and token: top-k ids, gates, margin = smallest selected minus largest unselected BF16 router logit). "likely" is the golden metric (max |Δ logprob| of the reference's top-5 candidates above −2; bound 1.01).
+
+| placement | prompt | worst likely / tail | router-logit \|Δ\| vs one GPU p50 / p99 / max | top-k flips (positions) | argmax ≠ one GPU at token | ranks route identically |
+| --------- | ------ | ------------------- | --------------------------------------------- | ----------------------- | ------------------------- | ----------------------- |
+| one GPU   | p08    | 0.517 / 1.193       | —                                             | —                       | —                         | —                       |
+| one GPU   | p10    | 0.292 / 1.318       | —                                             | —                       | —                         | —                       |
+| tp2       | p08    | 0.420 / 1.517       | 0.034 / 0.190 / 0.243                         | 111 (49)                | —                         | yes                     |
+| tp2       | p10    | **1.006** / 1.233   | 0.029 / 0.215 / 0.268                         | 57 (29)                 | —                         | yes                     |
+| ep2       | p08    | 0.440 / 1.388       | 0.026 / 0.134 / 0.196                         | 86 (43)                 | 29                        | yes                     |
+| ep2       | p10    | 0.301 / 1.295       | 0.021 / 0.150 / 0.196                         | 37 (25)                 | —                         | yes                     |
+| ep2×tp2   | p08    | 0.221 / 1.071       | 0.036 / 0.180 / 0.315                         | 119 (51)                | 17                        | yes                     |
+| ep2×tp2   | p10    | **1.056** / 1.626   | 0.030 / 0.199 / 0.259                         | 69 (30)                 | 21                        | yes                     |
+
+One-GPU routing margins (both prompts): p01 0.000 (exact BF16 ties), p10 0.0078 (one BF16 ulp of a logit in [1, 2)), p50 0.055–0.070; 1,016–1,113 of p08's 1,264 (layer, position) rows and 673–751 of p10's 896 have a margin at or below the placement's p99 router-logit |Δ|.
+
+First divergences: in every placement and prompt the first flip of the sequence is at prompt position 0 (p10 ep2: position 4) on a near-tie — one-GPU margin 0.000 (p10, layer 2 / 12) or 0.0078 (p08, layer 15), moved by a pair swing of 0.001–0.019, i.e. the partial-sum rounding of the hidden row alone. Per position, the lowest-layer flip has a one-GPU margin of median 0.0034–0.0078 and ≤ 1/128 at 14/25 … 38/49 positions (tp2 p08 38/49, tp2 p10 17/29, ep2 p08 30/43, ep2 p10 14/25, ep2×tp2 p08 35/51, ep2×tp2 p10 21/30); the later-layer flips at the same position have margins up to 0.15–0.24: a flipped expert changes the residual stream, and the router logits of the next layers move by up to 0.23 (the cascade).
+
+The p10 failure (token 17, position 41): one GPU likely 0.292; tp2 1.006 and ep2×tp2 1.056 at the same token, with the same five flipped layers and the same expert swaps in both (layer 5: 10 → 0, one-GPU margin 0.0024; then layers 6, 8, 10, 13: 21 → 5, 20 → 42, 17 → 23, 36 → 34, margins 0.018–0.152 crossed by the cascade). ep2×tp2's argmax change at token 21 (4768 → 13) sits where tp2's top-2 gap has already shrunk to 0.006 (one GPU 0.934). p08: one GPU itself takes 102 instead of the reference's 215 at token 17 (gap 0.21); ep2×tp2 keeps 215 there — p08 is a near-tie prompt for every placement.
+
+Cause (S-3): the near-tie hypothesis holds, and nothing is specific to ep × tp. Any change of summation order (TP partial sums of the O and FFN projections, the EP combine of per-rank expert sums) moves the router logits by ~0.02–0.03 (p50), while a tenth of one GPU's routing decisions sit within one BF16 ulp and a hundredth are exact ties; the first flip at a position is such a near-tie, and the flipped expert cascades through the later layers' routing. tp2 alone shows the same flips at the same positions and reaches 1.006 on p10 against the 1.01 bound; ep2×tp2's extra EP-combine rounding takes the same token to 1.056. Rank-invariance is not the defect: every rank of every group routes identically (the router input is the all-reduced row on every rank), so Task 13's expected fix (rank-invariant router input) would change nothing. Fixing the drift is a numerics/gate trade for the user (options in the Task 12 report): (A) gate ep2×tp2 with a multi-GPU OLMoE bound calibrated from this spread (the self-spread method) and drop the refusal; (B) all-reduce FP32 partials (one BF16 rounding instead of two; roughly halves the router-logit noise at best, doubles the all-reduce bytes, unmeasured; flips remain); (C) keep the refusal (tp2 alone sits 0.004 under the bound on p10).
+
+> > > > > > > p7-stack
