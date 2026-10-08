@@ -4200,6 +4200,7 @@ gptq / gptq-own / autoround-gptq / mxfp4-a4 variants) there. Active models stay 
 downloaded locally while its family is active and moves to the iSCSI volume once the family closes.
 
 Phase 7 spec, second round (user, 2026-10-07):
+
 - gpt-oss Harmony — A) full Harmony (registered template + tool-call parser; analysis channel → `reasoning_content`,
   tool calls → `tool_calls`, reasoning effort from the request; golden and GSM8K judged on the final channel);
   B) final channel only, tools refused. **Decision: A.**
@@ -4218,6 +4219,7 @@ Local agent worktrees whose branch is merged into main and clean are removed so 
 target dirs (user: yes, merged only).
 
 Phase 7 spec, third round (user, 2026-10-08):
+
 - Reasoning output — A) a registered reasoning parser per family (Qwen `<think>`, Harmony analysis channel) puts
   reasoning in `reasoning_content`, streaming too; golden and GSM8K run with thinking off where the template allows,
   plus one logged GSM8K run with thinking on; B) raw text inline. **Decision: A.**
@@ -4232,12 +4234,13 @@ Phase 7 spec, third round (user, 2026-10-08):
 From the Phase 7 plan (5395d31b). (1) Qwen3.5-9B's recurrent + conv state is ~48 MiB per sequence against ~4 MiB of
 KV per 128-token block; a snapshot at every full-block boundary (spec S-12 as decided) charges each hybrid block its KV
 plus a full snapshot, cutting the pool's block count ~12×.
+
 - A) Keep: a snapshot at every full block (finest reuse, smallest pool).
 - B) A snapshot every N full blocks (`kv.hybrid_snapshot_interval_blocks`, default 8 = 1024 tokens) plus the last full
   block of every finished sequence (the multi-turn hit point); a hit restores the nearest snapshot at or before the
   match and recomputes the rest.
 - C) Only the last full block of every finished sequence.
-(2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
+  (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 - A) Keep closed checkpoints local (lab pods read them; local free space ~320 GB after the cache move).
 - B) Move them to iSCSI and bind-mount each back under `/home/piwi/turbine-models/<slug>`.
 
@@ -4258,6 +4261,7 @@ clean up; the exit tier and the soak are announced.
 The plan's `lab-cluster.sh` family scenario runs vLLM-ROCm "on the same pod" as Turbine, but the cluster pod
 (`novanas-cluster-job.yaml`, `rust:1.97-trixie`, `amd.com/gpu: 2`) has no vLLM, and a second container cannot share
 the pod's two GPUs (GPUs are per container).
+
 - A) Two Jobs in sequence inside `lab-cluster.sh`: the Turbine GPU Job, then a two-GPU `rocm/vllm` Job on :18100;
   eval-compare and the ratio line assembled on the workstation.
 - B) The family scenario runs the Turbine legs only (golden c1/c16 batched, GSM8K eval, c16 bench); the vLLM baseline
@@ -4265,7 +4269,7 @@ the pod's two GPUs (GPUs are per container).
   placements (Turbine then vLLM on the same cards, as Phase 2c does on one), which prints the S-13 ratio verdict.
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
-Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
+  Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
 **Decision (user, 2026-10-08): B** — `lab-cluster.sh` family scenarios run the Turbine legs only; `lab-perf.sh` gains
 two-card placements (Turbine, then vLLM-ROCm on the same two cards) and prints the S-13 ratio verdict; an unknown
@@ -4276,6 +4280,7 @@ two-card placements (Turbine, then vLLM-ROCm on the same two cards) and prints t
 From Task 8 (`p7-t8`, fb1ec3ce): Mixtral-8x7B-Instruct-v0.1's chat template (and the pinned RedHatAI FP8 revision's,
 identical) renders neither `tools` into the prompt nor an assistant turn's `tool_calls`, so spec S-18's "every family
 round-trips a tool call" cannot hold for Mixtral as is. The test currently asserts the template drops the call.
+
 - A) The `mistral` tool format renders tools and calls itself (`[AVAILABLE_TOOLS]` / `[TOOL_CALLS]`) when the
   template does not.
 - B) Mixtral refuses requests carrying `tools` (400 with a reason code); S-18 amended to exclude Mixtral.
@@ -4292,6 +4297,7 @@ From `p7-t10` (a8631565, gate ok 522). Qwen3's per-head QK-norm on HIP runs the 
 Llama bound 0.12 (decision 1A, 2026-10-07): one `k_norm` element rounds 1 BF16 ulp differently in prefill, so the
 difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identical. Qwen3-4B golden trace: norms within
 2 ulps (one element of 14 336 at 2 ulps, |Δ| 4.9e-4, the norm rounds to BF16 twice); top-5 order matches every step.
+
 - A) Accept: `HIP_QWEN3_MAX_ABS_LOGIT_DIFF = 0.16` (Llama keeps 0.12) and a 2-ulp norm bound for Qwen3.
 - B) Make the per-head norm round once (a fused per-head QK-norm that matches the CPU's single rounding), then keep
   Qwen3 at Llama's 0.12 and 1 ulp — a new kernel path with its own reference and invariance tests.
@@ -4299,3 +4305,30 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 
 **Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
 per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
+
+## P7 attention sinks/window instances (2026-10-08)
+
+Phase 7 Task 23 evaluation (`p7-t23`), CK at the pinned commit `cd957402` (`generate.py --targets gfx1201
+--list_blobs`, then the lab build):
+
+- `fmha_fwd_pagedkv` (pagedkv_prefill): gfx12 BF16 has **d128 only** — the d64 / d256 tile entries are commented out
+  in `KernelComponentFactoryGfx12` at this commit. Its masked (simplified mask: bottom-right causal and the local
+  window) and `_sink` instances codegen and compile at d128.
+- `fmha_fwd_splitkv`: gfx12 BF16 has d32 / d64 / d128 / d256 group-mode paged instances with mask × sink variants
+  (three tiles each) and their combine kernels; d64, d128 and d256 masked/unmasked × sink/nsink codegen and compile.
+- So no needed case is missing at the pin: d64 / d256 prefill and decode run `fmha_fwd_splitkv` with one split
+  (group mode, `seqstart_q = q_indptr`, bottom-right / local mask), d128 keeps `fmha_fwd_pagedkv` for prefill and
+  splitkv for grouped decode. No newer CK pin and no own kernel (options A / B of the plan) were needed; recorded
+  here as built rather than asked.
+- Cost: generated FMHA sources 29 → 75 (+46: pagedkv d128 sink 2, splitkv d128 masked/sink 9, d64 12 + 4 combine,
+  d256 12 + 4 combine); `libturbine_hip.so` 4.33 MB → 7.77 MB; the incremental lab build of the new sources ran inside
+  the one `lab-test.sh` Job build step (88 ninja steps). With one split a d64 / d256 prefill chunk's F32 split
+  scratch is `total_q × num_q_heads × head_dim × 4` bytes (gpt-oss 64 × 64: 16 KiB a row, 128 MiB at 8,192 rows).
+- Finding: CK's head-merged splitkv decode (no mask, `max_seqlen_q == 1`) reads `sink_ptr[i_nhead]` with `i_nhead`
+  the KV head of its merged tile, so every query head of a group gets the group's first sink. Calls with sinks
+  therefore always take the masked instances (no head merge); `hip_ops attention_sinks_window_match_reference`
+  caught it (d64 decode with sinks, |Δ| 0.09). Worth an upstream CK report.
+- ABI semantics: `window_left = w` lets query position `p` see keys `p − w ..= p` (w + 1 keys); HF's
+  `sliding_window = W` (gpt-oss 128) is `window_left = W − 1`. The gpt-oss tasks (24/26) must map it so.
+- Minor: the header says 17 although v2.16 (Task 15, experts) has not landed on `p7-stack`; the lead orders the two
+  at merge.
