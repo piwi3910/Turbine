@@ -468,7 +468,7 @@ Interfaces:
 
 ## Task 23: Attention ABI v2.17 — window and sink fields, d64 and d256 CK instances (S-8, S-11 attention)
 
-Files: `kernels/include/turbine_kernels.h` (`turbine_attention_paged_desc` v2.17: `int32_t window_left` (−1 = none), `const float *sinks` (nullable, `[num_q_heads]` F32 logits); `TURBINE_ABI_MINOR 17u`), `kernels/rocm/CMakeLists.txt` (CK codegen filters: head_dim 64 and 256, `_sink` and local-mask variants for `fmha_fwd_pagedkv` and `fmha_fwd_splitkv`), `kernels/rocm/src/paged_attention_splitkv.cpp` and `paged_attention.cpp` (dispatch on head_dim, window, sinks; `kHeadDim` a template parameter), `kernels/rocm/src/abi_minor.cpp`, `crates/turbine-kernels/src/ffi.rs`, `crates/turbine-kernels/src/ops/mod.rs` (`PagedAttentionConfig { window: Option<u32>, sinks: bool }`), `crates/turbine-kernels/src/cpu/paged.rs` (reference: sink logit concatenated into the softmax, window mask), `crates/turbine-kernels/tests/hip_ops.rs` (tests), `.procoder/ask/decisions.md` (entry "P7 attention sinks/window instances")
+Files: `kernels/include/turbine_kernels.h` (`turbine_attention_paged_desc` v2.17: `int32_t window_left` (−1 = none), `const float *sinks` (nullable, `[num_q_heads]` F32 logits); `TURBINE_ABI_MINOR 17u`), `kernels/rocm/CMakeLists.txt` (CK codegen filters: `_sink` and masked variants of `fmha_fwd_pagedkv` at d128 — the pinned commit has no gfx12 pagedkv d64/d256 instance — and of `fmha_fwd_splitkv` at d64, d128 and d256; as built 2026-10-08: d64/d256 prefill and decode both run `fmha_fwd_splitkv` with one split, decision "P7 attention sinks/window instances"), `kernels/rocm/src/paged_attention_splitkv.cpp` and `paged_attention.cpp` (dispatch on head_dim, window, sinks; the head dim a runtime value of CK's own runtime dispatch), `kernels/rocm/src/impl_table.cpp` (`ck_tile_fmha_splitkv` appended to the prefill implementations), `kernels/rocm/src/abi_minor.cpp`, `crates/turbine-kernels/src/ffi.rs`, `crates/turbine-kernels/src/ops/mod.rs` (as built: `AttentionConfig { window: Option<u32>, sinks: bool }` — the existing config type, no separate `PagedAttentionConfig` — and `PagedAttentionContext::sinks: Option<TensorView>`), `crates/turbine-kernels/src/cpu/paged.rs` (reference: sink logit concatenated into the softmax, window mask), `crates/turbine-kernels/tests/hip_ops.rs` (tests), `.procoder/ask/decisions.md` (entry "P7 attention sinks/window instances")
 Interfaces:
 
 - Semantics: for query position `p`, keys with `p − window_left ≤ j ≤ p` (all `j ≤ p` when −1); softmax over `{s_j} ∪ {sinks[h]}` where the sink contributes to the denominator only (gpt-oss), read by CK as `sink_ptr[i_nhead]`
@@ -480,7 +480,7 @@ Interfaces:
 - [ ] Write failing CPU tests `cpu::paged::tests::sinks_and_window_match_naive` (against a naive softmax over the masked scores plus the sink term). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::paged::tests::sinks_and_window` — expect FAIL; implement the reference — expect PASS.
 - [ ] Write the two lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops attention_sinks` — expect FAIL with "TURBINE_E_UNSUPPORTED"
 - [ ] Implement the header fields, FFI and the HIP dispatch — run the lab command, expect PASS.
-- [ ] Lab: `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` — expect golden1=PASS and tok/s within 1 % of the previous perf-log rows (the d128 path unchanged), perf-log rows.
+- [x] Lab: `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` — expect golden1=PASS and tok/s within 1 % of the previous perf-log rows (the d128 path unchanged), perf-log rows.
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0
 - [ ] Commit: `feat(kernels): paged attention window and sinks, d64 and d256 instances (ABI v2.17)`
 
@@ -490,7 +490,7 @@ Files: `crates/turbine-model/src/families/gpt_oss.rs` (new), `crates/turbine-mod
 Interfaces:
 
 - `pub struct GptOss;` `hf_architectures() == ["GptOssForCausalLM"]`; `layer_kinds` from `layer_types` (`sliding_attention` → `SlidingWindow { window: sliding_window }`); `state_layout` empty; `default_tool_format() == Some("harmony")` and `default_reasoning_parser() == Some("harmony")` (both registered in Task 25; until then the family test asserts the names only)
-- Router: `TopkThenSoftmax` with `router.bias`; experts `ExpertDtype::Mxfp4`, `ExpertActivation::GptOssClamp { limit: 7.0 }`, `gate_up_interleaved: true`, biases; attention `PagedAttentionConfig { window: Some(128) | None, sinks: true }`, head_dim 64
+- Router: `TopkThenSoftmax` with `router.bias`; experts `ExpertDtype::Mxfp4`, `ExpertActivation::GptOssClamp { limit: 7.0 }`, `gate_up_interleaved: true`, biases; attention `AttentionConfig { window: Some(128) | None, sinks: true }` (Task 23 as built), head_dim 64
 - `scripts/golden/tiny_trace.py --model-dir <tiny> --prompt-ids 1,2,3,4,5 --out <json>` — per-layer hidden state, attention output, router top-k and final logits in F32
   Covers: S-8 AC `tiny_model gpt_oss_matches_reference`; S-1 (gpt-oss row of `layer_kinds_and_state_layout`)
   Depends on: Tasks 2, 4, 5, 15, 23

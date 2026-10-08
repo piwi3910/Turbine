@@ -408,8 +408,9 @@ bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);
 // paged_attention_splitkv.cpp: what CK fmha_fwd_splitkv adds to the paged
-// checks (one query per sequence, grouped query heads), and its call (after
-// the append). kv_layer's page layout as for fmha_fwd_pagedkv.
+// checks (head_dim 128: one query per sequence, grouped query heads; head_dim
+// 64 / 256: every call, prefill included), and its call (after the append).
+// kv_layer's page layout as for fmha_fwd_pagedkv.
 bool ck_splitkv_serves(const turbine_attention_paged_desc *d);
 int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                        const std::string &entry);

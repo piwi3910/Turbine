@@ -4240,6 +4240,7 @@ plus a full snapshot, cutting the pool's block count ~12×.
   block of every finished sequence (the multi-turn hit point); a hit restores the nearest snapshot at or before the
   match and recomputes the rest.
 - C) Only the last full block of every finished sequence.
+  (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
 (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
@@ -4273,6 +4274,7 @@ the pod's two GPUs (GPUs are per container).
   placements (Turbine then vLLM on the same cards, as Phase 2c does on one), which prints the S-13 ratio verdict.
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
+  Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
 Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
@@ -4312,6 +4314,33 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 
 **Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
 per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
+
+## P7 attention sinks/window instances (2026-10-08)
+
+Phase 7 Task 23 evaluation (`p7-t23`), CK at the pinned commit `cd957402` (`generate.py --targets gfx1201
+--list_blobs`, then the lab build):
+
+- `fmha_fwd_pagedkv` (pagedkv_prefill): gfx12 BF16 has **d128 only** — the d64 / d256 tile entries are commented out
+  in `KernelComponentFactoryGfx12` at this commit. Its masked (simplified mask: bottom-right causal and the local
+  window) and `_sink` instances codegen and compile at d128.
+- `fmha_fwd_splitkv`: gfx12 BF16 has d32 / d64 / d128 / d256 group-mode paged instances with mask × sink variants
+  (three tiles each) and their combine kernels; d64, d128 and d256 masked/unmasked × sink/nsink codegen and compile.
+- So no needed case is missing at the pin: d64 / d256 prefill and decode run `fmha_fwd_splitkv` with one split
+  (group mode, `seqstart_q = q_indptr`, bottom-right / local mask), d128 keeps `fmha_fwd_pagedkv` for prefill and
+  splitkv for grouped decode. No newer CK pin and no own kernel (options A / B of the plan) were needed; recorded
+  here as built rather than asked.
+- Cost: generated FMHA sources 29 → 75 (+46: pagedkv d128 sink 2, splitkv d128 masked/sink 9, d64 12 + 4 combine,
+  d256 12 + 4 combine); `libturbine_hip.so` 4.33 MB → 7.77 MB; the incremental lab build of the new sources ran inside
+  the one `lab-test.sh` Job build step (88 ninja steps). With one split a d64 / d256 prefill chunk's F32 split
+  scratch is `total_q × num_q_heads × head_dim × 4` bytes (gpt-oss 64 × 64: 16 KiB a row, 128 MiB at 8,192 rows).
+- Finding: CK's head-merged splitkv decode (no mask, `max_seqlen_q == 1`) reads `sink_ptr[i_nhead]` with `i_nhead`
+  the KV head of its merged tile, so every query head of a group gets the group's first sink. Calls with sinks
+  therefore always take the masked instances (no head merge); `hip_ops attention_sinks_window_match_reference`
+  caught it (d64 decode with sinks, |Δ| 0.09). Worth an upstream CK report.
+- ABI semantics: `window_left = w` lets query position `p` see keys `p − w ..= p` (w + 1 keys); HF's
+  `sliding_window = W` (gpt-oss 128) is `window_left = W − 1`. The gpt-oss tasks (24/26) must map it so.
+- Minor: the header says 17 although v2.16 (Task 15, experts) has not landed on `p7-stack`; the lead orders the two
+  at merge.
 
 ## Phase 7 Task 13: OLMoE EP×TP drift — cause found, fix is a gate trade (2026-10-08)
 

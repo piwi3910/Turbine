@@ -65,6 +65,18 @@
 // - "turbine_hip_mixed_staged" (prefill, any page size): the same staging with
 //   the Turbine BF16 kernel attending.
 //
+// Sliding window and sink logits (ABI v2.17, Phase 7 S-8) and head_dim 64 /
+// 256 (decision "P7 attention sinks/window instances"): only the CK paths over
+// BF16 flat pages of a 128 multiple take them -- fmha_fwd_pagedkv (d128 only at
+// the pinned CK commit; its masked and _sink instances) and fmha_fwd_splitkv
+// (d64 / d128 / d256, masked and _sink instances; for d64 and d256 it serves
+// prefill as well as decode, as the pinned commit has no gfx12 pagedkv
+// instance of those head dims). The window is CK's bottom-right local mask
+// (window_size_left = window_left, window_size_right = 0); the sinks are CK's
+// sink_ptr, the running max and a sum of 1 before the first key. The Turbine
+// kernels (b1, FP8, mixed, the 16-token kernel) stay head_dim 128 without
+// window or sinks and refuse the rest.
+//
 // The device arrays (block_table, q_indptr, kv_lens) are trusted: the host
 // cannot read them without a synchronisation. The Turbine kernels skip pages
 // outside the pool instead of faulting.
@@ -99,6 +111,7 @@ constexpr int32_t kMixedPageMultiple = 16;
 // Bytes of BF16 staged pages (plus their table) one CK call of the staged FP8
 // prefill may use: sequences are staged in groups that fit.
 constexpr int64_t kStagedMaxBytes = int64_t{256} << 20;
+// The head dim of the Turbine kernels and of the CK pagedkv instances.
 constexpr int32_t kHeadDim = 128;
 // Page sizes the CK pagedkv instances serve are multiples of this: a
 // property of the instances (a capability supports reports), not a tuning
@@ -115,12 +128,24 @@ bool mixed(const turbine_attention_paged_desc *d) {
          d->block_formats != nullptr || d->page_classes != nullptr;
 }
 
+// Head dim 128 without a window or sinks: what every path takes. The rest
+// (ABI v2.17) only the CK paths over BF16 flat pages of a 128 multiple.
+bool plain(const turbine_attention_paged_desc *d) {
+  return d->head_dim == kHeadDim && d->window_left < 0 && d->sinks == nullptr;
+}
+
 bool supported(const turbine_attention_paged_desc *d) {
   if (d == nullptr)
     return false;
   if ((d->dtype != TURBINE_DTYPE_BF16 && d->dtype != TURBINE_DTYPE_F8E4M3 &&
        d->dtype != TURBINE_DTYPE_TQ4 && d->dtype != TURBINE_DTYPE_TQ2) ||
-      d->head_dim != kHeadDim) {
+      (d->head_dim != 64 && d->head_dim != kHeadDim && d->head_dim != 256)) {
+    return false;
+  }
+  if (d->window_left < -1 || (d->window_left >= 0 && d->causal != 1))
+    return false;
+  if (!plain(d) && (d->dtype != TURBINE_DTYPE_BF16 || mixed(d) ||
+                    d->block_tokens % kCkPagedkvPage != 0)) {
     return false;
   }
   if (mixed(d) &&
@@ -148,14 +173,15 @@ bool supported(const turbine_attention_paged_desc *d) {
   // v2.12 fused RoPE: half-split over an even rotary width within the head.
   if (d->rope_inv_freq != nullptr &&
       (d->rope_rotary_dim < 2 || d->rope_rotary_dim % 2 != 0 ||
-       d->rope_rotary_dim > kHeadDim)) {
+       d->rope_rotary_dim > d->head_dim)) {
     return false;
   }
-  return d->q_stride_token >= static_cast<int64_t>(d->num_q_heads) * kHeadDim &&
+  return d->q_stride_token >=
+             static_cast<int64_t>(d->num_q_heads) * d->head_dim &&
          d->out_stride_token >=
-             static_cast<int64_t>(d->num_q_heads) * kHeadDim &&
+             static_cast<int64_t>(d->num_q_heads) * d->head_dim &&
          d->new_stride_token >=
-             static_cast<int64_t>(d->num_kv_heads) * kHeadDim;
+             static_cast<int64_t>(d->num_kv_heads) * d->head_dim;
 }
 
 // What the CK instances can serve: a page size they are built for and every
@@ -164,7 +190,7 @@ bool ck_serves(const turbine_attention_paged_desc *d) {
   if (d->block_tokens % kCkPagedkvPage != 0)
     return false;
   const int64_t page_stride =
-      2 * static_cast<int64_t>(d->block_tokens) * d->num_kv_heads * kHeadDim;
+      2 * static_cast<int64_t>(d->block_tokens) * d->num_kv_heads * d->head_dim;
   return page_stride <= INT32_MAX && d->q_stride_token <= INT32_MAX &&
          d->out_stride_token <= INT32_MAX;
 }
@@ -179,7 +205,9 @@ std::string describe(const turbine_attention_paged_desc *d) {
          std::to_string(d->num_kv_heads) +
          " head_dim=" + std::to_string(d->head_dim) +
          " dtype=" + std::to_string(d->dtype) +
-         " causal=" + std::to_string(d->causal);
+         " causal=" + std::to_string(d->causal) +
+         " window_left=" + std::to_string(d->window_left) +
+         " sinks=" + (d->sinks != nullptr ? "1" : "0");
 }
 
 // The pages CK reads: the pool (BF16) or a staged copy of FP8 pages, with its
@@ -221,7 +249,7 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   traits.use_pagedkv = true;
   traits.do_fp8_static_quant = false;
   traits.skip_min_seqlen_q = false;
-  traits.has_sink = false;
+  traits.has_sink = d->sinks != nullptr;
 
   const int64_t token_elems = static_cast<int64_t>(d->num_kv_heads) * kHeadDim;
   const auto page_stride =
@@ -249,7 +277,7 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.seqstart_q_ptr = d->q_indptr + pages.g0;
   args.seqstart_k_ptr = d->q_indptr + pages.g0;
   args.seqlen_k_ptr = pages.kv_lens;
-  args.sink_ptr = nullptr;
+  args.sink_ptr = d->sinks;
   args.seqlen_q = d->max_q_len;
   args.seqlen_k = d->max_kv_len;
   args.batch = pages.count;
@@ -279,8 +307,10 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
   args.batch_stride_bias = 0;
   args.batch_stride_lse = 0;
   args.batch_stride_o = 0;
-  args.window_size_left = -1;
+  // The bottom-right causal mask, local with a window (ABI v2.17).
+  args.window_size_left = d->window_left;
   args.window_size_right = d->causal == 1 ? 0 : -1;
+  // CK's sink_size is StreamingLLM's kept-first-tokens, not the sink logits.
   args.sink_size = 0;
   args.mask_type = static_cast<ck_tile::index_t>(traits.mask_type);
   args.min_seqlen_q = 0;
@@ -299,6 +329,11 @@ int32_t run_ck_pages(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 bool path_serves(const turbine_attention_paged_desc *d,
                  turbine_hip::PagedPath path) {
   const bool fp8 = d->dtype == TURBINE_DTYPE_F8E4M3;
+  // Head dims other than 128, a window and sinks: the CK paths only.
+  if (!plain(d) && path != turbine_hip::PagedPath::CkPagedkv &&
+      path != turbine_hip::PagedPath::CkSplitkv) {
+    return false;
+  }
   if (mixed(d)) {
     switch (path) {
     case turbine_hip::PagedPath::CkPagedkvMixedStaged:
@@ -316,7 +351,8 @@ bool path_serves(const turbine_attention_paged_desc *d,
   case turbine_hip::PagedPath::TurbineMixed:
     return false;
   case turbine_hip::PagedPath::CkPagedkv:
-    return !fp8 && ck_serves(d);
+    // The pinned commit's gfx12 pagedkv instances are head_dim 128 only.
+    return !fp8 && d->head_dim == kHeadDim && ck_serves(d);
   case turbine_hip::PagedPath::CkSplitkv:
     return !fp8 && ck_serves(d) && turbine_hip::ck_splitkv_serves(d);
   case turbine_hip::PagedPath::TurbineB1:

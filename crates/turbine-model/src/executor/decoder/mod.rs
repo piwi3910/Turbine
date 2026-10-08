@@ -312,6 +312,8 @@ impl DecoderDims {
             dtype,
             block_tokens: Some(block_tokens),
             causal: true,
+            window: None,
+            sinks: false,
         }
     }
 
@@ -2218,6 +2220,8 @@ impl DecoderExecutor {
                         inv_freq: b.inv_freq.view(),
                         attn_factor: d.rope_attn_factor,
                     }),
+                    // Phase 7 S-8: the families with sinks (gpt-oss) pass them here.
+                    sinks: None,
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;

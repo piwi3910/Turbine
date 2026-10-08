@@ -1,7 +1,8 @@
 # libturbine_hip.so: the Turbine kernel C ABI (kernels/include/turbine_kernels.h)
 # on ROCm. GEMM through hipBLASLt, attention through Composable Kernel ck_tile
 # FMHA (contiguous and, for 128-multiple pages, paged; split-KV for paged decode
-# of grouped query heads), RMSNorm through ck_tile
+# of grouped query heads and for paged attention at head_dim 64 and 256),
+# RMSNorm through ck_tile
 # rmsnorm2d where an instance exists, MoE expert GEMMs through hipBLASLt, and
 # Turbine HIP kernels for the rest (16-token paged attention, MoE routing,
 # elementwise ops). Loaded at run time by turbine-kernels. The same build also
@@ -86,19 +87,24 @@ if(NOT EXISTS "${CK_FMHA_DIR}/generate.py")
   message(FATAL_ERROR "Composable Kernel checkout at ${CK_ROOT} lacks ${CK_FMHA_DIR}/generate.py")
 endif()
 
-# ---- CK FMHA instances: head_dim 128, BF16, no bias/lse/dropout/sink ----
-# fwd: contiguous prefill/decode (ABI v1 attention). pagedkv_prefill: group-mode
-# paged attention for pages of a multiple of 128 tokens (ABI v2 paged attention).
-# fwd_splitkv: group-mode split-KV paged decode without a mask (the
-# ck_tile_fmha_splitkv decode implementation) and its combine kernels
-# (filter "<combine>@<splitkv>"). One --filter pattern per --api entry, in order.
+# ---- CK FMHA instances: BF16, no bias/dropout ----
+# fwd: contiguous prefill/decode (ABI v1 attention), head_dim 128, no sink.
+# pagedkv_prefill: group-mode paged attention for pages of a multiple of 128
+# tokens (ABI v2 paged attention), head_dim 128 (the pinned commit's only gfx12
+# pagedkv head dim), with the bottom-right / local mask and the _sink instances
+# (ABI v2.17 window and sink logits). fwd_splitkv: group-mode split-KV paged
+# attention (the ck_tile_fmha_splitkv implementation) at head_dim 64, 128 and
+# 256 -- "_d[!39]" keeps those and drops the generator's d32 / d96 -- masked
+# and unmasked, with and without sinks (ABI v2.17; decision "P7 attention
+# sinks/window instances"), and its combine kernels (filter
+# "<combine>@<splitkv>"). One --filter pattern per --api entry, in order.
 set(FMHA_GEN_DIR "${CMAKE_BINARY_DIR}/fmha")
 file(MAKE_DIRECTORY "${FMHA_GEN_DIR}")
 set(FMHA_GEN_ARGS
   "${CK_FMHA_DIR}/generate.py"
   --targets ${GPU_TARGETS}
   --api fwd,pagedkv_prefill,fwd_splitkv
-  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*,*d128_bf16_group*nlogits_nbias*nlse_nskip_nsquant_pagedkv_nsink*,*d128_bf16_group*_nsquant*@*d128_bf16_group*nlogits_nbias_nmask_lse_nsquant_pagedkv_nsink*")
+  --filter "*d128_bf16*nlogits_nbias*nlse_ndropout_nskip_nqscale_ntrload_nsink*,*d128_bf16_group*nlogits_nbias*nlse_nskip_nsquant_pagedkv_*sink*,*_d[!39]*_bf16_group*_nsquant*@*_d[!39]*_bf16_group*nlogits_nbias_*mask_lse_nsquant_pagedkv_*sink*")
 file(REMOVE "${FMHA_GEN_DIR}/blobs.txt")
 execute_process(
   COMMAND "${Python3_EXECUTABLE}" ${FMHA_GEN_ARGS} --list_blobs "${FMHA_GEN_DIR}/blobs.txt"
@@ -109,20 +115,22 @@ endif()
 file(STRINGS "${FMHA_GEN_DIR}/blobs.txt" FMHA_BLOBS)
 list(LENGTH FMHA_BLOBS fmha_blob_count)
 if(fmha_blob_count LESS 2)
-  message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 instances")
+  message(FATAL_ERROR "CK FMHA generator listed no gfx1201 bf16 instances")
 endif()
 set(fmha_pagedkv_blobs ${FMHA_BLOBS})
 list(FILTER fmha_pagedkv_blobs INCLUDE REGEX "fmha_fwd_pagedkv_d128_bf16_group")
 if(NOT fmha_pagedkv_blobs)
   message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 group-mode pagedkv instance")
 endif()
-set(fmha_splitkv_blobs ${FMHA_BLOBS})
-list(FILTER fmha_splitkv_blobs INCLUDE REGEX "fmha_fwd_splitkv_d128_bf16_group.*_pagedkv_")
-set(fmha_combine_blobs ${FMHA_BLOBS})
-list(FILTER fmha_combine_blobs INCLUDE REGEX "fmha_fwd_splitkv_combine_d128_bf16_group")
-if(NOT fmha_splitkv_blobs OR NOT fmha_combine_blobs)
-  message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d128 bf16 group-mode split-KV paged instance or combine kernel")
-endif()
+foreach(hdim IN ITEMS 64 128 256)
+  set(fmha_splitkv_blobs ${FMHA_BLOBS})
+  list(FILTER fmha_splitkv_blobs INCLUDE REGEX "fmha_fwd_splitkv_d${hdim}_bf16_group.*_mask_lse_nsquant_pagedkv_sink")
+  set(fmha_combine_blobs ${FMHA_BLOBS})
+  list(FILTER fmha_combine_blobs INCLUDE REGEX "fmha_fwd_splitkv_combine_d${hdim}_bf16_group")
+  if(NOT fmha_splitkv_blobs OR NOT fmha_combine_blobs)
+    message(FATAL_ERROR "CK FMHA generator listed no gfx1201 d${hdim} bf16 group-mode masked split-KV paged sink instance or combine kernel")
+  endif()
+endforeach()
 message(STATUS "CK FMHA: ${fmha_blob_count} generated sources")
 file(GLOB_RECURSE FMHA_CODEGEN_SCRIPTS "${CK_FMHA_DIR}/codegen/*.py")
 add_custom_command(
