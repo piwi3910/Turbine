@@ -24,8 +24,9 @@ pub use cpu::{card_reference_provider, cpu_reference_provider, round_to, torch_t
 pub use ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
-    ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, FusedRope, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel,
+    Conv1dConfig, Conv1dContext, Conv1dKernel, ElementwiseConfig, ElementwiseContext,
+    ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel, FusedRope, GdnConfig,
+    GdnContext, GdnKernel, GdnMode, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel,
     ImplChoice, ImplInfo, KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KernelProvider,
     KvCodecFns, KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig, KvTranscodeContext,
     KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel, KvTranscodeTables,
