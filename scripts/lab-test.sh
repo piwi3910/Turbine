@@ -49,6 +49,12 @@ usage() {
 # tests: > ~60 s each on novanas (nextest's "has been running for over 60 seconds" warning in
 # scripts/lab-test.sh full runs, e.g. target/lab-perf and lab-test logs from 2026-09-26/27).
 # One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
+# Lab tests against a model already served by `scripts/lab-serve.sh` (they read TURBINE_LAB_URL
+# and run through `scripts/remote-cargo.sh`): always skipped here.
+SERVED_TESTS=(
+	# crates/turbine-server/tests/lab_openai.rs (P7 Task 19)
+	mistral_tool_call_round_trip
+)
 # Lab tests that open two GPUs (Phase 5): skipped (libtest `--skip`, by substring) in a
 # one-GPU Job, where they would fail on the missing device; run them with `--gpus 2`.
 # (tiny_model's hip_tp2_matches_tp1 / hip_ep2_matches_ep1 / hip_pp2_matches_pp1 open their
@@ -225,6 +231,11 @@ build_test_command() {
 	# The golden references are committed; the Hugging Face transformers CPU reference is only
 	# needed to regenerate them.
 	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
+	# Lab tests against an already served model (TURBINE_LAB_URL; a lab-serve.sh session runs
+	# them through remote-cargo.sh): never in a lab-test Job.
+	for t in "${SERVED_TESTS[@]}"; do
+		TEST_CMD+=(--skip "$t")
+	done
 	# A one-GPU Job cannot run the two-GPU tests (TWO_GPU_TESTS above); `--gpus 2` runs them.
 	# Without an explicit selection (`-- …`) the two-GPU leg runs only those and GPU_COUNT_TESTS
 	# (bare filter args, which libtest ORs by substring): every other test is the one-GPU leg's.
