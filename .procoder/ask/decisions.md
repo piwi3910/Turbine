@@ -4407,3 +4407,7 @@ scheduler alignment; it unblocks Tasks 30–32. For conv, take AITER `causal_con
 split and state write, 3× faster at 2048) and llama.cpp `ssm_conv` for decode, if the per-mode split is acceptable;
 otherwise llama.cpp for both. Revisit A (AITER `chunk_h` + own WMMA glue) once Qwen3.5 serves and a 16k-token TTFT
 profile shows the GDN share; land it only if it measures faster served. Not decided here.
+
+**Decision (user, 2026-10-08), "P7 Gated DeltaNet provider": B** — llama.cpp's `gated_delta_net` vendored (BF16 loads,
+transformers' `h / 2` head pairing) for decode and prefill; conv: AITER `causal_conv1d_fwd_split_qkv` for prefill,
+llama.cpp `ssm_conv` for decode; a chunked prefill (option A) is a measured follow-up once Qwen3.5 serves.
