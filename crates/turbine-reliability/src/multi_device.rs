@@ -87,24 +87,11 @@ pub fn try_reserve_group(
     blocks: u32,
     block_bytes_per_rank: u64,
 ) -> Result<Vec<Reservation>, (DeviceId, LedgerError)> {
-    try_reserve_group_with_state(ledgers, blocks, block_bytes_per_rank, 0)
-}
-
-/// [`try_reserve_group`] with `state_bytes_per_rank` of per-sequence state (P7 S-1) reserved
-/// beside the KV blocks on every rank ([`Reservation::state_bytes`]).
-pub fn try_reserve_group_with_state(
-    ledgers: &[(DeviceId, Arc<Ledger>)],
-    blocks: u32,
-    block_bytes_per_rank: u64,
-    state_bytes_per_rank: u64,
-) -> Result<Vec<Reservation>, (DeviceId, LedgerError)> {
-    let bytes = u64::from(blocks)
-        .saturating_mul(block_bytes_per_rank)
-        .saturating_add(state_bytes_per_rank);
+    let bytes = u64::from(blocks).saturating_mul(block_bytes_per_rank);
     let mut taken = Vec::with_capacity(ledgers.len());
     for (device, ledger) in ledgers {
         match ledger.reserve(*device, PoolKind::Kv, bytes) {
-            Ok(r) => taken.push(r.with_state_bytes(state_bytes_per_rank)),
+            Ok(r) => taken.push(r),
             Err(e) => {
                 tracing::debug!(
                     event = "group_reservation_queued",

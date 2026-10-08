@@ -58,6 +58,70 @@ impl PoolUsage {
     }
 }
 
+/// The fixed allocation that holds per-sequence state (P7 review fix: `max_running_requests`
+/// sequences of the family's state), counted apart from the KV pool: the ledger's `kv` capacity
+/// is the physical block pool, so state never takes pages from it. A [`StateCharge`] takes bytes
+/// and gives them back when it drops.
+#[derive(Debug)]
+pub struct StateSlots {
+    capacity: u64,
+    used: Mutex<u64>,
+}
+
+impl StateSlots {
+    pub fn new(capacity: u64) -> Arc<StateSlots> {
+        Arc::new(StateSlots {
+            capacity,
+            used: Mutex::new(0),
+        })
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn lock_used(&self) -> MutexGuard<'_, u64> {
+        self.used.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn available(&self) -> u64 {
+        self.capacity.saturating_sub(*self.lock_used())
+    }
+
+    /// Takes `bytes` of the allocation, or `None` when fewer are free.
+    pub fn try_charge(self: &Arc<Self>, bytes: u64) -> Option<StateCharge> {
+        let mut used = self.lock_used();
+        if bytes > self.capacity.saturating_sub(*used) {
+            return None;
+        }
+        *used += bytes;
+        Some(StateCharge {
+            slots: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+
+/// Bytes taken from a [`StateSlots`]; released on drop.
+#[derive(Debug)]
+pub struct StateCharge {
+    slots: Arc<StateSlots>,
+    bytes: u64,
+}
+
+impl StateCharge {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for StateCharge {
+    fn drop(&mut self) {
+        let mut used = self.slots.lock_used();
+        *used = used.saturating_sub(self.bytes);
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LedgerError {
     #[error("pool {} exhausted: requested {requested} bytes, {available} available", pool.as_str())]
@@ -243,7 +307,7 @@ impl Ledger {
             pool,
             bytes,
             committed: 0,
-            state_bytes: 0,
+            state: None,
             members: Vec::new(),
         })
     }
@@ -361,9 +425,9 @@ pub struct Reservation {
     pool: PoolKind,
     bytes: u64,
     committed: u64,
-    /// The part of `bytes` that holds the request's per-sequence state (P7 S-1); the rest is
-    /// its KV blocks. Released with the guard like the KV part.
-    state_bytes: u64,
+    /// The request's per-sequence state (P7 S-1), charged against its own fixed allocation
+    /// ([`StateSlots`], not the KV pool); released with the guard like the KV bytes.
+    state: Option<StateCharge>,
     members: Vec<Reservation>,
 }
 
@@ -414,17 +478,16 @@ impl Reservation {
         self.bytes
     }
 
-    /// This reservation with `state` of its bytes marked as per-sequence state (P7 S-1),
-    /// capped at its total; the members of a group reservation keep their own marks.
-    pub fn with_state_bytes(mut self, state: u64) -> Reservation {
-        self.state_bytes = state.min(self.bytes);
+    /// This reservation holding `charge` of per-sequence state (P7 S-1) until it drops.
+    pub fn with_state(mut self, charge: StateCharge) -> Reservation {
+        self.state = Some(charge);
         self
     }
 
-    /// The part of [`Reservation::bytes`] that holds per-sequence state (0 for families
-    /// without state).
+    /// The per-sequence state bytes this reservation holds beside its KV [`bytes`](Self::bytes)
+    /// (0 for families without state).
     pub fn state_bytes(&self) -> u64 {
-        self.state_bytes
+        self.state.as_ref().map_or(0, StateCharge::bytes)
     }
 
     pub fn committed(&self) -> u64 {
