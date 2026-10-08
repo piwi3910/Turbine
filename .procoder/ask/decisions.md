@@ -4580,3 +4580,11 @@ the reference emulates. The plan says "the existing emulated-KV reference"; its 
 
 **Decision (user, 2026-10-08): A** — regenerate the emulated-KV reference with the calibrated (served) scales;
 re-run golden c1/c16 and the GSM8K OLMoE pair; the row flips to `supported` only if all pass.
+
+## P7 Harmony marker visibility (Task 25, 2026-10-09)
+
+gpt-oss's Harmony control tokens (`<|channel|>`, `<|message|>`, `<|call|>`, `<|start|>`, `<|end|>`, `<|return|>`, `<|constrain|>`) are all `special: true` in the checkpoint's tokenizer.json, and Turbine's incremental detokenizer always decodes with `skip_special_tokens = true` (pinned by `special_token_is_skipped_in_stream`). The plan's Task 25 Harmony parser is a text-level state machine over streamed text, so on the served model reasoning_content stays empty and tool calls parse-fail; only Task 26's lab test would catch it. Qwen3's `<think>` markers are `special: false`, which is why `qwen_think` works. Secondary: making the tokens `required` in the format declaration breaks the formats conformance suite bound to the tiny tokenizer, so they would be `required: false` like Hermes/Mistral.
+
+- A) Emit the declared format's markers: at load/bind, clear the special flag (or an emit-list in `IncrementalDetokenizer`) for the tokens the bound tool format declares. Text-level parsers keep working; changes what un-parsed streams look like for that model.
+- B) Token-id-level Harmony parsing (vLLM's way): push token ids into the reasoning/tool parsers. Most robust; an engine API change and a Task 25 rewrite of the parser interface.
+- C) Keep specials dropped, parse heuristically (regex on `commentary to=`, leading channel word). Not recommended: the analysis→final boundary is ambiguous when reasoning text contains the word "final".
