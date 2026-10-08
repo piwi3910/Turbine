@@ -486,6 +486,8 @@ Interfaces:
 
 ## Task 24: gpt-oss family module on the CPU executor (S-8)
 
+> Amended 2026-10-08 (lead, sequencing): Task 16 landed the quantized-expert loader for per-expert tensors (FP8 block, FP8 tensor, MXFP4) and the MXFP4-expert tiny writer; the mapping of gpt-oss's fused `mlp.experts.gate_up_proj_{blocks,scales,bias}` / `down_proj_{blocks,scales,bias}` onto `gate_up_interleaved` + biases moves here from Task 16's loader line, with its own host test in `gpt_oss_matches_reference`.
+
 Files: `crates/turbine-model/src/families/gpt_oss.rs` (new), `crates/turbine-model/src/families/mod.rs` (registered after `Mixtral`), `crates/turbine-model/src/executor/decoder/hooks/` (`ATTENTION_SINKS_WINDOW` hook: biases on q/k/v/o, sinks, per-layer window from `LayerKind`), `crates/turbine-model/src/testing/tiny.rs` (`gpt_oss` tiny writer: 4 layers alternating `sliding_attention` 128 / `full_attention`, head_dim 64, 4 experts top-2, MXFP4 experts with biases, YaRN), `crates/turbine-model/tests/fixtures/gpt-oss-20b/` (real `config.json`, `tokenizer_config.json`, `chat_template.jinja`), `crates/turbine-model/tests/fixtures/tiny-gpt-oss-trace.json` (committed transformers per-op trace of the tiny checkpoint), `scripts/golden/tiny_trace.py` (new fixture tool: transformers per-op trace of a tiny checkpoint), `crates/turbine-model/examples/write_tiny.rs` (new: writes a registered family's tiny checkpoint, `write_tiny <family> <seed> <dir>`), `crates/turbine-model/tests/tiny_model.rs` (test `gpt_oss_matches_reference`)
 Interfaces:
 
