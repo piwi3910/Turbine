@@ -472,7 +472,7 @@ Interfaces:
 - [ ] Write failing CPU tests `cpu::paged::tests::sinks_and_window_match_naive` (against a naive softmax over the masked scores plus the sink term). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::paged::tests::sinks_and_window` — expect FAIL; implement the reference — expect PASS.
 - [ ] Write the two lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops attention_sinks` — expect FAIL with "TURBINE_E_UNSUPPORTED"
 - [ ] Implement the header fields, FFI and the HIP dispatch — run the lab command, expect PASS.
-- [ ] Lab: `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` — expect golden1=PASS and tok/s within 1 % of the previous perf-log rows (the d128 path unchanged), perf-log rows.
+- [x] Lab: `scripts/lab-bench.sh --quick --model llama` and `--model olmoe` — expect golden1=PASS and tok/s within 1 % of the previous perf-log rows (the d128 path unchanged), perf-log rows.
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0
 - [ ] Commit: `feat(kernels): paged attention window and sinks, d64 and d256 instances (ABI v2.17)`
 
