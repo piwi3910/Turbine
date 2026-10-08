@@ -2031,7 +2031,7 @@ Cause (S-3): the near-tie hypothesis holds, and nothing is specific to ep × tp.
 
 ### P7 OLMoE FP8 KV — calibrated K/V scales (plan Task 36, branch `p7-t36`, 2026-10-08)
 
-- P7 open: OlmoeForCausalLM/bf16/fp8_e4m3/tp1 golden c1/c16 10/16 against the unit-scale emulated reference (need 14); the reference must be regenerated with the calibrated scales before the gate can judge them.
+- P7 open: OlmoeForCausalLM/bf16/fp8_e4m3/tp1 golden c1/c16 15/16 against the regenerated calibrated-scale emulated reference — the token rule passes (need 14), but p10's strict likely |Δ| 1.1450 exceeds the 1.14 bound by 0.005; that bound is the scale-1.0 reference's observed engine order noise (decision 2026-10-06 A), and the slug's README requires re-deriving the bounds after a reference change, so the row stays `experimental` until the engine spread is re-run against the calibrated-scale reference. The full-GSM8K pair with the calibrated scales PASSES (drop 0.0030 against 0.01).
 
 `kv_scales::calibrate` runs the 32 prompts of `crates/turbine-model/tests/fixtures/kv_calibration_prompts.jsonl` on the served FP8 executor with unit scales (no second BF16 weight load; the pool is read back, so a layer's scale is the absmax of the e4m3 pages / 448, within one e4m3 step of the BF16 absmax) and caches the set under `$TURBINE_CACHE_DIR` / `~/.cache/turbine` keyed by the checkpoint identity and the prompt set. Served OLMoE-1B-7B-0125-Instruct (`event="kv_scales_calibrated" layers=16`):
 
@@ -2055,6 +2055,21 @@ Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36 -- --se
 | p16    | 12/32            | 0.582                                         | 0.424 / 1.404       |
 
 Per-position |Δ| was not collected: no bound is exceeded, so the misses carry no position to explain. The reference is the wrong yardstick for calibrated scales (it quantizes K with scale 1.0 and V with 1.0; the served run now uses the table above), so the next step is a reference regenerated with `quant_reference.py --kv-quant fp8_e4m3` using these per-layer scales, a CPU fixture job under `fixture.lock`, plus the full-GSM8K OLMoE pair (BF16 KV 0.6603, unit-scale FP8 KV 0.6459) with the calibrated scales. The `OlmoeForCausalLM` fp8_e4m3 row stays `experimental`.
+
+### P7 OLMoE FP8 KV — golden against the regenerated calibrated-scale reference (plan Task 36, decision "P7 OLMoE FP8 KV golden reference" A, 2026-10-08)
+
+`quant_reference.py` gained `--kv-scales <kv-scales-v1-*.json>`: per-layer (k, v) scales from the server's calibration cache file, read through the f32 bit patterns (`k_bits` / `v_bits`) so the emulation quantizes with exactly the served scales; checked by a `--self-test` section (`kv_scales_file_self_test`). The reference `tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/reference.jsonl` was regenerated on `novanas` as a `fixture.lock` CPU fixture job (`nice -n 19`, self-test ok, `FP8 KV with 16 layer scale pairs (file)`, engine `transformers-4.57.1-bf16-cpu-act-none-kv-fp8_e4m3-fp32-logits`, revision `b89a7c4b…`); all 16 prompts differ from the scale-1.0 reference. The README describes the flag and the regeneration.
+
+Full-GSM8K OLMoE pair with the calibrated scales (1,319 items, c16, `eval-compare --max-drop 0.01`): BF16 KV 0.6603 (871), calibrated-scale FP8 KV **0.6573** (867, `tests/eval/olmoe-1b-7b-0125-instruct/turbine-fp8_e4m3-calibrated-full.json`): drop **0.0030**, PASS — the unit-scale run was 0.6459 (drop 0.0144, accepted as noise 2026-09-29), so calibration recovers most of the gap. (Measured at the pre-merge worktree state `f4d07957`; the later p7-stack merge, Task 16, only restructures the expert dispatch — golden below shows BF16 numerics unchanged.)
+
+Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36c` (post-merge `cde71da3`, GPU 0):
+
+- `BENCH p7-t36c olmoe-fp8kv commit=cde71da3 gpu=0 tests=skipped golden1=FAIL: golden16=FAIL: client=novanas weight_format=bf16 kv=fp8_e4m3 conc=16 host_share=0.0210 ok=200 failed=0 tok/s=560.9 itl_p50=26.4 ttft_p50=142 decode_fwd_ms=25.6`
+- golden c1 and c16 are again identical, now **15/16 prompts pass the token rule (need 14)**: the calibrated run and the calibrated reference agree on the greedy tokens nearly everywhere. The FAIL verdict is one bound miss: **p10's strict likely |Δ| 1.1450 against the 1.14 bound** (tail 1.1187 against 3.42); every other prompt is well inside (worst others: p14 likely 0.9381, p16 tail 1.3190).
+- `turbine-golden positions --prompt-id p10` (teacher-forced re-run, fresh server): worst likely |Δ| **1.0663 at position 5** (the reference #2 candidate 1223 ref −1.3008 vs got −2.3670), worst tail |Δ| **2.0606 at position 18**; the free-running compare's 1.1450 and the teacher-forced 1.0663 straddle the 1.14 bound, which is today's **observed engine order noise** (max likely noise 1.14, measured on the scale-1.0 reference, decision 2026-10-06 A) — p10's miss is order noise at the bound's edge, not a systematic offset like the old p03 tail (−17.78 every capture).
+
+Row verdict: **stays `experimental`** — the gate is not green (a bound miss, 0.005 over). The follow-up the slug's README already prescribes is the engine-spread re-run against the calibrated-scale reference (`scripts/lab/golden-engine-spread.sh` olmoe-fp8kv slug + `engine_spread.py`, ~20 captures) to re-derive the bounds, then the gate again; expected to flip the row without any engine change.
+
 ## Phase 7 Task 23 — attention ABI v2.17 (window, sinks, d64 / d256), 2026-10-08
 
 Lab-bench `--quick` (64 requests, concurrency 16, client on novanas, GPU 0) on d4542e81, both golden c1 PASS. The d128 plain path's arguments are unchanged; the rows sit +2.5 % and +2.9 % above the last full rows (p5p-exit, 200 requests, local client), which is the quick tier's client and sample difference, not a change of the path.

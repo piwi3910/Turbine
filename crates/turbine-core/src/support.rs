@@ -386,15 +386,14 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     ),
     // FP8 KV on gfx1201 (Phase 6a S-13, S-14). Llama: `supported` after the Task 24 proof, full
     // GSM8K at c16 (1,319 items) BF16 KV 0.7801, FP8 KV 0.7885, golden c1 / c16 16/16 against
-    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `experimental` for 6a (user
-    // decision 2026-09-30, "OLMoE FP8 KV: golden against the emulated-KV reference misses", B):
-    // full GSM8K 0.6603 vs 0.6459 (drop 0.0144, accepted as noise 2026-09-29), but golden c1 / c16
-    // 13/16 against tests/golden/olmoe-1b-7b-0125-instruct-fp8kv (need 14; p03 tail 5.38). The
-    // checkpoint ships no K/V scales; calibrated V scales and the golden miss are a Phase 7 item.
-    // P7 Task 36: the server now calibrates per-layer K/V scales for such a checkpoint
-    // (`kv_scales::calibrate`); golden c1/c16 10/16 against the unit-scale emulated reference
-    // (perf-log "P7 OLMoE FP8 KV"), so the row stays `experimental` until that reference is
-    // regenerated with the calibrated scales.
+    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `experimental` (user decisions
+    // 2026-09-30 B and 2026-10-08 "P7 OLMoE FP8 KV golden reference" A). P7 Task 36 calibrated
+    // the per-layer K/V scales (`kv_scales::calibrate`) and regenerated the emulated-KV reference
+    // with them: golden c1 / c16 15/16 (token rule met, need 14), but p10's strict likely |Δ|
+    // 1.1450 sits 0.005 over the 1.14 bound — the scale-1.0 reference's observed engine order
+    // noise, to be re-derived by the engine-spread re-run the slug's README prescribes after a
+    // reference change (perf-log "P7 OLMoE FP8 KV"); the full-GSM8K pair passes (0.6603 vs
+    // 0.6573, drop 0.0030).
     row(
         Some("amd"),
         Some("gfx1201"),
