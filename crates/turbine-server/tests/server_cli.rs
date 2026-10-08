@@ -9,6 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
+use turbine_model::testing::tiny::write_tiny_llama;
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
