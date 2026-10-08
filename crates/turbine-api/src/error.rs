@@ -219,6 +219,12 @@ impl ApiError {
         Self::from_code(ErrorCode::ContextExceedsKvCapacity, message)
     }
 
+    /// 400 `invalid_request_error`/`state_exceeds_capacity`: `n` sequences need more
+    /// per-sequence state than the server holds for `scheduler.max_running_requests` sequences.
+    pub fn state_exceeds_capacity(message: impl Into<String>) -> Self {
+        Self::from_code(ErrorCode::StateExceedsCapacity, message)
+    }
+
     /// 400 `invalid_request_error`/`invalid_json_schema`: the schema or tool grammar does not
     /// compile within bounds; `message` names the llguidance error or the bound.
     pub fn invalid_json_schema(message: impl Into<String>) -> Self {
@@ -348,6 +354,7 @@ impl ApiError {
             | ErrorCode::TemplateError
             | ErrorCode::InvalidRequest
             | ErrorCode::ContextExceedsKvCapacity
+            | ErrorCode::StateExceedsCapacity
             | ErrorCode::InvalidJsonSchema
             | ErrorCode::ToolsNotSupported
             | ErrorCode::UnknownTool
