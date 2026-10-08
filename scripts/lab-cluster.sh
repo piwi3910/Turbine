@@ -75,8 +75,8 @@
 #                      positions` report of p14, the standard throughput workload: 512-word
 #                      prompts, 256 tokens with --ignore-eos, concurrency 16, 200 requests,
 #                      after a 16-request warm-up); then ep 2 with tp 1 over rccl, ep 2 over
-#                      hostmem, and a check that ep 2 with tp 2 is refused (exit 2,
-#                      olmoe_ep_tp_drift). The accuracy gate of every EP run is the ep 1
+#                      hostmem, and ep 2 with tp 2 (golden c1 and c16 against the committed
+#                      reference with --multi-gpu-bounds). The accuracy gate of every EP run is the ep 1
 #                      capture of the same run: strict bounds at concurrency 1, batched at 16
 #                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
 #                      the transformers reference is compared for information only (and p14's
@@ -121,7 +121,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|<qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas|<qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -130,7 +130,7 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas)$ ]] ||
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas)$ ]] ||
 		family_scenario "$1"
 }
 
@@ -835,18 +835,14 @@ scenario_ep2() {
 	ep_counts ep2-hostmem
 	stop_servers
 
-	# OLMoE at ep 2 x tp 2 is refused (user decision 2026-09-28, olmoe_ep_tp_drift, until the
-	# phase 7 OLMoE tensor-parallel drift investigation): the server must exit 2 with the reason
-	# before binding.
-	local rc=0
-	timeout 600 "${BIN}/turbine-server" --config "$ep2" --set parallel.tensor_parallel_size=2 \
-		>"${WORK}/ep2-tp2.log" 2>&1 || rc=$?
-	if [[ $rc -eq 2 ]] && grep -q "olmoe_ep_tp_drift" "${WORK}/ep2-tp2.log"; then
-		echo "lab-step: olmoe ep2 tp2 refused: exit 2, olmoe_ep_tp_drift"
-	else
-		tail -n 20 "${WORK}/ep2-tp2.log"
-		GATE_FAILED+=("olmoe ep2 tp2 not refused (exit ${rc})")
-	fi
+	# OLMoE at ep 2 x tp 2 (the Phase 7 Task 13 gate, decision 2026-10-08 A): golden c1 and c16
+	# against the committed reference with the multi-GPU bounds calibrated from the placement
+	# spread (`_multi_gpu` keys of tolerance.json, scripts/golden/engine_spread.py --multi-gpu).
+	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
+	wait_ready "$URL" "${WORK}/ep2-tp2.log"
+	golden_gate "$slug" "olmoe ep2 tp2 c1 vs HF" --multi-gpu-bounds
+	golden_gate "$slug" "olmoe ep2 tp2 c16 vs HF" --multi-gpu-bounds --concurrency 16
+	stop_servers
 
 	local f
 	for f in ep1-c16 ep2-c16 ep2-hostmem-c16; do
@@ -856,6 +852,73 @@ scenario_ep2() {
 	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
 		job_fail "outside tolerance: ${GATE_FAILED[*]}"
 	fi
+}
+
+# olmoe_capture_set <dir> <prefix> <rotated-dir>: the greedy captures of one placement: c1 as
+# <prefix>c1 and 16 prompt-rotated captures at once as <prefix>c16-NN (batched, like the par-*
+# captures of scripts/lab/golden-engine-spread.sh).
+olmoe_capture_set() {
+	local dir="$1" prefix="$2" rot="$3" i pids=()
+	echo "lab-step: turbine-golden capture ${prefix}c1"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl --out "${dir}/${prefix}c1.jsonl" || job_fail "turbine-golden capture ${prefix}c1 failed"
+	for i in $(seq 0 15); do
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" --out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" &
+		pids+=($!)
+	done
+	# Not a bare wait: the server is a child of this shell too.
+	for i in "${pids[@]}"; do
+		wait "$i" || job_fail "a ${prefix}c16 capture failed"
+	done
+}
+
+# olmoe_spread (Phase 7 Task 13, decision 2026-10-08 A): captures of OLMoE's greedy outputs per
+# placement into results/spread/<slug>/ (copied back to target/lab-cluster/<run id>/): one GPU
+# as c1-cold, c1-warm and par-NN, then tp 2, ep 2 and ep 2 x tp 2 as mg-<placement>-c1 and
+# mg-<placement>-c16-NN. scripts/golden/engine_spread.py derives the `_multi_gpu` bounds from them.
+scenario_olmoe_spread() {
+	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
+	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
+	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i k placement
+	mkdir -p "$dir" "$rot" || job_fail "cannot create ${dir}"
+	chmod -R a+rwx "${results}" || true
+	n=$(grep -c . tests/golden/prompts.jsonl)
+	for i in $(seq 0 15); do
+		k=$((i % n))
+		{
+			tail -n +$((k + 1)) tests/golden/prompts.jsonl
+			head -n $k tests/golden/prompts.jsonl
+		} | grep . >"${rot}/${i}.jsonl"
+	done
+	start_server "${WORK}/spread-1gpu.log" "$ep2" --set parallel.expert_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/spread-1gpu.log"
+	echo "lab-step: turbine-golden capture c1-cold"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${dir}/c1-cold.jsonl" || job_fail "turbine-golden capture c1-cold failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${dir}/c1-warm.jsonl" || job_fail "turbine-golden capture c1-warm failed"
+	local pids=()
+	for i in $(seq 0 15); do
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" \
+			--out "${dir}/$(printf 'par-%02d' "$i").jsonl" &
+		pids+=($!)
+	done
+	for i in "${pids[@]}"; do
+		wait "$i" || job_fail "a par capture failed"
+	done
+	stop_servers
+	for placement in tp2 ep2 ep2tp2; do
+		case "$placement" in
+		tp2) set -- --set parallel.expert_parallel_size=1 --set parallel.tensor_parallel_size=2 ;;
+		ep2) set -- ;;
+		ep2tp2) set -- --set parallel.tensor_parallel_size=2 ;;
+		esac
+		start_server "${WORK}/spread-${placement}.log" "$ep2" "$@"
+		wait_ready "$URL" "${WORK}/spread-${placement}.log"
+		olmoe_capture_set "$dir" "mg-${placement}-" "$rot"
+		stop_servers
+	done
+	echo "lab-info: spread captures $(find "$dir" -name '*.jsonl' | wc -l) in ${dir}"
 }
 
 # pp_parallel <label>: the running server's parallel plan (backend, pp, stages, reasons) and
@@ -1036,6 +1099,7 @@ in_job() {
 	dp2-novanas) scenario_dp2 ;;
 	ep2-novanas) scenario_ep2 ;;
 	pp2-novanas) scenario_pp2 ;;
+	olmoe-spread-novanas) scenario_olmoe_spread ;;
 	*) scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")" ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
@@ -1344,9 +1408,9 @@ run_scenario() {
 	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
-	if family_scenario "$SCENARIO"; then
+	if family_scenario "$SCENARIO" || [[ $SCENARIO == olmoe-spread-novanas ]]; then
 		# A dry run cannot stream the pod log: print the in-Job steps of the family scenario.
-		[[ $DRY_RUN -eq 0 ]] || family_dry_steps
+		[[ $DRY_RUN -eq 0 ]] || ! family_scenario "$SCENARIO" || family_dry_steps
 		# The GSM8K report (and the bench) outlive the run directory: copy them back first.
 		local results="${REPO_ROOT}/target/lab-cluster/${RUN_ID}/"
 		say "copying ${RUN_DIR}/results/ to ${results}"

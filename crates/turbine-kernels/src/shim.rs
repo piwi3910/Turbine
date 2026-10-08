@@ -45,25 +45,27 @@ use turbine_tensor::{
 
 use crate::cards::CardProfile;
 use crate::ffi::{
-    self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
-    EmbeddingDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
+    self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, Conv1dDesc, CopyBlocksDesc,
+    CtxInfo, EmbeddingDesc, GdnDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
     MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc,
-    QuantizeActDesc, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols,
-    SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
+    QuantizeActDesc, ROUTE_TOPK_THEN_SOFTMAX, RmsnormDesc, RmsnormShardedDesc, RopeDesc,
+    RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent,
+    TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
-    ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel, ImplChoice,
-    ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig,
-    KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel,
-    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext,
-    QGemmKernel, QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
-    RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext,
-    ShardedNormKernel,
+    Conv1dConfig, Conv1dContext, Conv1dKernel, ElementwiseConfig, ElementwiseContext,
+    ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel, ExpertActivation,
+    GdnConfig, GdnContext, GdnKernel, GdnMode, GemmConfig, GemmContext, GemmFused, GemmFusion,
+    GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel,
+    KvTranscodeConfig, KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat,
+    KvTranscodeKernel, KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext,
+    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
+    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
+    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RopeKernel, RouteMode, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
 use crate::quant::{ActQuantDesc, QuantSchemeDesc};
@@ -1357,6 +1359,18 @@ impl ShimProvider {
         &self.ctx.lib.syms
     }
 
+    /// The device pointer of an optional operand; null when absent.
+    fn optional_ptr(
+        &self,
+        name: &str,
+        view: &Option<TensorView<'_>>,
+    ) -> Result<*const c_void, KernelError> {
+        match view {
+            Some(v) => Ok(self.ctx.device_ptr(name, v)?.cast_const()),
+            None => Ok(std::ptr::null()),
+        }
+    }
+
     fn supported<D>(trio: &OpTrio<D>, d: &D) -> bool {
         // SAFETY: `d` is a fully initialised descriptor; `_supported` reads only its shape and
         // dtype fields, ignores its (null) pointers and needs no context (contract §9.2).
@@ -1482,6 +1496,10 @@ const GEMM_SILU_MUL_MINOR: u32 = 14;
 /// (`c_residual`, `a_norm_weight`, v2.15).
 const GEMM_NORM_RESIDUAL_MINOR: u32 = 15;
 
+/// The ABI minor whose `turbine_attention_paged_desc` carries the sliding window and the sink
+/// logits (`window_left`, `sinks`, v2.17; Phase 7 S-8).
+const ATTENTION_WINDOW_SINKS_MINOR: u32 = 17;
+
 /// A non-null, 16-byte aligned stand-in for a probe's v2.15 operands: `supports` reads the
 /// pointers' presence and alignment only, never the memory.
 const PROBE_OPERAND: *const c_void = std::ptr::without_provenance(16);
@@ -1600,6 +1618,13 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         i64::from(cfg.num_kv_heads),
         i64::from(cfg.head_dim),
     );
+    // A prefill call has several query rows per sequence: CK splitkv serves head_dim 128 only
+    // at one (ABI v2.17), so a one-row probe would enumerate it for a prefill it cannot run.
+    let q_len = if matches!(cfg.kind, AttentionKind::PrefillPaged) {
+        2
+    } else {
+        1
+    };
     AttentionPagedDesc {
         q: null(),
         k_new: null(),
@@ -1610,8 +1635,8 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         q_indptr: std::ptr::null(),
         kv_lens: std::ptr::null(),
         num_seqs: 1,
-        total_q: 1,
-        max_q_len: 1,
+        total_q: q_len,
+        max_q_len: q_len,
         max_kv_len: 1,
         max_blocks_per_seq: 1,
         num_blocks: 1,
@@ -1638,6 +1663,16 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         rope_inv_freq: std::ptr::null(),
         rope_rotary_dim: 0,
         rope_attn_factor: 1.0,
+        window_left: cfg
+            .window
+            .map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX)),
+        // `_supported` reads no pointer but this one's presence: a dangling, never-read
+        // pointer stands for the config's sinks.
+        sinks: if cfg.sinks {
+            std::ptr::NonNull::<f32>::dangling().as_ptr().cast_const()
+        } else {
+            std::ptr::null()
+        },
     }
 }
 
@@ -1682,6 +1717,55 @@ fn qgemm_bf16_acts_probe(cfg: &QGemmConfig, rows: usize, prefill: bool) -> QGemm
     d.m = i64::try_from(rows).unwrap_or(i64::MAX);
     d.prefill = i32::from(prefill);
     d
+}
+
+fn gdn_probe(cfg: &GdnConfig) -> GdnDesc {
+    GdnDesc {
+        q: std::ptr::null(),
+        k: std::ptr::null(),
+        v: std::ptr::null(),
+        g: std::ptr::null(),
+        beta: std::ptr::null(),
+        state: std::ptr::null_mut(),
+        state_slots: std::ptr::null(),
+        cu_seqlens: std::ptr::null(),
+        out: null(),
+        boundary_states: std::ptr::null_mut(),
+        q_stride: i64::from(cfg.k_heads * cfg.k_dim),
+        k_stride: i64::from(cfg.k_heads * cfg.k_dim),
+        v_stride: i64::from(cfg.v_heads * cfg.v_dim),
+        out_stride: i64::from(cfg.v_heads * cfg.v_dim),
+        boundary_tokens: 0,
+        num_tokens: 1,
+        num_seqs: 1,
+        k_heads: cfg.k_heads as i32,
+        v_heads: cfg.v_heads as i32,
+        k_dim: cfg.k_dim as i32,
+        v_dim: cfg.v_dim as i32,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn conv1d_probe(cfg: &Conv1dConfig) -> Conv1dDesc {
+    Conv1dDesc {
+        x: std::ptr::null(),
+        w: std::ptr::null(),
+        bias: std::ptr::null(),
+        conv_state: null(),
+        state_slots: std::ptr::null(),
+        cu_seqlens: std::ptr::null(),
+        out: null(),
+        boundary_conv_states: null(),
+        x_stride: i64::from(cfg.channels),
+        out_stride: i64::from(cfg.channels),
+        boundary_tokens: 0,
+        num_tokens: 1,
+        num_seqs: 1,
+        channels: cfg.channels as i32,
+        kernel: cfg.kernel as i32,
+        activation: 1,
+        dtype: cfg.dtype.abi_code(),
+    }
 }
 
 fn kv_transcode_probe(cfg: &KvTranscodeConfig) -> KvTranscodeDesc {
@@ -1755,7 +1839,23 @@ fn moe_route_flags(cfg: &MoeRouteConfig) -> i32 {
     if cfg.bf16_logits {
         flags |= MOE_ROUTE_BF16_LOGITS;
     }
+    if cfg.mode == RouteMode::TopkThenSoftmax {
+        flags |= ROUTE_TOPK_THEN_SOFTMAX;
+    }
     flags
+}
+
+/// The ABI minor from which a library reads the v2.16 expert and router fields: a config that
+/// sets one is unsupported below it (an older library would ignore the field and run another
+/// computation).
+const MOE_V2_16_MINOR: u32 = 16;
+
+/// The `clamp_limit` of `cfg`'s activation (0 for SwiGLU).
+fn expert_clamp_limit(cfg: &MoeExpertsConfig) -> f32 {
+    match cfg.activation {
+        ExpertActivation::GptOssClamp { limit } => limit,
+        _ => 0.0,
+    }
 }
 
 fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
@@ -1769,6 +1869,7 @@ fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
         topk_weights: std::ptr::null_mut(),
         sorted_rows: std::ptr::null_mut(),
         expert_offsets: std::ptr::null_mut(),
+        router_bias: std::ptr::null(),
     }
 }
 
@@ -1798,6 +1899,23 @@ fn moe_experts_probe_tokens(cfg: &MoeExpertsConfig, num_tokens: i32) -> MoeExper
         expert_begin: cfg.expert_begin as i32,
         expert_end: cfg.expert_end as i32,
         dtype: cfg.dtype.abi_code(),
+        weight_dtype: cfg.weight_dtype.abi_code(),
+        w_gate_scale: null(),
+        w_up_scale: null(),
+        w_down_scale: null(),
+        act_static_scale: std::ptr::null(),
+        act_static_scale_down: std::ptr::null(),
+        b_gate: null(),
+        b_up: null(),
+        b_down: null(),
+        activation: cfg.activation.abi_code(),
+        gate_up_interleaved: i32::from(cfg.gate_up_interleaved),
+        clamp_limit: expert_clamp_limit(cfg),
+        shared_w_gate: null(),
+        shared_w_up: null(),
+        shared_w_down: null(),
+        shared_gate_w: null(),
+        shared_inter: cfg.shared_inter.map_or(0, |s| s as i32),
     }
 }
 
@@ -2361,6 +2479,267 @@ impl KvTranscodeKernel for ShimProvider {
     }
 }
 
+impl ShimProvider {
+    /// The v2.18 Gated DeltaNet trio of `mode`; `KernelProvider::gdn` is `Some` exactly when
+    /// the group exists.
+    fn gdn_trio(&self, mode: GdnMode) -> Result<&OpTrio<GdnDesc>, KernelError> {
+        let fns = self
+            .syms()
+            .v21
+            .gdn
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.18 gdn group"))?;
+        Ok(match mode {
+            GdnMode::Prefill => &fns.prefill,
+            GdnMode::Decode => &fns.decode,
+        })
+    }
+
+    /// The v2.18 conv1d trio of `mode`.
+    fn conv1d_trio(&self, mode: GdnMode) -> Result<&OpTrio<Conv1dDesc>, KernelError> {
+        let fns = self
+            .syms()
+            .v21
+            .conv1d
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.18 conv1d group"))?;
+        Ok(match mode {
+            GdnMode::Prefill => &fns.prefill,
+            GdnMode::Decode => &fns.update,
+        })
+    }
+
+    /// The sequence arguments shared by both v2.18 ops: the slot list, the `cu_seqlens` of a
+    /// prefill (absent for decode) and the sequence count. The slot values and the offsets live
+    /// on the device: the caller keeps them in range (`cu_seqlens` monotone, ending at the token
+    /// count, slots below the state's slot count).
+    #[allow(clippy::type_complexity)]
+    fn sequence_args(
+        &self,
+        mode: GdnMode,
+        tokens: usize,
+        slots: &TensorView<'_>,
+        cu_seqlens: Option<&TensorView<'_>>,
+    ) -> Result<(*const i32, *const i32, usize), KernelError> {
+        let seqs = slots.shape.first().copied().unwrap_or(0);
+        dense("state_slots", slots, &[seqs], DType::I32)?;
+        let slots_ptr = self
+            .ctx
+            .device_ptr("state_slots", slots)?
+            .cast_const()
+            .cast();
+        let cu_ptr = match (mode, cu_seqlens) {
+            (GdnMode::Prefill, Some(cu)) => {
+                dense("cu_seqlens", cu, &[seqs + 1], DType::I32)?;
+                self.ctx.device_ptr("cu_seqlens", cu)?.cast_const().cast()
+            }
+            (GdnMode::Prefill, None) => return Err(invalid("prefill needs cu_seqlens".into())),
+            (GdnMode::Decode, None) => {
+                if tokens != seqs {
+                    return Err(invalid(format!(
+                        "decode takes one token per sequence, got {tokens} tokens for {seqs}"
+                    )));
+                }
+                std::ptr::null()
+            }
+            (GdnMode::Decode, Some(_)) => return Err(invalid("decode takes no cu_seqlens".into())),
+        };
+        Ok((slots_ptr, cu_ptr, seqs))
+    }
+}
+
+impl GdnKernel for ShimProvider {
+    fn supports(&self, cfg: &GdnConfig) -> bool {
+        cfg.heads_per_key().is_some()
+            && self
+                .gdn_trio(cfg.mode)
+                .is_ok_and(|t| Self::supported(t, &gdn_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &GdnConfig) -> String {
+        self.gdn_trio(cfg.mode)
+            .map(|t| self.implementation_of(cfg.op(), t, &gdn_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut GdnContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let trio = self.gdn_trio(cfg.mode)?;
+        let (kh, vh, kd, vd) = (
+            cfg.k_heads as usize,
+            cfg.v_heads as usize,
+            cfg.k_dim as usize,
+            cfg.v_dim as usize,
+        );
+        let tokens = ctx.q.shape.first().copied().unwrap_or(0);
+        let q_stride = row_stride("q", &ctx.q, 3)?;
+        let k_stride = row_stride("k", &ctx.k, 3)?;
+        let v_stride = row_stride("v", &ctx.v, 3)?;
+        let out_stride = row_stride("out", &ctx.out, 3)?;
+        for (name, v, want, stride) in [
+            ("q", &ctx.q, [tokens, kh, kd], q_stride),
+            ("k", &ctx.k, [tokens, kh, kd], k_stride),
+            ("v", &ctx.v, [tokens, vh, vd], v_stride),
+            ("out", &ctx.out, [tokens, vh, vd], out_stride),
+        ] {
+            if v.shape.as_slice() != want || v.dtype != cfg.dtype {
+                return Err(invalid(format!(
+                    "{name} must be {} {want:?}, has {} {:?}",
+                    cfg.dtype.as_str(),
+                    v.dtype.as_str(),
+                    v.shape.as_slice()
+                )));
+            }
+            if stride < want[1] as i64 * want[2] as i64 {
+                return Err(invalid(format!("{name} row stride {stride} overlaps rows")));
+            }
+        }
+        dense("g", &ctx.g, &[tokens, vh], DType::F32)?;
+        dense("beta", &ctx.beta, &[tokens, vh], DType::F32)?;
+        let slots = ctx.state.shape.first().copied().unwrap_or(0);
+        dense("state", &ctx.state, &[slots, vh, vd, kd], DType::F32)?;
+        let (slots_ptr, cu_ptr, seqs) =
+            self.sequence_args(cfg.mode, tokens, &ctx.state_slots, ctx.cu_seqlens.as_ref())?;
+        let boundary = match &ctx.boundary_states {
+            None => std::ptr::null_mut(),
+            Some(_) if cfg.mode == GdnMode::Decode => {
+                return Err(invalid("decode writes no boundary states".into()));
+            }
+            Some(_) if ctx.boundary_tokens == 0 => {
+                return Err(invalid("boundary_states without boundary_tokens".into()));
+            }
+            Some(b) => {
+                let rows = b.shape.first().copied().unwrap_or(0);
+                dense("boundary_states", b, &[rows, vh, vd, kd], DType::F32)?;
+                self.ctx.device_ptr("boundary_states", b)?.cast::<f32>()
+            }
+        };
+        if tokens == 0 || seqs == 0 {
+            return Ok(());
+        }
+        let d = GdnDesc {
+            q: self.ctx.device_ptr("q", &ctx.q)?.cast_const(),
+            k: self.ctx.device_ptr("k", &ctx.k)?.cast_const(),
+            v: self.ctx.device_ptr("v", &ctx.v)?.cast_const(),
+            g: self.ctx.device_ptr("g", &ctx.g)?.cast_const().cast(),
+            beta: self.ctx.device_ptr("beta", &ctx.beta)?.cast_const().cast(),
+            state: self.ctx.device_ptr("state", &ctx.state)?.cast(),
+            state_slots: slots_ptr,
+            cu_seqlens: cu_ptr,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            boundary_states: boundary,
+            q_stride,
+            k_stride,
+            v_stride,
+            out_stride,
+            boundary_tokens: to_i32("boundary_tokens", ctx.boundary_tokens)?,
+            num_tokens: to_i32("tokens", tokens)?,
+            num_seqs: to_i32("sequences", seqs)?,
+            k_heads: to_i32("k_heads", kh)?,
+            v_heads: to_i32("v_heads", vh)?,
+            k_dim: to_i32("k_dim", kd)?,
+            v_dim: to_i32("v_dim", vd)?,
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(cfg.op(), trio, &d, 0)
+    }
+}
+
+impl Conv1dKernel for ShimProvider {
+    fn supports(&self, cfg: &Conv1dConfig) -> bool {
+        self.conv1d_trio(cfg.mode)
+            .is_ok_and(|t| Self::supported(t, &conv1d_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &Conv1dConfig) -> String {
+        self.conv1d_trio(cfg.mode)
+            .map(|t| self.implementation_of(cfg.op(), t, &conv1d_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut Conv1dContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let trio = self.conv1d_trio(cfg.mode)?;
+        let (ch, kernel) = (cfg.channels as usize, cfg.kernel as usize);
+        let tokens = ctx.x.shape.first().copied().unwrap_or(0);
+        let x_stride = row_stride("x", &ctx.x, 2)?;
+        let out_stride = row_stride("out", &ctx.out, 2)?;
+        for (name, v) in [("x", &ctx.x), ("out", &ctx.out)] {
+            if v.shape.as_slice() != [tokens, ch] || v.dtype != cfg.dtype {
+                return Err(invalid(format!(
+                    "{name} must be {} [{tokens}, {ch}], has {} {:?}",
+                    cfg.dtype.as_str(),
+                    v.dtype.as_str(),
+                    v.shape.as_slice()
+                )));
+            }
+        }
+        dense("weight", &ctx.weight, &[ch, kernel], cfg.dtype)?;
+        let bias = match &ctx.bias {
+            Some(b) => {
+                dense("bias", b, &[ch], cfg.dtype)?;
+                self.ctx.device_ptr("bias", b)?.cast_const()
+            }
+            None => std::ptr::null(),
+        };
+        let slots = ctx.conv_state.shape.first().copied().unwrap_or(0);
+        dense(
+            "conv_state",
+            &ctx.conv_state,
+            &[slots, ch, kernel.saturating_sub(1)],
+            cfg.dtype,
+        )?;
+        let (slots_ptr, cu_ptr, seqs) =
+            self.sequence_args(cfg.mode, tokens, &ctx.state_slots, ctx.cu_seqlens.as_ref())?;
+        let boundary = match &ctx.boundary_conv_states {
+            None => null(),
+            Some(_) if cfg.mode == GdnMode::Decode => {
+                return Err(invalid("update writes no boundary states".into()));
+            }
+            Some(_) if (ctx.boundary_tokens as usize) < kernel.saturating_sub(1) => {
+                return Err(invalid(format!(
+                    "boundary_tokens {} below the {}-input conv tail",
+                    ctx.boundary_tokens,
+                    kernel.saturating_sub(1)
+                )));
+            }
+            Some(b) => {
+                let rows = b.shape.first().copied().unwrap_or(0);
+                dense(
+                    "boundary_conv_states",
+                    b,
+                    &[rows, ch, kernel.saturating_sub(1)],
+                    cfg.dtype,
+                )?;
+                self.ctx.device_ptr("boundary_conv_states", b)?
+            }
+        };
+        if tokens == 0 || seqs == 0 {
+            return Ok(());
+        }
+        let d = Conv1dDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?.cast_const(),
+            w: self.ctx.device_ptr("weight", &ctx.weight)?.cast_const(),
+            bias,
+            conv_state: self.ctx.device_ptr("conv_state", &ctx.conv_state)?,
+            state_slots: slots_ptr,
+            cu_seqlens: cu_ptr,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            boundary_conv_states: boundary,
+            x_stride,
+            out_stride,
+            boundary_tokens: to_i32("boundary_tokens", ctx.boundary_tokens)?,
+            num_tokens: to_i32("tokens", tokens)?,
+            num_seqs: to_i32("sequences", seqs)?,
+            channels: to_i32("channels", ch)?,
+            kernel: to_i32("kernel", kernel)?,
+            activation: ctx.activation,
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(cfg.op(), trio, &d, 0)
+    }
+}
+
 /// Checks that `v` is a dense F32 view of shape `[rows]` (the per-row sums of squares).
 fn sumsq_view(v: &TensorView<'_>, rows: usize) -> Result<(), KernelError> {
     dense("sumsq", v, &[rows], DType::F32)
@@ -2744,9 +3123,14 @@ impl AttentionKernel for ShimProvider {
             // TurboQuant pages need the v2.11 descriptor fields (P6b S-5).
             cfg.block_tokens.is_some_and(|b| b > 0)
                 && (cfg.dtype.tq_record_bytes().is_none() || self.ctx.lib.abi_minor() >= 11)
+                && (cfg.window.is_none() && !cfg.sinks
+                    || self.ctx.lib.abi_minor() >= ATTENTION_WINDOW_SINKS_MINOR)
                 && Self::supported(trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
-            cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
+            cfg.block_tokens.is_none()
+                && cfg.window.is_none()
+                && !cfg.sinks
+                && Self::supported(trio, &attention_probe(cfg))
         } else {
             false
         }
@@ -2821,6 +3205,38 @@ impl AttentionKernel for ShimProvider {
                 ),
             });
         }
+        // Phase 7 S-8: the window and the sinks travel in the ABI v2.17 fields, which a
+        // library below minor 17 would ignore.
+        if (cfg.window.is_some() || cfg.sinks)
+            && self.ctx.lib.abi_minor() < ATTENTION_WINDOW_SINKS_MINOR
+        {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "{} with a sliding window or sinks ({cfg}) needs a kernel library of ABI \
+                     minor {ATTENTION_WINDOW_SINKS_MINOR} (this one is {})",
+                    cfg.op(),
+                    self.ctx.lib.abi_minor()
+                ),
+            });
+        }
+        let window_left = match cfg.window {
+            Some(w) => to_i32("window", w)?,
+            None => -1,
+        };
+        let sinks = match (&ctx.sinks, cfg.sinks) {
+            (Some(v), true) => {
+                dense("sinks", v, &[cfg.num_q_heads as usize], DType::F32)?;
+                self.ctx.device_ptr("sinks", v)?.cast_const().cast()
+            }
+            (None, false) => std::ptr::null(),
+            _ => {
+                return Err(invalid(format!(
+                    "{}: the sinks tensor must be passed exactly when the config names sinks \
+                     ({cfg})",
+                    cfg.op()
+                )));
+            }
+        };
         let (hkv, d) = (cfg.num_kv_heads as usize, cfg.head_dim as usize);
         let new_stride_token = row_stride("k_new", &ctx.k_new, 3)?;
         if row_stride("v_new", &ctx.v_new, 3)? != new_stride_token {
@@ -3010,6 +3426,8 @@ impl AttentionKernel for ShimProvider {
             rope_inv_freq,
             rope_rotary_dim,
             rope_attn_factor,
+            window_left,
+            sinks,
         };
         if ctx.block_formats.is_some() && !self.bound_takes(cfg.op(), &d) {
             // A block table that may mix formats, and a bound implementation (chosen for pages
@@ -3141,11 +3559,15 @@ impl MoeKernel for ShimProvider {
     /// BF16 router logits need kernel ABI minor 2: an older library may not check `flags`.
     fn supports_route(&self, cfg: &MoeRouteConfig) -> bool {
         (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+            && (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
             && Self::supported(&self.syms().moe_route, &moe_route_probe(cfg))
     }
 
+    /// The v2.16 fields (quantized weights, biases, activation variants, shared expert) need a
+    /// library of minor 16: an older one ignores them and would run the BF16 SwiGLU experts.
     fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool {
-        Self::supported(&self.syms().moe_experts, &moe_experts_probe(cfg))
+        (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
+            && Self::supported(&self.syms().moe_experts, &moe_experts_probe(cfg))
     }
 
     fn implementation_route(&self, cfg: &MoeRouteConfig) -> String {
@@ -3182,6 +3604,18 @@ impl MoeKernel for ShimProvider {
             &[experts + 1],
             DType::I32,
         )?;
+        let router_bias = match (&ctx.router_bias, ctx.cfg.bias) {
+            (Some(b), true) => {
+                dense("router_bias", b, &[experts], DType::F32)?;
+                self.ctx.device_ptr("router_bias", b)?.cast_const()
+            }
+            (None, false) => std::ptr::null(),
+            _ => {
+                return Err(invalid(
+                    "router_bias must be passed exactly when the config has bias".into(),
+                ));
+            }
+        };
         let d = MoeRouteDesc {
             router_logits: self.ctx.device_ptr("router_logits", &ctx.router_logits)? as *const f32,
             num_tokens: to_i32("num_tokens", tokens)?,
@@ -3198,21 +3632,21 @@ impl MoeKernel for ShimProvider {
                 .ctx
                 .device_ptr("expert_offsets", &ctx.expert_offsets)?
                 .cast(),
+            router_bias,
         };
         self.run(OpKind::MoeRoute, &self.syms().moe_route, &d, 0)
     }
 
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
         let cfg = ctx.cfg;
-        let (h, inter) = (cfg.hidden as usize, cfg.inter as usize);
+        let h = cfg.hidden as usize;
         let (experts, k) = (cfg.num_experts as usize, cfg.top_k as usize);
-        let local = cfg.num_local_experts() as usize;
         let tokens = ctx.x.shape.first().copied().unwrap_or(0);
         dense("x", &ctx.x, &[tokens, h], cfg.dtype)?;
         dense("out", &ctx.out, &[tokens, h], cfg.dtype)?;
-        dense("w_gate", &ctx.w_gate, &[local, inter, h], cfg.dtype)?;
-        dense("w_up", &ctx.w_up, &[local, inter, h], cfg.dtype)?;
-        dense("w_down", &ctx.w_down, &[local, h, inter], cfg.dtype)?;
+        for (name, view, shape, dtype) in ctx.weight_operands()? {
+            dense(name, view, &shape, dtype)?;
+        }
         dense("sorted_rows", &ctx.sorted_rows, &[tokens * k], DType::I32)?;
         dense(
             "expert_offsets",
@@ -3258,6 +3692,27 @@ impl MoeKernel for ShimProvider {
             expert_begin: to_i32("expert_begin", cfg.expert_begin)?,
             expert_end: to_i32("expert_end", cfg.expert_end)?,
             dtype: cfg.dtype.abi_code(),
+            weight_dtype: cfg.weight_dtype.abi_code(),
+            w_gate_scale: self.optional_ptr("w_gate_scale", &ctx.extra.w_gate_scale)?,
+            w_up_scale: self.optional_ptr("w_up_scale", &ctx.extra.w_up_scale)?,
+            w_down_scale: self.optional_ptr("w_down_scale", &ctx.extra.w_down_scale)?,
+            act_static_scale: self
+                .optional_ptr("act_static_scale", &ctx.extra.act_static_scale)?
+                .cast(),
+            act_static_scale_down: self
+                .optional_ptr("act_static_scale_down", &ctx.extra.act_static_scale_down)?
+                .cast(),
+            b_gate: self.optional_ptr("b_gate", &ctx.extra.b_gate)?,
+            b_up: self.optional_ptr("b_up", &ctx.extra.b_up)?,
+            b_down: self.optional_ptr("b_down", &ctx.extra.b_down)?,
+            activation: cfg.activation.abi_code(),
+            gate_up_interleaved: i32::from(cfg.gate_up_interleaved),
+            clamp_limit: expert_clamp_limit(&cfg),
+            shared_w_gate: self.optional_ptr("shared_w_gate", &ctx.extra.shared_w_gate)?,
+            shared_w_up: self.optional_ptr("shared_w_up", &ctx.extra.shared_w_up)?,
+            shared_w_down: self.optional_ptr("shared_w_down", &ctx.extra.shared_w_down)?,
+            shared_gate_w: self.optional_ptr("shared_gate_w", &ctx.extra.shared_gate_w)?,
+            shared_inter: cfg.shared_inter.map_or(0, |s| s as i32),
         };
         self.run(OpKind::MoeExperts, &self.syms().moe_experts, &d, tokens * k)
     }
@@ -3504,6 +3959,21 @@ impl KernelProvider for ShimProvider {
             .then_some(self as &dyn KvTranscodeKernel)
     }
 
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        self.syms()
+            .v21
+            .gdn
+            .is_some()
+            .then_some(self as &dyn GdnKernel)
+    }
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        self.syms()
+            .v21
+            .conv1d
+            .is_some()
+            .then_some(self as &dyn Conv1dKernel)
+    }
+
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
     }
@@ -3567,9 +4037,13 @@ impl KernelProvider for ShimProvider {
             }
             OpConfig::MoeRoute(cfg) => {
                 (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+                    && (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
                     && lib.impl_supports(OpKind::MoeRoute, index, &moe_route_probe(cfg))
             }
             OpConfig::MoeExperts(cfg) => {
+                if cfg.needs_v2_16() && self.syms().v21.minor < MOE_V2_16_MINOR {
+                    return false;
+                }
                 let top_k = cfg.top_k.max(1);
                 let tokens = rows.map_or(1, |r| r.div_ceil(top_k));
                 let Ok(tokens) = i32::try_from(tokens) else {
@@ -3605,6 +4079,8 @@ impl KernelProvider for ShimProvider {
                 cfg.direction().is_some()
                     && lib.impl_supports(OpKind::KvTranscode, index, &kv_transcode_probe(cfg))
             }
+            OpConfig::Gdn(cfg) => lib.impl_supports(cfg.op(), index, &gdn_probe(cfg)),
+            OpConfig::Conv1d(cfg) => lib.impl_supports(cfg.op(), index, &conv1d_probe(cfg)),
         }
     }
 }
@@ -3825,6 +4301,8 @@ pub(crate) mod tests {
             dtype: DType::BF16,
             block_tokens: Some(16),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let attn = provider.attention().expect("attention family");
         assert!(!attn.supports(&paged));
@@ -3874,6 +4352,46 @@ pub(crate) mod tests {
             matches!(&err, KernelError::InvalidArgument { message } if message.contains("execute_paged")),
             "{err:?}"
         );
+        // Phase 7 S-8: a window or sinks need the ABI v2.17 fields; this v2.0 library would
+        // ignore them, so the call is refused before any FFI call.
+        let i32s = Tensor::empty(&mem, &[2], DType::I32).expect("i32");
+        let sink_t = Tensor::empty(&mem, &[16], DType::F32).expect("sinks");
+        for (window, sinks) in [(Some(128), false), (None, true)] {
+            let cfg = AttentionConfig {
+                window,
+                sinks,
+                ..paged
+            };
+            assert!(!attn.supports(&cfg), "{cfg}");
+            let err = attn
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg,
+                    q: t.view(),
+                    k_new: t.view(),
+                    v_new: t.view(),
+                    out: t.view(),
+                    kv_layer: t.view(),
+                    block_table: i32s.view(),
+                    q_indptr: i32s.view(),
+                    kv_lens: i32s.view(),
+                    max_q_len: 1,
+                    max_kv_len: 1,
+                    max_blocks_per_seq: 1,
+                    scale: 1.0,
+                    k_scale: 1.0,
+                    v_scale: 1.0,
+                    block_formats: None,
+                    classes: None,
+                    tq: None,
+                    rope: None,
+                    sinks: sinks.then(|| sink_t.view()),
+                })
+                .expect_err("window / sinks below minor 17");
+            assert!(
+                matches!(&err, KernelError::Unsupported { message } if message.contains("ABI minor 17")),
+                "{err:?}"
+            );
+        }
 
         let copy = KvCopyConfig {
             num_layers: 2,
@@ -3916,6 +4434,7 @@ pub(crate) mod tests {
             top_k: 8,
             renormalize: false,
             bf16_logits: false,
+            ..Default::default()
         };
         assert!(!moe.supports_route(&route));
         assert_eq!(moe.implementation_route(&route), "stub_moe_route");
@@ -3927,6 +4446,7 @@ pub(crate) mod tests {
             expert_begin: 0,
             expert_end: 64,
             dtype: DType::BF16,
+            ..Default::default()
         };
         assert!(!moe.supports_experts(&experts));
         assert_eq!(moe.implementation_experts(&experts), "stub_moe_experts");
@@ -4184,6 +4704,8 @@ pub(crate) mod tests {
             size_of::<ffi::QuantizeActDesc>(),
             size_of::<ffi::KvTranscodeDesc>(),
             size_of::<ffi::TqParamsDesc>(),
+            size_of::<ffi::GdnDesc>(),
+            size_of::<ffi::Conv1dDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

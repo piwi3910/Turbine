@@ -798,6 +798,10 @@ impl ModelBackend {
                     self.pool_blocks
                 ))
             }
+            SubmitError::StateExceedsCapacity => ApiError::state_exceeds_capacity(
+                "the request's n sequences need more per-sequence model state than the server \
+                 holds (scheduler.max_running_requests sequences); lower n",
+            ),
             SubmitError::PromptTooLong => ApiError::context_length_exceeded(format!(
                 "the prompt has {prompt_len} tokens; without scheduler.chunked_prefill a prompt \
                  must fit scheduler.max_batch_tokens ({})",

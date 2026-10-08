@@ -649,6 +649,9 @@ fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'
         "olmoe" => (None, &[]),
         "qwen3" | "qwen3_moe" => (Some(hermes::HERMES), &["<|im_end|>"]),
         "mistral" | "mixtral" => (Some(mistral::MISTRAL), &[mistral::TOOL_CALLS, "</s>"]),
+        // Harmony is registered with Phase 7 Task 25, which adds the template round trip; until
+        // then the name alone is asserted.
+        "gpt_oss" => (Some("harmony"), &[]),
         other => panic!("family {other} has no expected default tool format"),
     }
 }

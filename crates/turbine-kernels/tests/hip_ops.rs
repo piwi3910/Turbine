@@ -1174,6 +1174,8 @@ fn attention_case(p: &Pair, rng: &mut Rng, kind: AttentionKind, q_len: usize, q_
         dtype: DType::BF16,
         block_tokens: None,
         causal: true,
+        window: None,
+        sinks: false,
     };
     let hip = p.hip.attention().expect("hip attention");
     assert!(hip.supports(&cfg), "hip must support {} {cfg}", cfg.op());
@@ -2027,6 +2029,8 @@ fn paged_case_pages(
         dtype: page_dtype,
         block_tokens: Some(block_tokens as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let hip = p.hip.attention().expect("hip attention");
     assert!(hip.supports(&cfg), "hip must support {} {cfg}", cfg.op());
@@ -2123,6 +2127,7 @@ fn paged_case_pages(
             classes: None,
             tq: None,
             rope: None,
+            sinks: None,
         };
         kernel.execute_paged(&mut ctx).expect("paged attention");
     }
@@ -2191,6 +2196,7 @@ fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> R
             topk_weights: w.view(),
             sorted_rows: s.view(),
             expert_offsets: off.view(),
+            router_bias: None,
         };
         kernel.route(&mut ctx).expect("moe_route");
     }
@@ -2291,6 +2297,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     let routing = route_case(p, route_cfg, tokens, case.logits);
     let host_offsets: Vec<i32> = routing.expert_offsets.iter().map(|&o| o as i32).collect();
@@ -2307,6 +2314,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         expert_begin: begin as u32,
         expert_end: end as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let hip = p.hip.moe().expect("hip moe");
     assert!(
@@ -2375,6 +2383,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
             host_expert_offsets: offsets,
             out: o.view(),
             workspace: ws.map(|t| t.view().slice),
+            extra: Default::default(),
         };
         kernel.experts(&mut ctx).expect("moe_experts");
     }
@@ -2404,6 +2413,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
             host_expert_offsets: hip_offsets,
             out: out.view(),
             workspace: ws.as_ref().map(|t| t.view().slice),
+            extra: Default::default(),
         })
     };
     again.storage.copy_from_host(0, &raw).expect("copy to HIP");
@@ -2521,6 +2531,8 @@ fn paged_decode_splitkv_matches_cpu() {
         dtype: DType::BF16,
         block_tokens: Some(128),
         causal: true,
+        window: None,
+        sinks: false,
     });
     let splitkv = p
         .hip
@@ -2623,6 +2635,8 @@ fn paged_decode_fused_rope_matches_separate() {
             dtype: DType::BF16,
             block_tokens: Some(128),
             causal: true,
+            window: None,
+            sinks: false,
         })
     };
     let splitkv = p
@@ -2681,6 +2695,8 @@ fn fused_rope_case(
         dtype: DType::BF16,
         block_tokens: Some(block_tokens as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let rope_cfg = RopeConfig {
         num_q_heads: q_heads as u32,
@@ -2772,6 +2788,7 @@ fn fused_rope_case(
                 inv_freq: freq.view(),
                 attn_factor,
             }),
+            sinks: None,
         })
         .expect("paged decode attention");
         (read(&o_t), read(&pool_t))
@@ -2827,6 +2844,8 @@ fn paged_fp8_matches_cpu() {
                 dtype: DType::F8E4M3,
                 block_tokens: Some(block_tokens as u32),
                 causal: true,
+                window: None,
+                sinks: false,
             };
             let hip = p.hip.attention().expect("hip attention");
             let prefill_default = hip.implementation(&cfg(AttentionKind::PrefillPaged));
@@ -2905,6 +2924,8 @@ fn paged_fp8_matches_cpu() {
         dtype: DType::F8E4M3,
         block_tokens: Some(128),
         causal: true,
+        window: None,
+        sinks: false,
     });
     let staged = p
         .hip
@@ -2953,6 +2974,8 @@ fn paged_fp8_group16_avoids_the_decode_kernel() {
         dtype: DType::F8E4M3,
         block_tokens: Some(128),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let hip = p.hip.attention().expect("hip attention");
     for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
@@ -3098,6 +3121,7 @@ fn decode_attention_timings_fp8() {
                             classes: None,
                             tq: None,
                             rope: None,
+                            sinks: None,
                         })
                         .expect("paged decode attention");
                     });
@@ -3207,6 +3231,7 @@ fn prefill_op_timings_fp8() {
                             classes: None,
                             tq: None,
                             rope: None,
+                            sinks: None,
                         })
                         .expect("paged prefill attention");
                     });
@@ -3413,6 +3438,7 @@ fn paged_and_moe_ops() {
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0));
     let mut ties = vec![0f32; 3 * MOE_EXPERTS];
@@ -3438,6 +3464,7 @@ fn paged_and_moe_ops() {
         top_k: 2,
         renormalize: true,
         bf16_logits: false,
+        ..Default::default()
     };
     route_case(&p, small, 13, &rng.normal(13 * 8, 1.0));
     let wide = MoeRouteConfig {
@@ -3445,6 +3472,7 @@ fn paged_and_moe_ops() {
         top_k: 4,
         renormalize: true,
         bf16_logits: true,
+        ..Default::default()
     };
     let wide_ties: Vec<f32> = rng
         .normal(9 * 256, 1.0)
@@ -4129,6 +4157,8 @@ impl BenchModel {
             dtype: DType::BF16,
             block_tokens: Some(block_tokens as u32),
             causal: true,
+            window: None,
+            sinks: false,
         }
     }
 
@@ -4506,6 +4536,7 @@ fn decode_op_timings() {
                         classes: None,
                         tq: None,
                         rope: None,
+                        sinks: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -4534,6 +4565,7 @@ fn decode_op_timings() {
                 top_k: top_k as u32,
                 renormalize: false,
                 bf16_logits: true,
+                ..Default::default()
             };
             let experts_cfg = MoeExpertsConfig {
                 hidden: h as u32,
@@ -4543,6 +4575,7 @@ fn decode_op_timings() {
                 expert_begin: 0,
                 expert_end: experts as u32,
                 dtype: DType::BF16,
+                ..Default::default()
             };
             let up_scale = 1.0 / (h as f32).sqrt();
             let gate_raw = encode(
@@ -4582,6 +4615,7 @@ fn decode_op_timings() {
                         topk_weights: topk_w.view().rows(0, m),
                         sorted_rows: sorted_rows.clone(),
                         expert_offsets: offsets.view(),
+                        router_bias: None,
                     })
                     .expect("moe_route");
                 };
@@ -4639,6 +4673,7 @@ fn decode_op_timings() {
                         host_expert_offsets: &host_offsets,
                         out: o.view().rows(0, m),
                         workspace: Some(workspace.storage.slice(0, ws_len)),
+                        extra: Default::default(),
                     })
                     .expect("moe_experts");
                 });
@@ -4898,6 +4933,7 @@ fn decode_forward_timing() {
             top_k: top_k as u32,
             renormalize: false,
             bf16_logits: true,
+            ..Default::default()
         };
         let experts_cfg = MoeExpertsConfig {
             hidden: h as u32,
@@ -4907,6 +4943,7 @@ fn decode_forward_timing() {
             expert_begin: 0,
             expert_end: experts as u32,
             dtype: DType::BF16,
+            ..Default::default()
         };
         let gi = |n: usize, k: usize, c: DType| gemm.implementation(&gemm_config(n, k, c));
         let impls = BenchImpls {
@@ -5057,6 +5094,7 @@ fn decode_forward_timing() {
                             classes: None,
                             tq: None,
                             rope: None,
+                            sinks: None,
                         })
                         .expect("paged decode attention")
                     });
@@ -5114,6 +5152,7 @@ fn decode_forward_timing() {
                                     topk_weights: rows(&topk_w, m),
                                     sorted_rows: sorted_rows.clone(),
                                     expert_offsets: offsets.view(),
+                                    router_bias: None,
                                 })
                                 .expect("moe_route")
                             });
@@ -5150,6 +5189,7 @@ fn decode_forward_timing() {
                                     host_expert_offsets: &host_offsets,
                                     out: rows(&proj, m),
                                     workspace: Some(workspace.storage.slice(0, moe_ws_len(m))),
+                                    extra: Default::default(),
                                 })
                                 .expect("moe_experts")
                             });
@@ -5361,6 +5401,7 @@ fn decode_attention_timings() {
                         classes: None,
                         tq: None,
                         rope: None,
+                        sinks: None,
                     })
                     .expect("paged decode attention");
                 });
@@ -5495,6 +5536,7 @@ fn b1_ck_edge_timings() {
                             inv_freq: freq.view(),
                             attn_factor: 1.0,
                         }),
+                        sinks: None,
                     })
                     .expect("paged decode attention");
                 };
@@ -5827,6 +5869,7 @@ fn fused_projection_timings() {
                 classes: None,
                 tq: None,
                 rope: None,
+                sinks: None,
             })
             .expect("paged decode attention");
         };
@@ -6127,6 +6170,7 @@ fn prefill_shapes_match_cpu() {
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     for tokens in [680, 2048] {
         route_case(&p, olmoe, tokens, &rng.normal(tokens * MOE_EXPERTS, 2.0));
@@ -6304,6 +6348,7 @@ fn prefill_op_timings() {
                     top_k: top_k as u32,
                     renormalize: false,
                     bf16_logits: true,
+                    ..Default::default()
                 };
                 let experts_cfg = MoeExpertsConfig {
                     hidden: h as u32,
@@ -6313,6 +6358,7 @@ fn prefill_op_timings() {
                     expert_begin: 0,
                     expert_end: experts as u32,
                     dtype: DType::BF16,
+                    ..Default::default()
                 };
                 let up_scale = 1.0 / (h as f32).sqrt();
                 let gate_raw = encode(
@@ -6356,6 +6402,7 @@ fn prefill_op_timings() {
                             topk_weights: topk_w.view().rows(0, m),
                             sorted_rows: sorted_rows.clone(),
                             expert_offsets: offsets.view(),
+                            router_bias: None,
                         })
                         .expect("moe_route");
                     };
@@ -6389,6 +6436,7 @@ fn prefill_op_timings() {
                             host_expert_offsets: &host_offsets,
                             out: o.view().rows(0, m),
                             workspace: None,
+                            extra: Default::default(),
                         })
                         .expect("moe_experts");
                     });
@@ -6445,6 +6493,8 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
                 .get("block_tokens")
                 .map(|b| b.parse().expect("block_tokens")),
             causal: flag("causal"),
+            window: None,
+            sinks: false,
         })
     };
     let spec = match op {
@@ -6497,6 +6547,7 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
             top_k: num("top_k") as u32,
             renormalize: flag("renormalize"),
             bf16_logits: flag("bf16_logits"),
+            ..Default::default()
         }),
         "moe_experts" => {
             let (begin, end) = kv["local"].split_once("..").expect("local=a..b");
@@ -6508,6 +6559,7 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
                 expert_begin: begin.parse().expect("expert_begin"),
                 expert_end: end.parse().expect("expert_end"),
                 dtype: dtype("dtype"),
+                ..Default::default()
             })
         }
         "logits_reduce" => OpConfig::LogitsReduce(LogitsReduceConfig {
@@ -6579,6 +6631,8 @@ fn implementations_enumerated() {
         ("ck_tile_fmha_pagedkv_mixed_staged", "ck", false),
         ("turbine_hip_mixed_staged", "turbine_hip", false),
         ("turbine_hip_mixed", "turbine_hip", false),
+        // ABI v2.17: head_dim 64 / 256, which fmha_fwd_pagedkv has no gfx12 instance of.
+        ("ck_tile_fmha_splitkv", "ck", false),
     ];
     let paged_decode = vec![
         ("turbine_hip_b1_decode", "turbine_hip", false),
@@ -6619,6 +6673,8 @@ fn implementations_enumerated() {
                 ("turbine_hip_moe_wmma", "turbine_hip", false),
                 ("hipblaslt_grouped", "hipblaslt", HOST),
                 ("hipblaslt_per_expert", "hipblaslt", HOST),
+                // ABI v2.16: the quantized experts' per-expert loop.
+                ("turbine_hip_moe_quant", "turbine_hip", HOST),
             ],
         ),
         (OpKind::AddRmsnorm, norm),
@@ -6653,6 +6709,20 @@ fn implementations_enumerated() {
                 ("turbine_hip_tq", "turbine_hip", false),
             ],
         ),
+        // ABI v2.18 (Phase 7 Task 30): Gated DeltaNet and causal conv1d.
+        (
+            OpKind::GdnPrefill,
+            one("llama_cpp_gated_delta_net", "llama_cpp"),
+        ),
+        (
+            OpKind::GdnDecode,
+            one("llama_cpp_gated_delta_net", "llama_cpp"),
+        ),
+        (
+            OpKind::Conv1dPrefill,
+            one("aiter_causal_conv1d_split_qkv", "aiter"),
+        ),
+        (OpKind::Conv1dUpdate, one("llama_cpp_ssm_conv", "llama_cpp")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -6779,6 +6849,8 @@ fn every_implementation_matches_cpu() {
             dtype: bf16,
             block_tokens: block_tokens.map(|b| b as u32),
             causal: true,
+            window: None,
+            sinks: false,
         })
     };
     let w = expert_weights(&p, &mut rng);
@@ -6790,12 +6862,14 @@ fn every_implementation_matches_cpu() {
         expert_begin: 0,
         expert_end: MOE_EXPERTS as u32,
         dtype: bf16,
+        ..Default::default()
     };
     let olmoe_route = MoeRouteConfig {
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     fn case<'a>(spec: OpConfig, run: CaseFn<'a>) -> ImplCase<'a> {
         ImplCase {
@@ -7086,8 +7160,27 @@ fn every_implementation_matches_cpu() {
         if op == OpKind::KvTranscode {
             continue;
         }
+        // The v2.18 Gated DeltaNet and conv1d ops (single-implementation each) are judged
+        // against `cpu/gdn.rs` by their own suite (`tests/hip_gdn.rs`: GDN within about one
+        // BF16 ulp, conv exact), on its Qwen3.5 shapes and sequence-length edges.
+        if matches!(
+            op,
+            OpKind::GdnPrefill | OpKind::GdnDecode | OpKind::Conv1dPrefill | OpKind::Conv1dUpdate
+        ) {
+            continue;
+        }
         for info in p.hip.implementations(op) {
             if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
+                continue;
+            }
+            // CK splitkv for prefill (ABI v2.17) serves head_dim 64 / 256 only, which no case
+            // of this harness uses; `attention_sinks_window_match_reference` runs it there.
+            if op == OpKind::AttentionPrefillPaged && info.name == "ck_tile_fmha_splitkv" {
+                continue;
+            }
+            // The quantized experts (ABI v2.16) are run against the CPU reference by their own
+            // suite (`tests/hip_moe_quant.rs`).
+            if info.name == "turbine_hip_moe_quant" {
                 continue;
             }
             assert_eq!(
@@ -8241,6 +8334,8 @@ fn paged_mixed_case(
         dtype: base,
         block_tokens: Some(bt as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let base_fmt = turbine_kernels::kv_format_code(base).expect("KV dtype");
     let seqs = q_lens.len();
@@ -8381,6 +8476,7 @@ fn paged_mixed_case(
                 device,
             }),
             rope: None,
+            sinks: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -8497,6 +8593,7 @@ fn paged_mixed_case(
                     classes: None,
                     tq: None,
                     rope: None,
+                    sinks: None,
                 })
                 .expect("BF16 reference");
             // Decode rows riding along in a staged prefill run turbine_hip_mixed after the
@@ -8581,6 +8678,8 @@ fn paged_mixed_matches_cpu() {
                     dtype: DType::Tq4,
                     block_tokens: Some(block_tokens as u32),
                     causal: true,
+                    window: None,
+                    sinks: false,
                 };
                 let hip = p.hip.attention().expect("hip attention");
                 let want = match (kind, block_tokens) {
@@ -8673,6 +8772,8 @@ fn paged_mixed_staged_skips_single_pass() {
             dtype: DType::Tq4,
             block_tokens: Some(block_tokens as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let spec = OpConfig::Attention(probe);
         let info = p
@@ -8771,6 +8872,8 @@ fn paged_mixed_classed_matches_cpu() {
         dtype: DType::Tq4,
         block_tokens: Some(bt as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     // Tokens 0..16 in base block 10 (tq4), 16..24 in class block 12 (bf16): a partial tail in
     // the window class. Sequence 1 (a decode row riding along) starts in class block 13
@@ -8915,6 +9018,7 @@ fn paged_mixed_classed_matches_cpu() {
                 device,
             }),
             rope: None,
+            sinks: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -9025,6 +9129,7 @@ fn paged_mixed_classed_matches_cpu() {
                 device,
             }),
             rope: None,
+            sinks: None,
         };
         kernel
             .execute_paged(&mut ctx)
@@ -9140,6 +9245,8 @@ fn mixed_time_us(
         dtype: base,
         block_tokens: Some(bt as u32),
         causal: true,
+        window: None,
+        sinks: false,
     };
     let base_fmt = turbine_kernels::kv_format_code(base).expect("KV dtype");
     let seqs = q_lens.len();
@@ -9250,8 +9357,318 @@ fn mixed_time_us(
                 device: Some(tables.view()),
             }),
             rope: None,
+            sinks: None,
         })
         .expect("timed mixed attention");
     };
     time_us(p, 50, &mut run)
+}
+
+/// One paged attention layout of the Phase 7 window / sink cases (kernel ABI v2.17).
+#[derive(Clone, Copy, Debug)]
+struct WindowCase {
+    heads: (usize, usize),
+    head_dim: usize,
+    window: Option<u32>,
+    sinks: bool,
+}
+
+/// The gpt-oss sliding layers (d64, 64/8 heads, window 128, sinks), its full layers (d64 with
+/// sinks), the Qwen3.5 full-attention layers (d256, 16/4 heads, neither) and a d128 layer with
+/// a window and sinks (the pagedkv `_sink` instances).
+const WINDOW_CASES: [WindowCase; 4] = [
+    WindowCase {
+        heads: (64, 8),
+        head_dim: 64,
+        window: Some(128),
+        sinks: true,
+    },
+    WindowCase {
+        heads: (64, 8),
+        head_dim: 64,
+        window: None,
+        sinks: true,
+    },
+    WindowCase {
+        heads: (16, 4),
+        head_dim: 256,
+        window: None,
+        sinks: false,
+    },
+    WindowCase {
+        heads: (Q_HEADS, KV_HEADS),
+        head_dim: 128,
+        window: Some(128),
+        sinks: true,
+    },
+];
+
+/// A ragged paged batch's host data: sequence `s` owns `q_lens[s]` new rows over `kv_lens[s]`
+/// tokens and blocks `tables[s]`; the pool starts with `pool` (random history everywhere).
+struct WindowBatch {
+    q_lens: Vec<usize>,
+    kv_lens: Vec<usize>,
+    tables: Vec<Vec<usize>>,
+    num_blocks: usize,
+    pool: Vec<f32>,
+    /// Per sequence: its q, k_new and v_new rows.
+    q: Vec<Vec<f32>>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    sinks: Vec<f32>,
+}
+
+const WINDOW_BLOCK_TOKENS: usize = 128;
+
+fn window_batch(rng: &mut Rng, c: &WindowCase, q_lens: &[usize], kv_lens: &[usize]) -> WindowBatch {
+    let (hq, hkv) = c.heads;
+    let d = c.head_dim;
+    let blocks_of: Vec<usize> = kv_lens
+        .iter()
+        .map(|&kv| kv.div_ceil(WINDOW_BLOCK_TOKENS))
+        .collect();
+    let num_blocks = blocks_of.iter().sum::<usize>() + 2;
+    let order = shuffled(rng, num_blocks);
+    let mut next = 0;
+    let tables = blocks_of
+        .iter()
+        .map(|&n| {
+            let t = order[next..next + n].to_vec();
+            next += n;
+            t
+        })
+        .collect();
+    let pool = rng.normal(num_blocks * 2 * WINDOW_BLOCK_TOKENS * hkv * d, 1.0);
+    // Sink logits around the scores' range, so they move every row's max and sum.
+    let sinks = rng.normal(hq, 2.0);
+    WindowBatch {
+        q_lens: q_lens.to_vec(),
+        kv_lens: kv_lens.to_vec(),
+        tables,
+        num_blocks,
+        pool,
+        q: q_lens
+            .iter()
+            .map(|&n| rng.normal(n * hq * d, 1.0))
+            .collect(),
+        k: q_lens
+            .iter()
+            .map(|&n| rng.normal(n * hkv * d, 1.0))
+            .collect(),
+        v: q_lens
+            .iter()
+            .map(|&n| rng.normal(n * hkv * d, 1.0))
+            .collect(),
+        sinks,
+    }
+}
+
+/// Runs sequences `which` of `b` as one call on the HIP provider (`hip`) or the CPU reference;
+/// returns each selected sequence's output rows, the implementation that ran and the pool after
+/// the append.
+fn window_run(
+    p: &Pair,
+    hip: bool,
+    kind: AttentionKind,
+    c: &WindowCase,
+    b: &WindowBatch,
+    which: &[usize],
+) -> (Vec<Vec<f32>>, String, Vec<f32>) {
+    let (hq, hkv) = c.heads;
+    let d = c.head_dim;
+    let cfg = AttentionConfig {
+        kind,
+        num_q_heads: hq as u32,
+        num_kv_heads: hkv as u32,
+        head_dim: d as u32,
+        dtype: DType::BF16,
+        block_tokens: Some(WINDOW_BLOCK_TOKENS as u32),
+        causal: true,
+        window: c.window,
+        sinks: c.sinks,
+    };
+    let (kernel, mem) = if hip {
+        (p.hip.attention().expect("hip attention"), &p.hip_mem)
+    } else {
+        (p.cpu.attention().expect("cpu attention"), &p.cpu_mem)
+    };
+    assert!(kernel.supports(&cfg), "{} must support {cfg}", cfg.op());
+    let impl_name = kernel.implementation(&cfg);
+    let tensor = |shape: &[usize], dtype: DType, data: &[f32]| {
+        let mut t = Tensor::empty(mem, shape, dtype).expect("alloc");
+        t.storage
+            .copy_from_host(0, &encode(dtype, data))
+            .expect("copy in");
+        t
+    };
+    let max_blocks = which
+        .iter()
+        .map(|&s| b.tables[s].len())
+        .max()
+        .expect("a sequence");
+    let mut table = vec![-1f32; which.len() * max_blocks];
+    let mut indptr = vec![0usize];
+    let (mut q, mut k, mut v) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, &s) in which.iter().enumerate() {
+        for (n, &blk) in b.tables[s].iter().enumerate() {
+            table[i * max_blocks + n] = blk as f32;
+        }
+        indptr.push(indptr[i] + b.q_lens[s]);
+        q.extend_from_slice(&b.q[s]);
+        k.extend_from_slice(&b.k[s]);
+        v.extend_from_slice(&b.v[s]);
+    }
+    let total_q = indptr[which.len()];
+    let kv: Vec<f32> = which.iter().map(|&s| b.kv_lens[s] as f32).collect();
+    let indptr_f: Vec<f32> = indptr.iter().map(|&x| x as f32).collect();
+    let pool = tensor(
+        &[b.num_blocks, 2, WINDOW_BLOCK_TOKENS, hkv, d],
+        DType::BF16,
+        &b.pool,
+    );
+    let qt = tensor(&[total_q, hq, d], DType::BF16, &q);
+    let kt = tensor(&[total_q, hkv, d], DType::BF16, &k);
+    let vt = tensor(&[total_q, hkv, d], DType::BF16, &v);
+    let out = tensor(&[total_q, hq, d], DType::BF16, &vec![0.0; total_q * hq * d]);
+    let bt = tensor(&[which.len(), max_blocks], DType::I32, &table);
+    let ip = tensor(&[which.len() + 1], DType::I32, &indptr_f);
+    let kvt = tensor(&[which.len()], DType::I32, &kv);
+    let sinks = tensor(&[hq], DType::F32, &b.sinks);
+    kernel
+        .execute_paged(&mut PagedAttentionContext {
+            cfg,
+            q: qt.view(),
+            k_new: kt.view(),
+            v_new: vt.view(),
+            out: out.view(),
+            kv_layer: pool.view(),
+            block_table: bt.view(),
+            q_indptr: ip.view(),
+            kv_lens: kvt.view(),
+            max_q_len: which.iter().map(|&s| b.q_lens[s]).max().unwrap_or(0) as u32,
+            max_kv_len: which.iter().map(|&s| b.kv_lens[s]).max().unwrap_or(0) as u32,
+            max_blocks_per_seq: max_blocks as u32,
+            scale: 1.0 / (d as f32).sqrt(),
+            k_scale: 1.0,
+            v_scale: 1.0,
+            block_formats: None,
+            classes: None,
+            tq: None,
+            rope: None,
+            sinks: c.sinks.then(|| sinks.view()),
+        })
+        .unwrap_or_else(|e| panic!("{} {cfg}: {e}", cfg.op()));
+    let all = read(&out);
+    let row = hq * d;
+    let outs = (0..which.len())
+        .map(|i| all[indptr[i] * row..indptr[i + 1] * row].to_vec())
+        .collect();
+    (outs, impl_name, read(&pool))
+}
+
+/// Phase 7 S-8 (kernel ABI v2.17): paged attention with a sliding window and sink logits, and
+/// at head_dim 64 and 256, matches the CPU reference (`sinks_and_window_match_naive` checks the
+/// reference itself) over prefill and decode batches of sequence lengths 1, 127, 128, 129 and
+/// 1000 (a page edge and a context far beyond the window), plus a chunked prefill over earlier
+/// history; the append is exact. Pins the implementation: CK fmha_fwd_splitkv for d64 / d256
+/// (prefill included), CK fmha_fwd_pagedkv for the d128 prefill and splitkv for its decode.
+/// Breaks if the window is off by one or anchored at the wrong end, a sink is dropped, read
+/// from the wrong head or added to the numerator, a head-dim stride is still 128, or a call
+/// lands on a Turbine kernel that ignores the new fields.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn attention_sinks_window_match_reference() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(23);
+    let lens = [1usize, 127, 128, 129, 1000];
+    for c in WINDOW_CASES {
+        for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+            let (q_lens, kv_lens): (Vec<usize>, Vec<usize>) = match kind {
+                // Fresh prefills of every length, and 100 new rows over 900 earlier tokens.
+                AttentionKind::PrefillPaged => {
+                    lens.iter().map(|&n| (n, n)).chain([(100, 1000)]).unzip()
+                }
+                _ => lens.iter().map(|&n| (1, n)).unzip(),
+            };
+            let b = window_batch(&mut rng, &c, &q_lens, &kv_lens);
+            let all: Vec<usize> = (0..q_lens.len()).collect();
+            let (hip_out, impl_name, hip_pool) = window_run(&p, true, kind, &c, &b, &all);
+            let (cpu_out, _, cpu_pool) = window_run(&p, false, kind, &c, &b, &all);
+            let want = if c.head_dim != HEAD_DIM || kind == AttentionKind::DecodePaged {
+                "ck_tile_fmha_splitkv"
+            } else {
+                "ck_tile_fmha_pagedkv"
+            };
+            assert_eq!(impl_name, want, "{c:?} {kind:?}");
+            let what = format!("{kind:?} {c:?} q_lens={q_lens:?} kv_lens={kv_lens:?}");
+            assert_close(
+                &format!("{what} out"),
+                &impl_name,
+                &hip_out.concat(),
+                &cpu_out.concat(),
+                DType::BF16,
+            );
+            assert_exact(
+                &format!("{what} pool after append"),
+                &impl_name,
+                &hip_pool,
+                &cpu_pool,
+            );
+        }
+    }
+}
+
+/// Phase 7 S-8: a sequence's window / sink attention output is bit-identical alone and in a
+/// batch of 16 sequences of mixed lengths, for prefill and for decode (CK fmha_fwd_splitkv
+/// with one split included), at every layout of `WINDOW_CASES`. Breaks if a tile or split
+/// choice, the scratch layout or the mask depends on the batch around the sequence.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn attention_sinks_batch_invariant() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(29);
+    let kv_mix = [
+        1usize, 127, 128, 129, 1000, 7, 300, 513, 64, 250, 129, 900, 2, 640, 31, 1000,
+    ];
+    for c in WINDOW_CASES {
+        for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+            let (q_lens, kv_lens): (Vec<usize>, Vec<usize>) = match kind {
+                // Mixed prefill chunks: the whole sequence, or its last 33 rows.
+                AttentionKind::PrefillPaged => kv_mix
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| (if i % 2 == 0 { n } else { n.min(33) }, n))
+                    .unzip(),
+                _ => kv_mix.iter().map(|&n| (1, n)).unzip(),
+            };
+            let b = window_batch(&mut rng, &c, &q_lens, &kv_lens);
+            let all: Vec<usize> = (0..kv_mix.len()).collect();
+            let (batched, impl_name, _) = window_run(&p, true, kind, &c, &b, &all);
+            for target in [3usize, 4, 9] {
+                let (alone, alone_impl, _) = window_run(&p, true, kind, &c, &b, &[target]);
+                assert_eq!(alone_impl, impl_name, "{c:?} {kind:?}");
+                let (a, bt) = (&alone[0], &batched[target]);
+                let first = a
+                    .iter()
+                    .zip(bt)
+                    .position(|(x, y)| x.to_bits() != y.to_bits());
+                assert!(
+                    first.is_none(),
+                    "{kind:?} {c:?} ({impl_name}): sequence {target} (q {}, kv {}) differs \
+                     alone vs batched at element {first:?}",
+                    q_lens[target],
+                    kv_lens[target]
+                );
+            }
+            println!("{kind:?} {c:?}: impl={impl_name} batch-invariant ok");
+        }
+    }
 }

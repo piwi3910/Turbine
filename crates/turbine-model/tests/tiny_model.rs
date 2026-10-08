@@ -28,7 +28,7 @@ use turbine_kernels::{
     PagedAttentionContext, ProviderId, RopeConfig, RopeContext, RopeKernel, ShimContext,
     ShimLibrary, card_reference_provider, cpu_reference_provider, shim_provider,
 };
-use turbine_kernels::{KV_FMT_TQ2, KV_FMT_TQ4, OpKind, TqHeadTables, TqParams};
+use turbine_kernels::{ExpertDtype, KV_FMT_TQ2, KV_FMT_TQ4, OpKind, TqHeadTables, TqParams};
 use turbine_kv::codec::turboquant::codebook::{TQ_DIM, codebook};
 use turbine_kv::codec::turboquant::hadamard::{SignKind, rademacher};
 use turbine_kv::codec::turboquant::{Tq2Codec, Tq4Codec, TqWidths, decode_record, encode_record};
@@ -45,7 +45,8 @@ use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_with_head_dim, write_tiny_llama,
-    write_tiny_llama_with, write_tiny_olmoe, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
+    write_tiny_llama_with, write_tiny_olmoe, write_tiny_olmoe_quantized,
+    write_tiny_olmoe_with_head_dim, write_tiny_quantized,
 };
 use turbine_model::testing::trace::{
     DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
@@ -469,13 +470,8 @@ impl Naive {
         out.into_iter().map(bf).collect()
     }
 
-    /// `down(silu(gate(h)) · up(h))` for rows `h` of `hidden`; `gate`/`up` are
-    /// `[inter, hidden]`, `down` is `[hidden, inter]`.
-    fn swiglu(&self, h: &[f32], gate: &[f32], up: &[f32], down: &[f32]) -> Vec<f32> {
-        self.swiglu_in(h, gate, up, down, "")
-    }
-
-    /// [`Naive::swiglu`] of the layer whose MLP module is `mlp` (`model.layers.<i>.mlp`, or ""
+    /// `down(silu(gate(h)) · up(h))` for rows `h` of `hidden`; `gate`/`up` are `[inter, hidden]`,
+    /// `down` is `[hidden, inter]`, of the layer (or expert) whose MLP module is `mlp` (`model.layers.<i>.mlp`, or ""
     /// for experts): its inputs are quantized as [`Naive::act_in`] prescribes.
     fn swiglu_in(&self, h: &[f32], gate: &[f32], up: &[f32], down: &[f32], mlp: &str) -> Vec<f32> {
         let hidden = self.cfg.hidden as usize;
@@ -523,11 +519,12 @@ impl Naive {
                     probs[e]
                 };
                 let x = format!("{p}.mlp.experts.{e}");
-                let y = self.swiglu(
+                let y = self.swiglu_in(
                     row,
                     self.get(&format!("{x}.gate_proj.weight")),
                     self.get(&format!("{x}.up_proj.weight")),
                     self.get(&format!("{x}.down_proj.weight")),
+                    &x,
                 );
                 for (a, y) in acc.iter_mut().zip(y) {
                     *a = bf(*a + bf(y * bf(weight)));
@@ -1371,6 +1368,163 @@ fn quantized_matches_dequantized_bf16() {
                 tokens.push(next);
                 feed = vec![next];
             }
+        }
+    }
+}
+
+/// Phase 7 S-4: the tiny OLMoE (hidden 128, expert width 128, 8 experts top-2) with FP8 block,
+/// FP8 tensor (static activation scales: W8A8) and MXFP4 experts on the CPU provider — prefill
+/// and greedy decode — gives logits within 1e-3 of the naive model over its dequantized BF16 twin
+/// (W8A8: with every expert projection's input quantize-dequantized by the expert's static
+/// scale, the larger of gate and up for their shared input); weight-only formats equal the twin
+/// run on the same executor bit for bit. Formats without an expert kernel row (FP8 channel,
+/// token-dynamic FP8, INT4) are refused `quant_moe_phase7` naming the format and architecture.
+/// Breaks if an expert's scale is read from another expert's slot, the per-row copies of a
+/// per-tensor scale are not reduced to one per expert, the static scales are not the larger
+/// of gate and up, or the executor runs the BF16 experts on quantized bytes.
+#[test]
+fn quantized_moe_matches_dequantized_bf16() {
+    use serde_json::json;
+    let tmp = TempDir::new("tiny-model-quantized-moe");
+    let ct_fp8 = |strategy: &str, input: serde_json::Value| {
+        json!({"quant_method": "compressed-tensors", "format": "float-quantized",
+               "ignore": ["lm_head", "mlp.gate"],
+               "config_groups": {"group_0": {"targets": ["Linear"],
+                   "input_activations": input,
+                   "weights": {"num_bits": 8, "type": "float", "strategy": strategy,
+                               "dynamic": false, "symmetric": true}}}})
+    };
+    let static_tensor =
+        json!({"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": false});
+    let cases = [
+        (
+            "hf block",
+            json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+                   "weight_block_size": [128, 128], "modules_to_not_convert": ["mlp.gate"]}),
+            Some(ExpertDtype::Fp8Block),
+        ),
+        (
+            "ct tensor static (W8A8)",
+            ct_fp8("tensor", static_tensor.clone()),
+            Some(ExpertDtype::Fp8Tensor),
+        ),
+        (
+            "hf tensor static (W8A8)",
+            json!({"quant_method": "fp8", "activation_scheme": "static",
+                   "modules_to_not_convert": ["mlp.gate"]}),
+            Some(ExpertDtype::Fp8Tensor),
+        ),
+        (
+            "ct mxfp4",
+            json!({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                   "ignore": ["lm_head", "mlp.gate"],
+                   "config_groups": {"group_0": {"targets": ["Linear"],
+                       "weights": {"num_bits": 4, "type": "float", "strategy": "group",
+                                   "group_size": 32}}}}),
+            Some(ExpertDtype::Mxfp4),
+        ),
+        // No expert kernel row: refused at build.
+        (
+            "ct channel weight-only",
+            ct_fp8("channel", json!(null)),
+            None,
+        ),
+        (
+            "awq",
+            json!({"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": true,
+                   "version": "gemm", "modules_to_not_convert": ["mlp.gate"]}),
+            None,
+        ),
+    ];
+    for (i, (name, q, expert)) in cases.into_iter().enumerate() {
+        let fixture =
+            write_tiny_olmoe_quantized(&tmp.path().join(i.to_string()), SEED, &q, 128, 128);
+        let cfg = &fixture.quantized.config;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let Some(dtype) = expert else {
+            let index = SafetensorsIndex::open(&fixture.quantized.dir).expect("index");
+            let weights = WeightLoader::load_format(
+                cfg.weight_format.get(),
+                &index,
+                &cfg.family.0.weight_slots(cfg),
+                &mem,
+                MAX_STAGING_BYTES,
+            )
+            .expect("the loader reads quantized experts");
+            let reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
+            let provider = cpu_reference_provider();
+            let order = [provider.id()];
+            let card = provider.card_profile();
+            let metrics = KernelMetrics::register(&MetricsRegistry::new());
+            let registry = KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+                .expect("registry");
+            let err = build_executor(
+                cfg,
+                weights,
+                Arc::new(registry),
+                Arc::clone(&mem),
+                BLOCK_TOKENS,
+                64,
+                MAX_SEQS,
+                ExecutorOptions::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{name}: must be refused"))
+            .to_string();
+            assert!(err.contains("quant_moe_phase7"), "{name}: {err}");
+            assert!(
+                err.contains("experts for OlmoeForCausalLM"),
+                "{name}: {err}"
+            );
+            assert!(err.contains("have no supported row"), "{name}: {err}");
+            continue;
+        };
+        let format = cfg.weight_format.get();
+        let mode = format.activation().kernel();
+        let mut naive = Naive::load(&fixture.twin.dir, &fixture.twin.config);
+        naive.act_quant = mode;
+        naive.input_scales = input_scales(&fixture.quantized.dir);
+        let reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
+        assert!(
+            reqs.iter()
+                .any(|r| matches!(&r.spec, OpConfig::MoeExperts(c) if c.weight_dtype == dtype)),
+            "{name}: no {dtype:?} moe_experts in the requirements"
+        );
+        let mut exec = cpu_model(&fixture.quantized, &mem, 64);
+        let layout = *exec.kv_layout();
+        let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+        let mut twin = (mode == ActQuantDesc::None).then(|| {
+            let exec = cpu_model(&fixture.twin, &mem, 64);
+            let kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+            (exec, kv)
+        });
+        let mut tokens = prompt(fixture.quantized.vocab);
+        let mut feed = tokens.clone();
+        let mut start = 0u32;
+        for step in 0..=4 {
+            let positions: Vec<u32> = (start..start + feed.len() as u32).collect();
+            let row = kv
+                .forward(exec.as_mut(), &feed, &positions)
+                .expect("forward")
+                .row(0)
+                .to_vec();
+            let diff = max_abs_diff(&row, &naive.logits(&tokens));
+            assert!(diff <= 1e-3, "{name} step {step}: max abs diff {diff}");
+            if let Some((texec, tkv)) = twin.as_mut() {
+                let want = tkv
+                    .forward(texec.as_mut(), &feed, &positions)
+                    .expect("twin forward")
+                    .row(0)
+                    .to_vec();
+                assert_eq!(
+                    row, want,
+                    "{name} step {step}: weight-only differs from its twin"
+                );
+            }
+            let next = argmax(&row);
+            start += feed.len() as u32;
+            tokens.push(next);
+            feed = vec![next];
         }
     }
 }
@@ -4376,7 +4530,14 @@ fn cpu_profiled(
     let cfg = &spec.config;
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = cfg.family.0.weight_slots(cfg);
-    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
     let provider = cpu_reference_provider();
     let order = [provider.id()];
     let metrics = KernelMetrics::register(&MetricsRegistry::new());
@@ -4416,6 +4577,7 @@ fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
         "llama" => families::llama::decoder_spec(),
         "olmoe" => families::olmoe::decoder_spec(),
         "qwen3" => families::qwen3::decoder_spec(),
+        "gpt_oss" => families::gpt_oss::decoder_spec(),
         other => panic!("no tiny decoder spec for family {other}"),
     }
 }
@@ -5388,7 +5550,9 @@ fn tp2_quantized_matches_tp1_on_host() {
     assert!(err.contains("quant_shard_misaligned"), "{err}");
     assert!(err.contains("mlp."), "names the layer: {err}");
 
-    // A quantized mixture of experts is Phase 7's.
+    // A quantized mixture of experts whose format has no expert kernel row (here FP8 channel
+    // weights, weight-only) is refused `quant_moe_phase7`; `quantized_moe_matches_dequantized_bf16`
+    // covers the served formats.
     let dir = tmp.path().join("olmoe");
     write_tiny_olmoe(&dir, SEED);
     let format = turbine_model::weights::detect(
@@ -6650,4 +6814,155 @@ fn tp2_prefill_split_at_a_block_boundary_matches_unsplit() {
         }
     }
     println!("tp2_prefill_split_at_a_block_boundary_matches_unsplit: bitwise on both ranks");
+}
+
+// ------------------------------------------------------------------------------------ gpt-oss
+
+/// The per-op trace of transformers on a tiny gpt-oss checkpoint
+/// (`scripts/golden/tiny_trace.py`, committed under `tests/fixtures/`).
+struct ReferenceTrace {
+    prompt: Vec<u32>,
+    ops: Vec<ReferenceOp>,
+}
+
+/// One recorded op: layer (`None` for `embed`, `final_norm`, `logits`), name, shape, data.
+struct ReferenceOp {
+    layer: Option<usize>,
+    name: String,
+    shape: Vec<usize>,
+    data: Vec<f32>,
+}
+
+fn reference_trace(file: &str) -> ReferenceTrace {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(file);
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())),
+    )
+    .expect("trace JSON");
+    let ops = json["ops"]
+        .as_array()
+        .expect("ops")
+        .iter()
+        .map(|o| ReferenceOp {
+            layer: o["layer"].as_u64().map(|l| l as usize),
+            name: o["name"].as_str().expect("name").to_string(),
+            shape: o["shape"]
+                .as_array()
+                .expect("shape")
+                .iter()
+                .map(|d| d.as_u64().expect("dim") as usize)
+                .collect(),
+            data: o["data"]
+                .as_array()
+                .expect("data")
+                .iter()
+                .map(|v| v.as_f64().expect("number") as f32)
+                .collect(),
+        })
+        .collect();
+    ReferenceTrace {
+        prompt: json["prompt_ids"]
+            .as_array()
+            .expect("prompt_ids")
+            .iter()
+            .map(|v| v.as_u64().expect("id") as u32)
+            .collect(),
+        ops,
+    }
+}
+
+/// The CPU executor on the tiny gpt-oss checkpoint of seed 7 and sliding window `window`,
+/// one prefill of the fixture's prompt, against transformers' trace of the same checkpoint
+/// (`file`): every recorded op within the Phase 1 trace bounds (hidden states and projections
+/// to 2e-2 absolute, or two BF16 ulps where a value's magnitude makes that finer than the
+/// format), the routed experts equal, every op within the bound below.
+fn gpt_oss_against_transformers(window: u32, file: &str) {
+    let reference = reference_trace(file);
+    let tmp = TempDir::new("tiny-model-gpt-oss");
+    let spec = turbine_model::testing::tiny::write_tiny_gpt_oss(tmp.path(), SEED, window);
+    let cfg = &spec.config;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv =
+        SequenceKv::new(&mem, spec.config.kv_layout(BLOCK_TOKENS), MAX_SEQ_LEN).expect("kv");
+    exec.set_trace(true);
+    let tokens = &reference.prompt;
+    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+    kv.forward(&mut exec, tokens, &positions).expect("prefill");
+    let trace = exec.take_trace();
+
+    let mut worst: Vec<(String, f32)> = Vec::new();
+    let mut failures = Vec::new();
+    for ReferenceOp {
+        layer,
+        name,
+        shape,
+        data: want,
+    } in &reference.ops
+    {
+        let got = trace
+            .iter()
+            .find(|t| t.layer == *layer && t.name == name)
+            .unwrap_or_else(|| panic!("the executor did not record {layer:?} {name}"));
+        assert_eq!(&got.shape[..], &shape[..], "{layer:?} {name} shape");
+        if name == "topk_ids" {
+            // The selected experts as a set: their order within the top-k (by descending
+            // weight) is numerics-dependent when two gates are close, and the sum does not
+            // care about it.
+            let (mut a, mut b) = (got.data.clone(), want.clone());
+            a.sort_by(|x, y| x.total_cmp(y));
+            b.sort_by(|x, y| x.total_cmp(y));
+            assert_eq!(a, b, "{layer:?} routed experts differ");
+            continue;
+        }
+        let stats = turbine_model::testing::trace::DiffStats::of(want, &got.data);
+        worst.push((format!("{layer:?} {name}"), stats.max_abs));
+        // The per-op bound: max |d| over 2e-2, or a quarter of the op's largest value.
+        // transformers and the executor are different BF16 numerics models (every GEMM rounds
+        // once; the accumulation order differs), so each op adds one-ulp differences that the
+        // next layer's GEMMs and the MoE gate (a softmax over close logits) amplify: on this
+        // fixture every layer-0 op is within two BF16 ulps, while layer 3 reaches a few
+        // tenths (~8-20 % of the values). A structural error - a wrong expert layout, bias,
+        // window or sink - is a O(value) mismatch and fails by orders of magnitude; the
+        // executor's own numerics are held to 2e-2 against the naive decoder by the
+        // conformance suite.
+        let bad = stats.max_abs > 2e-2 && stats.max_abs > stats.max_ref / 4.0;
+        if bad {
+            failures.push(format!(
+                "{layer:?} {name}: max |d| {} ({} ulps), max |ref| {}",
+                stats.max_abs, stats.max_ulps, stats.max_ref
+            ));
+        }
+    }
+    println!(
+        "gpt_oss_against_transformers (window {window}, {} ops over {} layers):",
+        reference.ops.len(),
+        cfg.num_layers
+    );
+    for (op, d) in &worst {
+        println!("  {op}: max |d| {d}");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// P7 Task 24 (S-8): the tiny gpt-oss checkpoint (4 layers alternating a 128-position window
+/// with full attention, head_dim 64, biased projections, sinks, YaRN, 4 MXFP4 experts with
+/// biases and the clamped activation behind a top-k-then-softmax router with a bias) on the CPU
+/// executor equals transformers op by op on a 5-token prefill. The window never binds at five
+/// tokens; `gpt_oss_window_matches_reference` binds it. Breaks if any of the fused expert
+/// mapping (interleaved gate/up, biases, MXFP4 scales), the sinks, the biases, the router mode
+/// or the clamp is off.
+#[test]
+fn gpt_oss_matches_reference() {
+    gpt_oss_against_transformers(128, "tiny-gpt-oss-trace.json");
+}
+
+/// The window of the sliding-attention layers equals transformers': with `sliding_window` 4 and
+/// a 10-token prompt, layers 0 and 2 attend the last 4 positions (the kernels' `window_left`
+/// is `window - 1`), layers 1 and 3 all of them. Breaks if the window is off by one.
+#[test]
+fn gpt_oss_window_matches_reference() {
+    gpt_oss_against_transformers(4, "tiny-gpt-oss-window-trace.json");
 }

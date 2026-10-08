@@ -70,7 +70,15 @@ mod registry_conformance {
         names_are(
             reg,
             "model_family",
-            &["llama", "olmoe", "qwen3", "qwen3_moe", "mistral", "mixtral"],
+            &[
+                "llama",
+                "olmoe",
+                "qwen3",
+                "qwen3_moe",
+                "mistral",
+                "mixtral",
+                "gpt_oss",
+            ],
         );
         passes(families_suite(reg));
     }

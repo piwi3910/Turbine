@@ -29,9 +29,10 @@ use crate::KernelError;
 use crate::cards::CardProfile;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel,
-    AttentionKind, ElementwiseKernel, EmbeddingKernel, GemmKernel, KernelProvider, KvCopyKernel,
-    KvTranscodeKernel, LogitsReduceKernel, MoeKernel, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
+    AttentionKind, Conv1dKernel, ElementwiseKernel, EmbeddingKernel, GdnKernel, GemmKernel,
+    KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel, NormKernel,
+    OpKind, PagedAttentionContext, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel,
+    ShardedNormKernel,
 };
 
 /// The b1 decode kernel's implementation name in a card's decode-attention order.
@@ -51,7 +52,14 @@ pub fn b1_runs(cfg: &AttentionConfig, num_seqs: usize) -> bool {
     let grouped = cfg.num_kv_heads > 0
         && cfg.num_q_heads > cfg.num_kv_heads
         && cfg.num_q_heads / cfg.num_kv_heads <= B1_MAX_GROUP;
-    let b1_serves = cfg.kind == AttentionKind::DecodePaged && cfg.dtype == DType::BF16 && grouped;
+    // The b1 kernel is head_dim 128 only and takes neither a window nor sinks (ABI v2.17):
+    // those calls run CK.
+    let b1_serves = cfg.kind == AttentionKind::DecodePaged
+        && cfg.dtype == DType::BF16
+        && grouped
+        && cfg.head_dim == 128
+        && cfg.window.is_none()
+        && !cfg.sinks;
     let ck_takes = num_seqs >= B1_CK_SEQS
         && cfg
             .block_tokens
@@ -159,6 +167,12 @@ impl KernelProvider for CardReference {
     fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         CPU.kv_transcode()
     }
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        CPU.gdn()
+    }
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        CPU.conv1d()
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +195,8 @@ mod tests {
             dtype,
             block_tokens: Some(block_tokens),
             causal: true,
+            window: None,
+            sinks: false,
         }
     }
 
@@ -210,6 +226,24 @@ mod tests {
         assert!(!b1_runs(&cfg(DecodePaged, (72, 8), DType::BF16, 128), 1));
         assert!(!b1_runs(&cfg(DecodePaged, llama, DType::F8E4M3, 128), 1));
         assert!(!b1_runs(&cfg(PrefillPaged, llama, DType::BF16, 128), 1));
+        // Phase 7 S-8: other head dims, a window or sinks run CK (the b1 kernel takes none).
+        let plain = cfg(DecodePaged, llama, DType::BF16, 128);
+        for other in [
+            AttentionConfig {
+                head_dim: 64,
+                ..plain
+            },
+            AttentionConfig {
+                window: Some(128),
+                ..plain
+            },
+            AttentionConfig {
+                sinks: true,
+                ..plain
+            },
+        ] {
+            assert!(!b1_runs(&other, 1), "{other}");
+        }
     }
 
     /// One grouped BF16 decode step over `kv_lens` (one query per sequence, sequence `s` in
@@ -244,6 +278,8 @@ mod tests {
                     dtype,
                     block_tokens: Some(bt as u32),
                     causal: true,
+                    window: None,
+                    sinks: false,
                 },
                 q: q.view(),
                 k_new: kn.view(),
@@ -263,6 +299,7 @@ mod tests {
                 classes: None,
                 tq: None,
                 rope: None,
+                sinks: None,
             })
             .expect("decode");
         crate::cpu::load(&out.view()).expect("load out")

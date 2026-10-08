@@ -79,6 +79,7 @@ impl ModelFamily for Mixtral {
             moe: Some(moe),
             qk_norm: false,
             qk_norm_per_head: false,
+            ..FamilyConfig::default()
         })
     }
 

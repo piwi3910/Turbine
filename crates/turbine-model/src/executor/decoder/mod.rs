@@ -76,6 +76,7 @@ use super::{
 use crate::ModelError;
 use crate::config::{ModelArchConfig, MoeConfig};
 use crate::ep::{EpContext, EpDims};
+use crate::families::LayerKind;
 use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
 use crate::pp::PpContext;
 use crate::testing::trace::RoutingRow;
@@ -88,7 +89,10 @@ mod trace;
 
 pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
-pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
+pub use hooks::{
+    ATTENTION_SINKS_WINDOW, MOE, MOE_GPT_OSS, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD,
+    SWIGLU,
+};
 pub use tq_tables::TqDeviceTables;
 pub use trace::TraceTensor;
 use trace::{RoutingTracer, Tracer};
@@ -158,6 +162,19 @@ pub struct DecoderDims {
     pub quant: Option<LinearQuant>,
     /// Some decoder linear layers stay BF16 (the checkpoint's ignore list, or no quantization).
     pub bf16_linears: bool,
+    /// Per layer, the sliding window of its attention as the kernels take it
+    /// ([`AttentionConfig::window`], `window_left`): `Some(w − 1)` for a layer of
+    /// [`LayerKind::SlidingWindow`] `{ window: w }`, which attends the last `w` positions
+    /// (transformers' mask keeps `q − k < w`), `None` for full attention (P7 S-8).
+    pub window_left: Vec<Option<u32>>,
+}
+
+/// The `window_left` of a layer kind (`None`: every position `≤ p`).
+fn window_left(kind: LayerKind) -> Option<u32> {
+    match kind {
+        LayerKind::SlidingWindow { window } => Some(window.saturating_sub(1)),
+        _ => None,
+    }
 }
 
 /// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
@@ -201,6 +218,7 @@ impl DecoderDims {
             ep: None,
             quant,
             bf16_linears,
+            window_left: cfg.layer_kinds.iter().map(|k| window_left(*k)).collect(),
         }
     }
 
@@ -297,7 +315,14 @@ impl DecoderDims {
     /// Paged causal GQA attention over blocks of `block_tokens` tokens of `kv` pages (the
     /// activation dtype, or F8E4M3 under `kv.dtype: fp8_e4m3`: the config then names the page
     /// dtype, [`AttentionConfig::dtype`]).
-    fn attention(&self, kind: AttentionKind, block_tokens: u32, kv: DType) -> AttentionConfig {
+    fn attention(
+        &self,
+        kind: AttentionKind,
+        block_tokens: u32,
+        kv: DType,
+        window: Option<u32>,
+        sinks: bool,
+    ) -> AttentionConfig {
         // Quantized pages (FP8, TurboQuant) name the page dtype; float pages the activations'.
         let dtype = if kv == DType::F8E4M3 || kv.tq_record_bytes().is_some() {
             kv
@@ -312,7 +337,32 @@ impl DecoderDims {
             dtype,
             block_tokens: Some(block_tokens),
             causal: true,
+            window,
+            sinks,
         }
+    }
+
+    /// Every distinct attention config of `kind` the layers run: one per distinct window.
+    fn attentions(
+        &self,
+        kind: AttentionKind,
+        block_tokens: u32,
+        kv: DType,
+        sinks: bool,
+    ) -> Vec<AttentionConfig> {
+        let mut out: Vec<AttentionConfig> = Vec::new();
+        let windows: &[Option<u32>] = if self.window_left.is_empty() {
+            &[None]
+        } else {
+            &self.window_left
+        };
+        for &w in windows {
+            let cfg = self.attention(kind, block_tokens, kv, w, sinks);
+            if !out.contains(&cfg) {
+                out.push(cfg);
+            }
+        }
+        out
     }
 
     /// Parameter `name` taken from `weights`, checked to be the `shape` matrix (or stack of
@@ -380,6 +430,46 @@ pub trait AttentionHook: Send + Sync {
         q: &TensorView<'_>,
         k: &TensorView<'_>,
     ) -> Result<(), ModelError>;
+    /// Runs on the raw Q/K/V GEMM outputs `q`, `k`, `v` in place, before their trace points
+    /// (projection biases, P7 S-8). Nothing by default.
+    fn after_linear(
+        &self,
+        run: &LayerRun<'_>,
+        w: &HookWeights,
+        q: &TensorView<'_>,
+        k: &TensorView<'_>,
+        v: &TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let _ = (run, w, q, k, v);
+        Ok(())
+    }
+    /// Runs on the O projection's output rows `proj` in place, before its all-reduce (output
+    /// bias, P7 S-8). Nothing by default.
+    fn after_o_proj(
+        &self,
+        run: &LayerRun<'_>,
+        w: &HookWeights,
+        proj: &TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let _ = (run, w, proj);
+        Ok(())
+    }
+    /// Whether the layers' attention takes learned sink logits ([`AttentionConfig::sinks`]);
+    /// [`AttentionHook::sinks`] then returns each layer's. False by default.
+    fn has_sinks(&self) -> bool {
+        false
+    }
+    /// The layer's sink logits: F32 `[heads]` in the scaled-score domain, when
+    /// [`AttentionHook::has_sinks`].
+    fn sinks<'a>(&self, w: &'a HookWeights) -> Option<TensorView<'a>> {
+        let _ = w;
+        None
+    }
+    /// Whether decode may take the fused form (norm and residual add inside the GEMVs): false
+    /// for a hook whose projections carry biases the fused GEMVs do not add. True by default.
+    fn allows_fused_decode(&self) -> bool {
+        true
+    }
 }
 
 /// The FFN variant: the block from the normalised rows ([`LayerRun::normed`]) to its output
@@ -702,7 +792,7 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
 /// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
 /// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
 /// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
-/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and pipeline
+/// experts of a format without a kernel row (`quant_moe_phase7`) and pipeline
 /// parallelism (`pipeline` set: not yet proven with quantized stages). Tensor parallelism is
 /// served (Phase 6a S-12): the loader refuses a shard that cuts a group or block
 /// (`quant_shard_misaligned`).
@@ -719,10 +809,14 @@ fn check_weight_format(cfg: &ModelArchConfig, pipeline: bool) -> Result<(), Mode
         return Ok(());
     };
     let refuse = |why: String| Err(invalid(format!("weight format {}: {why}", format.name())));
-    if cfg.moe.is_some() {
-        return refuse(
-            "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
-        );
+    // Quantized experts run on the Phase 7 per-expert kernels: FP8 block (W8A16), FP8 tensor
+    // with static activation scales (W8A8) and MXFP4 weights; any other format has no row.
+    if cfg.moe.is_some() && !hooks::experts_served(&quant) {
+        return refuse(format!(
+            "quant_moe_phase7: {} experts for {} have no supported row",
+            format.name(),
+            cfg.hf_architecture
+        ));
     }
     if pipeline {
         return refuse(
@@ -943,19 +1037,15 @@ impl DecoderExecutor {
             specs.extend(d.linear_ops(d.kv_dim, d.hidden));
         }
         specs.extend(spec.attention.requirements(d));
-        specs.extend([
-            OpConfig::Rope(d.rope()),
-            OpConfig::Attention(d.attention(
-                AttentionKind::PrefillPaged,
-                block_tokens,
-                cfg.kv_cache.dtype,
-            )),
-            OpConfig::Attention(d.attention(
-                AttentionKind::DecodePaged,
-                block_tokens,
-                cfg.kv_cache.dtype,
-            )),
-        ]);
+        specs.extend([OpConfig::Rope(d.rope())]);
+        let sinks = spec.attention.has_sinks();
+        for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+            specs.extend(
+                d.attentions(kind, block_tokens, cfg.kv_cache.dtype, sinks)
+                    .into_iter()
+                    .map(OpConfig::Attention),
+            );
+        }
         specs.extend(d.linear_ops(d.hidden, d.q_dim));
         specs.push(OpConfig::Add(d.add()));
         if opts.fused_ops {
@@ -1459,16 +1549,18 @@ impl DecoderExecutor {
     /// and k, is off.
     pub fn decode_fuses_rope(&self) -> bool {
         let d = &self.dims;
-        let attn = d.attention(
+        let attns = d.attentions(
             AttentionKind::DecodePaged,
             self.kv_layout.block_tokens,
             self.kv_layout.dtype,
+            self.spec.attention.has_sinks(),
         );
         !self.trace.is_on()
-            && self
-                .registry
-                .attention(&attn)
-                .fuses_decode_rope(&attn, &d.rope())
+            && attns.iter().all(|attn| {
+                self.registry
+                    .attention(attn)
+                    .fuses_decode_rope(attn, &d.rope())
+            })
     }
 
     /// The decode graph key [`ModelExecutor::launch`] would run `batch` with `feeds` under
@@ -1793,6 +1885,7 @@ impl DecoderExecutor {
             || self.pp.is_some()
             || !self.add_norm
             || !self.qkv.fused
+            || !self.spec.attention.allows_fused_decode()
         {
             return false;
         }
@@ -2131,6 +2224,9 @@ impl DecoderExecutor {
             self.linear(at(&b.h), wq(d.q_dim, d.kv_dim), k())?;
             self.linear(at(&b.h), wq(d.q_dim + d.kv_dim, d.kv_dim), v())?;
         }
+        self.spec
+            .attention
+            .after_linear(&run, &l.attention, &q(), &k(), &v())?;
         self.record(li, "q", q())?;
         self.record(li, "k", k())?;
         self.record(li, "v", v())?;
@@ -2146,7 +2242,13 @@ impl DecoderExecutor {
         } else {
             AttentionKind::PrefillPaged
         };
-        let attn = d.attention(kind, self.kv_layout.block_tokens, self.kv_layout.dtype);
+        let attn = d.attention(
+            kind,
+            self.kv_layout.block_tokens,
+            self.kv_layout.dtype,
+            d.window_left.get(i).copied().flatten(),
+            self.spec.attention.has_sinks(),
+        );
         // P5p b1 attention II: on decode steps RoPE rides in the attention call when its kernel
         // takes it (kernel ABI v2.12: the same operations, one launch and one boundary fewer),
         // except while tracing, which records the rotated q and k.
@@ -2218,6 +2320,8 @@ impl DecoderExecutor {
                         inv_freq: b.inv_freq.view(),
                         attn_factor: d.rope_attn_factor,
                     }),
+                    // Phase 7 S-8: the families with sinks (gpt-oss) pass them here.
+                    sinks: self.spec.attention.sinks(&l.attention),
                 })
         })?;
         self.record(li, "attn", at(&b.attn))?;
@@ -2232,7 +2336,10 @@ impl DecoderExecutor {
                 Some(at(&b.x)),
             );
         }
-        self.linear(at(&b.attn), l.wo.view(), at(&b.proj))
+        self.linear(at(&b.attn), l.wo.view(), at(&b.proj))?;
+        self.spec
+            .attention
+            .after_o_proj(&run, &l.attention, &at(&b.proj))
     }
 
     /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the

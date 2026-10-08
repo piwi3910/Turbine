@@ -4240,6 +4240,9 @@ plus a full snapshot, cutting the pool's block count ~12×.
   block of every finished sequence (the multi-turn hit point); a hit restores the nearest snapshot at or before the
   match and recomputes the rest.
 - C) Only the last full block of every finished sequence.
+  (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
+
+(2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
 (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
@@ -4271,6 +4274,9 @@ the pod's two GPUs (GPUs are per container).
   placements (Turbine then vLLM on the same cards, as Phase 2c does on one), which prints the S-13 ratio verdict.
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
+  Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
+
+Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
 Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
@@ -4308,6 +4314,33 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 
 **Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
 per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
+
+## P7 attention sinks/window instances (2026-10-08)
+
+Phase 7 Task 23 evaluation (`p7-t23`), CK at the pinned commit `cd957402` (`generate.py --targets gfx1201
+--list_blobs`, then the lab build):
+
+- `fmha_fwd_pagedkv` (pagedkv_prefill): gfx12 BF16 has **d128 only** — the d64 / d256 tile entries are commented out
+  in `KernelComponentFactoryGfx12` at this commit. Its masked (simplified mask: bottom-right causal and the local
+  window) and `_sink` instances codegen and compile at d128.
+- `fmha_fwd_splitkv`: gfx12 BF16 has d32 / d64 / d128 / d256 group-mode paged instances with mask × sink variants
+  (three tiles each) and their combine kernels; d64, d128 and d256 masked/unmasked × sink/nsink codegen and compile.
+- So no needed case is missing at the pin: d64 / d256 prefill and decode run `fmha_fwd_splitkv` with one split
+  (group mode, `seqstart_q = q_indptr`, bottom-right / local mask), d128 keeps `fmha_fwd_pagedkv` for prefill and
+  splitkv for grouped decode. No newer CK pin and no own kernel (options A / B of the plan) were needed; recorded
+  here as built rather than asked.
+- Cost: generated FMHA sources 29 → 75 (+46: pagedkv d128 sink 2, splitkv d128 masked/sink 9, d64 12 + 4 combine,
+  d256 12 + 4 combine); `libturbine_hip.so` 4.33 MB → 7.77 MB; the incremental lab build of the new sources ran inside
+  the one `lab-test.sh` Job build step (88 ninja steps). With one split a d64 / d256 prefill chunk's F32 split
+  scratch is `total_q × num_q_heads × head_dim × 4` bytes (gpt-oss 64 × 64: 16 KiB a row, 128 MiB at 8,192 rows).
+- Finding: CK's head-merged splitkv decode (no mask, `max_seqlen_q == 1`) reads `sink_ptr[i_nhead]` with `i_nhead`
+  the KV head of its merged tile, so every query head of a group gets the group's first sink. Calls with sinks
+  therefore always take the masked instances (no head merge); `hip_ops attention_sinks_window_match_reference`
+  caught it (d64 decode with sinks, |Δ| 0.09). Worth an upstream CK report.
+- ABI semantics: `window_left = w` lets query position `p` see keys `p − w ..= p` (w + 1 keys); HF's
+  `sliding_window = W` (gpt-oss 128) is `window_left = W − 1`. The gpt-oss tasks (24/26) must map it so.
+- Minor: the header says 17 although v2.16 (Task 15, experts) has not landed on `p7-stack`; the lead orders the two
+  at merge.
 
 ## Phase 7 Task 13: OLMoE EP×TP drift — cause found, fix is a gate trade (2026-10-08)
 
@@ -4442,3 +4475,108 @@ reference, but the logprob bounds (Llama's, 0.15 likely / 0.56 tail) miss: c1 9/
 
 **Decision (user, 2026-10-08): C** — Qwen3's own bounds from a transformers self-spread run now (documented in the
 slug README), re-gate; the fused single-rounding QK-norm stays a follow-up.
+
+## P7 quantized MoE expert provider (Task 14, 2026-10-08)
+
+Which kernel runs the quantized experts of Qwen3-30B-A3B (FP8 128x128 block, W8A16), Mixtral-8x7B (FP8 static
+per-tensor, W8A8) and gpt-oss-20b (MXFP4, W4A16) on gfx1201? Dequantizing experts to BF16 at load does not fit
+32 GB (Qwen3 ~60 GB, Mixtral ~93 GB, gpt-oss ~40 GB), so a quantized expert path is required. Harness:
+`kernels/rocm/tools/moe_quant_eval/` (random top-k routing, gate_up + down over all active experts, median of 5x10,
+weight copies rotated >= 512 MiB, GPU 0 under the bench lock; correctness on sampled rows vs a host reference over the
+exact dequantized weights, 6a bound `|d| <= |ref|/256 + rms/128`). Pins: CK `cd957402`, latest rocm-libraries
+`fc6b9d63`, llama.cpp `bd4eeaa0`, hipBLASLt 1.4.1 (ROCm 7.14).
+
+**Measured (us, gate_up + down, all active experts; tokens = rows routed top-k):**
+
+| format                             | candidate                                                             | 1                                                                                                                                                                                                                                      | 4      | 16     | 256    | 2048               | correct vs CPU ref                                                                                            |
+| ---------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------ | ------ | ------------------ | ------------------------------------------------------------------------------------------------------------- |
+| FP8 block (Qwen3, 128e top-8)      | own per-expert loop `turbine_hip_fp8_block`                           | 137.9                                                                                                                                                                                                                                  | 540.4  | 1441.6 | 8355.1 | 9281.9             | pass (max ratio 0.48-0.89)                                                                                    |
+|                                    | BF16 fused `turbine_moe_experts` (cost reference, weights do not fit) | 109.7                                                                                                                                                                                                                                  | 533.6  | 1359.7 | 2258.9 | 2870.3             | n/a                                                                                                           |
+|                                    | CK `moe_flatmm`, `quant_grouped_gemm`                                 | does not compile on gfx1201                                                                                                                                                                                                            |        |        |        |                    |                                                                                                               |
+|                                    | CK `abquant_grouped_gemm` (1x128x128)                                 | builds; own CPU validation fails (see gaps); example ignores our shapes                                                                                                                                                                |        |        |        |                    | FAIL                                                                                                          |
+|                                    | hipBLASLt grouped / block scale                                       | 0 solutions; `BLK128x128_32F` not supported                                                                                                                                                                                            |        |        |        |                    | n/a                                                                                                           |
+|                                    | llama.cpp                                                             | no FP8 type                                                                                                                                                                                                                            |        |        |        |                    | n/a                                                                                                           |
+| FP8 per-tensor (Mixtral, 8e top-2) | own loop `hipblaslt_fp8` + quant_act                                  | 723.5                                                                                                                                                                                                                                  | 1751.2 | 2802.5 | 5557.4 | 7190.2             | pass                                                                                                          |
+|                                    | own loop `turbine_hip_fp8_wmma` + quant_act                           | 747.4                                                                                                                                                                                                                                  | 1838.8 | 2958.0 | 5573.0 | 7254.2             | pass                                                                                                          |
+|                                    | BF16 fused (reference cost)                                           | 1163.2                                                                                                                                                                                                                                 | 2858.5 | 4501.3 | 8230.0 | 36871.1            | n/a                                                                                                           |
+|                                    | CK `moe_flatmm` fp8                                                   | static_assert in `warp_gemm_impl.hpp:51` at the pin; at latest `flatKPerWarp == KThdPerWave * KBPerLoad` (wave64 B shuffle; gfx12 is wave32)                                                                                           |        |        |        |                    | n/a                                                                                                           |
+|                                    | CK `grouped_gemm` fp8                                                 | builds; own validation fails (95.8 % wrong at defaults; pass 3: 0.06 % wrong, max err 1127); our shape flags ignored                                                                                                                   |        |        |        |                    | FAIL                                                                                                          |
+|                                    | hipBLASLt grouped fp8                                                 | 0 heuristic solutions                                                                                                                                                                                                                  |        |        |        |                    | n/a                                                                                                           |
+| MXFP4 (gpt-oss, 32e top-4)         | own loop `turbine_hip_mxfp4` (W4A16)                                  | 176.9                                                                                                                                                                                                                                  | 510.5  | 1099.8 | 3621.5 | 7029.1             | pass                                                                                                          |
+|                                    | BF16 fused (reference cost)                                           | 391.2                                                                                                                                                                                                                                  | 1066.9 | 2273.8 | 2700.7 | 5371.8             | n/a                                                                                                           |
+|                                    | llama.cpp `MUL_MAT_ID` mxfp4 (W4A8 q8_1)                              | 60.0                                                                                                                                                                                                                                   | -      | 726.9  | 1371.3 | 4096 tokens: 10510 | its own test OK; vs the W4A16 reference q8_1 activations exceed the 6a bound by 1.6-2.1x at every count: FAIL |
+|                                    | llama.cpp bf16 (speed reference)                                      | 308.3                                                                                                                                                                                                                                  | -      | 2229.9 | 3483.8 | -                  | OK                                                                                                            |
+|                                    | CK `a16w4_moe_flatmm` (bf16 x fp4)                                    | fails at the pin (warp_gemm static_assert); builds at latest; K=2880 refused (not a multiple of KPerBlock), with K padded to 3072 it still refuses: "N not a multiple of NPerBlock" (gate_up N=5760, down N=2880) at every token count |        |        |        |                    | no run                                                                                                        |
+
+llama.cpp rows are the sum of its gate_up (m 5760) and down (m 2880) ops at the same token count (its n).
+Gaps common to every candidate: gpt-oss needs clamped SwiGLU (alpha 1.702, limit 7), expert biases and an
+interleaved gate_up layout; none of the reused kernels express them (CK a16w4 fuses plain SiLU only). Qwen3 needs
+per-128x128-block scales with BF16 activations; the Mixtral expert needs a static activation scale. CK
+`abquant`/`grouped_gemm` examples are the same class as 6a's "CK gemm_quant FP8 wrong on gfx1201" (CPU validation
+fails; group 7 of the defaults). Their binaries parse none of our `-Ms/-Ns/-Ks` shapes in pass 3 (defaults used, and
+at the largest token counts out of memory), so no timing at our shapes exists; the example's own default-shape rate
+(abquant 318 TFlops, validation FAIL) is not a usable number.
+
+Reading: at decode (1-16 tokens) the own per-expert loop is at or below the BF16 fused op (bandwidth-bound; Qwen3 1
+token = 16 launches of launch overhead). At prefill it loses where experts are many and small: Qwen3 2048 tokens
+9.3 ms vs 2.9 ms BF16 fused (3.2x), gpt-oss 7.0 vs 5.4 ms (1.3x), Mixtral FP8 7.2 ms (faster than its BF16 fused
+op, which is poor at 2048). llama.cpp's MXFP4 kernel is 2.6-3x faster than ours but W4A8 and not our arithmetic.
+
+Options (per format):
+
+- A) Reuse a provider. Not available on gfx1201 today: nothing builds and validates for FP8 (either scaling) or for
+  gpt-oss MXFP4 with its activation, bias and layout. Would need CK fixes upstream (wave32 flatmm, gfx12 FP8 WMMA
+  distributions) and CK padding support.
+- B) Own grouped expert kernels (`kernels/rocm/src/moe_quant.hip`, the Task 15 form): one launch over all experts
+  with a tile-per-expert schedule like `turbine_moe_experts` wmma_prefill, reusing the correct qgemm inner loops
+  (fp8 block, fp8 wmma, mxfp4) and expressing clamped SwiGLU, biases and interleaved gate_up in the epilogue.
+  Decode keeps the bandwidth-level loop shape; prefill removes the launch/loop cost (the 3.2x Qwen3 gap).
+- C) Split: own per-expert loop at decode (already correct and bandwidth-level, ships first), own grouped kernel for
+  prefill only, added after a measured gain. Smallest first step; the same files as B.
+
+Recommendation: B (C as its landing order). The own loop is the only candidate that is correct on every format
+today; the gap is prefill throughput on many-small-expert shapes, which a grouped kernel closes. Keep llama.cpp's
+MXFP4 and CK a16w4 as revisit items (W4A8 q8_1 fails the 6a bound; CK a16w4 needs N/K padding and an epilogue the
+gpt-oss activation does not match). Re-measure CK at a later pin if gfx12 flatmm support lands upstream.
+
+**Decision (user, 2026-10-08): B, landed in C's order** — own grouped expert kernels; the per-expert loop stays at decode, the grouped kernel lands for prefill first, each step kept only after a measured gain.
+
+## P7 quantized expert test bound (Task 16, 2026-10-08)
+
+The HIP quantized experts (own per-expert loop over the 6a qgemm kernels) are compared with the CPU reference
+in `hip_moe_quant` under the 6a bound `|d| <= |ref|/256 + rms/128`. Two real reference mismatches were fixed
+(FP8-block weights staged as BF16, bias added after the BF16 qgemm output; `ce99a47f`), and the reference's
+expert scatter already mirrors the kernel and HF's BF16 `index_add_` (`6f5c75dc`). Still, 7 of 12 cases exceed
+the 6a bound (run `1008112147-0f4907dc`): qwen3 FP8-block 1.21 (16 tok) / 2.33 (256), qwen3 shared 1.21,
+mixtral W8A8 1.51 / 1.71 / static 1.46, gpt-oss 1.55 (256); every 1-token case passes, and batch invariance is
+exact. The residual is 1-2 BF16 ulp flips from FP32 accumulation order (WMMA tiles vs sequential CPU GEMM)
+compounding through three chained GEMMs plus activation and scatter. Under 4x the bound every case passes
+(worst 0.78).
+
+- A) A chained-expert bound for the end-to-end test only, 4x the 6a bound (`/64 + rms/32`), set from these
+  measurements and documented beside the test; the model-level golden and GSM8K gates stay the bar.
+- B) Make the reference emulate the kernel's WMMA k-chunked accumulation order so the 6a bound holds; ties the
+  reference to one kernel's tiling and must change with it.
+- C) Split the test: each stage (gate_up qgemm, activation, down qgemm, scatter) checked alone against the
+  reference on the same BF16 input under the 6a bound, and the chained end-to-end output under the 4x bound
+  of A (recommended: per-kernel correctness at the 6a bar, chaining measured and bounded).
+
+**Decision (user, 2026-10-08): C** — split the test: each stage under the 6a bound on the same BF16 input, the
+chained end-to-end output under 4x the 6a bound, documented beside the test.
+
+## P7 OLMoE FP8 KV golden reference (Task 36, 2026-10-08)
+
+Task 36 calibrates per-layer FP8 KV scales for the scale-less OLMoE checkpoint (absmax/448 over 32 prompts,
+cached). Golden against the committed emulated-KV reference (`tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/`,
+which quantizes K/V with scale 1.0 because the checkpoint ships none) is 10/16 at c1 and c16 (14 needed); every
+logprob bound holds, the six misses are token-rule divergences — the served run now uses different scales than
+the reference emulates. The plan says "the existing emulated-KV reference"; its README says the reference uses
+"the served scales".
+
+- A) Regenerate the reference with the calibrated scales (`quant_reference.py --kv-quant fp8_e4m3`, CPU fixture
+  job), re-run golden c1/c16 and the GSM8K OLMoE pair, flip the row to `supported` only if all pass.
+- B) Keep the scale-1.0 reference as the plan says; the row stays `experimental` and Task 36 is done.
+- C) Both: keep the scale-1.0 reference as a diagnostic, gate on the regenerated one.
+
+**Decision (user, 2026-10-08): A** — regenerate the emulated-KV reference with the calibrated (served) scales;
+re-run golden c1/c16 and the GSM8K OLMoE pair; the row flips to `supported` only if all pass.

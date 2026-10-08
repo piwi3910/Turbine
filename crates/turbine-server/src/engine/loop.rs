@@ -4419,7 +4419,14 @@ mod tests {
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
         // The family's own slots (the tiny Llama's are `llama_slots`).
         let slots = cfg.family.0.weight_slots(cfg);
-        let weights = WeightLoader::load(&index, &slots, &mem, MAX_STAGING_BYTES).expect("load");
+        let weights = WeightLoader::load_format(
+            cfg.weight_format.get(),
+            &index,
+            &slots,
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load");
         let provider = cpu_reference_provider();
         let order = [provider.id()];
         let mut reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());

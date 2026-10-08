@@ -225,6 +225,11 @@ pub(crate) struct AttentionPagedDesc {
     pub rope_inv_freq: *const f32,
     pub rope_rotary_dim: i32,
     pub rope_attn_factor: f32,
+    /// v2.17 (Phase 7 S-8): sliding window, keys `p − window_left ..= p` of query position `p`;
+    /// -1 = none (read only by a library of minor ≥ 17, so set only for one).
+    pub window_left: i32,
+    /// v2.17: device F32 `[num_q_heads]` sink logits; NULL = none.
+    pub sinks: *const f32,
 }
 
 /// `turbine_kv_page_class` (v2.11): one page class besides the base.
@@ -262,6 +267,9 @@ pub(crate) const MOE_ROUTE_RENORMALIZE: i32 = 1;
 /// `TURBINE_MOE_ROUTE_BF16_LOGITS`: `MoeRouteDesc::flags` bit rounding each logit to BF16 before
 /// the softmax (v2.2; a library of an earlier minor reports such a descriptor unsupported).
 pub(crate) const MOE_ROUTE_BF16_LOGITS: i32 = 2;
+/// `TURBINE_ROUTE_TOPK_THEN_SOFTMAX`: `MoeRouteDesc::flags` bit selecting the top `top_k` of the
+/// logits first and a softmax over those only (v2.16; read only by a library of minor >= 16).
+pub(crate) const ROUTE_TOPK_THEN_SOFTMAX: i32 = 4;
 
 /// `turbine_moe_route_desc` (v2; `flags` was `renormalize`, whose values 0 and 1 keep their
 /// meaning).
@@ -277,9 +285,13 @@ pub(crate) struct MoeRouteDesc {
     pub topk_weights: *mut f32,
     pub sorted_rows: *mut i32,
     pub expert_offsets: *mut i32,
+    /// v2.16 (read only by a library of minor >= 16): `[num_experts]` F32 added to the logits,
+    /// or null.
+    pub router_bias: *const c_void,
 }
 
-/// `turbine_moe_experts_desc` (v2). `host_expert_offsets` is a host array.
+/// `turbine_moe_experts_desc` (v2; the fields after `dtype` are v2.16 and read only by a
+/// library of minor >= 16, zero or null they describe the BF16 SwiGLU experts of v2). `host_expert_offsets` is a host array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeExpertsDesc {
@@ -302,6 +314,23 @@ pub(crate) struct MoeExpertsDesc {
     pub expert_begin: i32,
     pub expert_end: i32,
     pub dtype: i32,
+    pub weight_dtype: i32,
+    pub w_gate_scale: *const c_void,
+    pub w_up_scale: *const c_void,
+    pub w_down_scale: *const c_void,
+    pub act_static_scale: *const f32,
+    pub act_static_scale_down: *const f32,
+    pub b_gate: *const c_void,
+    pub b_up: *const c_void,
+    pub b_down: *const c_void,
+    pub activation: i32,
+    pub gate_up_interleaved: i32,
+    pub clamp_limit: f32,
+    pub shared_w_gate: *const c_void,
+    pub shared_w_up: *const c_void,
+    pub shared_w_down: *const c_void,
+    pub shared_gate_w: *const c_void,
+    pub shared_inter: i32,
 }
 
 /// Opaque `turbine_graph` (v2.1); only ever handled by pointer.
@@ -438,6 +467,71 @@ pub(crate) struct KvTranscodeDesc {
     pub format: i32,
     pub direction: i32,
     pub tq_params: *const TqParamsDesc,
+}
+
+/// `turbine_gdn_desc` (v2.18).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnDesc {
+    pub q: *const c_void,
+    pub k: *const c_void,
+    pub v: *const c_void,
+    pub g: *const f32,
+    pub beta: *const f32,
+    pub state: *mut f32,
+    pub state_slots: *const i32,
+    pub cu_seqlens: *const i32,
+    pub out: *mut c_void,
+    pub boundary_states: *mut f32,
+    pub q_stride: i64,
+    pub k_stride: i64,
+    pub v_stride: i64,
+    pub out_stride: i64,
+    pub boundary_tokens: i32,
+    pub num_tokens: i32,
+    pub num_seqs: i32,
+    pub k_heads: i32,
+    pub v_heads: i32,
+    pub k_dim: i32,
+    pub v_dim: i32,
+    pub dtype: i32,
+}
+
+/// `turbine_conv1d_desc` (v2.18).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Conv1dDesc {
+    pub x: *const c_void,
+    pub w: *const c_void,
+    pub bias: *const c_void,
+    pub conv_state: *mut c_void,
+    pub state_slots: *const i32,
+    pub cu_seqlens: *const i32,
+    pub out: *mut c_void,
+    pub boundary_conv_states: *mut c_void,
+    pub x_stride: i64,
+    pub out_stride: i64,
+    pub boundary_tokens: i32,
+    pub num_tokens: i32,
+    pub num_seqs: i32,
+    pub channels: i32,
+    pub kernel: i32,
+    pub activation: i32,
+    pub dtype: i32,
+}
+
+/// The v2.18 Gated DeltaNet group: the `gdn_prefill` and `gdn_decode` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct GdnFns {
+    pub prefill: OpTrio<GdnDesc>,
+    pub decode: OpTrio<GdnDesc>,
+}
+
+/// The v2.18 causal conv1d group: the `conv1d_prefill` and `conv1d_update` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct Conv1dFns {
+    pub prefill: OpTrio<Conv1dDesc>,
+    pub update: OpTrio<Conv1dDesc>,
 }
 
 /// `turbine_tq_params` (v2.11): the TurboQuant tables, device pointers.
@@ -688,7 +782,8 @@ pub(crate) struct ImplFns {
 /// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
 /// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
 /// from minor 10, `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
-/// (v2.5) groups resolved, and `copy_kernel` minor ≥ 11 with `copies`.
+/// (v2.5) groups resolved, `copy_kernel` minor ≥ 11 with `copies`, and `gdn` and `conv1d`
+/// minor ≥ 18.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -718,6 +813,10 @@ pub(crate) struct V21Symbols {
     pub kv_transcode: Option<OpTrio<KvTranscodeDesc>>,
     /// v2.11 host-to-device copy kernel (Phase 6b); needs the v2.5 group.
     pub copy_kernel: Option<CopyKernelFn>,
+    /// v2.18 Gated DeltaNet (Phase 7).
+    pub gdn: Option<GdnFns>,
+    /// v2.18 causal conv1d (Phase 7).
+    pub conv1d: Option<Conv1dFns>,
 }
 
 impl V21Symbols {
@@ -840,8 +939,28 @@ impl V21Symbols {
         } else {
             None
         };
+        let gdn = (|| {
+            if minor < 18 {
+                return None;
+            }
+            Some(GdnFns {
+                prefill: optional_trio(lib, "gdn_prefill")?,
+                decode: optional_trio(lib, "gdn_decode")?,
+            })
+        })();
+        let conv1d = (|| {
+            if minor < 18 {
+                return None;
+            }
+            Some(Conv1dFns {
+                prefill: optional_trio(lib, "conv1d_prefill")?,
+                update: optional_trio(lib, "conv1d_update")?,
+            })
+        })();
         V21Symbols {
             minor,
+            gdn,
+            conv1d,
             rope_attn_factor: minor >= 10,
             kv_transcode,
             copy_kernel,

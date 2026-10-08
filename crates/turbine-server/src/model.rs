@@ -83,7 +83,31 @@ pub(crate) fn model_error(context: &str, e: ModelError) -> StartupError {
     StartupError::new(format!("{context}: {e}"))
 }
 
+/// A kernel selection failure. A requirement no provider supports is `kernel_op_unavailable`
+/// (P7 S-4, the spec failure mode "kernel library without an op the family needs"): logged as
+/// the `kernel_capability` event and named by the ABI entry point and the config, e.g.
+/// `turbine_moe_experts (hidden=2880 … weight_dtype=mxfp4)`, so a library below the needed ABI
+/// minor is told apart from a broken one.
 fn kernel_error(context: &str, e: KernelError) -> StartupError {
+    if let KernelError::NoProvider { op, config, detail } = &e {
+        tracing::error!(
+            event = "kernel_capability",
+            reason = "kernel_op_unavailable",
+            op = %op,
+            config = %config,
+            detail = %detail,
+            "no kernel provider runs a configuration the model needs"
+        );
+        return StartupError::new(format!(
+            "kernel_op_unavailable: {context}: turbine_{op} ({config}) is not supported by any \
+             kernel provider{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            }
+        ));
+    }
     StartupError::new(format!("{context}: {e}"))
 }
 
@@ -885,12 +909,15 @@ fn prepare_with(
         &reliability,
         config.kv.gpu.max_bytes,
         0,
+        state_allocation(
+            scheduler.max_running_requests,
+            arch.state.bytes_per_sequence(),
+        ),
     )?;
     let pool = kv_pool_config(
         layout,
         budget.pool(PoolKind::Kv),
         scheduler.max_running_requests,
-        arch.state.bytes_per_sequence(),
     )?;
     tracing::info!(
         event = "memory_budget",
@@ -1040,12 +1067,15 @@ impl PreparedModel {
             &self.reliability,
             self.kv_cap,
             0,
+            state_allocation(
+                self.scheduler.max_running_requests,
+                self.arch.state.bytes_per_sequence(),
+            ),
         )?;
         self.pool = kv_pool_config(
             layout,
             self.budget.pool(PoolKind::Kv),
             self.scheduler.max_running_requests,
-            self.arch.state.bytes_per_sequence(),
         )?;
         tracing::info!(
             event = "device_shared",
@@ -1091,9 +1121,10 @@ pub(crate) fn measure_budget(
     reliability: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
     collective: u64,
+    state_allocation: u64,
 ) -> Result<DeviceBudget, StartupError> {
     let host = read_host(&FsProc::default()).sample.mem_available_bytes;
-    compute_budget(
+    let mut budget = compute_budget(
         &BudgetInputs {
             device,
             memory_kind,
@@ -1109,7 +1140,13 @@ pub(crate) fn measure_budget(
         reliability,
         kv_cap,
     )
-    .map_err(|e| StartupError::new(format!("startup: {e}")))
+    .map_err(|e| StartupError::new(format!("startup: {e}")))?;
+    // The state allocation (`max_running × state`, P7 review fix) is set aside inside the
+    // `kv` pool: the pool left is the physical KV block pool, the ledger's `kv` capacity.
+    if let Some((_, kv)) = budget.pools.iter_mut().find(|(k, _)| *k == PoolKind::Kv) {
+        *kv = kv.saturating_sub(state_allocation);
+    }
+    Ok(budget)
 }
 
 /// Logs a backend's note on the kernel selections at INFO: `event=<note.event>`, `block_tokens`
@@ -1129,28 +1166,27 @@ fn log_backend_note(note: &BackendNote, block_tokens: u32) {
     );
 }
 
+/// The fixed state allocation: the state of `max_running` sequences (P7 review fix; admission
+/// charges each request's `n × state` against it, apart from the KV pool).
+pub(crate) fn state_allocation(max_running: u32, state_bytes: u64) -> u64 {
+    u64::from(max_running).saturating_mul(state_bytes)
+}
+
 /// The L0 pool: as many blocks as the budget's `kv` pool (`bytes`: the budget remainder after
-/// weights, workspace, runtime overhead and the emergency reserve, capped by
-/// `kv.gpu.max_bytes`) holds once every running sequence's state is set aside
-/// (`max_running × state_bytes`, P7 S-1: the admission ledger's `kv` pool reserves each
-/// request's state beside its blocks). At least one block per running request.
+/// weights, workspace, runtime overhead, the emergency reserve and the state allocation,
+/// capped by `kv.gpu.max_bytes` — [`measure_budget`] — so the physical block pool the ledger's
+/// `kv` capacity stands for) holds. At least one block per running request.
 pub(crate) fn kv_pool_config(
     layout: KvLayout,
     bytes: u64,
     max_running: u32,
-    state_bytes: u64,
 ) -> Result<BlockPoolConfig, StartupError> {
-    let state = u64::from(max_running).saturating_mul(state_bytes);
-    let pool = BlockPoolConfig::for_bytes(layout, bytes.saturating_sub(state));
+    let pool = BlockPoolConfig::for_bytes(layout, bytes);
     if pool.num_blocks < max_running {
-        let state = if state == 0 {
-            String::new()
-        } else {
-            format!(" after the state of {max_running} running sequences ({state} B)")
-        };
         return Err(StartupError::new(format!(
-            "the kv pool of {bytes} B holds {} KV blocks of {} B{state}; at least one block per \
-             running request (scheduler.max_running_requests = {max_running}) is required",
+            "the kv pool of {bytes} B (after the state of {max_running} running sequences) holds \
+             {} KV blocks of {} B; at least one block per running request \
+             (scheduler.max_running_requests = {max_running}) is required",
             pool.num_blocks,
             pool.layout.block_bytes()
         )));
@@ -1395,6 +1431,10 @@ pub(crate) fn post_load_budget(
         &prepared.reliability,
         prepared.kv_cap,
         collective,
+        state_allocation(
+            prepared.scheduler.max_running_requests,
+            prepared.arch.state.bytes_per_sequence(),
+        ),
     )?;
     let ledger = Ledger::new(&budget);
     ledger.set_metrics(reliability.clone());
@@ -1473,7 +1513,6 @@ pub(crate) fn pool_blocks(
         prepared.pool.layout,
         budget.pool(PoolKind::Kv),
         prepared.scheduler.max_running_requests,
-        prepared.arch.state.bytes_per_sequence(),
     )?;
     Ok(measured.num_blocks.min(prepared.pool.num_blocks))
 }
@@ -1676,6 +1715,115 @@ mod tests {
         let mut both = old.clone();
         both.extend(cpu);
         assert!(check_rope_attn_factor(m, &requirements, &both).is_err());
+    }
+
+    /// A provider whose MoE ops run only the BF16 SwiGLU experts of kernel ABI v2, like a
+    /// library below minor 16.
+    struct OldMoe;
+
+    impl turbine_kernels::MoeKernel for OldMoe {
+        fn supports_route(&self, cfg: &turbine_kernels::MoeRouteConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn supports_experts(&self, cfg: &turbine_kernels::MoeExpertsConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn implementation_route(&self, _cfg: &turbine_kernels::MoeRouteConfig) -> String {
+            "old_moe_route".into()
+        }
+        fn implementation_experts(&self, _cfg: &turbine_kernels::MoeExpertsConfig) -> String {
+            "old_moe_experts".into()
+        }
+        fn route(
+            &self,
+            _ctx: &mut turbine_kernels::MoeRouteContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+        fn experts(
+            &self,
+            _ctx: &mut turbine_kernels::MoeExpertsContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+    }
+
+    impl KernelProvider for OldMoe {
+        fn id(&self) -> turbine_kernels::ProviderId {
+            turbine_kernels::ProviderId("old-moe")
+        }
+        fn gemm(&self) -> Option<&dyn turbine_kernels::GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn turbine_kernels::AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn turbine_kernels::NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn turbine_kernels::RopeKernel> {
+            None
+        }
+        fn activation(&self) -> Option<&dyn turbine_kernels::ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn turbine_kernels::EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn turbine_kernels::ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn turbine_kernels::KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn turbine_kernels::MoeKernel> {
+            Some(self)
+        }
+    }
+
+    /// P7 Task 15: a registry that cannot run `MoeExpertsConfig { weight_dtype: Mxfp4, .. }`
+    /// fails kernel selection as `kernel_op_unavailable`, naming `turbine_moe_experts` and the
+    /// config; the same experts in BF16 select fine. Breaks if a library below ABI minor 16
+    /// would be reported as a generic selection failure (or, worse, selected).
+    #[test]
+    fn kernel_op_unavailable_names_the_abi_entry_point() {
+        let experts = |weight_dtype| {
+            OpRequirement::from(OpConfig::MoeExperts(turbine_kernels::MoeExpertsConfig {
+                hidden: 2880,
+                inter: 2880,
+                num_experts: 32,
+                top_k: 4,
+                expert_begin: 0,
+                expert_end: 32,
+                dtype: DType::BF16,
+                weight_dtype,
+                ..Default::default()
+            }))
+        };
+        let providers: Vec<Arc<dyn KernelProvider>> = vec![Arc::new(OldMoe)];
+        let order = [turbine_kernels::ProviderId("old-moe")];
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        KernelRegistry::build(
+            providers.clone(),
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Bf16)],
+            &metrics,
+            None,
+        )
+        .expect("BF16 experts are supported");
+        let e = KernelRegistry::build(
+            providers,
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Mxfp4)],
+            &metrics,
+            None,
+        )
+        .err()
+        .expect("MXFP4 experts are refused");
+        let err = kernel_error("kernel selection", e).to_string();
+        assert!(err.starts_with("kernel_op_unavailable"), "{err}");
+        assert!(err.contains("turbine_moe_experts"), "{err}");
+        assert!(err.contains("weight_dtype=mxfp4"), "{err}");
     }
 
     #[test]

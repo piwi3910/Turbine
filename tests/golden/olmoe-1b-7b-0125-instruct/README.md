@@ -34,16 +34,16 @@ Measured 2026-09-26 (max |Δ logprob| over the reference top-5 before the first 
 "prefix ok" = first 32 greedy tokens identical or a divergence at a reference margin < 0.5 nats;
 no variant misses a reference top-5 id from its top-20):
 
-| variant                          | prefix ok | max likely | max tail |
-| -------------------------------- | --------- | ---------- | -------- |
-| bf16 sdpa incremental (control)  | 16/16     | 0.0000     | 0.0000   |
-| bf16 sdpa full sequence          | 16/16     | 0.4236     | 1.2588   |
-| bf16 eager incremental           | 14/16     | 1.0092     | 1.6569   |
-| bf16 eager full sequence         | 14/16     | 1.0092     | 1.6569   |
-| fp32 sdpa incremental            | 14/16     | 0.9891     | 1.5281   |
-| fp32 sdpa full sequence          | 14/16     | 0.9891     | 1.5281   |
-| fp32 eager incremental           | 14/16     | 0.9891     | 1.5281   |
-| fp32 eager full sequence         | 14/16     | 0.9891     | 1.5281   |
+| variant                         | prefix ok | max likely | max tail |
+| ------------------------------- | --------- | ---------- | -------- |
+| bf16 sdpa incremental (control) | 16/16     | 0.0000     | 0.0000   |
+| bf16 sdpa full sequence         | 16/16     | 0.4236     | 1.2588   |
+| bf16 eager incremental          | 14/16     | 1.0092     | 1.6569   |
+| bf16 eager full sequence        | 14/16     | 1.0092     | 1.6569   |
+| fp32 sdpa incremental           | 14/16     | 0.9891     | 1.5281   |
+| fp32 sdpa full sequence         | 14/16     | 0.9891     | 1.5281   |
+| fp32 eager incremental          | 14/16     | 0.9891     | 1.5281   |
+| fp32 eager full sequence        | 14/16     | 0.9891     | 1.5281   |
 
 The control reproduces the reference (|Δ| ≤ 8e-6), so the harness itself adds nothing. The
 largest deviations come from prompts that sit near a routing or greedy flip (p10 likely 1.01,
@@ -94,14 +94,43 @@ itself, so the most the noise justifies); proposed = max(today, observed), cappe
 The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
 Decision A (user, 2026-10-06): the proposed column is applied to `tolerance.json` (unchanged where proposed = today).
 
-| bound | today | observed | triangle | proposed |
-|---|---|---|---|---|
-| likely | 1.01 | 0.65 | 1.58 | 1.01 |
-| tail | 1.66 | 1.72 | 3.17 | 1.72 **changed** |
-| likely batched | 1.01 | 0.65 | 1.58 | 1.01 |
-| tail batched | 1.66 | 1.72 | 3.17 | 1.72 **changed** |
+| bound          | today | observed | triangle | proposed         |
+| -------------- | ----- | -------- | -------- | ---------------- |
+| likely         | 1.01  | 0.65     | 1.58     | 1.01             |
+| tail           | 1.66  | 1.72     | 3.17     | 1.72 **changed** |
+| likely batched | 1.01  | 0.65     | 1.58     | 1.01             |
+| tail batched   | 1.66  | 1.72     | 3.17     | 1.72 **changed** |
 
 Default server c1 against the reference: prefix ok 16/16, likely 0.517 (p08),
 tail 1.461 (p03).
 
 The tail moves 1.66 → 1.72 (`fused_ops=false` 1.71, `gemm_autotune=false` 1.55, default 1.46). Batched captures are bitwise equal to c1 here (OLMoE's decode path does not change summation order with the batch).
+
+## Multi-GPU bound (2026-10-08)
+
+Decision "Phase 7 Task 13: OLMoE EP×TP drift" (A): the multi-GPU placements are gated by a calibrated
+bound, `max_abs_logprob_diff_likely_multi_gpu` / `_tail_multi_gpu`, which `turbine-golden compare
+--multi-gpu-bounds` applies at every concurrency (falling back to the batched bounds when absent).
+`scripts/lab-cluster.sh olmoe-spread-novanas` (run 1008081228-24302d18) captured the slug free-running
+(top-20) on one GPU (`c1-cold`, `c1-warm`, `par-00`…`par-15`) and on two GPUs at c1 and at c16
+(16 captures each): tensor parallel 2 (`mg-tp2-*`), expert parallel 2 (`mg-ep2-*`) and both
+(`mg-ep2tp2-*`), 69 captures in all. `python3 scripts/golden/engine_spread.py <captures>/spread
+--slug olmoe-1b-7b-0125-instruct` (data: `engine_spread.json`) derives the bound with the rule above:
+old = the batched bound, noise = the range over every capture including the placements,
+triangle = old + noise, proposed = min(triangle, max(old, observed)).
+
+| placement         | prefix ok | likely (position) | tail (position) |
+| ----------------- | --------- | ----------------- | --------------- |
+| one GPU (c1, c16) | 16/16     | 0.517 (p08)       | 1.461 (p03)     |
+| tp2               | 16/16     | 1.006 (p10)       | 1.309 (p08)     |
+| ep2               | 16/16     | 0.962 (p14)       | 1.149 (p10)     |
+| ep2×tp2           | 15/16     | 1.056 (p10)       | 0.902 (p06)     |
+
+| bound            | today (batched) | observed | triangle | proposed     |
+| ---------------- | --------------- | -------- | -------- | ------------ |
+| likely multi-GPU | 1.01            | 1.06     | 2.39     | 1.06 **new** |
+| tail multi-GPU   | 1.72            | 1.47     | 3.45     | 1.72         |
+
+Every capture of one placement is bitwise equal across concurrencies. The likely bound moves 1.01 → 1.06
+(ep2×tp2 prompt p10, whose expert routing flips at a near-tie; the per-position trace is in the perf log,
+"P7 OLMoE EP×TP drift"); the one-GPU and single-parallelism bounds stay as they are.

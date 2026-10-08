@@ -59,6 +59,11 @@ enum Command {
         /// tensor-parallel gate against a one-GPU capture, P5).
         #[arg(long)]
         batched_bounds: bool,
+        /// Judge with the tolerance's `_multi_gpu` logprob bounds at every concurrency (an MoE
+        /// model over several GPUs, bounds calibrated from the placement spread; falls back to
+        /// the batched bounds when the keys are absent).
+        #[arg(long, conflicts_with = "batched_bounds")]
+        multi_gpu_bounds: bool,
     },
     /// Record reference.jsonl from any OpenAI-compatible endpoint.
     Capture {
@@ -330,6 +335,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             output,
             concurrency,
             batched_bounds,
+            multi_gpu_bounds,
         } => {
             let endpoint = Endpoint::new(&url)?;
             let references: Vec<ReferenceRecord> = read_jsonl(&reference)?;
@@ -343,6 +349,8 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             let tol = read_tolerance(&tolerance)?;
             let tol = if batched_bounds {
                 tol.batched_everywhere()
+            } else if multi_gpu_bounds {
+                tol.multi_gpu_everywhere()
             } else {
                 tol
             };
@@ -358,6 +366,10 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             .await?;
             if batched_bounds {
                 report.logprob_bounds.batched = true;
+            }
+            if multi_gpu_bounds {
+                report.logprob_bounds.batched = true;
+                report.logprob_bounds.multi_gpu = true;
             }
             match output {
                 OutputFormat::Json => println!(

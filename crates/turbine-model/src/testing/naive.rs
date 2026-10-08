@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use half::bf16;
+use turbine_kernels::cpu::quant::{e2m1_value, e8m0_value};
 use turbine_kernels::torch_topk;
 
 use crate::config::{ModelArchConfig, RopeScaling};
@@ -58,19 +59,72 @@ pub struct Naive {
 }
 
 impl Naive {
-    /// Reads every tensor of `dir/model.safetensors` (BF16 only).
+    /// Reads every tensor of `dir/model.safetensors`: BF16 as f32 values, and a gpt-oss
+    /// layer's fused MXFP4 expert tensor (`<proj>_blocks` U8 with `<proj>_scales`) dequantized
+    /// to the f32 values the kernels decode it to, stored under the base name.
     pub fn load(dir: &Path, cfg: &ModelArchConfig) -> Naive {
         let bytes = std::fs::read(dir.join("model.safetensors")).expect("read safetensors");
         let st = ::safetensors::SafeTensors::deserialize(&bytes).expect("parse safetensors");
+        let mut raw: Vec<(String, ::safetensors::Dtype, Vec<usize>, Vec<u8>)> = st
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| {
+                (
+                    name,
+                    view.dtype(),
+                    view.shape().to_vec(),
+                    view.data().to_vec(),
+                )
+            })
+            .collect();
+        raw.sort_by(|a, b| a.0.cmp(&b.0));
         let mut w = HashMap::new();
-        for (name, view) in st.tensors() {
-            assert_eq!(view.dtype(), ::safetensors::Dtype::BF16, "{name}");
-            let values = view
-                .data()
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect();
-            w.insert(name, values);
+        for (name, dtype, shape, data) in &raw {
+            match dtype {
+                ::safetensors::Dtype::BF16 => {
+                    let values: Vec<f32> = data
+                        .chunks_exact(2)
+                        .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect();
+                    w.insert(name.clone(), values);
+                }
+                ::safetensors::Dtype::U8 => {
+                    // `_scales` is consumed with its `_blocks` (a lookup in `raw`).
+                    if name.ends_with("_scales") {
+                        continue;
+                    }
+                    let base = name.strip_suffix("_blocks").unwrap_or_else(|| {
+                        panic!("{name}: the only U8 tensors are fused expert `_blocks`/`_scales`")
+                    });
+                    let scales_name = format!("{base}_scales");
+                    let at = shape.len();
+                    let (se, sn, groups) = (shape[at - 4], shape[at - 3], shape[at - 2]);
+                    let (_, _, sshape, sdata) = raw
+                        .iter()
+                        .find(|(n, ..)| n == &scales_name)
+                        .unwrap_or_else(|| panic!("{scales_name}: missing"));
+                    assert_eq!(sshape.as_slice(), &[se, sn, groups], "{scales_name}");
+                    let sc: &[u8] = sdata;
+                    let sk = groups * 32;
+                    let mut values = Vec::with_capacity(se * sn * sk);
+                    for e in 0..se {
+                        for r in 0..sn {
+                            for g in 0..groups {
+                                let scale = e8m0_value(sc[(e * sn + r) * groups + g]);
+                                let at = (((e * sn + r) * groups) + g) * 16;
+                                for b in 0..16 {
+                                    let byte = data[at + b];
+                                    values.push(e2m1_value(byte & 0xf) * scale);
+                                    values.push(e2m1_value(byte >> 4) * scale);
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(values.len(), se * sn * sk, "{name}");
+                    w.insert(base.to_string(), values);
+                }
+                other => panic!("{name}: dtype {other:?}"),
+            }
         }
         Naive {
             cfg: cfg.clone(),
@@ -85,6 +139,21 @@ impl Naive {
 
     fn get(&self, name: &str) -> &[f32] {
         self.w.get(name).unwrap_or_else(|| panic!("missing {name}"))
+    }
+
+    fn opt(&self, name: &str) -> Option<&[f32]> {
+        self.w.get(name).map(|v| v.as_slice())
+    }
+
+    /// Adds a projection bias (`None` without one) to the BF16-rounded output rows of a linear
+    /// layer: the add rounds again, as the executor's `add` op does.
+    fn bias(&self, mut out: Vec<f32>, b: Option<&[f32]>) -> Vec<f32> {
+        if let Some(b) = b {
+            for (v, &b) in out.iter_mut().zip(b.iter().cycle()) {
+                *v = bf(*v + b);
+            }
+        }
+        out
     }
 
     /// `x [t, k] · wᵀ` with `w [n, k]`, sequential f32 accumulation.
@@ -153,9 +222,19 @@ impl Naive {
     }
 
     /// Causal GQA attention over the whole sequence; query head `h` reads KV head
-    /// `h / (heads / kv_heads)`. The f32 sum is of the unrounded exponentials, P·V uses them
+    /// `h / (heads / kv_heads)`. `window` (`Some(w)`: the last `w` positions only) and the
+    /// per-head sink logits (which join the softmax denominator and add nothing to the output)
+    /// are gpt-oss's; the f32 sum is of the unrounded exponentials, P·V uses them
     /// rounded to BF16, the row is normalised last (CK FMHA / PyTorch CPU flash order).
-    fn attention(&self, q: &[f32], k: &[f32], v: &[f32], t: usize) -> Vec<f32> {
+    fn attention(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        t: usize,
+        window: Option<u32>,
+        sinks: Option<&[f32]>,
+    ) -> Vec<f32> {
         let d = self.cfg.head_dim as usize;
         let hq = self.cfg.num_attention_heads as usize;
         let hkv = self.cfg.num_kv_heads as usize;
@@ -165,7 +244,8 @@ impl Naive {
             for h in 0..hq {
                 let kvh = h / (hq / hkv);
                 let qv = &q[(i * hq + h) * d..][..d];
-                let mut scores: Vec<f32> = (0..=i)
+                let first = window.map_or(0, |w| i.saturating_sub(w as usize - 1));
+                let mut scores: Vec<f32> = (first..=i)
                     .map(|j| {
                         let kv = &k[(j * hkv + kvh) * d..][..d];
                         let mut dot = 0f32;
@@ -175,15 +255,23 @@ impl Naive {
                         dot * scale
                     })
                     .collect();
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sink = sinks.map(|s| s[h]);
+                if let Some(sink) = sink {
+                    max = max.max(sink);
+                }
                 let mut sum = 0f32;
                 for s in &mut scores {
                     *s = (*s - max).exp();
                     sum += *s;
                 }
+                if let Some(sink) = sink {
+                    sum += (sink - max).exp();
+                }
                 let o = &mut out[(i * hq + h) * d..][..d];
                 for (j, s) in scores.iter().enumerate() {
                     let p = bf(*s);
+                    let j = j + first;
                     let vv = &v[(j * hkv + kvh) * d..][..d];
                     for (acc, x) in o.iter_mut().zip(vv) {
                         *acc += p * x;
@@ -274,6 +362,73 @@ impl Naive {
         out
     }
 
+    /// The gpt-oss MoE block of layer prefix `p` over rows `h` (`mlp.router.{weight,bias}`,
+    /// the fused dequantized `mlp.experts.{gate_up_proj,down_proj}`): the top-k of the biased
+    /// BF16-rounded logits, a softmax over those, and the clamped activation of the
+    /// interleaved gate/up rows, with the same rounding as the kernels' expert path.
+    fn moe_gpt_oss(&self, h: &[f32], p: &str) -> Vec<f32> {
+        let hidden = self.cfg.hidden as usize;
+        let moe = self.cfg.moe.expect("a MoE config");
+        let (inter, top_k) = (
+            moe.expert_intermediate as usize,
+            moe.experts_per_token as usize,
+        );
+        let limit = crate::executor::decoder::hooks::GPT_OSS_SWIGLU_LIMIT;
+        let router = self.get(&format!("{p}.mlp.router.weight"));
+        let bias = self.get(&format!("{p}.mlp.router.bias"));
+        let gate_up = self.get(&format!("{p}.mlp.experts.gate_up_proj"));
+        let gu_bias = self.get(&format!("{p}.mlp.experts.gate_up_proj_bias"));
+        let down = self.get(&format!("{p}.mlp.experts.down_proj"));
+        let down_bias = self.get(&format!("{p}.mlp.experts.down_proj_bias"));
+        let mut out = Vec::with_capacity(h.len());
+        for row in h.chunks_exact(hidden) {
+            let logits: Vec<f32> = Naive::linear(row, router, hidden)
+                .iter()
+                .zip(bias)
+                .map(|(l, b)| bf(l + b))
+                .collect();
+            let chosen = torch_topk(&logits, top_k);
+            let m = chosen
+                .iter()
+                .map(|&e| logits[e])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = chosen.iter().map(|&e| (logits[e] - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            let weights: HashMap<usize, f32> = chosen
+                .iter()
+                .zip(&exps)
+                .map(|(&e, x)| (e, x / sum))
+                .collect();
+            let mut acc = vec![0f32; hidden];
+            let mut by_expert = chosen.clone();
+            by_expert.sort_unstable();
+            for e in by_expert {
+                let gu = &gate_up[e * 2 * inter * hidden..][..2 * inter * hidden];
+                let gu_b = &gu_bias[e * 2 * inter..][..2 * inter];
+                let gu_out = self.bias(Naive::linear_bf(row, gu, hidden), Some(gu_b));
+                let act: Vec<f32> = gu_out
+                    .chunks_exact(2)
+                    .map(|p| {
+                        // `gptoss_glu` (the kernels' expert activation), rounded per step.
+                        let gate = p[0].min(limit);
+                        let up = p[1].clamp(-limit, limit);
+                        let sig = bf(1.0 / (1.0 + (-bf(gate * 1.702)).exp()));
+                        bf(bf(bf(up + 1.0) * bf(gate * sig)))
+                    })
+                    .collect();
+                let dn = &down[e * hidden * inter..][..hidden * inter];
+                let dn_b = &down_bias[e * hidden..][..hidden];
+                let y = self.bias(Naive::linear_bf(&act, dn, inter), Some(dn_b));
+                let w = bf(weights[&e]);
+                for (a, y) in acc.iter_mut().zip(y) {
+                    *a = bf(*a + bf(y * w));
+                }
+            }
+            out.extend(acc);
+        }
+        out
+    }
+
     /// Logits of every position of `tokens` (positions `0..tokens.len()`): row `i` depends
     /// only on `tokens[..=i]` (causal attention).
     pub fn forward(&self, tokens: &[u32]) -> Vec<Vec<f32>> {
@@ -290,21 +445,41 @@ impl Naive {
         for layer in 0..c.num_layers {
             let p = format!("model.layers.{layer}");
             let w = |s: &str| self.get(&format!("{p}.{s}.weight"));
+            let b = |s: &str| self.opt(&format!("{p}.{s}.bias"));
+            let sinks = self.opt(&format!("{p}.self_attn.sinks"));
             let h = self.rmsnorm(&x, w("input_layernorm"));
-            let mut q = Naive::linear_bf(&h, w("self_attn.q_proj"), hidden);
-            let mut k = Naive::linear_bf(&h, w("self_attn.k_proj"), hidden);
-            let v = Naive::linear_bf(&h, w("self_attn.v_proj"), hidden);
+            let mut q = self.bias(
+                Naive::linear_bf(&h, w("self_attn.q_proj"), hidden),
+                b("self_attn.q_proj"),
+            );
+            let mut k = self.bias(
+                Naive::linear_bf(&h, w("self_attn.k_proj"), hidden),
+                b("self_attn.k_proj"),
+            );
+            let v = self.bias(
+                Naive::linear_bf(&h, w("self_attn.v_proj"), hidden),
+                b("self_attn.v_proj"),
+            );
             if self.qk_norm {
                 q = self.qk_norm(&q, w("self_attn.q_norm"), heads);
                 k = self.qk_norm(&k, w("self_attn.k_norm"), kv_heads);
             }
             self.rope(&mut q, heads);
             self.rope(&mut k, kv_heads);
-            let attn = self.attention(&q, &k, &v, t);
-            let o = Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim);
+            let window = match c.layer_kinds[layer as usize] {
+                crate::families::LayerKind::SlidingWindow { window } => Some(window),
+                _ => None,
+            };
+            let attn = self.attention(&q, &k, &v, t, window, sinks);
+            let o = self.bias(
+                Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim),
+                b("self_attn.o_proj"),
+            );
             x = x.iter().zip(&o).map(|(a, b)| bf(a + b)).collect();
             let h = self.rmsnorm(&x, w("post_attention_layernorm"));
-            let down = if c.moe.is_some() {
+            let down = if self.opt(&format!("{p}.mlp.experts.gate_up_proj")).is_some() {
+                self.moe_gpt_oss(&h, &p)
+            } else if c.moe.is_some() {
                 self.moe(&h, &p)
             } else {
                 self.swiglu(&h, w("mlp.gate_proj"), w("mlp.up_proj"), w("mlp.down_proj"))

@@ -2045,4 +2045,31 @@ The p10 failure (token 17, position 41): one GPU likely 0.292; tp2 1.006 and ep2
 
 Cause (S-3): the near-tie hypothesis holds, and nothing is specific to ep × tp. Any change of summation order (TP partial sums of the O and FFN projections, the EP combine of per-rank expert sums) moves the router logits by ~0.02–0.03 (p50), while a tenth of one GPU's routing decisions sit within one BF16 ulp and a hundredth are exact ties; the first flip at a position is such a near-tie, and the flipped expert cascades through the later layers' routing. tp2 alone shows the same flips at the same positions and reaches 1.006 on p10 against the 1.01 bound; ep2×tp2's extra EP-combine rounding takes the same token to 1.056. Rank-invariance is not the defect: every rank of every group routes identically (the router input is the all-reduced row on every rank), so Task 13's expected fix (rank-invariant router input) would change nothing. Fixing the drift is a numerics/gate trade for the user (options in the Task 12 report): (A) gate ep2×tp2 with a multi-GPU OLMoE bound calibrated from this spread (the self-spread method) and drop the refusal; (B) all-reduce FP32 partials (one BF16 rounding instead of two; roughly halves the router-logit noise at best, doubles the all-reduce bytes, unmeasured; flips remain); (C) keep the refusal (tp2 alone sits 0.004 under the bound on p10).
 
-> > > > > > > p7-stack
+### P7 OLMoE EP×TP — calibrated multi-GPU golden bound (plan Task 13, branch `p7-t13`, decision 2026-10-08 A)
+
+`scripts/lab-cluster.sh --bench-lock olmoe-spread-novanas`, run `1008081228-24302d18` (both R9700s): 69 free-running top-20 captures of OLMoE-1B-7B-0125-Instruct (one GPU c1-cold/c1-warm/par-00..15; tp2, ep2 and ep2×tp2 at c1 and c16). Placements against the committed reference (likely / tail): one GPU 0.517 / 1.461, tp2 1.006 / 1.309, ep2 0.962 / 1.149, ep2×tp2 1.056 / 0.902 (prefix ok 15/16, `min_prompts_passing` 14); a placement's c1 and c16 captures are bitwise equal. `engine_spread.py` (`mg-*` captures): `max_abs_logprob_diff_likely_multi_gpu` 1.06 (old 1.01, triangle 2.39), `_tail_multi_gpu` 1.72 (old 1.72, observed 1.47, triangle 3.45) written to `tests/golden/olmoe-1b-7b-0125-instruct/tolerance.json`; derivation in its README. The `olmoe_ep_tp_drift` refusal is removed; `ep2-novanas` gates ep2×tp2 at c1 and c16 with `--multi-gpu-bounds` against the committed reference. Gate run `1008082229-115db0e8`: `ep2-novanas` PASS, ep2×tp2 golden c1 and c16 15/16 prompts passing (need 14), multi-GPU bounds 1.06 / 1.72 hold; ep2 and ep2 hostmem pass the strict and batched bounds against the one-GPU capture.
+
+## Phase 7 Task 23 — attention ABI v2.17 (window, sinks, d64 / d256), 2026-10-08
+
+Lab-bench `--quick` (64 requests, concurrency 16, client on novanas, GPU 0) on d4542e81, both golden c1 PASS. The d128 plain path's arguments are unchanged; the rows sit +2.5 % and +2.9 % above the last full rows (p5p-exit, 200 requests, local client), which is the quick tier's client and sample difference, not a change of the path.
+
+- `BENCH p7t23 llama commit=d4542e81 gpu=0 tests=skipped golden1=PASS: golden16=SKIP quick=1 client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0388 ok=64 failed=0 tok/s=886.0 itl_p50=15.3 ttft_p50=244 decode_fwd_ms=15.0` (p5p-exit: 864.0, decode_fwd 14.9)
+- `BENCH p7t23 olmoe commit=d4542e81 gpu=0 tests=skipped golden1=PASS: golden16=SKIP quick=1 client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0219 ok=64 failed=0 tok/s=654.4 itl_p50=23.1 ttft_p50=135 decode_fwd_ms=22.7` (p5p-exit: 636.1, decode_fwd 22.6)
+
+### P7 quantized experts on HIP — OLMoE BF16 unchanged (plan Task 16, branch `p7-t16`, 2026-10-08)
+
+`scripts/lab-bench.sh --quick --model olmoe --label p7t16` (GPU 0, 64 requests, c16): `BENCH p7t16 olmoe commit=d11161ed golden1=PASS tok/s=650.3 itl_p50=23.3 ttft_p50=135 decode_fwd_ms=22.9`, against 636.1 tok/s at `p5p-exit` (a2478b63): +2.2 %, so the BF16 expert paths (only `experts_supported` restructured, a sixth impl entry added) did not regress. Quantized experts: stage ratios under the 6a bound (worst 0.95, qgemm FP8 block at 64 rows), chained output 0.58 of 4x the bound, in `hip_moe_quant`.
+
+### P7 Mistral gate — Mistral-7B-Instruct-v0.3 BF16 tp1 closes (plan Task 20, branch `p7-t20`, 2026-10-08)
+
+- Throughput (`scripts/lab-perf.sh novanas mistral-7b --eval`, run `20261008T064517Z`, 3 runs each, vLLM-ROCm on the
+  same card): Turbine 406.7 vs vLLM 410.3 tok/s, ratio 0.99 — PASS (≥ 0.75).
+- GSM8K c16 (`tests/eval/gsm8k-200.jsonl`, serve run `1008081232-21ea1365`): Turbine 0.550 vs vLLM 0.530,
+  `eval-compare --max-drop 0.01` PASS.
+- Golden (`tests/golden/mistral-7b-instruct-v0.3/`, tolerance from the transformers self-spread — see the slug
+  README; the Llama-3.2-3B bounds miss at 12/16 and 15/16): `BENCH p7-t20b mistral-7b commit=2fd0c84c gpu=0
+tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0173
+ok=200 failed=0 tok/s=413.5 itl_p50=30.4 ttft_p50=508 decode_fwd_ms=30.0` — c1 strict 16/16 (max likely 0.330,
+  max tail 0.544), c16 batched 16/16 (max likely 0.281, max tail 0.455).
+
+- P7 closed: MistralForCausalLM/bf16/bf16/tp1 20261008T064517Z 1008081232-21ea1365 p7-t20b

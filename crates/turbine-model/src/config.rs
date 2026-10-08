@@ -1,7 +1,8 @@
 //! Hugging Face `config.json` / `generation_config.json` parsing and the allowlist (P1 S-3):
 //! `architectures[0]` must name a registered model family (`crate::families::resolve`, Phase 2m
 //! S-2), whose own keys it parses; the keys every decoder shares are parsed here (and
-//! `attention_bias: true`, which no executor implements, is refused for every family). Anything
+//! `attention_bias: true`, which only gpt-oss's executor implements, is refused for every other
+//! family). Anything
 //! else is refused with the offending field named and the supported set listed.
 //!
 //! The weight-format part of the allowlist is the checkpoint's [`crate::weights::WeightFormat`] (Phase 2m S-10,
@@ -89,6 +90,9 @@ pub struct ModelArchConfig {
     /// RMSNorm over each Q and K head (`q_norm` / `k_norm` of `[head_dim]`) before RoPE
     /// (Qwen3, Qwen3-MoE); never together with `qk_norm`.
     pub qk_norm_per_head: bool,
+    /// The window of the sliding-attention layers ([`LayerKind::SlidingWindow`]), for a family
+    /// that alternates them with full attention (gpt-oss, P7 S-8); `None` otherwise.
+    pub sliding_window: Option<u32>,
     /// How the weights are stored and which dtypes weights and activations use.
     pub weight_format: WeightFormatRef,
     /// How the paged KV pool stores K and V (`kv.dtype`, Phase 6a S-13): BF16 as parsed; the
@@ -132,6 +136,7 @@ const TRANSFORMERS_DEFAULT_THETA: &[(&str, f64)] = &[
     ("llama", 10_000.0),
     ("mistral", 10_000.0),
     ("mixtral", 1_000_000.0),
+    ("gpt_oss", 150_000.0),
     ("olmoe", 10_000.0),
     ("qwen3", 10_000.0),
     ("qwen3_moe", 10_000.0),
@@ -410,7 +415,8 @@ struct RawConfig {
     max_position_embeddings: u32,
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
-    /// Biased Q/K/V/O projections; no executor implements them (refused for every family).
+    /// Biased Q/K/V/O projections; refused unless the family adds them
+    /// ([`crate::families::ModelFamily::attention_bias`]).
     #[serde(default)]
     attention_bias: Option<bool>,
 }
@@ -586,7 +592,8 @@ pub fn load_model_config_with(
         )));
     }
 
-    if raw.attention_bias == Some(true) {
+    // Biased Q/K/V/O projections: only a family whose executor adds them (gpt-oss) takes them.
+    if raw.attention_bias == Some(true) && !family.attention_bias() {
         return Err(unsupported("attention_bias", "true", "false"));
     }
 
@@ -669,6 +676,7 @@ pub fn load_model_config_with(
         moe: family_cfg.moe,
         qk_norm: family_cfg.qk_norm,
         qk_norm_per_head: family_cfg.qk_norm_per_head,
+        sliding_window: family_cfg.sliding_window,
         weight_format,
         kv_cache: crate::kv_scales::KvCache::bf16(),
         layer_kinds: Vec::new(),
@@ -1289,7 +1297,7 @@ mod tests {
             "unsupported architectures = ExampleUnregisteredForCausalLM; supported: registered \
              families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
              qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
-             (MixtralForCausalLM)"
+             (MixtralForCausalLM), gpt_oss (GptOssForCausalLM)"
         );
         fs::remove_dir_all(dir).unwrap();
 

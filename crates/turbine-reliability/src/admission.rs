@@ -1,9 +1,9 @@
 //! Predictive admission (P3 S-9): estimate → Admit | Queue{reason} | Reject{reason}, worst-case KV
 //! reservation, and the bounded admission queue with its starvation guard.
 use crate::budget::PoolKind;
-use crate::ledger::{Ledger, LedgerError, PoolUsage, Reservation};
+use crate::ledger::{Ledger, LedgerError, PoolUsage, Reservation, StateSlots};
 use crate::metrics::{DecisionLabels, ReliabilityMetrics};
-use crate::multi_device::{GroupReservation, try_reserve_group_with_state};
+use crate::multi_device::{GroupReservation, try_reserve_group};
 use crate::signals::SignalThresholds;
 use serde::Serialize;
 use std::sync::Arc;
@@ -141,6 +141,9 @@ pub struct Admission {
     /// A tensor-parallel group's ledgers (P5 S-8), rank 0 (`ledger`) first; empty on one
     /// device. Every admission reserves on each of them ([`Admission::with_group_ledgers`]).
     group: Vec<(DeviceId, Arc<Ledger>)>,
+    /// The fixed allocation per-sequence state is charged against (P7 review fix); `None` =
+    /// the family has no state.
+    state: Option<Arc<StateSlots>>,
 }
 
 impl Admission {
@@ -157,13 +160,21 @@ impl Admission {
             expensive_in_flight: 0,
             kv_headroom: None,
             group: Vec::new(),
+            state: None,
         }
+    }
+
+    /// Per-sequence state is charged against its own allocation of `bytes` (P7 review fix),
+    /// not the KV pool: a request waits (`kv_reservation`) while the free state is short and is
+    /// rejected when its state exceeds the whole allocation. 0 bytes = no state.
+    pub fn set_state_capacity(&mut self, bytes: u64) {
+        self.state = (bytes > 0).then(|| StateSlots::new(bytes));
     }
 
     /// Admission for a tensor-parallel group (P5 S-8, user decision "P5: KV admission across
     /// tensor-parallel ranks" B): `workers` are the other ranks' devices and ledgers. Each
     /// admission then reserves its worst-case KV (and state) on every rank's ledger through
-    /// [`try_reserve_group_with_state`], all or nothing, and the decision checks capacity,
+    /// [`try_reserve_group`], all or nothing, and the decision checks capacity,
     /// availability and headroom on every rank (the tightest decides). No workers: one device,
     /// unchanged.
     pub fn with_group_ledgers(mut self, workers: Vec<(DeviceId, Arc<Ledger>)>) -> Self {
@@ -306,11 +317,9 @@ impl Admission {
         self.decide_inner(est, PressureState::Green, state, circuit, 0)
     }
 
-    /// The worst-case reservation of `est`: its KV blocks plus its per-sequence state (P7 S-1).
+    /// The worst-case KV reservation of `est` (its state is charged apart, P7 review fix).
     pub fn reservation_bytes(&self, est: &ResourceEstimate) -> u64 {
-        u64::from(est.projected_kv_blocks)
-            .saturating_mul(self.params.block_bytes)
-            .saturating_add(est.state_bytes)
+        u64::from(est.projected_kv_blocks).saturating_mul(self.params.block_bytes)
     }
 
     /// An admitted request that had not started goes back to the queue (SURVIVAL, option A):
@@ -382,7 +391,8 @@ impl Admission {
     ) -> AdmissionDecision {
         let need = self.reservation_bytes(est);
         let capacity = self.kv_usages().map(|u| u.capacity).min().unwrap_or(0);
-        if need > capacity {
+        let state_capacity = self.state.as_ref().map_or(0, |s| s.capacity());
+        if need > capacity || (self.state.is_some() && est.state_bytes > state_capacity) {
             return AdmissionDecision::Reject {
                 reason: RejectionReason::ContextExceedsKvCapacity,
             };
@@ -413,7 +423,12 @@ impl Admission {
                 _ => None,
             }
         };
-        let short = self.kv_usages().any(|kv| need > kv.available())
+        let state_short = self
+            .state
+            .as_ref()
+            .is_some_and(|s| est.state_bytes > s.available());
+        let short = state_short
+            || self.kv_usages().any(|kv| need > kv.available())
             || (self.params.adaptive && !self.within_headroom(need, actual));
         let reason = pressure.or(short.then_some(PressureReason::KvReservation));
         match reason {
@@ -457,30 +472,39 @@ impl Admission {
     }
 
     /// Takes the worst-case reservation of an admitted request (its KV and its per-sequence
-    /// state, [`Admission::reservation_bytes`]). In a tensor-parallel group it holds on every
+    /// state charged against its own allocation). In a tensor-parallel group it holds on every
     /// rank's ledger (rank 0's guard carrying the others as members) or on none: a rank that
     /// cannot hold it releases what the earlier ranks took.
     pub fn reserve_kv(&self, est: &ResourceEstimate) -> Result<Reservation, LedgerError> {
-        if self.group.is_empty() {
-            return self
-                .ledger
-                .reserve(
-                    self.params.device,
-                    PoolKind::Kv,
-                    self.reservation_bytes(est),
-                )
-                .map(|r| r.with_state_bytes(est.state_bytes));
+        let mut res = if self.group.is_empty() {
+            self.ledger.reserve(
+                self.params.device,
+                PoolKind::Kv,
+                self.reservation_bytes(est),
+            )?
+        } else {
+            let taken = try_reserve_group(
+                &self.group,
+                est.projected_kv_blocks,
+                self.params.block_bytes,
+            )
+            .map_err(|(_, e)| e)?;
+            GroupReservation::from(taken)
+                .into_reservation()
+                .expect("a group has rank 0")
+        };
+        if let Some(slots) = &self.state {
+            // On failure `res` drops here and gives the KV back.
+            let charge = slots
+                .try_charge(est.state_bytes)
+                .ok_or(LedgerError::Exhausted {
+                    pool: PoolKind::Kv,
+                    requested: est.state_bytes,
+                    available: slots.available(),
+                })?;
+            res = res.with_state(charge);
         }
-        let taken = try_reserve_group_with_state(
-            &self.group,
-            est.projected_kv_blocks,
-            self.params.block_bytes,
-            est.state_bytes,
-        )
-        .map_err(|(_, e)| e)?;
-        Ok(GroupReservation::from(taken)
-            .into_reservation()
-            .expect("a group has rank 0"))
+        Ok(res)
     }
 
     pub fn expensive_prefill_started(&mut self) {

@@ -103,6 +103,13 @@ struct Tolerance {
     #[serde(default)]
     #[allow(dead_code)]
     max_abs_logprob_diff_tail_batched: Option<f32>,
+    /// Bounds for an MoE model over several GPUs (`turbine-golden compare --multi-gpu-bounds`).
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_abs_logprob_diff_likely_multi_gpu: Option<f32>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    max_abs_logprob_diff_tail_multi_gpu: Option<f32>,
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -273,6 +280,8 @@ fn compare_prompt_applies_the_tolerance_rule() {
         margin_nats: 0.5,
         max_abs_logprob_diff_likely_batched: None,
         max_abs_logprob_diff_tail_batched: None,
+        max_abs_logprob_diff_likely_multi_gpu: None,
+        max_abs_logprob_diff_tail_multi_gpu: None,
     };
     // Four positions: token 10+i with runner-up 20+i at the given margin.
     let reference = |margins: [f32; 4]| ReferenceRecord {
@@ -346,6 +355,8 @@ fn logprob_bound_has_a_likely_and_a_tail_tier() {
         margin_nats: 0.5,
         max_abs_logprob_diff_likely_batched: None,
         max_abs_logprob_diff_tail_batched: None,
+        max_abs_logprob_diff_likely_multi_gpu: None,
+        max_abs_logprob_diff_tail_multi_gpu: None,
     };
     // One position: top-1 token 10, runner-up 20 at `ref_lp`, moved by `delta` in the candidate.
     let check = |ref_lp: f32, delta: f32| {

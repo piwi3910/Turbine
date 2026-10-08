@@ -18,9 +18,10 @@ use turbine_tensor::TensorView;
 
 use crate::KernelError;
 use crate::ops::{
-    ActivationKernel, AddRmsnormKernel, AttentionKernel, ElementwiseKernel, EmbeddingKernel,
-    GemmKernel, KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel,
-    NormKernel, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
+    ActivationKernel, AddRmsnormKernel, AttentionKernel, Conv1dKernel, ElementwiseKernel,
+    EmbeddingKernel, GdnKernel, GemmKernel, KernelProvider, KvCopyKernel, KvTranscodeKernel,
+    LogitsReduceKernel, MoeKernel, NormKernel, ProviderId, QGemmKernel, QuantizeActKernel,
+    RopeKernel, ShardedNormKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -29,6 +30,7 @@ mod attention;
 pub mod card_reference;
 mod elementwise;
 mod embedding;
+mod gdn;
 mod gemm;
 mod kv_copy;
 mod kv_transcode;
@@ -352,6 +354,12 @@ impl KernelProvider for CpuReference {
     fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         Some(self)
     }
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        Some(self)
+    }
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        Some(self)
+    }
 }
 
 /// Test helpers and imports shared by the op-family test modules.
@@ -532,6 +540,8 @@ mod tests {
                 dtype: DType::BF16,
                 block_tokens: None,
                 causal: true,
+                window: None,
+                sinks: false,
             }
         ));
     }

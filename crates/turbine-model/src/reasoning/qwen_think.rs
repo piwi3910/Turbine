@@ -1,7 +1,7 @@
 //! `qwen_think`: reasoning between `<think>` and `</think>` (Qwen3, Qwen3-MoE).
 //!
-//! The stream starts in reasoning when the prompt's generation prompt left a `<think>` open
-//! (the Qwen3 templates with `enable_thinking`); otherwise an output that opens with `<think>`
+//! The stream starts in reasoning when the prompt's generation prompt (the text after the last
+//! `<|im_start|>`) left a `<think>` open (the Qwen3 templates with `enable_thinking`); otherwise an output that opens with `<think>`
 //! (after optional whitespace) enters reasoning there. Everything up to `</think>` is
 //! reasoning, everything after it content; a `<think>` never closed before the output ends is
 //! all reasoning. Markers split across pushes are held back until decided; the markers
@@ -13,6 +13,8 @@ use super::{ReasoningDelta, ReasoningParser, ReasoningSample, ReasoningStream, h
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
+/// The ChatML turn opener: the text after the last one is the generation prefix.
+const TURN_START: &str = "<|im_start|>";
 
 /// The `qwen_think` parser.
 pub struct QwenThink;
@@ -25,7 +27,12 @@ impl Module for QwenThink {
 
 impl ReasoningParser for QwenThink {
     fn start(&self, prompt_tail: &str) -> Box<dyn ReasoningStream> {
-        let open = match (prompt_tail.rfind(OPEN), prompt_tail.rfind(CLOSE)) {
+        // Only the current assistant generation prefix decides: a `<think>` quoted in an
+        // earlier message must not start the answer in reasoning.
+        let turn = prompt_tail
+            .rfind(TURN_START)
+            .map_or(prompt_tail, |at| &prompt_tail[at..]);
+        let open = match (turn.rfind(OPEN), turn.rfind(CLOSE)) {
             (Some(o), Some(c)) => o > c,
             (Some(_), None) => true,
             (None, _) => false,
@@ -144,6 +151,19 @@ mod tests {
             split("", "a b")
         );
         assert_eq!(run("assistant\n", &["a b"]), split("", "a b"));
+    }
+
+    /// Only the current assistant turn decides the start: a literal `<think>` in an earlier
+    /// message must not put the answer in reasoning. Breaks if the whole tail is searched.
+    #[test]
+    fn marker_in_an_earlier_message_is_ignored() {
+        let tail = "<|im_start|>user\nExplain <think><|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(run(tail, &["plain answer"]), split("", "plain answer"));
+        let sample = QwenThink.sample();
+        assert_eq!(
+            run(sample.prompt_tail, &[sample.output]),
+            split(sample.reasoning, sample.content)
+        );
     }
 
     /// An output that opens `<think>` itself (after whitespace, possibly split) is reasoning
