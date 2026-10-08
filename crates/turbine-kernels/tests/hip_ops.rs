@@ -6707,6 +6707,20 @@ fn implementations_enumerated() {
                 ("turbine_hip_tq", "turbine_hip", false),
             ],
         ),
+        // ABI v2.18 (Phase 7 Task 30): Gated DeltaNet and causal conv1d.
+        (
+            OpKind::GdnPrefill,
+            one("llama_cpp_gated_delta_net", "llama_cpp"),
+        ),
+        (
+            OpKind::GdnDecode,
+            one("llama_cpp_gated_delta_net", "llama_cpp"),
+        ),
+        (
+            OpKind::Conv1dPrefill,
+            one("aiter_causal_conv1d_split_qkv", "aiter"),
+        ),
+        (OpKind::Conv1dUpdate, one("llama_cpp_ssm_conv", "llama_cpp")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -7142,6 +7156,15 @@ fn every_implementation_matches_cpu() {
         // The v2.11 KV transcode is judged against the `turbine-kv` codecs by
         // `kv_transcode_matches_cpu`.
         if op == OpKind::KvTranscode {
+            continue;
+        }
+        // The v2.18 Gated DeltaNet and conv1d ops (single-implementation each) are judged
+        // against `cpu/gdn.rs` by their own suite (`tests/hip_gdn.rs`: GDN within about one
+        // BF16 ulp, conv exact), on its Qwen3.5 shapes and sequence-length edges.
+        if matches!(
+            op,
+            OpKind::GdnPrefill | OpKind::GdnDecode | OpKind::Conv1dPrefill | OpKind::Conv1dUpdate
+        ) {
             continue;
         }
         for info in p.hip.implementations(op) {
