@@ -4296,3 +4296,6 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 - B) Make the per-head norm round once (a fused per-head QK-norm that matches the CPU's single rounding), then keep
   Qwen3 at Llama's 0.12 and 1 ulp — a new kernel path with its own reference and invariance tests.
 - C) Accept A now and do B as a later perf/numerics follow-up.
+
+**Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
+per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
