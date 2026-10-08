@@ -493,7 +493,7 @@ Interfaces:
 - Router: `TopkThenSoftmax` with `router.bias`; experts `ExpertDtype::Mxfp4`, `ExpertActivation::GptOssClamp { limit: 7.0 }`, `gate_up_interleaved: true`, biases; attention `AttentionConfig { window: Some(128) | None, sinks: true }` (Task 23 as built), head_dim 64
 - `scripts/golden/tiny_trace.py --model-dir <tiny> --prompt-ids 1,2,3,4,5 --out <json>` — per-layer hidden state, attention output, router top-k and final logits in F32
   Covers: S-8 AC `tiny_model gpt_oss_matches_reference`; S-1 (gpt-oss row of `layer_kinds_and_state_layout`)
-  Depends on: Tasks 2, 4, 5, 15, 23
+  Depends on: Tasks 2, 4, 5, 15, 16 (the quantized-expert loader, the gpt-oss fused `gate_up_proj_*`/`down_proj_*` mapping and the MXFP4-expert tiny writer), 23
 
 - [ ] Write failing test `tiny_model gpt_oss_matches_reference`: write the tiny gpt-oss checkpoint with seed 7, run the CPU executor with `set_trace`, compare each op of `tests/fixtures/tiny-gpt-oss-trace.json` within the Phase 1 trace bounds (max |Δ| 2e-2 on hidden states, logits top-5 order equal). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model gpt_oss_matches_reference` — expect FAIL with "unregistered architecture GptOssForCausalLM"
 - [ ] Generate the trace fixture (fixture time, novanas `fixture.lock`): `cargo run -p turbine-model --example write_tiny -- gpt_oss 7 <dir>` then `uv run scripts/golden/tiny_trace.py --model-dir <dir> --prompt-ids 1,2,3,4,5 --out crates/turbine-model/tests/fixtures/tiny-gpt-oss-trace.json`.
