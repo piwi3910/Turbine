@@ -939,6 +939,7 @@ mod tests {
             top_k: 8,
             renormalize: false,
             bf16_logits: true,
+            ..Default::default()
         };
         let experts = MoeExpertsConfig {
             hidden: 2048,
@@ -948,6 +949,7 @@ mod tests {
             expert_begin: 0,
             expert_end: 64,
             dtype: DType::BF16,
+            ..Default::default()
         };
         let reqs: Vec<OpRequirement> = [
             OpConfig::Attention(paged),
@@ -1593,6 +1595,7 @@ mod tests {
             expert_begin: 0,
             expert_end: 2,
             dtype: DType::BF16,
+            ..Default::default()
         };
         let registry = KernelRegistry::build(
             vec![fake],
@@ -1638,6 +1641,7 @@ mod tests {
                 host_expert_offsets: &[],
                 out: out.view(),
                 workspace: None,
+                extra: Default::default(),
             })
             .expect("fake experts");
         }

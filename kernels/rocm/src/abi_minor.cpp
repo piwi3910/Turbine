@@ -40,7 +40,9 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
-  return TURBINE_ABI_MINOR;
+  // The header is at 16 (expert ABI v2.16); this library implements 15 until
+  // the HIP quantized experts land (P7 Task 16 returns TURBINE_ABI_MINOR).
+  return 15u;
 #endif
 }
 

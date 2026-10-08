@@ -2191,6 +2191,7 @@ fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> R
             topk_weights: w.view(),
             sorted_rows: s.view(),
             expert_offsets: off.view(),
+            router_bias: None,
         };
         kernel.route(&mut ctx).expect("moe_route");
     }
@@ -2291,6 +2292,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     let routing = route_case(p, route_cfg, tokens, case.logits);
     let host_offsets: Vec<i32> = routing.expert_offsets.iter().map(|&o| o as i32).collect();
@@ -2307,6 +2309,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         expert_begin: begin as u32,
         expert_end: end as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let hip = p.hip.moe().expect("hip moe");
     assert!(
@@ -2375,6 +2378,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
             host_expert_offsets: offsets,
             out: o.view(),
             workspace: ws.map(|t| t.view().slice),
+            extra: Default::default(),
         };
         kernel.experts(&mut ctx).expect("moe_experts");
     }
@@ -2404,6 +2408,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
             host_expert_offsets: hip_offsets,
             out: out.view(),
             workspace: ws.as_ref().map(|t| t.view().slice),
+            extra: Default::default(),
         })
     };
     again.storage.copy_from_host(0, &raw).expect("copy to HIP");
@@ -3413,6 +3418,7 @@ fn paged_and_moe_ops() {
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0));
     let mut ties = vec![0f32; 3 * MOE_EXPERTS];
@@ -3438,6 +3444,7 @@ fn paged_and_moe_ops() {
         top_k: 2,
         renormalize: true,
         bf16_logits: false,
+        ..Default::default()
     };
     route_case(&p, small, 13, &rng.normal(13 * 8, 1.0));
     let wide = MoeRouteConfig {
@@ -3445,6 +3452,7 @@ fn paged_and_moe_ops() {
         top_k: 4,
         renormalize: true,
         bf16_logits: true,
+        ..Default::default()
     };
     let wide_ties: Vec<f32> = rng
         .normal(9 * 256, 1.0)
@@ -4534,6 +4542,7 @@ fn decode_op_timings() {
                 top_k: top_k as u32,
                 renormalize: false,
                 bf16_logits: true,
+                ..Default::default()
             };
             let experts_cfg = MoeExpertsConfig {
                 hidden: h as u32,
@@ -4543,6 +4552,7 @@ fn decode_op_timings() {
                 expert_begin: 0,
                 expert_end: experts as u32,
                 dtype: DType::BF16,
+                ..Default::default()
             };
             let up_scale = 1.0 / (h as f32).sqrt();
             let gate_raw = encode(
@@ -4582,6 +4592,7 @@ fn decode_op_timings() {
                         topk_weights: topk_w.view().rows(0, m),
                         sorted_rows: sorted_rows.clone(),
                         expert_offsets: offsets.view(),
+                        router_bias: None,
                     })
                     .expect("moe_route");
                 };
@@ -4639,6 +4650,7 @@ fn decode_op_timings() {
                         host_expert_offsets: &host_offsets,
                         out: o.view().rows(0, m),
                         workspace: Some(workspace.storage.slice(0, ws_len)),
+                        extra: Default::default(),
                     })
                     .expect("moe_experts");
                 });
@@ -4898,6 +4910,7 @@ fn decode_forward_timing() {
             top_k: top_k as u32,
             renormalize: false,
             bf16_logits: true,
+            ..Default::default()
         };
         let experts_cfg = MoeExpertsConfig {
             hidden: h as u32,
@@ -4907,6 +4920,7 @@ fn decode_forward_timing() {
             expert_begin: 0,
             expert_end: experts as u32,
             dtype: DType::BF16,
+            ..Default::default()
         };
         let gi = |n: usize, k: usize, c: DType| gemm.implementation(&gemm_config(n, k, c));
         let impls = BenchImpls {
@@ -5114,6 +5128,7 @@ fn decode_forward_timing() {
                                     topk_weights: rows(&topk_w, m),
                                     sorted_rows: sorted_rows.clone(),
                                     expert_offsets: offsets.view(),
+                                    router_bias: None,
                                 })
                                 .expect("moe_route")
                             });
@@ -5150,6 +5165,7 @@ fn decode_forward_timing() {
                                     host_expert_offsets: &host_offsets,
                                     out: rows(&proj, m),
                                     workspace: Some(workspace.storage.slice(0, moe_ws_len(m))),
+                                    extra: Default::default(),
                                 })
                                 .expect("moe_experts")
                             });
@@ -6127,6 +6143,7 @@ fn prefill_shapes_match_cpu() {
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     for tokens in [680, 2048] {
         route_case(&p, olmoe, tokens, &rng.normal(tokens * MOE_EXPERTS, 2.0));
@@ -6304,6 +6321,7 @@ fn prefill_op_timings() {
                     top_k: top_k as u32,
                     renormalize: false,
                     bf16_logits: true,
+                    ..Default::default()
                 };
                 let experts_cfg = MoeExpertsConfig {
                     hidden: h as u32,
@@ -6313,6 +6331,7 @@ fn prefill_op_timings() {
                     expert_begin: 0,
                     expert_end: experts as u32,
                     dtype: DType::BF16,
+                    ..Default::default()
                 };
                 let up_scale = 1.0 / (h as f32).sqrt();
                 let gate_raw = encode(
@@ -6356,6 +6375,7 @@ fn prefill_op_timings() {
                             topk_weights: topk_w.view().rows(0, m),
                             sorted_rows: sorted_rows.clone(),
                             expert_offsets: offsets.view(),
+                            router_bias: None,
                         })
                         .expect("moe_route");
                     };
@@ -6389,6 +6409,7 @@ fn prefill_op_timings() {
                             host_expert_offsets: &host_offsets,
                             out: o.view().rows(0, m),
                             workspace: None,
+                            extra: Default::default(),
                         })
                         .expect("moe_experts");
                     });
@@ -6497,6 +6518,7 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
             top_k: num("top_k") as u32,
             renormalize: flag("renormalize"),
             bf16_logits: flag("bf16_logits"),
+            ..Default::default()
         }),
         "moe_experts" => {
             let (begin, end) = kv["local"].split_once("..").expect("local=a..b");
@@ -6508,6 +6530,7 @@ fn parse_choice(op: &str, config: &str) -> OpConfig {
                 expert_begin: begin.parse().expect("expert_begin"),
                 expert_end: end.parse().expect("expert_end"),
                 dtype: dtype("dtype"),
+                ..Default::default()
             })
         }
         "logits_reduce" => OpConfig::LogitsReduce(LogitsReduceConfig {
@@ -6790,12 +6813,14 @@ fn every_implementation_matches_cpu() {
         expert_begin: 0,
         expert_end: MOE_EXPERTS as u32,
         dtype: bf16,
+        ..Default::default()
     };
     let olmoe_route = MoeRouteConfig {
         num_experts: MOE_EXPERTS as u32,
         top_k: MOE_TOP_K as u32,
         renormalize: false,
         bf16_logits: true,
+        ..Default::default()
     };
     fn case<'a>(spec: OpConfig, run: CaseFn<'a>) -> ImplCase<'a> {
         ImplCase {

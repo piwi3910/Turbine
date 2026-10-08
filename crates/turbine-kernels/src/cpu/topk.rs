@@ -195,9 +195,55 @@ pub fn torch_topk(values: &[f32], k: usize) -> Vec<usize> {
     chosen.into_iter().map(|e| e.1 as usize).collect()
 }
 
+/// gpt-oss routing: the top `k` of `logits + bias` as [`torch_topk`] selects them (descending
+/// biased value), then a softmax over those `k` values only (F32, max-subtracted, sequential
+/// sum). Returns the selected indices and their weights, which sum to one.
+pub(crate) fn topk_then_softmax(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    k: usize,
+) -> (Vec<usize>, Vec<f32>) {
+    let biased: Vec<f32> = match bias {
+        Some(b) => logits.iter().zip(b).map(|(&l, &b)| l + b).collect(),
+        None => logits.to_vec(),
+    };
+    let chosen = torch_topk(&biased, k);
+    let picked: Vec<f32> = chosen.iter().map(|&e| biased[e]).collect();
+    let max = picked.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut weights: Vec<f32> = picked.iter().map(|&v| (v - max).exp()).collect();
+    let mut sum = 0f32;
+    for &w in &weights {
+        sum += w;
+    }
+    for w in &mut weights {
+        *w /= sum;
+    }
+    (chosen, weights)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::torch_topk;
+    use super::{topk_then_softmax, torch_topk};
+
+    /// The bias moves the selection (expert 0 has the largest raw logit but expert 3 wins with
+    /// its bias) and the softmax runs over the `k` selected biased logits only.
+    #[test]
+    fn topk_then_softmax_with_bias() {
+        let logits = [2.0f32, 1.0, 0.0, 0.5];
+        let bias = [0.0f32, 0.0, 0.0, 3.0];
+        let (ids, w) = topk_then_softmax(&logits, Some(&bias), 2);
+        assert_eq!(ids, [3, 0]);
+        // Biased values 3.5 and 2.0; the other two experts do not enter the denominator.
+        let (a, b) = ((3.5f32 - 3.5).exp(), (2.0f32 - 3.5).exp());
+        assert!((w[0] - a / (a + b)).abs() < 1e-6, "{w:?}");
+        assert!((w[1] - b / (a + b)).abs() < 1e-6, "{w:?}");
+        assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        // Without the bias the raw top-2 is experts 0 and 1.
+        let (ids, w) = topk_then_softmax(&logits, None, 2);
+        assert_eq!(ids, [0, 1]);
+        let (a, b) = (1.0f32, (1.0f32 - 2.0).exp());
+        assert!((w[0] - a / (a + b)).abs() < 1e-6, "{w:?}");
+    }
 
     /// The cases of `torch_topk_fixture.txt`: `k;values;selected indices ascending`.
     fn fixture() -> Vec<(usize, Vec<f32>, Vec<usize>)> {

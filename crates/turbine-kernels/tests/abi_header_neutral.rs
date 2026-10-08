@@ -207,7 +207,7 @@ fn header_declares_the_v24_minor_revision() {
     );
     // v2.5 (Phase 4), v2.6, v2.7 and v2.8 (Phase 5) and v2.9 (Phase 6a) raised the minor; the
     // v2.4 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     for (i, op) in OpKind::ALL.iter().enumerate() {
         let name = format!("TURBINE_OP_{}", op.as_str().to_ascii_uppercase());
         assert_eq!(define(&code, &name), i.to_string(), "{name}");
@@ -247,7 +247,7 @@ fn header_declares_the_v25_copy_streams() {
         "v2.5 keeps major 2"
     );
     // v2.6, v2.7 and v2.8 (Phase 5) raised the minor; the v2.5 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(define(&code, "TURBINE_COPY_H2D"), "0");
     assert_eq!(define(&code, "TURBINE_COPY_D2H"), "1");
     assert_eq!(define(&code, "TURBINE_COPY_D2D"), "2");
@@ -281,7 +281,7 @@ fn header_declares_the_v26_tensor_parallel_group() {
         "v2.6 keeps major 2"
     );
     // v2.7 and v2.8 raised the minor; the v2.6 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(define(&code, "TURBINE_OP_ROW_SUMSQ"), "15");
     assert_eq!(define(&code, "TURBINE_OP_RMSNORM_SHARDED"), "16");
     for op in [OpKind::RowSumsq, OpKind::RmsnormSharded] {
@@ -324,7 +324,7 @@ fn header_declares_the_v27_host_mapped_group() {
         "v2.7 keeps major 2"
     );
     // v2.8 raised the minor; the v2.7 group is unchanged.
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     for (name, value) in [
         ("TURBINE_MAPPED_ALL_REDUCE", "0"),
         ("TURBINE_MAPPED_ALL_GATHER", "1"),
@@ -377,7 +377,7 @@ fn header_declares_the_v28_device_sequenced_step() {
         "2u",
         "v2.8 keeps major 2"
     );
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() <= 8).count(),
         17,
@@ -402,7 +402,7 @@ fn header_declares_the_v29_quantization_group() {
     use turbine_core::types::DType;
     use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(define(&code, "TURBINE_OP_QGEMM"), "17");
     assert_eq!(define(&code, "TURBINE_OP_QUANTIZE_ACT"), "18");
     assert_eq!(OpKind::QGemm.abi_code(), 17);
@@ -474,7 +474,7 @@ fn header_declares_the_v29_quantization_group() {
 #[test]
 fn header_declares_the_v210_rope_attn_factor() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(
         OpKind::ALL.iter().filter(|op| op.abi_minor() == 10).count(),
         0,
@@ -500,7 +500,7 @@ fn header_declares_the_v211_kv_transcode_group() {
         KV_FMT_BF16, KV_FMT_FP8_E4M3, KV_FMT_TQ2, KV_FMT_TQ4, KvTranscodeFormat,
     };
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     assert_eq!(define(&code, "TURBINE_OP_KV_TRANSCODE"), "19");
     assert_eq!(OpKind::KvTranscode.abi_code(), 19);
     assert_eq!(OpKind::KvTranscode.abi_minor(), 11);
@@ -657,7 +657,7 @@ fn header_declares_the_v212_fused_rope_fields() {
 #[test]
 fn header_declares_the_v213_qgemm_act_static_scale() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let qgemm = "float alpha; int32_t prefill; float act_static_scale; } turbine_qgemm_desc;";
     assert!(
@@ -673,7 +673,7 @@ fn header_declares_the_v213_qgemm_act_static_scale() {
 #[test]
 fn header_declares_the_v214_gemm_silu_mul_input() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let gemm = "float alpha, beta; int64_t a_up_offset; int32_t a_silu_mul;";
     assert!(
@@ -689,7 +689,7 @@ fn header_declares_the_v214_gemm_silu_mul_input() {
 #[test]
 fn header_declares_the_v215_gemm_residual_and_norm_input() {
     let code = strip_comments(&header());
-    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "15u");
+    assert_eq!(define(&code, "TURBINE_ABI_MINOR"), "16u");
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let gemm = "int32_t a_silu_mul; const void *c_residual; const void *a_norm_weight; \
                 float a_norm_eps; } turbine_gemm_desc;";
@@ -697,4 +697,43 @@ fn header_declares_the_v215_gemm_residual_and_norm_input() {
         flat.contains(gemm),
         "turbine_kernels.h lacks the v2.15 gemm fields {gemm}"
     );
+}
+
+/// Kernel ABI v2.16 (P7 S-4): the expert descriptor ends with the weight dtype, scales, biases,
+/// activation, interleave flag, clamp limit and shared expert, after `dtype`; the router
+/// descriptor ends with `router_bias`; `TURBINE_ROUTE_TOPK_THEN_SOFTMAX` is the flag bit 4 and
+/// the minor is at least 16. Breaks if a field moves (a library would read a scale pointer as
+/// the dtype) or a code changes value (an older library would misread a descriptor instead of
+/// refusing it).
+#[test]
+fn header_declares_the_v216_expert_fields() {
+    let code = strip_comments(&header());
+    let minor: u32 = define(&code, "TURBINE_ABI_MINOR")
+        .trim_end_matches('u')
+        .parse()
+        .expect("TURBINE_ABI_MINOR is a number");
+    assert!(minor >= 16, "TURBINE_ABI_MINOR {minor}");
+    for (name, value) in [
+        ("TURBINE_EXPERT_BF16", "0"),
+        ("TURBINE_EXPERT_FP8_BLOCK", "1"),
+        ("TURBINE_EXPERT_FP8_TENSOR", "2"),
+        ("TURBINE_EXPERT_MXFP4", "3"),
+        ("TURBINE_EXPERT_SWIGLU", "0"),
+        ("TURBINE_EXPERT_GPTOSS_CLAMP", "1"),
+        ("TURBINE_ROUTE_TOPK_THEN_SOFTMAX", "4"),
+    ] {
+        assert_eq!(define(&code, name), value, "{name}");
+    }
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t expert_begin, expert_end; int32_t dtype; int32_t weight_dtype; \
+         const void *w_gate_scale, *w_up_scale, *w_down_scale; \
+         const float *act_static_scale, *act_static_scale_down; const void *b_gate, *b_up, *b_down; \
+         int32_t activation, gate_up_interleaved; float clamp_limit; \
+         const void *shared_w_gate, *shared_w_up, *shared_w_down, *shared_gate_w; \
+         int32_t shared_inter; } turbine_moe_experts_desc;",
+        "int32_t *expert_offsets; const void *router_bias; } turbine_moe_route_desc;",
+    ] {
+        assert!(flat.contains(decl), "turbine_kernels.h lacks {decl}");
+    }
 }
