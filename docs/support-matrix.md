@@ -152,9 +152,7 @@ The seven Phase 7 architectures — `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM`, `
 
 ## Parallel-mode refusals
 
-| Architecture     | Modes   | Reason                                                                                                                                                                                                                                                                                                                                                      |
-| ---------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OlmoeForCausalLM | `ep+tp` | `olmoe_ep_tp_drift`: OLMoE with expert parallelism > 1 and tensor parallelism > 1 together drifts past its golden tolerance (p10 likely Δ 1.031 > 1.01, and p08); user decision 2026-09-28, refused at startup naming `parallel.expert_parallel_size` — `phase 7` investigates the drift (expansion umbrella question (d)). Each mode alone stays supported |
+No combination is refused today (`PARALLEL_REFUSALS` is empty). OLMoE at expert parallelism > 1 together with tensor parallelism > 1 was refused as `olmoe_ep_tp_drift` until Phase 7 Task 13; any change of summation order flips near-tie router experts, so the combination is gated by the calibrated `_multi_gpu` bounds of `tests/golden/olmoe-1b-7b-0125-instruct/tolerance.json` instead (`turbine-golden compare --multi-gpu-bounds`).
 
 ## Experimental today, and what would flip it
 

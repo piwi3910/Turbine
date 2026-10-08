@@ -16,7 +16,7 @@
 //!   both id sets, one GPU's margin, the |Δ router logit| of the flipped experts) and whether
 //!   the ranks of the group routed identically.
 //!
-//! The ep 2 × tp 2 refusal (`olmoe_ep_tp_drift`) is a server startup check; the executors are
+//! The ep 2 × tp 2 refusal (`olmoe_ep_tp_drift`, removed in Task 13) was a server startup check; the executors are
 //! built here directly, so it needs no bypass. Run by `scripts/lab-test.sh novanas --gpus 2 --
 //! -p turbine-model --test olmoe_ep_tp_lab -- olmoe_routing_trace` (a `TWO_GPU_TESTS` entry).
 use std::collections::HashMap;

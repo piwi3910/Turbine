@@ -32,6 +32,14 @@ Bounds per tier (likely, tail), strict and batched:
   variant above the cap is flagged, since then something beyond reduction order moved it).
 The token-identity rule (min_identical_prefix, min_prompts_passing, margin_nats) is unchanged.
 
+Multi-GPU bound (decision "Phase 7 Task 13: OLMoE EP×TP drift", 2026-10-08 A): captures named
+`mg-<placement>-c<n>` (tp2, ep2, ep2tp2 at c1 and c16; one GPU stays `c1-cold`) are the placement
+captures of an MoE slug. They are left out of the strict and batched bounds above and give
+`likely_multi_gpu` / `tail_multi_gpu` the same way: old = the batched bound, noise = the range
+over every capture including the placements, observed = the largest placement-vs-reference |Δ|
+over every capture (one GPU, par-*, mg-*), proposed = min(triangle, max(old, observed)). The
+proposed values are what `tolerance.json` carries as `max_abs_logprob_diff_{likely,tail}_multi_gpu`.
+
 usage: engine_spread.py <captures-dir> [--slug <slug>]... [--json <out.json>] [--slug-json <label>]
 
 --slug-json writes each slug's report to tests/golden/<slug>/engine_spread.json, tagged with
@@ -177,10 +185,12 @@ def slug_report(slug, cap_dir):
             "max_abs_logprob_diff_tail_batched", tol["max_abs_logprob_diff_tail"]
         ),
     }
-    all_l, all_t, worst_noise = range_noise(refs, caps, tol)
+    mg = [k for k in caps if k.startswith("mg-")]
+    std_caps = {k: v for k, v in caps.items() if k not in mg}
+    all_l, all_t, worst_noise = range_noise(refs, std_caps, tol)
     n_l = max(all_l, default=0.0)
     n_t = max(all_t, default=0.0)
-    c1 = [k for k in vs_ref if not k.startswith("par-")]
+    c1 = [k for k in vs_ref if not k.startswith("par-") and k not in mg]
     par = [k for k in vs_ref if k.startswith("par-")]
     obs = lambda keys, tier: max((vs_ref[k][tier][0] for k in keys), default=0.0)
     out = {
@@ -205,6 +215,27 @@ def slug_report(slug, cap_dir):
             "proposed": min(tri, max(old[key], o)),
             "over_cap": o > tri,
         }
+    if mg:
+        ml, mt, mworst = range_noise(refs, caps, tol)
+        out["noise_multi_gpu"] = {
+            "likely": max(ml, default=0.0),
+            "tail": max(mt, default=0.0),
+            "worst": mworst,
+        }
+        for key, tier, nz in (
+            ("likely_multi_gpu", "likely", max(ml, default=0.0)),
+            ("tail_multi_gpu", "tail", max(mt, default=0.0)),
+        ):
+            base_old = old[tier + "_batched"]
+            o = ceil2(obs(list(vs_ref), tier))
+            tri = ceil2(base_old + nz)
+            old[key] = base_old
+            prop[key] = {
+                "observed": o,
+                "triangle": tri,
+                "proposed": min(tri, max(base_old, o)),
+                "over_cap": o > tri,
+            }
     out["bounds"] = prop
     out["noise_distribution"] = {
         tier: {q: quantile(xs, float(q)) for q in ("0.5", "0.9", "0.99", "1.0")}
