@@ -1590,7 +1590,6 @@ mod tests {
             ("Qwen3ForCausalLM", W::Bf16),
             ("Qwen3MoeForCausalLM", W::Bf16),
             ("Qwen3MoeForCausalLM", W::Fp8Block),
-            ("MistralForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Fp8),
             ("GptOssForCausalLM", W::Mxfp4),
@@ -1619,6 +1618,48 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
+        // Mistral BF16 closed its gate on gfx1201 (perf-log "P7 Mistral gate"): supported
+        // there, pending on the other amd archs and on the CPU reference.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "MistralForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        let k = key(
+            "amd",
+            "gfx942",
+            "MistralForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+        let k = key(
+            "cpu",
+            "cpu",
+            "MistralForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+        let k = key(
+            "amd",
+            "gfx1201",
+            "MistralForCausalLM",
+            W::AwqInt4,
+            K::Bf16,
+            S::None,
+        );
+        let status = resolve(&k);
+        assert!(
+            status.reason().unwrap().contains("phase-6a-quantization"),
+            "{k}: {status:?}"
+        );
         // Rows outside Phase 7 carry no pending reason.
         let k = key(
             "amd",
