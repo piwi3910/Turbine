@@ -8,9 +8,8 @@
 //
 // Numerics follow the cpu-reference moe_experts (crates/turbine-kernels/src/
 // cpu/moe.rs): every step rounds to BF16 as the BF16 model's ops do; a
-// projection's bias is added to the BF16 qgemm output and rounded again (the
-// reference adds it to the F32 accumulator before the one rounding, a double
-// rounding within the 6a bound).
+// projection's bias is added to the BF16 qgemm output and rounded again, as
+// the BF16 model's `x @ W + b` does, and the reference rounds the same way.
 #include "bf16.hpp"
 #include "qgemm_quantize.hpp"
 #include "turbine_hip.hpp"

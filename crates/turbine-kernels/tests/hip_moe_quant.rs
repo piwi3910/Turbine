@@ -4,12 +4,11 @@
 //! softmax, router bias) match the `cpu-reference` provider on the three Task 14 shapes. Run by
 //! `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_moe_quant`.
 //!
-//! Tolerance of the experts: both sides round to BF16 after every op and accumulate in F32, so
-//! they differ by summation order only, which flips an intermediate by one BF16 ulp now and then;
-//! an output element agrees within `|want| / 64 + rms(want) / 32` (the 6a per-GEMM bound is
-//! `|ref| / 256 + rms / 128`: one output rounding plus the BF16 rounding of the dequantized
-//! weights the kernels feed the WMMA; an expert layer chains three GEMMs and the routing sum). The worst ratio of
-//! every case is printed (`moe_quant: ... ratio=`).
+//! Tolerance of the experts: the 6a per-GEMM bound, an output element agrees within
+//! `|want| / 256 + rms(want) / 128`. The reference models the two documented roundings the
+//! kernels share with the BF16 model path (FP8-block weights as `bf16(e4m3(q) * s)`, a projection
+//! bias added to the already rounded matmul output); what is left is summation order. The worst
+//! ratio of every case is printed (`moe_quant: ... ratio=`).
 use std::sync::Arc;
 
 use half::bf16;
@@ -456,14 +455,14 @@ fn run(
     read_f32(&ot)
 }
 
-/// Worst `|got - want| / (|want| / 64 + rms(want) / 32)`.
+/// Worst `|got - want| / (|want| / 256 + rms(want) / 128)`.
 fn worst_ratio(got: &[f32], want: &[f32]) -> (f32, usize) {
     assert_eq!(got.len(), want.len());
     let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
     assert!(rms > 1e-3, "degenerate reference (rms {rms})");
     let mut worst = (0f32, 0usize);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        let ratio = (g - w).abs() / (w.abs() / 64.0 + rms / 32.0);
+        let ratio = (g - w).abs() / (w.abs() / 256.0 + rms / 128.0);
         if ratio.is_nan() || ratio > worst.0 {
             worst = (ratio, i);
         }
