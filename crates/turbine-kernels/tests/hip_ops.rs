@@ -6671,6 +6671,8 @@ fn implementations_enumerated() {
                 ("turbine_hip_moe_wmma", "turbine_hip", false),
                 ("hipblaslt_grouped", "hipblaslt", HOST),
                 ("hipblaslt_per_expert", "hipblaslt", HOST),
+                // ABI v2.16: the quantized experts' per-expert loop.
+                ("turbine_hip_moe_quant", "turbine_hip", HOST),
             ],
         ),
         (OpKind::AddRmsnorm, norm),
@@ -7144,6 +7146,11 @@ fn every_implementation_matches_cpu() {
         }
         for info in p.hip.implementations(op) {
             if ran.iter().any(|(o, n)| *o == op && *n == info.name) {
+                continue;
+            }
+            // The quantized experts (ABI v2.16) are run against the CPU reference by their own
+            // suite (`tests/hip_moe_quant.rs`).
+            if info.name == "turbine_hip_moe_quant" {
                 continue;
             }
             assert_eq!(

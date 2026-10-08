@@ -67,7 +67,7 @@ In `crates/turbine-model/src/weights/mod.rs`: `pub mod <name>;` and the entry in
 
 ## Pitfalls
 
-- `check_weight_format` in `crates/turbine-model/src/executor/decoder/mod.rs` refuses layers of different quantized schemes, a fused stack (Q/K/V, gate/up) whose parts differ in scheme, block-scaled parts off block boundaries, a quantized `lm_head`, quantized mixture-of-experts models (`quant_moe_phase7`) and tensor, expert or pipeline parallelism (until Phase 6a Task 21).
+- `check_weight_format` in `crates/turbine-model/src/executor/decoder/mod.rs` refuses layers of different quantized schemes, a fused stack (Q/K/V, gate/up) whose parts differ in scheme, block-scaled parts off block boundaries, a quantized `lm_head`, quantized mixture-of-experts models whose format has no expert kernel row (`quant_moe_phase7`: FP8 block, FP8 tensor with static activation scales and MXFP4 experts are served by `turbine_hip_moe_quant`; the router must stay BF16) and tensor, expert or pipeline parallelism (until Phase 6a Task 21).
 - Fused stacks concatenate the parts' packed rows and scales: per-tensor scales are stored per row so parts with different scales stay exact, and a static activation scale is the largest of the parts'.
 - `n` or `k` not a multiple of the group or block size is refused (`quant_scheme_unsupported`), as is act-order GPTQ (`gptq_act_order`).
 - A layer's quantization is decided from `config.json` (the ignore list), not from the tensor dtype: a checkpoint that leaves a layer in BF16 without listing it is refused by `check_tensor`.

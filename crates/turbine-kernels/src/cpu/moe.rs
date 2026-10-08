@@ -270,6 +270,15 @@ impl MoeKernel for CpuReference {
                 expert_weight(&cfg, &ctx.w_up, ex.w_up_scale.as_ref(), li, inter, h)?
             };
             let w_down = expert_weight(&cfg, &ctx.w_down, ex.w_down_scale.as_ref(), li, h, inter)?;
+            // FP8 block weights reach the GEMM as the BF16 the golden dequantized checkpoint holds
+            // (`bf16(e4m3(q) * s)`, qgemm_fp8_block's staging); the other formats' decoded values
+            // are exact in BF16 or (FP8 tensor, W8A8) multiplied as FP8.
+            let (w_gate, w_up, w_down) = if cfg.weight_dtype == ExpertDtype::Fp8Block {
+                let r = |v: Vec<f32>| v.into_iter().map(round).collect::<Vec<f32>>();
+                (r(w_gate), r(w_up), r(w_down))
+            } else {
+                (w_gate, w_up, w_down)
+            };
             let bias = |b: &Option<turbine_tensor::TensorView<'_>>| {
                 b.as_ref().map(|v| load(&v.rows(li, 1))).transpose()
             };
@@ -305,6 +314,9 @@ impl MoeKernel for CpuReference {
                 };
                 let mut y = math::gemm(a, w, &[], &shape, 1.0, 0.0);
                 if let Some(b) = bias {
+                    // `x @ W + b` in the BF16 model: the matmul's output is rounded, then the
+                    // bias add rounds again (the kernels' qgemm output plus bias kernel).
+                    y = y.into_iter().map(round).collect();
                     for row in y.chunks_exact_mut(cols) {
                         for (v, &b) in row.iter_mut().zip(b) {
                             *v += b;
@@ -340,6 +352,10 @@ impl MoeKernel for CpuReference {
                 quant::quantize_dequantize_activations(&mut act, n, inter, mode, scale);
             }
             let down = proj(&w_down, b_down.as_deref(), h, inter, &act);
+            // The BF16 expert scatter, as `moe_scatter_kernel` (moe.hip) and Hugging Face's
+            // `index_add_` do it: experts in ascending id order, and per expert and element
+            // `out = bf16(out + bf16(bf16(y) * bf16(w)))`, so the running sum is rounded to BF16
+            // after every top-k contribution (not accumulated in F32).
             for (i, &r) in rows.iter().enumerate() {
                 let t = r / k;
                 let w = round(weights[r]);

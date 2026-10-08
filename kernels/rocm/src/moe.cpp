@@ -4,12 +4,13 @@
 // out[t] += sum_k w_k * down(silu(gate(x_t)) * up(x_t)) over the local experts
 // [expert_begin, expert_end).
 //
-// Five implementations (impl_table.cpp; the caller picks one with
-// turbine_impl_run, or turbine_moe_experts takes the first that supports the
-// descriptor within the context's card profile): the Turbine small-m kernels
-// (moe_small_m.hip, impl "turbine_hip_moe_small_m"; the default uses them up
-// to the profile's moe_small_max_rows routed rows, num_tokens * top_k; for
-// hidden and inter multiples of 64 they are WMMA kernels with the grouped
+// Six implementations (impl_table.cpp; the sixth, "turbine_hip_moe_quant",
+// runs the v2.16 quantized experts, see run_quant below; the caller picks one
+// with turbine_impl_run, or turbine_moe_experts takes the first that supports
+// the descriptor within the context's card profile): the Turbine small-m
+// kernels (moe_small_m.hip, impl "turbine_hip_moe_small_m"; the default uses
+// them up to the profile's moe_small_max_rows routed rows, num_tokens * top_k;
+// for hidden and inter multiples of 64 they are WMMA kernels with the grouped
 // tier's per-element chain, bitwise equal to the next tiers row by row), the
 // Turbine prefill WMMA kernels (moe_grouped.hip, impl
 // "turbine_hip_moe_wmma_prefill"; hidden and inter multiples of 256; the
@@ -39,6 +40,7 @@
 #include <hipblaslt/hipblaslt-ext.hpp>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -58,6 +60,7 @@ constexpr const char *kImplRoute = "turbine_hip";
 constexpr const char *kImplSmallM = "turbine_hip_moe_small_m";
 constexpr const char *kImplWmmaPrefill = "turbine_hip_moe_wmma_prefill";
 constexpr const char *kImplWmma = "turbine_hip_moe_wmma";
+constexpr const char *kImplQuant = "turbine_hip_moe_quant";
 constexpr const char *kImplPerExpert = "hipblaslt_per_expert";
 constexpr const char *kImplGrouped = "hipblaslt_grouped";
 constexpr size_t kAlign = 256;
@@ -78,30 +81,116 @@ bool route_supported(const turbine_moe_route_desc *d) {
     return false;
   }
   if ((d->flags &
-       ~(TURBINE_MOE_ROUTE_RENORMALIZE | TURBINE_MOE_ROUTE_BF16_LOGITS)) != 0)
-    return false;
-  // v2.16 router bias: not implemented here until P7 Task 16.
-  if (d->router_bias != nullptr)
+       ~(TURBINE_MOE_ROUTE_RENORMALIZE | TURBINE_MOE_ROUTE_BF16_LOGITS |
+         TURBINE_ROUTE_TOPK_THEN_SOFTMAX)) != 0)
     return false;
   return d->num_tokens >= 0 &&
          static_cast<int64_t>(d->num_tokens) * d->top_k <= INT32_MAX;
 }
 
+bool quantized(const turbine_moe_experts_desc *d) {
+  return d->weight_dtype != TURBINE_EXPERT_BF16;
+}
+
+// The pre-v2.16 form: BF16 weights, SwiGLU, no biases or shared expert.
+bool plain_bf16(const turbine_moe_experts_desc *d) {
+  return d->weight_dtype == TURBINE_EXPERT_BF16 &&
+         d->activation == TURBINE_EXPERT_SWIGLU &&
+         d->gate_up_interleaved == 0 && d->w_gate_scale == nullptr &&
+         d->w_up_scale == nullptr && d->w_down_scale == nullptr &&
+         d->act_static_scale == nullptr &&
+         d->act_static_scale_down == nullptr && d->b_gate == nullptr &&
+         d->b_up == nullptr && d->b_down == nullptr &&
+         d->shared_w_gate == nullptr && d->shared_w_up == nullptr &&
+         d->shared_w_down == nullptr && d->shared_gate_w == nullptr &&
+         d->shared_inter == 0;
+}
+
+size_t weight_code_bytes(int32_t weight_dtype, int64_t n, int64_t k) {
+  return static_cast<size_t>(weight_dtype == TURBINE_EXPERT_MXFP4 ? n * k / 2
+                                                                  : n * k);
+}
+
+size_t weight_scale_bytes(int32_t weight_dtype, int64_t n, int64_t k) {
+  switch (weight_dtype) {
+  case TURBINE_EXPERT_FP8_BLOCK:
+    return static_cast<size_t>(((n + 127) / 128) * ((k + 127) / 128)) * 4;
+  case TURBINE_EXPERT_FP8_TENSOR:
+    return 4;
+  default:
+    return static_cast<size_t>(n * k / 32);
+  }
+}
+
+// One expert projection as a qgemm call (the own implementations of v2.9):
+// c[m, n] = a[m, k] . dequant(b)[n, k]^T. Always a "prefill" call so that a
+// row's output does not depend on how many rows its expert got (the batch
+// invariance of the loop); the W8A8 activation form is set by the caller.
+turbine_qgemm_desc qgemm_for(const turbine_moe_experts_desc *d, int64_t m,
+                             int64_t n, int64_t k) {
+  turbine_qgemm_desc q{};
+  q.m = m;
+  q.n = n;
+  q.k = k;
+  q.lda = k;
+  q.ldc = n;
+  q.c_dtype = TURBINE_DTYPE_BF16;
+  q.alpha = 1.0f;
+  q.prefill = 1;
+  q.a_dtype = TURBINE_DTYPE_BF16;
+  q.act_quant = TURBINE_ACTQ_NONE;
+  switch (d->weight_dtype) {
+  case TURBINE_EXPERT_FP8_BLOCK:
+    q.scheme = TURBINE_QSCHEME_FP8_BLOCK;
+    q.block_n = q.block_k = 128;
+    break;
+  case TURBINE_EXPERT_FP8_TENSOR:
+    q.scheme = TURBINE_QSCHEME_FP8_TENSOR;
+    q.act_quant = TURBINE_ACTQ_FP8_TENSOR;
+    q.a_dtype = TURBINE_DTYPE_F8E4M3;
+    break;
+  default:
+    q.scheme = TURBINE_QSCHEME_MXFP4;
+    q.group_size = 32;
+    break;
+  }
+  return q;
+}
+
+// The v2.16 quantized experts: the structure of the descriptor and whether the
+// qgemm implementations take the three projection shapes.
+bool quant_supported(const turbine_moe_experts_desc *d) {
+  const int32_t wd = d->weight_dtype;
+  if (wd != TURBINE_EXPERT_FP8_BLOCK && wd != TURBINE_EXPERT_FP8_TENSOR &&
+      wd != TURBINE_EXPERT_MXFP4) {
+    return false;
+  }
+  if (d->activation != TURBINE_EXPERT_SWIGLU &&
+      d->activation != TURBINE_EXPERT_GPTOSS_CLAMP) {
+    return false;
+  }
+  if (d->activation == TURBINE_EXPERT_GPTOSS_CLAMP &&
+      !(d->clamp_limit > 0.0f && d->clamp_limit < INFINITY)) {
+    return false;
+  }
+  if (d->gate_up_interleaved != 0 && d->gate_up_interleaved != 1)
+    return false;
+  const bool interleaved = d->gate_up_interleaved != 0;
+  // Support is decided by the configuration alone (the Rust shim probes with
+  // NULL pointers); the operands are checked by run_quant. An FP8 tensor
+  // expert with BF16 activations (no act_static_scale) has no qgemm
+  // implementation and is refused there.
+  if (d->shared_inter < 0)
+    return false;
+  const int64_t gate_n = interleaved ? 2 * static_cast<int64_t>(d->inter)
+                                     : static_cast<int64_t>(d->inter);
+  const turbine_qgemm_desc gu = qgemm_for(d, 1, gate_n, d->hidden);
+  const turbine_qgemm_desc dn = qgemm_for(d, 1, d->hidden, d->inter);
+  return turbine_qgemm_supported(&gu) == 1 && turbine_qgemm_supported(&dn) == 1;
+}
+
 bool experts_supported(const turbine_moe_experts_desc *d) {
   if (d == nullptr || d->dtype != TURBINE_DTYPE_BF16)
-    return false;
-  // The v2.16 variants (quantized weights, static activation scales, biases,
-  // the gpt-oss activation, interleaved gate_up, a shared expert) land in P7
-  // Task 16; until then this library runs only the BF16 SwiGLU experts.
-  if (d->weight_dtype != TURBINE_EXPERT_BF16 ||
-      d->activation != TURBINE_EXPERT_SWIGLU || d->gate_up_interleaved != 0 ||
-      d->w_gate_scale != nullptr || d->w_up_scale != nullptr ||
-      d->w_down_scale != nullptr || d->act_static_scale != nullptr ||
-      d->act_static_scale_down != nullptr || d->b_gate != nullptr ||
-      d->b_up != nullptr || d->b_down != nullptr ||
-      d->shared_w_gate != nullptr || d->shared_w_up != nullptr ||
-      d->shared_w_down != nullptr || d->shared_gate_w != nullptr ||
-      d->shared_inter != 0)
     return false;
   if (d->hidden < 1 || d->inter < 1 || d->num_tokens < 0)
     return false;
@@ -113,7 +202,11 @@ bool experts_supported(const turbine_moe_experts_desc *d) {
       d->expert_end > d->num_experts) {
     return false;
   }
-  return static_cast<int64_t>(d->num_tokens) * d->top_k <= INT32_MAX;
+  if (static_cast<int64_t>(d->num_tokens) * d->top_k > INT32_MAX)
+    return false;
+  // BF16 experts run only in the pre-v2.16 form; the v2.16 variants are the
+  // quantized experts of turbine_hip_moe_quant.
+  return quantized(d) ? quant_supported(d) : plain_bf16(d);
 }
 
 bool aligned16(const void *p) {
@@ -417,6 +510,272 @@ int32_t run_device_offsets(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
                                          d->out);
 }
 
+// The quantized experts (ABI v2.16, impl "turbine_hip_moe_quant"): the own
+// per-expert loop of decision "P7 quantized MoE expert provider".
+//   1. gather the routed rows' activations (as run_experts), W8A8: quantize
+//      them with each expert's static scale (moe_quant.hip);
+//   2. per active expert one qgemm for gate_up (interleaved) or one each for
+//      gate and up, written into the two halves of a [rows, 2 * inter] buffer;
+//   3. one launch for the biases and the gated activation over every row;
+//   4. W8A8: quantize the activation (static per expert, or dynamic per
+//      token), per active expert one qgemm for down, the down bias;
+//   5. the ordered scatter (as every path), then the shared expert.
+// Every qgemm is a prefill call (qgemm_for), so a row's output does not depend
+// on the number of rows routed to its expert.
+int32_t run_shared_expert(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                          char *sg, char *su, char *sdown) {
+  const int64_t tokens = d->num_tokens;
+  const int64_t si = d->shared_inter;
+  int32_t rc =
+      run_one(ctx, {d->x, d->shared_w_gate, sg, tokens, si, d->hidden});
+  if (rc != TURBINE_OK)
+    return rc;
+  rc = run_one(ctx, {d->x, d->shared_w_up, su, tokens, si, d->hidden});
+  if (rc != TURBINE_OK)
+    return rc;
+  turbine_silu_mul_desc act{};
+  act.gate = sg;
+  act.up = su;
+  act.out = sg;
+  act.rows = tokens;
+  act.cols = si;
+  act.gate_stride_row = si;
+  act.up_stride_row = si;
+  act.out_stride_row = si;
+  act.dtype = TURBINE_DTYPE_BF16;
+  if (rc = turbine_silu_mul(ctx, &act); rc != TURBINE_OK)
+    return rc;
+  rc = run_one(ctx, {sg, d->shared_w_down, sdown, tokens, d->hidden, si});
+  if (rc != TURBINE_OK)
+    return rc;
+  return turbine_hip::launch_moe_shared_combine(
+      ctx, d->x, sdown, d->shared_gate_w, d->out, d->num_tokens, d->hidden);
+}
+
+int32_t run_quant(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
+  const int32_t *host = d->host_expert_offsets;
+  const int64_t all_rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
+  if (host[0] != 0 || host[d->num_experts] != all_rows) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: host_expert_offsets must run from 0 to " +
+                    std::to_string(all_rows));
+  }
+  for (int32_t e = 0; e < d->num_experts; ++e) {
+    if (host[e + 1] < host[e]) {
+      return fail(ctx, TURBINE_E_ARGUMENT,
+                  "turbine_moe_experts: host_expert_offsets decrease at "
+                  "expert " +
+                      std::to_string(e));
+    }
+  }
+  const int64_t first = host[d->expert_begin];
+  const int64_t rows = host[d->expert_end] - first;
+  const bool interleaved = d->gate_up_interleaved != 0;
+  const bool w8a8 = d->weight_dtype == TURBINE_EXPERT_FP8_TENSOR;
+  const bool static_down = w8a8 && d->act_static_scale_down != nullptr;
+  const int32_t wd = d->weight_dtype;
+  const int64_t h = d->hidden;
+  const int64_t inter = d->inter;
+  const int64_t gate_n = interleaved ? 2 * inter : inter;
+  const size_t r = static_cast<size_t>(rows);
+  const size_t t = static_cast<size_t>(d->num_tokens);
+  const size_t si = static_cast<size_t>(d->shared_inter);
+
+  const size_t pos_bytes = align_up(static_cast<size_t>(all_rows) * 4);
+  const size_t xs_bytes = align_up(r * h * 2);
+  const size_t xq_bytes = w8a8 ? align_up(r * h) : 0;
+  const size_t gu_bytes = align_up(r * 2 * inter * 2);
+  const size_t act_bytes = align_up(r * inter * 2);
+  const size_t actq_bytes = w8a8 ? align_up(r * inter) : 0;
+  const size_t asc_bytes = (w8a8 && !static_down) ? align_up(r * 4) : 0;
+  const size_t down_bytes = align_up(r * h * 2);
+  const size_t sg_bytes = align_up(t * si * 2);
+  const size_t sdown_bytes = si != 0 ? align_up(t * h * 2) : 0;
+  char *ws = nullptr;
+  if (int32_t rc = scratch(ctx, d,
+                           pos_bytes + xs_bytes + xq_bytes + gu_bytes +
+                               act_bytes + actq_bytes + asc_bytes + down_bytes +
+                               2 * sg_bytes + sdown_bytes,
+                           &ws);
+      rc != TURBINE_OK) {
+    return rc;
+  }
+  auto *pos = reinterpret_cast<int32_t *>(ws);
+  char *xs = ws + pos_bytes;
+  char *xq = xs + xs_bytes;
+  char *gu = xq + xq_bytes;
+  char *act = gu + gu_bytes;
+  char *actq = act + act_bytes;
+  auto *asc = reinterpret_cast<float *>(actq + actq_bytes);
+  char *down = reinterpret_cast<char *>(asc) + asc_bytes;
+  char *sg = down + down_bytes;
+  char *su = sg + sg_bytes;
+  char *sdown = su + sg_bytes;
+
+  if (d->w_gate_scale == nullptr || d->w_down_scale == nullptr ||
+      (!interleaved && d->w_up_scale == nullptr)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: a quantized expert needs its weight "
+                "scales");
+  }
+  if (wd == TURBINE_EXPERT_FP8_TENSOR && d->act_static_scale == nullptr) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                "turbine_moe_experts: FP8 tensor experts run W8A8 only "
+                "(act_static_scale is NULL)");
+  }
+  if (wd != TURBINE_EXPERT_FP8_TENSOR &&
+      (d->act_static_scale != nullptr || d->act_static_scale_down != nullptr)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: act_static_scale is for FP8 tensor "
+                "experts only");
+  }
+  if (d->act_static_scale == nullptr && d->act_static_scale_down != nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: act_static_scale_down without "
+                "act_static_scale");
+  }
+  if ((d->shared_inter > 0) != (d->shared_w_gate != nullptr) ||
+      (d->shared_inter > 0) != (d->shared_w_up != nullptr) ||
+      (d->shared_inter > 0) != (d->shared_w_down != nullptr)) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: shared_inter and the shared weights "
+                "must be given together");
+  }
+  int32_t rc = TURBINE_OK;
+  if (rows > 0) {
+    if (d->expert_offsets == nullptr) {
+      return fail(ctx, TURBINE_E_ARGUMENT,
+                  "turbine_moe_experts: expert_offsets is NULL");
+    }
+    if (rc = turbine_hip::launch_moe_clear_positions(ctx, pos, all_rows);
+        rc != TURBINE_OK) {
+      return rc;
+    }
+    if (rc = turbine_hip::launch_moe_gather(ctx, d->x, d->sorted_rows + first,
+                                            rows, d->hidden, d->top_k, xs, pos);
+        rc != TURBINE_OK) {
+      return rc;
+    }
+    const int32_t first32 = static_cast<int32_t>(first);
+    const int32_t lo = d->expert_begin;
+    const int32_t hi = d->expert_end;
+    if (w8a8) {
+      if (rc = turbine_hip::launch_moe_quant_static(
+              ctx, xs, xq, rows, d->hidden, d->expert_offsets, first32, lo, hi,
+              d->act_static_scale);
+          rc != TURBINE_OK) {
+        return rc;
+      }
+    }
+    const auto *w_gate = static_cast<const char *>(d->w_gate);
+    const auto *w_up = static_cast<const char *>(d->w_up);
+    const auto *w_down = static_cast<const char *>(d->w_down);
+    const auto *s_gate = static_cast<const char *>(d->w_gate_scale);
+    const auto *s_up = static_cast<const char *>(d->w_up_scale);
+    const auto *s_down = static_cast<const char *>(d->w_down_scale);
+    const size_t es_in = w8a8 ? 1 : 2;
+    const size_t gate_code = weight_code_bytes(wd, gate_n, h);
+    const size_t gate_scale = weight_scale_bytes(wd, gate_n, h);
+    const size_t up_code = weight_code_bytes(wd, inter, h);
+    const size_t up_scale = weight_scale_bytes(wd, inter, h);
+
+    for (int32_t e = lo; e < hi; ++e) {
+      const int64_t count = host[e + 1] - host[e];
+      if (count == 0)
+        continue;
+      const size_t off = static_cast<size_t>(host[e] - first);
+      const size_t l = static_cast<size_t>(e - lo);
+      turbine_qgemm_desc q = qgemm_for(d, count, gate_n, h);
+      q.a = (w8a8 ? xq : xs) + off * static_cast<size_t>(h) * es_in;
+      q.a_scales = w8a8 ? d->act_static_scale + l : nullptr;
+      q.b = w_gate + l * gate_code;
+      q.b_scales = s_gate + l * gate_scale;
+      q.c = gu + off * static_cast<size_t>(2 * inter) * 2;
+      q.ldc = 2 * inter;
+      if (rc = turbine_qgemm(ctx, &q); rc != TURBINE_OK)
+        return rc;
+      if (!interleaved) {
+        turbine_qgemm_desc u = qgemm_for(d, count, inter, h);
+        u.a = q.a;
+        u.a_scales = q.a_scales;
+        u.b = w_up + l * up_code;
+        u.b_scales = s_up + l * up_scale;
+        u.c = static_cast<char *>(q.c) + inter * 2;
+        u.ldc = 2 * inter;
+        if (rc = turbine_qgemm(ctx, &u); rc != TURBINE_OK)
+          return rc;
+      }
+    }
+    if (rc = turbine_hip::launch_moe_quant_act(
+            ctx, gu, act, rows, d->inter, interleaved,
+            d->activation == TURBINE_EXPERT_GPTOSS_CLAMP, d->clamp_limit,
+            d->b_gate, interleaved ? nullptr : d->b_up, d->expert_offsets,
+            first32, lo, hi);
+        rc != TURBINE_OK) {
+      return rc;
+    }
+    if (w8a8) {
+      if (static_down) {
+        rc = turbine_hip::launch_moe_quant_static(
+            ctx, act, actq, rows, d->inter, d->expert_offsets, first32, lo, hi,
+            d->act_static_scale_down);
+      } else {
+        turbine_quantize_act_desc qa{};
+        qa.x = act;
+        qa.out = actq;
+        qa.scales = asc;
+        qa.rows = rows;
+        qa.cols = inter;
+        qa.x_stride_row = qa.out_stride_row = inter;
+        qa.mode = TURBINE_ACTQ_FP8_TOKEN;
+        qa.x_dtype = TURBINE_DTYPE_BF16;
+        qa.out_dtype = TURBINE_DTYPE_F8E4M3;
+        rc = turbine_quantize_act(ctx, &qa);
+      }
+      if (rc != TURBINE_OK)
+        return rc;
+    }
+    const size_t down_code = weight_code_bytes(wd, h, inter);
+    const size_t down_scale = weight_scale_bytes(wd, h, inter);
+    for (int32_t e = lo; e < hi; ++e) {
+      const int64_t count = host[e + 1] - host[e];
+      if (count == 0)
+        continue;
+      const size_t off = static_cast<size_t>(host[e] - first);
+      const size_t l = static_cast<size_t>(e - lo);
+      turbine_qgemm_desc q = qgemm_for(d, count, h, inter);
+      q.a = (w8a8 ? actq : act) + off * static_cast<size_t>(inter) * es_in;
+      if (w8a8) {
+        q.act_quant =
+            static_down ? TURBINE_ACTQ_FP8_TENSOR : TURBINE_ACTQ_FP8_TOKEN;
+        q.a_scales = static_down ? d->act_static_scale_down + l : asc + off;
+      }
+      q.b = w_down + l * down_code;
+      q.b_scales = s_down + l * down_scale;
+      q.c = down + off * static_cast<size_t>(h) * 2;
+      if (rc = turbine_qgemm(ctx, &q); rc != TURBINE_OK)
+        return rc;
+    }
+    if (d->b_down != nullptr) {
+      if (rc = turbine_hip::launch_moe_quant_bias(ctx, down, rows, d->hidden,
+                                                  d->b_down, d->expert_offsets,
+                                                  first32, lo, hi);
+          rc != TURBINE_OK) {
+        return rc;
+      }
+    }
+    if (rc = turbine_hip::launch_moe_scatter(ctx, down, pos, d->topk_weights,
+                                             d->num_tokens, d->hidden, d->top_k,
+                                             d->out);
+        rc != TURBINE_OK) {
+      return rc;
+    }
+  }
+  if (d->shared_inter > 0)
+    return run_shared_expert(ctx, d, sg, su, sdown);
+  return TURBINE_OK;
+}
+
 } // namespace
 
 namespace turbine_hip {
@@ -480,12 +839,20 @@ const char *moe_path_name(MoePath path) {
     return kImplGrouped;
   case MoePath::PerExpert:
     return kImplPerExpert;
+  case MoePath::Quant:
+    return kImplQuant;
   }
   return kImplPerExpert;
 }
 
 bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
   if (!experts_supported(d))
+    return false;
+  // The quantized experts have their own path; the BF16 paths take only the
+  // pre-v2.16 form (experts_supported admits nothing else of BF16).
+  if (path == MoePath::Quant)
+    return quantized(d);
+  if (quantized(d))
     return false;
   switch (path) {
   case MoePath::SmallM:
@@ -498,6 +865,8 @@ bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
     return g_grouped_available.load();
   case MoePath::PerExpert:
     return true;
+  case MoePath::Quant:
+    return false;
   }
   return false;
 }
@@ -534,10 +903,17 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   }
   if (d->num_tokens == 0)
     return TURBINE_OK;
-  if (d->x == nullptr || d->w_gate == nullptr || d->w_up == nullptr ||
-      d->w_down == nullptr || d->sorted_rows == nullptr ||
-      d->topk_weights == nullptr || d->out == nullptr) {
+  const bool w_up_unused =
+      path == MoePath::Quant && d->gate_up_interleaved != 0;
+  if (d->x == nullptr || d->w_gate == nullptr ||
+      (d->w_up == nullptr && !w_up_unused) || d->w_down == nullptr ||
+      d->sorted_rows == nullptr || d->topk_weights == nullptr ||
+      d->out == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_moe_experts: NULL operand");
+  }
+  if (path == MoePath::Quant && d->expert_offsets == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_moe_experts: expert_offsets is NULL");
   }
   if (device_offsets && d->expert_offsets == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT,
@@ -547,6 +923,8 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
     return rc;
   if (device_offsets)
     return run_device_offsets(ctx, d, path);
+  if (path == MoePath::Quant)
+    return run_quant(ctx, d);
   return run_experts(ctx, d, path == MoePath::Grouped);
 }
 
