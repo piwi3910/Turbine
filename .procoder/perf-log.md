@@ -2028,3 +2028,30 @@ Cause (S-3): the near-tie hypothesis holds, and nothing is specific to ep × tp.
 ### P7 OLMoE EP×TP — calibrated multi-GPU golden bound (plan Task 13, branch `p7-t13`, decision 2026-10-08 A)
 
 `scripts/lab-cluster.sh --bench-lock olmoe-spread-novanas`, run `1008081228-24302d18` (both R9700s): 69 free-running top-20 captures of OLMoE-1B-7B-0125-Instruct (one GPU c1-cold/c1-warm/par-00..15; tp2, ep2 and ep2×tp2 at c1 and c16). Placements against the committed reference (likely / tail): one GPU 0.517 / 1.461, tp2 1.006 / 1.309, ep2 0.962 / 1.149, ep2×tp2 1.056 / 0.902 (prefix ok 15/16, `min_prompts_passing` 14); a placement's c1 and c16 captures are bitwise equal. `engine_spread.py` (`mg-*` captures): `max_abs_logprob_diff_likely_multi_gpu` 1.06 (old 1.01, triangle 2.39), `_tail_multi_gpu` 1.72 (old 1.72, observed 1.47, triangle 3.45) written to `tests/golden/olmoe-1b-7b-0125-instruct/tolerance.json`; derivation in its README. The `olmoe_ep_tp_drift` refusal is removed; `ep2-novanas` gates ep2×tp2 at c1 and c16 with `--multi-gpu-bounds` against the committed reference. Gate run `1008082229-115db0e8`: `ep2-novanas` PASS, ep2×tp2 golden c1 and c16 15/16 prompts passing (need 14), multi-GPU bounds 1.06 / 1.72 hold; ep2 and ep2 hostmem pass the strict and batched bounds against the one-GPU capture.
+
+### P7 OLMoE FP8 KV — calibrated K/V scales (plan Task 36, branch `p7-t36`, 2026-10-08)
+
+- P7 open: OlmoeForCausalLM/bf16/fp8_e4m3/tp1 golden c1/c16 10/16 against the unit-scale emulated reference (need 14); the reference must be regenerated with the calibrated scales before the gate can judge them.
+
+`kv_scales::calibrate` runs the 32 prompts of `crates/turbine-model/tests/fixtures/kv_calibration_prompts.jsonl` on the served FP8 executor with unit scales (no second BF16 weight load; the pool is read back, so a layer's scale is the absmax of the e4m3 pages / 448, within one e4m3 step of the BF16 absmax) and caches the set under `$TURBINE_CACHE_DIR` / `~/.cache/turbine` keyed by the checkpoint identity and the prompt set. Served OLMoE-1B-7B-0125-Instruct (`event="kv_scales_calibrated" layers=16`):
+
+| half | scale range over the 16 layers         | layer 0 | layer 15 |
+| ---- | -------------------------------------- | ------- | -------- |
+| K    | 0.0268 – 0.0536 (absmax 12 – 24)       | 0.0536  | 0.0268   |
+| V    | 0.00024 – 0.00279 (absmax 0.11 – 1.25) | 0.00035 | 0.00279  |
+
+Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36 -- --set kv.dtype=fp8_e4m3` (the `olmoe-fp8kv` slug is the reference `tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/`, emulated with the served scales — which were 1.0 when it was made):
+
+- `BENCH p7-t36 olmoe-fp8kv commit=afcaa4b0 gpu=0 tests=skipped golden1=FAIL: golden16=FAIL: client=novanas weight_format=bf16 kv=fp8_e4m3 conc=16 host_share=0.0219 ok=200 failed=0 tok/s=559.9 itl_p50=26.4 ttft_p50=142 decode_fwd_ms=25.5`
+- golden c1 and c16 are identical: 10/16 prompts pass (need 14; the unit-scale run was 13/16). Every logprob bound holds (worst likely 1.097 on p14 against 1.14, worst tail 3.05 against 3.42); the six misses are all the token rule, a first divergence with a margin above the 0.5 excuse or an unexcused one, i.e. the calibrated run picks different tokens than a reference that quantizes V with scale 1.0:
+
+| prompt | identical prefix | first divergence margin                       | worst likely / tail |
+| ------ | ---------------- | --------------------------------------------- | ------------------- |
+| p02    | 4/32             | 0.544                                         | 0.369 / 0.726       |
+| p05    | 18/32            | 1.423                                         | 0.293 / 1.709       |
+| p06    | 23/32            | 0.262 (missing top-k token 107 at position 7) | 0.848 / 1.609       |
+| p10    | 11/32            | 0.668                                         | 0.655 / 2.556       |
+| p13    | 10/32            | 0.807                                         | 0.376 / 0.919       |
+| p16    | 12/32            | 0.582                                         | 0.424 / 1.404       |
+
+Per-position |Δ| was not collected: no bound is exceeded, so the misses carry no position to explain. The reference is the wrong yardstick for calibrated scales (it quantizes K with scale 1.0 and V with 1.0; the served run now uses the table above), so the next step is a reference regenerated with `quant_reference.py --kv-quant fp8_e4m3` using these per-layer scales, a CPU fixture job under `fixture.lock`, plus the full-GSM8K OLMoE pair (BF16 KV 0.6603, unit-scale FP8 KV 0.6459) with the calibrated scales. The `OlmoeForCausalLM` fp8_e4m3 row stays `experimental`.

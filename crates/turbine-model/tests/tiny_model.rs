@@ -40,7 +40,7 @@ use turbine_model::executor::{
     TokenFeed, TraceTensor, build_executor, graphs,
 };
 use turbine_model::families;
-use turbine_model::kv_scales::{KvCache, TqKv};
+use turbine_model::kv_scales::{self, KvCache, TqKv};
 use turbine_model::pp;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
@@ -1020,6 +1020,155 @@ fn fp8_kv_matches_reference() {
         let read = KvCache::fp8_from_checkpoint(&index, spec.config.num_layers).expect("scales");
         assert_eq!((&read.k_scales[..], &read.v_scales[..]), (&k[..], &v[..]));
         check_fp8_kv(&spec, read, KvCache::fp8_e4m3(v.clone(), k.clone()));
+    }
+}
+
+/// Per-layer absolute maxima of K and V over the first `len` positions of `kv`'s one block
+/// (BF16 pages), by plain index arithmetic over the documented pool layout
+/// `layer l → block 0 → [K | V] → [token, kv_head, head_dim]`.
+fn bf16_pool_absmax(kv: &SequenceKv, layout: &KvLayout, len: usize) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(layout.dtype, DType::BF16);
+    let view = kv.view();
+    let row = (layout.num_kv_heads * layout.head_dim) as usize;
+    let half = layout.block_tokens as usize * row;
+    let mut bytes = vec![0u8; layout.layer_block_bytes() as usize];
+    let (mut ks, mut vs) = (Vec::new(), Vec::new());
+    for l in 0..layout.num_layers as u64 {
+        view.storage
+            .copy_to_host((l * view.layer_stride_bytes) as usize, &mut bytes)
+            .expect("read pool");
+        let max = |from: usize| {
+            (0..len * row)
+                .map(|i| {
+                    let o = 2 * (from + i);
+                    bf16::from_le_bytes([bytes[o], bytes[o + 1]]).to_f32().abs()
+                })
+                .fold(0.0f32, f32::max)
+        };
+        ks.push(max(0));
+        vs.push(max(half));
+    }
+    (ks, vs)
+}
+
+/// P7 S-15: calibrated FP8 KV scales for a checkpoint that stores none. On the tiny Llama and
+/// OLMoE (CPU provider, no `k_scale` / `v_scale` tensors): `kv_scales::calibrate` returns per
+/// layer `absmax / 448` of the K and V a BF16-page run writes, equal to a hand computation
+/// over the pool, the same over two runs, and one run on FP8 pages with unit scales within e4m3
+/// rounding of it; the calibrated scales decode closer to the BF16-KV run than the unit
+/// default does. Breaks if a layer or half is read from the wrong offset, a prompt's tail is
+/// skipped or an unwritten position is read, or the scales are not applied.
+#[test]
+fn kv_scales_calibrated_for_scaleless_checkpoint() {
+    let tmp = TempDir::new("tiny-model-kv-calibration");
+    for spec in both_checkpoints(&tmp) {
+        let name = spec.config.hf_architecture.clone();
+        let layers = spec.config.num_layers as usize;
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let prompts: Vec<Vec<u32>> = (0..3u32)
+            .map(|p| {
+                (0..(12 + 5 * p))
+                    .map(|i| (i * (31 + 6 * p) + 5 + p) % spec.vocab)
+                    .collect()
+            })
+            .collect();
+
+        // Hand computation: each prompt alone on a BF16 executor, the pool read directly.
+        let mut exec = cpu_model(&spec, &mem, MAX_SEQ_LEN);
+        let layout = *exec.kv_layout();
+        let mut expected_k = vec![0.0f32; layers];
+        let mut expected_v = vec![0.0f32; layers];
+        for prompt in &prompts {
+            let mut kv = SequenceKv::new(&mem, layout, MAX_SEQ_LEN).expect("kv");
+            let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+            kv.forward(exec.as_mut(), prompt, &positions)
+                .expect("prefill");
+            let (k, v) = bf16_pool_absmax(&kv, &layout, prompt.len());
+            for l in 0..layers {
+                expected_k[l] = expected_k[l].max(k[l]);
+                expected_v[l] = expected_v[l].max(v[l]);
+            }
+        }
+        assert!(
+            expected_k.iter().chain(&expected_v).all(|&m| m > 0.0),
+            "{name}: a layer wrote only zeros"
+        );
+
+        let scales = kv_scales::calibrate(exec.as_mut(), &mem, &prompts).expect("calibrate");
+        assert_eq!(scales.k.len(), layers);
+        assert_eq!(scales.v.len(), layers);
+        for l in 0..layers {
+            assert_eq!(scales.k[l], expected_k[l] / 448.0, "{name} layer {l} K");
+            assert_eq!(scales.v[l], expected_v[l] / 448.0, "{name} layer {l} V");
+        }
+        assert_ne!(scales.k, scales.v, "{name}: K and V scales differ");
+
+        let again = kv_scales::calibrate(exec.as_mut(), &mem, &prompts).expect("again");
+        assert_eq!(scales, again, "{name}: deterministic");
+
+        // The same calibration over an FP8 executor with unit scales (what the server runs, no
+        // second BF16 weight load): within the e4m3 rounding of the BF16 absmax.
+        let mut unit_spec = spec.clone();
+        let index = SafetensorsIndex::open(&spec.dir).expect("index");
+        unit_spec.config.kv_cache =
+            KvCache::fp8_from_checkpoint(&index, spec.config.num_layers).expect("unit");
+        let mut fp8 = cpu_model(&unit_spec, &mem, MAX_SEQ_LEN);
+        let from_fp8 = kv_scales::calibrate(fp8.as_mut(), &mem, &prompts).expect("fp8 pass");
+        for l in 0..layers {
+            for (a, b, half) in [
+                (from_fp8.k[l], scales.k[l], "K"),
+                (from_fp8.v[l], scales.v[l], "V"),
+            ] {
+                assert!(
+                    (a / b - 1.0).abs() < 0.25,
+                    "{name} layer {l} {half}: {a} vs {b}"
+                );
+            }
+        }
+
+        // Decode error against the BF16-KV run: calibrated scales beat the unit default.
+        let calibrated = scales.clone().into_cache();
+        let run = |cache: KvCache, feed: Option<&[u32]>| -> (Vec<Vec<f32>>, Vec<u32>) {
+            let mut s = spec.clone();
+            s.config.kv_cache = cache;
+            let mut exec = cpu_model(&s, &mem, MAX_SEQ_LEN);
+            let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+            let mut tokens = prompt(s.vocab);
+            let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+            let mut row = kv
+                .forward(exec.as_mut(), &tokens, &positions)
+                .expect("prefill")
+                .row(0)
+                .to_vec();
+            let (mut rows, mut chosen) = (vec![row.clone()], Vec::new());
+            for step in 0..10 {
+                let next = feed.map_or_else(|| argmax(&row), |f| f[step]);
+                chosen.push(next);
+                let pos = tokens.len() as u32;
+                tokens.push(next);
+                row = kv
+                    .forward(exec.as_mut(), &[next], &[pos])
+                    .expect("decode")
+                    .row(0)
+                    .to_vec();
+                rows.push(row.clone());
+            }
+            (rows, chosen)
+        };
+        let (reference, chosen) = run(KvCache::bf16(), None);
+        let error = |cache: KvCache| -> f32 {
+            let (rows, _) = run(cache, Some(&chosen));
+            rows.iter()
+                .zip(&reference)
+                .map(|(a, b)| max_abs_diff(a, b))
+                .sum()
+        };
+        let unit_error = error(unit_spec.config.kv_cache.clone());
+        let calibrated_error = error(calibrated);
+        assert!(
+            calibrated_error < unit_error,
+            "{name}: calibrated {calibrated_error} is not below unit-scale {unit_error}"
+        );
     }
 }
 

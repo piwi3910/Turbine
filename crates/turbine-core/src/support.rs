@@ -391,6 +391,10 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     // full GSM8K 0.6603 vs 0.6459 (drop 0.0144, accepted as noise 2026-09-29), but golden c1 / c16
     // 13/16 against tests/golden/olmoe-1b-7b-0125-instruct-fp8kv (need 14; p03 tail 5.38). The
     // checkpoint ships no K/V scales; calibrated V scales and the golden miss are a Phase 7 item.
+    // P7 Task 36: the server now calibrates per-layer K/V scales for such a checkpoint
+    // (`kv_scales::calibrate`); golden c1/c16 10/16 against the unit-scale emulated reference
+    // (perf-log "P7 OLMoE FP8 KV"), so the row stays `experimental` until that reference is
+    // regenerated with the calibrated scales.
     row(
         Some("amd"),
         Some("gfx1201"),
