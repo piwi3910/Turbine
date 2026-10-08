@@ -4299,3 +4299,20 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 
 **Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
 per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
+
+## Phase 7 Task 13: OLMoE EP×TP drift — cause found, fix is a gate trade (2026-10-08)
+
+From Task 12 (`p7-t12`, 0361db71; perf log "P7 OLMoE EP×TP drift"; teacher-forced routing trace on both cards,
+p08/p10). Cause: any change of summation order (TP partial sums, EP combine) moves router logits by ~0.02–0.03
+(p99 ~0.2); one GPU's own routing margins are 1 % exact BF16 ties and 10 % within one BF16 step, so experts flip and
+the flip cascades through later layers. Nothing is specific to EP×TP: tp2 alone has the same flips and passes p10 by
+0.004 (worst likely |Δ| 1.006 vs bound 1.01); ep2×tp2 reaches 1.056 at the same token (p10 token 17, the cascade
+starting at layer 5, expert 10 → 0, one-GPU margin 0.0024). ep2 alone: 0.301. The plan's Task 13 fix (route every
+rank on the same row) would change nothing — ranks already route identically. Applies to every MoE family run over
+two cards (Qwen3-MoE, Mixtral, Qwen3.6 in this phase).
+- A) Calibrate a multi-GPU bound per MoE slug from the measured placement spread (the self-spread method), gate
+  ep2×tp2 (and the Phase 7 MoE TP2/EP2 rows) at c1 and c16 against it, remove `olmoe_ep_tp_drift`. No speed cost;
+  a looser gate for multi-GPU MoE.
+- B) FP32 accumulation of the TP/EP partials (one BF16 rounding instead of two): expected ≤ ½ the router-logit noise,
+  2× all-reduce bytes, unmeasured; flips remain, so likely needs A too.
+- C) Keep the refusal (tp2 alone is also fragile on p10).
