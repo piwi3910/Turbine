@@ -521,8 +521,10 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * act_static_scale; no new symbol); v2.14 the SwiGLU input of a GEMM
  * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol); v2.15 the
  * residual-add epilogue and RMSNorm input of a GEMM (turbine_gemm_desc's
- * c_residual / a_norm_weight / a_norm_eps; no new symbol). */
-#define TURBINE_ABI_MINOR 15u
+ * c_residual / a_norm_weight / a_norm_eps; no new symbol); v2.18 Gated
+ * DeltaNet and the causal conv1d (below; v2.16 and v2.17 are added by other
+ * tasks of the same phase and carry no symbol of this group). */
+#define TURBINE_ABI_MINOR 18u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -1218,6 +1220,108 @@ typedef struct turbine_copy_seg {
 int32_t turbine_memcpy_h2d_kernel(turbine_ctx *ctx, turbine_stream *s,
                                   const turbine_copy_seg *segs, int32_t count,
                                   int32_t workgroups);
+
+/* ======== v2.18 (additive, optional): Gated DeltaNet, conv1d ========
+ * Phase 7 (Qwen3.5 / Qwen3.6 hybrids). Resolved only when turbine_abi_minor()
+ * >= 18 and a trio's three functions exist; a library without them is a
+ * fallback, not an error (the model family is then refused at startup).
+ *
+ * Gated DeltaNet (turbine_gdn_prefill / turbine_gdn_decode, ops 20 / 21) is
+ * the delta-rule recurrence of transformers' torch_recurrent_gated_delta_rule
+ * with use_qk_l2norm_in_kernel, per (sequence, value head), in F32:
+ *   q' = q / sqrt(sum q^2 + 1e-6) / sqrt(k_dim);  k' = k / sqrt(sum k^2 + 1e-6)
+ *   S  = exp(g_t) * S;  delta = (v_t - S k') * beta_t;  S += delta k'^T;
+ *   out_t = S q'
+ * Value head h reads key head h / (v_heads / k_heads). The state is F32
+ * [slots, v_heads, v_dim, k_dim] (k contiguous), the state of sequence s is
+ * slot state_slots[s], read at the start and written back at the end of the
+ * call (the caller zeroes a new sequence's slot); the layout is the library's
+ * own, a caller moves it between slots only as opaque v_heads * v_dim * k_dim
+ * F32 blocks. q, k, v and out are dtype (BF16) [tokens, heads, dim]; the
+ * token row strides are given in elements (the inner dimensions are dense),
+ * so the q | k | v columns of a conv1d output are read in place. g (the log
+ * decay) and beta are F32 [tokens, v_heads]. Prefill delimits the sequences
+ * with cu_seqlens [num_seqs + 1]; decode has one token per sequence
+ * (num_tokens == num_seqs, cu_seqlens NULL). boundary_states (prefill only,
+ * NULL = none) receives the state after every boundary_tokens tokens of each
+ * sequence: F32 [sum_s floor(len_s / boundary_tokens), v_heads, v_dim, k_dim],
+ * ordered by sequence then boundary, counted from the start of this call's
+ * sequence. A call's result does not depend on the other sequences of its
+ * batch (bit for bit), and a prefill split in two calls with the state
+ * carried equals the whole prefill.
+ *
+ * Causal conv1d (turbine_conv1d_prefill / turbine_conv1d_update, ops 22 / 23)
+ * is the depthwise conv of Qwen3.5's GDN layers, kernel 4:
+ *   out[t, c] = silu(bias[c] + w[c,0] x[t-3,c] + w[c,1] x[t-2,c]
+ *                    + w[c,2] x[t-1,c] + w[c,3] x[t,c])
+ * accumulated left to right in F32 and rounded to dtype once, the inputs
+ * before a sequence's first token read from its conv_state
+ * [slots, channels, kernel - 1] (oldest first; updated to the last kernel - 1
+ * inputs at the end of the call). boundary_conv_states likewise holds the
+ * tail after every boundary_tokens tokens (boundary_tokens >= kernel - 1).
+ * The update op takes one token per sequence and is bit-equal to the prefill
+ * op token by token. w is [channels, kernel], bias [channels] or NULL, x and
+ * out [tokens, channels] with the given row strides (elements).
+ * activation 1 = SiLU, 0 = none. */
+#define TURBINE_OP_GDN_PREFILL 20
+#define TURBINE_OP_GDN_DECODE 21
+#define TURBINE_OP_CONV1D_PREFILL 22
+#define TURBINE_OP_CONV1D_UPDATE 23
+
+typedef struct turbine_gdn_desc {
+  const void *q;
+  const void *k;
+  const void *v;
+  const float *g;
+  const float *beta;
+  float *state;
+  const int32_t *state_slots;
+  /* prefill: [num_seqs + 1] token offsets; decode: NULL */
+  const int32_t *cu_seqlens;
+  void *out;
+  /* NULL = no snapshots; prefill only */
+  float *boundary_states;
+  /* token row strides in elements */
+  int64_t q_stride, k_stride, v_stride, out_stride;
+  int32_t boundary_tokens;
+  int32_t num_tokens, num_seqs, k_heads, v_heads, k_dim, v_dim;
+  /* TURBINE_DTYPE_* of q, k, v and out */
+  int32_t dtype;
+} turbine_gdn_desc;
+
+int32_t turbine_gdn_prefill(turbine_ctx *ctx, const turbine_gdn_desc *d);
+int32_t turbine_gdn_prefill_supported(const turbine_gdn_desc *d);
+const char *turbine_gdn_prefill_impl(const turbine_gdn_desc *d);
+int32_t turbine_gdn_decode(turbine_ctx *ctx, const turbine_gdn_desc *d);
+int32_t turbine_gdn_decode_supported(const turbine_gdn_desc *d);
+const char *turbine_gdn_decode_impl(const turbine_gdn_desc *d);
+
+typedef struct turbine_conv1d_desc {
+  const void *x;
+  const void *w;
+  /* NULL = no bias */
+  const void *bias;
+  void *conv_state;
+  const int32_t *state_slots;
+  /* prefill: [num_seqs + 1] token offsets; update: NULL */
+  const int32_t *cu_seqlens;
+  void *out;
+  /* NULL = no snapshots; prefill only */
+  void *boundary_conv_states;
+  int64_t x_stride, out_stride;
+  int32_t boundary_tokens;
+  int32_t num_tokens, num_seqs, channels, kernel;
+  int32_t activation;
+  /* TURBINE_DTYPE_* of x, w, bias, conv_state and out */
+  int32_t dtype;
+} turbine_conv1d_desc;
+
+int32_t turbine_conv1d_prefill(turbine_ctx *ctx, const turbine_conv1d_desc *d);
+int32_t turbine_conv1d_prefill_supported(const turbine_conv1d_desc *d);
+const char *turbine_conv1d_prefill_impl(const turbine_conv1d_desc *d);
+int32_t turbine_conv1d_update(turbine_ctx *ctx, const turbine_conv1d_desc *d);
+int32_t turbine_conv1d_update_supported(const turbine_conv1d_desc *d);
+const char *turbine_conv1d_update_impl(const turbine_conv1d_desc *d);
 
 #ifdef __cplusplus
 }

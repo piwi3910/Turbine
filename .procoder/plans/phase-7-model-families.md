@@ -591,11 +591,13 @@ Interfaces:
   Covers: S-11 AC (`hip_gdn`), edge case "chunked prefill splitting a GDN chunk boundary"
   Depends on: Task 29
 
-- [ ] Write failing CPU tests `cpu::gdn::tests::recurrence_matches_naive` and `cpu::gdn::tests::split_prefill_equals_whole` (state carried across a split). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::gdn` — expect FAIL with "could not find `gdn`"; implement the reference — expect PASS.
-- [ ] Write the four lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_gdn` — expect FAIL with "TURBINE_E_UNSUPPORTED"
-- [ ] Implement header, FFI and HIP per the decision — run, expect PASS.
+As built (lead-approved changes to the interfaces above): the state is stored `[slots, v_heads, v_dim, k_dim]` (llama.cpp's layout, k contiguous, not `[k_dim, v_dim]`); callers treat it as opaque `v_heads · v_dim · k_dim` F32 blocks per slot, so `state_layout` byte counts are unchanged. `turbine_gdn_desc` and `turbine_conv1d_desc` gain token row strides in elements (`q_stride`, `k_stride`, `v_stride`, `out_stride`; `x_stride`, `out_stride`) so a conv1d output row `q | k | v` feeds the GDN in place with no split copy (the Rust contexts take `TensorView`s whose `strides[0]` is the row stride); `GdnConfig` and `Conv1dConfig` carry `dtype` next to `mode` (`GdnMode::{Prefill, Decode}` serves both; for conv1d `Decode` is the `conv1d_update` op). The op codes are appended: `GdnPrefill` 20, `GdnDecode` 21, `Conv1dPrefill` 22, `Conv1dUpdate` 23 (one trio each; `turbine_gdn_*` / `turbine_conv1d_*`), minor 18. The vendored kernels live inside `kernels/rocm/src/gdn.hip` and `conv1d.hip` between provenance markers (the repository's pattern for third-party device code, as `gemm_wvsplitk.hip`), with the licences in `kernels/rocm/third_party/LICENSES/` (`llama.cpp-LICENSE`, `aiter-LICENSE`), not as files under `third_party/<project>/`.
+
+- [x] Write failing CPU tests `cpu::gdn::tests::recurrence_matches_naive` and `cpu::gdn::tests::split_prefill_equals_whole` (state carried across a split). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::gdn` — expect FAIL with "could not find `gdn`"; implement the reference — expect PASS.
+- [x] Write the four lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_gdn` — expect FAIL with "TURBINE_E_UNSUPPORTED"
+- [x] Implement header, FFI and HIP per the decision — run, expect PASS.
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0
-- [ ] Commit: `feat(kernels): gated delta net and causal conv1d (ABI v2.18)`
+- [x] Commit: `feat(kernels): gated delta net and causal conv1d (ABI v2.18)`
 
 ## Task 31: Qwen3.5 hybrid family (dense) on CPU and HIP (S-11, S-18 part 2)
 

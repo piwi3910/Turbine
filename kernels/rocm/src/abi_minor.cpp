@@ -1,6 +1,6 @@
 // turbine_abi_minor: the minor revision of the library it is linked into.
 //
-// libturbine_hip.so reports TURBINE_ABI_MINOR (13): besides the ABI v2 trios it
+// libturbine_hip.so reports TURBINE_ABI_MINOR (18): besides the ABI v2 trios it
 // exports the optional add_rmsnorm trio (rmsnorm.cpp), the v2.1 context
 // options (context.cpp: the tuned GEMM table switch), logits_reduce
 // (logits_reduce.hip), the graph functions (graph.cpp), the v2.3 pinned host
@@ -26,6 +26,9 @@
 // refuses it. v2.15 adds no symbol: vllm_wvsplitk takes the residual-add
 // epilogue and the RMSNorm input of turbine_gemm_desc (c_residual,
 // a_norm_weight / a_norm_eps) in decode steps; hipblaslt refuses them.
+// v2.18 adds the Gated DeltaNet trios (gdn.hip: gdn_prefill, gdn_decode) and
+// the causal conv1d trios (conv1d.hip: conv1d_prefill, conv1d_update); v2.16
+// and v2.17 add no symbol of this group.
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)
