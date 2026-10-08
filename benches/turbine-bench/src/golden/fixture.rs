@@ -97,6 +97,15 @@ pub struct Tolerance {
     /// strict bound applies there too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_abs_logprob_diff_tail_batched: Option<f32>,
+    /// `max_abs_logprob_diff_likely` for a run over several GPUs of a mixture-of-experts model
+    /// (`turbine-golden compare --multi-gpu-bounds`), derived from the measured placement spread
+    /// by `scripts/golden/engine_spread.py --multi-gpu`; absent → the batched bound, then the
+    /// strict one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_abs_logprob_diff_likely_multi_gpu: Option<f32>,
+    /// `max_abs_logprob_diff_tail` for such a run; same fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_abs_logprob_diff_tail_multi_gpu: Option<f32>,
 }
 
 /// The logprob bounds one `compare` run is judged by (see [`Tolerance::logprob_bounds`]).
@@ -104,6 +113,8 @@ pub struct Tolerance {
 pub struct LogprobBounds {
     /// A `*_batched` bound from the tolerance file applies (concurrency > 1 and the key present).
     pub batched: bool,
+    /// The run was judged with `--multi-gpu-bounds` (`_multi_gpu` keys, else the batched bounds).
+    pub multi_gpu: bool,
     pub max_abs_logprob_diff_likely: f32,
     pub max_abs_logprob_diff_tail: f32,
 }
@@ -124,6 +135,7 @@ impl Tolerance {
         };
         LogprobBounds {
             batched: likely.is_some() || tail.is_some(),
+            multi_gpu: false,
             max_abs_logprob_diff_likely: likely.unwrap_or(self.max_abs_logprob_diff_likely),
             max_abs_logprob_diff_tail: tail.unwrap_or(self.max_abs_logprob_diff_tail),
         }
@@ -139,6 +151,27 @@ impl Tolerance {
         Tolerance {
             max_abs_logprob_diff_likely: bounds.max_abs_logprob_diff_likely,
             max_abs_logprob_diff_tail: bounds.max_abs_logprob_diff_tail,
+            ..self.clone()
+        }
+    }
+
+    /// The multi-GPU bounds at every concurrency (`turbine-golden compare --multi-gpu-bounds`):
+    /// each tier takes its `_multi_gpu` key, else its batched key, else the strict bound.
+    pub fn multi_gpu_everywhere(&self) -> Tolerance {
+        let batched = self.logprob_bounds(2);
+        let likely = self
+            .max_abs_logprob_diff_likely_multi_gpu
+            .unwrap_or(batched.max_abs_logprob_diff_likely);
+        let tail = self
+            .max_abs_logprob_diff_tail_multi_gpu
+            .unwrap_or(batched.max_abs_logprob_diff_tail);
+        // The batched keys carry the chosen bounds too, so `logprob_bounds` yields them at
+        // every concurrency (above 1 it reads the batched keys).
+        Tolerance {
+            max_abs_logprob_diff_likely: likely,
+            max_abs_logprob_diff_tail: tail,
+            max_abs_logprob_diff_likely_batched: Some(likely),
+            max_abs_logprob_diff_tail_batched: Some(tail),
             ..self.clone()
         }
     }
@@ -354,6 +387,7 @@ mod tests {
         };
         let b = |likely, tail, batched| LogprobBounds {
             batched,
+            multi_gpu: false,
             max_abs_logprob_diff_likely: likely,
             max_abs_logprob_diff_tail: tail,
         };

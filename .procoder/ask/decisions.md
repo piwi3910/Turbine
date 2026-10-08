@@ -4240,6 +4240,7 @@ plus a full snapshot, cutting the pool's block count ~12×.
   block of every finished sequence (the multi-turn hit point); a hit restores the nearest snapshot at or before the
   match and recomputes the rest.
 - C) Only the last full block of every finished sequence.
+  (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
 (2) Disk rounds 1 and 3 conflict on a closed family's checkpoint (round 1: move to iSCSI; round 3: models stay local).
 
@@ -4273,6 +4274,7 @@ the pod's two GPUs (GPUs are per container).
   placements (Turbine then vLLM on the same cards, as Phase 2c does on one), which prints the S-13 ratio verdict.
 - C) Run vLLM in the cluster pod by switching its image to `rocm/vllm` (glibc/runtime compatibility of our binaries
   unverified).
+  Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
 Also: the plan says an unknown `--vllm` slug exits 1; the existing test asserts exit 2 — keep 2 (plan line corrected).
 
@@ -4312,6 +4314,33 @@ difference enters the KV cache at step 0 (Llama: step 7); greedy tokens identica
 
 **Decision (user, 2026-10-08): C** — accept the Qwen3 bounds (0.16 logit, 2-ulp norm) now; a fused single-rounding
 per-head QK-norm is a later follow-up (recorded for after the Phase 7 families close).
+
+## P7 attention sinks/window instances (2026-10-08)
+
+Phase 7 Task 23 evaluation (`p7-t23`), CK at the pinned commit `cd957402` (`generate.py --targets gfx1201
+--list_blobs`, then the lab build):
+
+- `fmha_fwd_pagedkv` (pagedkv_prefill): gfx12 BF16 has **d128 only** — the d64 / d256 tile entries are commented out
+  in `KernelComponentFactoryGfx12` at this commit. Its masked (simplified mask: bottom-right causal and the local
+  window) and `_sink` instances codegen and compile at d128.
+- `fmha_fwd_splitkv`: gfx12 BF16 has d32 / d64 / d128 / d256 group-mode paged instances with mask × sink variants
+  (three tiles each) and their combine kernels; d64, d128 and d256 masked/unmasked × sink/nsink codegen and compile.
+- So no needed case is missing at the pin: d64 / d256 prefill and decode run `fmha_fwd_splitkv` with one split
+  (group mode, `seqstart_q = q_indptr`, bottom-right / local mask), d128 keeps `fmha_fwd_pagedkv` for prefill and
+  splitkv for grouped decode. No newer CK pin and no own kernel (options A / B of the plan) were needed; recorded
+  here as built rather than asked.
+- Cost: generated FMHA sources 29 → 75 (+46: pagedkv d128 sink 2, splitkv d128 masked/sink 9, d64 12 + 4 combine,
+  d256 12 + 4 combine); `libturbine_hip.so` 4.33 MB → 7.77 MB; the incremental lab build of the new sources ran inside
+  the one `lab-test.sh` Job build step (88 ninja steps). With one split a d64 / d256 prefill chunk's F32 split
+  scratch is `total_q × num_q_heads × head_dim × 4` bytes (gpt-oss 64 × 64: 16 KiB a row, 128 MiB at 8,192 rows).
+- Finding: CK's head-merged splitkv decode (no mask, `max_seqlen_q == 1`) reads `sink_ptr[i_nhead]` with `i_nhead`
+  the KV head of its merged tile, so every query head of a group gets the group's first sink. Calls with sinks
+  therefore always take the masked instances (no head merge); `hip_ops attention_sinks_window_match_reference`
+  caught it (d64 decode with sinks, |Δ| 0.09). Worth an upstream CK report.
+- ABI semantics: `window_left = w` lets query position `p` see keys `p − w ..= p` (w + 1 keys); HF's
+  `sliding_window = W` (gpt-oss 128) is `window_left = W − 1`. The gpt-oss tasks (24/26) must map it so.
+- Minor: the header says 17 although v2.16 (Task 15, experts) has not landed on `p7-stack`; the lead orders the two
+  at merge.
 
 ## Phase 7 Task 13: OLMoE EP×TP drift — cause found, fix is a gate trade (2026-10-08)
 
@@ -4511,3 +4540,43 @@ MXFP4 and CK a16w4 as revisit items (W4A8 q8_1 fails the 6a bound; CK a16w4 need
 gpt-oss activation does not match). Re-measure CK at a later pin if gfx12 flatmm support lands upstream.
 
 **Decision (user, 2026-10-08): B, landed in C's order** — own grouped expert kernels; the per-expert loop stays at decode, the grouped kernel lands for prefill first, each step kept only after a measured gain.
+
+## P7 quantized expert test bound (Task 16, 2026-10-08)
+
+The HIP quantized experts (own per-expert loop over the 6a qgemm kernels) are compared with the CPU reference
+in `hip_moe_quant` under the 6a bound `|d| <= |ref|/256 + rms/128`. Two real reference mismatches were fixed
+(FP8-block weights staged as BF16, bias added after the BF16 qgemm output; `ce99a47f`), and the reference's
+expert scatter already mirrors the kernel and HF's BF16 `index_add_` (`6f5c75dc`). Still, 7 of 12 cases exceed
+the 6a bound (run `1008112147-0f4907dc`): qwen3 FP8-block 1.21 (16 tok) / 2.33 (256), qwen3 shared 1.21,
+mixtral W8A8 1.51 / 1.71 / static 1.46, gpt-oss 1.55 (256); every 1-token case passes, and batch invariance is
+exact. The residual is 1-2 BF16 ulp flips from FP32 accumulation order (WMMA tiles vs sequential CPU GEMM)
+compounding through three chained GEMMs plus activation and scatter. Under 4x the bound every case passes
+(worst 0.78).
+
+- A) A chained-expert bound for the end-to-end test only, 4x the 6a bound (`/64 + rms/32`), set from these
+  measurements and documented beside the test; the model-level golden and GSM8K gates stay the bar.
+- B) Make the reference emulate the kernel's WMMA k-chunked accumulation order so the 6a bound holds; ties the
+  reference to one kernel's tiling and must change with it.
+- C) Split the test: each stage (gate_up qgemm, activation, down qgemm, scatter) checked alone against the
+  reference on the same BF16 input under the 6a bound, and the chained end-to-end output under the 4x bound
+  of A (recommended: per-kernel correctness at the 6a bar, chaining measured and bounded).
+
+**Decision (user, 2026-10-08): C** — split the test: each stage under the 6a bound on the same BF16 input, the
+chained end-to-end output under 4x the 6a bound, documented beside the test.
+
+## P7 OLMoE FP8 KV golden reference (Task 36, 2026-10-08)
+
+Task 36 calibrates per-layer FP8 KV scales for the scale-less OLMoE checkpoint (absmax/448 over 32 prompts,
+cached). Golden against the committed emulated-KV reference (`tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/`,
+which quantizes K/V with scale 1.0 because the checkpoint ships none) is 10/16 at c1 and c16 (14 needed); every
+logprob bound holds, the six misses are token-rule divergences — the served run now uses different scales than
+the reference emulates. The plan says "the existing emulated-KV reference"; its README says the reference uses
+"the served scales".
+
+- A) Regenerate the reference with the calibrated scales (`quant_reference.py --kv-quant fp8_e4m3`, CPU fixture
+  job), re-run golden c1/c16 and the GSM8K OLMoE pair, flip the row to `supported` only if all pass.
+- B) Keep the scale-1.0 reference as the plan says; the row stays `experimental` and Task 36 is done.
+- C) Both: keep the scale-1.0 reference as a diagnostic, gate on the regenerated one.
+
+**Decision (user, 2026-10-08): A** — regenerate the emulated-KV reference with the calibrated (served) scales;
+re-run golden c1/c16 and the GSM8K OLMoE pair; the row flips to `supported` only if all pass.

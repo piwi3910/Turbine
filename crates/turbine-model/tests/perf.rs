@@ -674,6 +674,7 @@ fn moe_prefill_timings() {
         top_k: top_k as u32,
         renormalize: moe.norm_topk_prob,
         bf16_logits: true,
+        ..Default::default()
     };
     let experts_cfg = MoeExpertsConfig {
         hidden: hidden as u32,
@@ -683,6 +684,7 @@ fn moe_prefill_timings() {
         expert_begin: 0,
         expert_end: experts as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let registry = KernelRegistry::build(
         vec![Arc::clone(&provider)],
@@ -751,6 +753,7 @@ fn moe_prefill_timings() {
                     topk_weights: tw.view(),
                     sorted_rows: sorted.view(),
                     expert_offsets: offsets.view(),
+                    router_bias: None,
                 })
                 .expect("moe_route");
             let host: Vec<i32> = offsets
@@ -791,6 +794,7 @@ fn moe_prefill_timings() {
                         host_expert_offsets: &host,
                         out: o.view(),
                         workspace: None,
+                        extra: Default::default(),
                     })
                 };
                 // A library may enumerate an implementation it cannot run on this device
@@ -897,12 +901,14 @@ fn moe_ep_local_timings() {
         expert_begin: begin as u32,
         expert_end: end as u32,
         dtype: DType::BF16,
+        ..Default::default()
     };
     let route_cfg = MoeRouteConfig {
         num_experts: experts as u32,
         top_k: top_k as u32,
         renormalize: moe.norm_topk_prob,
         bf16_logits: true,
+        ..Default::default()
     };
     // The library's default choice (its card profile's row tiers) for every range used.
     let mut reqs = vec![
@@ -959,6 +965,7 @@ fn moe_ep_local_timings() {
                     topk_weights: tw.view(),
                     sorted_rows: sorted.view(),
                     expert_offsets: offsets.view(),
+                    router_bias: None,
                 })
                 .expect("moe_route");
             let host: Vec<i32> = offsets
@@ -991,6 +998,7 @@ fn moe_ep_local_timings() {
                         host_expert_offsets: &host,
                         out: o.view(),
                         workspace: None,
+                        extra: Default::default(),
                     })
                     .expect("moe_experts");
             };

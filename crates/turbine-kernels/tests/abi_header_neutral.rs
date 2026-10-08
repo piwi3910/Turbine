@@ -641,8 +641,7 @@ fn header_declares_the_v212_fused_rope_fields() {
     let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
     let attn = "int32_t num_page_classes, base_blocks, slab_stride, slab_base_blocks; \
                 const int32_t *rope_positions; const float *rope_inv_freq; \
-                int32_t rope_rotary_dim; float rope_attn_factor; \
-                } turbine_attention_paged_desc;";
+                int32_t rope_rotary_dim; float rope_attn_factor;";
     let attn = attn.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
         flat.contains(&attn),
@@ -739,5 +738,44 @@ fn header_declares_the_v218_gdn_and_conv1d_group() {
             flat.contains(&decl),
             "turbine_kernels.h lacks the v2.18 {decl}"
         );
+    }
+}
+
+/// Kernel ABI v2.16 (P7 S-4): the expert descriptor ends with the weight dtype, scales, biases,
+/// activation, interleave flag, clamp limit and shared expert, after `dtype`; the router
+/// descriptor ends with `router_bias`; `TURBINE_ROUTE_TOPK_THEN_SOFTMAX` is the flag bit 4 and
+/// the minor is at least 16. Breaks if a field moves (a library would read a scale pointer as
+/// the dtype) or a code changes value (an older library would misread a descriptor instead of
+/// refusing it).
+#[test]
+fn header_declares_the_v216_expert_fields() {
+    let code = strip_comments(&header());
+    let minor: u32 = define(&code, "TURBINE_ABI_MINOR")
+        .trim_end_matches('u')
+        .parse()
+        .expect("TURBINE_ABI_MINOR is a number");
+    assert!(minor >= 16, "TURBINE_ABI_MINOR {minor}");
+    for (name, value) in [
+        ("TURBINE_EXPERT_BF16", "0"),
+        ("TURBINE_EXPERT_FP8_BLOCK", "1"),
+        ("TURBINE_EXPERT_FP8_TENSOR", "2"),
+        ("TURBINE_EXPERT_MXFP4", "3"),
+        ("TURBINE_EXPERT_SWIGLU", "0"),
+        ("TURBINE_EXPERT_GPTOSS_CLAMP", "1"),
+        ("TURBINE_ROUTE_TOPK_THEN_SOFTMAX", "4"),
+    ] {
+        assert_eq!(define(&code, name), value, "{name}");
+    }
+    let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for decl in [
+        "int32_t expert_begin, expert_end; int32_t dtype; int32_t weight_dtype; \
+         const void *w_gate_scale, *w_up_scale, *w_down_scale; \
+         const float *act_static_scale, *act_static_scale_down; const void *b_gate, *b_up, *b_down; \
+         int32_t activation, gate_up_interleaved; float clamp_limit; \
+         const void *shared_w_gate, *shared_w_up, *shared_w_down, *shared_gate_w; \
+         int32_t shared_inter; } turbine_moe_experts_desc;",
+        "int32_t *expert_offsets; const void *router_bias; } turbine_moe_route_desc;",
+    ] {
+        assert!(flat.contains(decl), "turbine_kernels.h lacks {decl}");
     }
 }

@@ -26,9 +26,12 @@
 // refuses it. v2.15 adds no symbol: vllm_wvsplitk takes the residual-add
 // epilogue and the RMSNorm input of turbine_gemm_desc (c_residual,
 // a_norm_weight / a_norm_eps) in decode steps; hipblaslt refuses them.
+// v2.16 is reserved for the Phase 7 quantized MoE experts. v2.17 adds no
+// symbol: paged attention reads the window_left / sinks fields of its
+// descriptor (CK's local mask and sink logits) and serves head_dim 64 and 256
+// on CK fmha_fwd_splitkv (paged_attention.cpp, paged_attention_splitkv.cpp).
 // v2.18 adds the Gated DeltaNet trios (gdn.hip: gdn_prefill, gdn_decode) and
-// the causal conv1d trios (conv1d.hip: conv1d_prefill, conv1d_update); v2.16
-// and v2.17 add no symbol of this group.
+// the causal conv1d trios (conv1d.hip: conv1d_prefill, conv1d_update).
 // libturbine_hip_v23.so, compiled with TURBINE_V23_BUILD, is the same kernels
 // without impl_exports.cpp and reports 3, so a caller keeps the library's own
 // choice of implementation (the fallback the v2.4 group is optional against)
@@ -43,6 +46,11 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
+  // The v2.16 expert variants are implemented by turbine_hip_moe_quant (the
+  // FP8 block / FP8 tensor / MXFP4 experts, biases, the gpt-oss activation,
+  // interleaved gate_up, the shared expert) and TOPK_THEN_SOFTMAX / router_bias
+  // by moe_route; BF16 experts with those extras are refused by
+  // turbine_moe_experts_supported.
   return TURBINE_ABI_MINOR;
 #endif
 }

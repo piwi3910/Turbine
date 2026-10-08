@@ -275,6 +275,46 @@ pub fn write_tiny_olmoe_with_head_dim(dir: &Path, seed: u64, head_dim: u32) -> T
     write_tiny(dir, seed, &config, &opts)
 }
 
+/// [`write_tiny_quantized`] for the tiny OLMoE (8 experts, top-2) with the given `hidden` size
+/// and expert width `inter` (both multiples of 128 for the block-scaled formats; heads of
+/// dimension 128): the checkpoint quantized as `quantization_config` says, in `dir/quantized`,
+/// and its dequantized BF16 twin in `dir/twin` (Phase 7 S-4 fixtures).
+pub fn write_tiny_olmoe_quantized(
+    dir: &Path,
+    seed: u64,
+    quantization_config: &serde_json::Value,
+    hidden: u32,
+    inter: u32,
+) -> TinyQuantized {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        head_dim: 128,
+        ..TinyOptions::default()
+    };
+    let mut config = olmoe_config_json();
+    config["head_dim"] = json!(128);
+    config["hidden_size"] = json!(hidden);
+    config["intermediate_size"] = json!(inter);
+    let (qdir, tdir) = (dir.join("quantized"), dir.join("twin"));
+    write_tiny(&qdir, seed, &config, &opts);
+    let format = crate::weights::detect(&json!({ "quantization_config": quantization_config }))
+        .unwrap_or_else(|e| panic!("{quantization_config}: {e}"));
+    let written = format
+        .write_tiny(&qdir, Some(&tdir))
+        .unwrap_or_else(|e| panic!("{}: write_tiny: {e}", format.name()));
+    assert!(written, "{} has no tiny writer", format.name());
+    let spec = |dir: PathBuf| TinySpec {
+        config: load_model_config(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())),
+        dir,
+        vocab: TINY_VOCAB,
+    };
+    TinyQuantized {
+        quantized: spec(qdir),
+        twin: spec(tdir),
+    }
+}
+
 /// The families [`write_tiny_family`] writes, by registry name.
 pub const TINY_PHASE8_FAMILIES: [&str; 4] = ["qwen3", "qwen3_moe", "mistral", "mixtral"];
 

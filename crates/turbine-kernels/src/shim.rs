@@ -48,23 +48,24 @@ use crate::ffi::{
     self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, Conv1dDesc, CopyBlocksDesc,
     CtxInfo, EmbeddingDesc, GdnDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
     MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc,
-    QuantizeActDesc, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols,
-    SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
+    QuantizeActDesc, ROUTE_TOPK_THEN_SOFTMAX, RmsnormDesc, RmsnormShardedDesc, RopeDesc,
+    RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent,
+    TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
     Conv1dConfig, Conv1dContext, Conv1dKernel, ElementwiseConfig, ElementwiseContext,
-    ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GdnConfig, GdnContext,
-    GdnKernel, GdnMode, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel, ImplChoice,
-    ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig,
-    KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel,
-    KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
-    MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext, NormConfig,
-    NormContext, NormKernel, OpKind, PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext,
-    QGemmKernel, QuantizeActConfig, QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig,
-    RmsnormShardedContext, RopeConfig, RopeContext, RopeKernel, RowSumsqConfig, RowSumsqContext,
-    ShardedNormKernel,
+    ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel, ExpertActivation,
+    GdnConfig, GdnContext, GdnKernel, GdnMode, GemmConfig, GemmContext, GemmFused, GemmFusion,
+    GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel,
+    KvTranscodeConfig, KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat,
+    KvTranscodeKernel, KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext,
+    LogitsReduceKernel, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
+    ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
+    QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
+    RopeKernel, RouteMode, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
 };
 use crate::pinned::PinnedState;
 use crate::quant::{ActQuantDesc, QuantSchemeDesc};
@@ -1358,6 +1359,18 @@ impl ShimProvider {
         &self.ctx.lib.syms
     }
 
+    /// The device pointer of an optional operand; null when absent.
+    fn optional_ptr(
+        &self,
+        name: &str,
+        view: &Option<TensorView<'_>>,
+    ) -> Result<*const c_void, KernelError> {
+        match view {
+            Some(v) => Ok(self.ctx.device_ptr(name, v)?.cast_const()),
+            None => Ok(std::ptr::null()),
+        }
+    }
+
     fn supported<D>(trio: &OpTrio<D>, d: &D) -> bool {
         // SAFETY: `d` is a fully initialised descriptor; `_supported` reads only its shape and
         // dtype fields, ignores its (null) pointers and needs no context (contract §9.2).
@@ -1482,6 +1495,10 @@ const GEMM_SILU_MUL_MINOR: u32 = 14;
 /// The ABI minor whose `turbine_gemm_desc` carries the residual epilogue and the RMSNorm input
 /// (`c_residual`, `a_norm_weight`, v2.15).
 const GEMM_NORM_RESIDUAL_MINOR: u32 = 15;
+
+/// The ABI minor whose `turbine_attention_paged_desc` carries the sliding window and the sink
+/// logits (`window_left`, `sinks`, v2.17; Phase 7 S-8).
+const ATTENTION_WINDOW_SINKS_MINOR: u32 = 17;
 
 /// A non-null, 16-byte aligned stand-in for a probe's v2.15 operands: `supports` reads the
 /// pointers' presence and alignment only, never the memory.
@@ -1639,6 +1656,16 @@ fn paged_probe(cfg: &AttentionConfig) -> AttentionPagedDesc {
         rope_inv_freq: std::ptr::null(),
         rope_rotary_dim: 0,
         rope_attn_factor: 1.0,
+        window_left: cfg
+            .window
+            .map_or(-1, |w| i32::try_from(w).unwrap_or(i32::MAX)),
+        // `_supported` reads no pointer but this one's presence: a dangling, never-read
+        // pointer stands for the config's sinks.
+        sinks: if cfg.sinks {
+            std::ptr::NonNull::<f32>::dangling().as_ptr().cast_const()
+        } else {
+            std::ptr::null()
+        },
     }
 }
 
@@ -1805,7 +1832,23 @@ fn moe_route_flags(cfg: &MoeRouteConfig) -> i32 {
     if cfg.bf16_logits {
         flags |= MOE_ROUTE_BF16_LOGITS;
     }
+    if cfg.mode == RouteMode::TopkThenSoftmax {
+        flags |= ROUTE_TOPK_THEN_SOFTMAX;
+    }
     flags
+}
+
+/// The ABI minor from which a library reads the v2.16 expert and router fields: a config that
+/// sets one is unsupported below it (an older library would ignore the field and run another
+/// computation).
+const MOE_V2_16_MINOR: u32 = 16;
+
+/// The `clamp_limit` of `cfg`'s activation (0 for SwiGLU).
+fn expert_clamp_limit(cfg: &MoeExpertsConfig) -> f32 {
+    match cfg.activation {
+        ExpertActivation::GptOssClamp { limit } => limit,
+        _ => 0.0,
+    }
 }
 
 fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
@@ -1819,6 +1862,7 @@ fn moe_route_probe(cfg: &MoeRouteConfig) -> MoeRouteDesc {
         topk_weights: std::ptr::null_mut(),
         sorted_rows: std::ptr::null_mut(),
         expert_offsets: std::ptr::null_mut(),
+        router_bias: std::ptr::null(),
     }
 }
 
@@ -1848,6 +1892,23 @@ fn moe_experts_probe_tokens(cfg: &MoeExpertsConfig, num_tokens: i32) -> MoeExper
         expert_begin: cfg.expert_begin as i32,
         expert_end: cfg.expert_end as i32,
         dtype: cfg.dtype.abi_code(),
+        weight_dtype: cfg.weight_dtype.abi_code(),
+        w_gate_scale: null(),
+        w_up_scale: null(),
+        w_down_scale: null(),
+        act_static_scale: std::ptr::null(),
+        act_static_scale_down: std::ptr::null(),
+        b_gate: null(),
+        b_up: null(),
+        b_down: null(),
+        activation: cfg.activation.abi_code(),
+        gate_up_interleaved: i32::from(cfg.gate_up_interleaved),
+        clamp_limit: expert_clamp_limit(cfg),
+        shared_w_gate: null(),
+        shared_w_up: null(),
+        shared_w_down: null(),
+        shared_gate_w: null(),
+        shared_inter: cfg.shared_inter.map_or(0, |s| s as i32),
     }
 }
 
@@ -3055,9 +3116,14 @@ impl AttentionKernel for ShimProvider {
             // TurboQuant pages need the v2.11 descriptor fields (P6b S-5).
             cfg.block_tokens.is_some_and(|b| b > 0)
                 && (cfg.dtype.tq_record_bytes().is_none() || self.ctx.lib.abi_minor() >= 11)
+                && (cfg.window.is_none() && !cfg.sinks
+                    || self.ctx.lib.abi_minor() >= ATTENTION_WINDOW_SINKS_MINOR)
                 && Self::supported(trio, &paged_probe(cfg))
         } else if let Some(trio) = self.attention_trio(cfg.kind) {
-            cfg.block_tokens.is_none() && Self::supported(trio, &attention_probe(cfg))
+            cfg.block_tokens.is_none()
+                && cfg.window.is_none()
+                && !cfg.sinks
+                && Self::supported(trio, &attention_probe(cfg))
         } else {
             false
         }
@@ -3132,6 +3198,38 @@ impl AttentionKernel for ShimProvider {
                 ),
             });
         }
+        // Phase 7 S-8: the window and the sinks travel in the ABI v2.17 fields, which a
+        // library below minor 17 would ignore.
+        if (cfg.window.is_some() || cfg.sinks)
+            && self.ctx.lib.abi_minor() < ATTENTION_WINDOW_SINKS_MINOR
+        {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "{} with a sliding window or sinks ({cfg}) needs a kernel library of ABI \
+                     minor {ATTENTION_WINDOW_SINKS_MINOR} (this one is {})",
+                    cfg.op(),
+                    self.ctx.lib.abi_minor()
+                ),
+            });
+        }
+        let window_left = match cfg.window {
+            Some(w) => to_i32("window", w)?,
+            None => -1,
+        };
+        let sinks = match (&ctx.sinks, cfg.sinks) {
+            (Some(v), true) => {
+                dense("sinks", v, &[cfg.num_q_heads as usize], DType::F32)?;
+                self.ctx.device_ptr("sinks", v)?.cast_const().cast()
+            }
+            (None, false) => std::ptr::null(),
+            _ => {
+                return Err(invalid(format!(
+                    "{}: the sinks tensor must be passed exactly when the config names sinks \
+                     ({cfg})",
+                    cfg.op()
+                )));
+            }
+        };
         let (hkv, d) = (cfg.num_kv_heads as usize, cfg.head_dim as usize);
         let new_stride_token = row_stride("k_new", &ctx.k_new, 3)?;
         if row_stride("v_new", &ctx.v_new, 3)? != new_stride_token {
@@ -3321,6 +3419,8 @@ impl AttentionKernel for ShimProvider {
             rope_inv_freq,
             rope_rotary_dim,
             rope_attn_factor,
+            window_left,
+            sinks,
         };
         if ctx.block_formats.is_some() && !self.bound_takes(cfg.op(), &d) {
             // A block table that may mix formats, and a bound implementation (chosen for pages
@@ -3452,11 +3552,15 @@ impl MoeKernel for ShimProvider {
     /// BF16 router logits need kernel ABI minor 2: an older library may not check `flags`.
     fn supports_route(&self, cfg: &MoeRouteConfig) -> bool {
         (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+            && (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
             && Self::supported(&self.syms().moe_route, &moe_route_probe(cfg))
     }
 
+    /// The v2.16 fields (quantized weights, biases, activation variants, shared expert) need a
+    /// library of minor 16: an older one ignores them and would run the BF16 SwiGLU experts.
     fn supports_experts(&self, cfg: &MoeExpertsConfig) -> bool {
-        Self::supported(&self.syms().moe_experts, &moe_experts_probe(cfg))
+        (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
+            && Self::supported(&self.syms().moe_experts, &moe_experts_probe(cfg))
     }
 
     fn implementation_route(&self, cfg: &MoeRouteConfig) -> String {
@@ -3493,6 +3597,18 @@ impl MoeKernel for ShimProvider {
             &[experts + 1],
             DType::I32,
         )?;
+        let router_bias = match (&ctx.router_bias, ctx.cfg.bias) {
+            (Some(b), true) => {
+                dense("router_bias", b, &[experts], DType::F32)?;
+                self.ctx.device_ptr("router_bias", b)?.cast_const()
+            }
+            (None, false) => std::ptr::null(),
+            _ => {
+                return Err(invalid(
+                    "router_bias must be passed exactly when the config has bias".into(),
+                ));
+            }
+        };
         let d = MoeRouteDesc {
             router_logits: self.ctx.device_ptr("router_logits", &ctx.router_logits)? as *const f32,
             num_tokens: to_i32("num_tokens", tokens)?,
@@ -3509,21 +3625,21 @@ impl MoeKernel for ShimProvider {
                 .ctx
                 .device_ptr("expert_offsets", &ctx.expert_offsets)?
                 .cast(),
+            router_bias,
         };
         self.run(OpKind::MoeRoute, &self.syms().moe_route, &d, 0)
     }
 
     fn experts(&self, ctx: &mut MoeExpertsContext<'_>) -> Result<(), KernelError> {
         let cfg = ctx.cfg;
-        let (h, inter) = (cfg.hidden as usize, cfg.inter as usize);
+        let h = cfg.hidden as usize;
         let (experts, k) = (cfg.num_experts as usize, cfg.top_k as usize);
-        let local = cfg.num_local_experts() as usize;
         let tokens = ctx.x.shape.first().copied().unwrap_or(0);
         dense("x", &ctx.x, &[tokens, h], cfg.dtype)?;
         dense("out", &ctx.out, &[tokens, h], cfg.dtype)?;
-        dense("w_gate", &ctx.w_gate, &[local, inter, h], cfg.dtype)?;
-        dense("w_up", &ctx.w_up, &[local, inter, h], cfg.dtype)?;
-        dense("w_down", &ctx.w_down, &[local, h, inter], cfg.dtype)?;
+        for (name, view, shape, dtype) in ctx.weight_operands()? {
+            dense(name, view, &shape, dtype)?;
+        }
         dense("sorted_rows", &ctx.sorted_rows, &[tokens * k], DType::I32)?;
         dense(
             "expert_offsets",
@@ -3569,6 +3685,27 @@ impl MoeKernel for ShimProvider {
             expert_begin: to_i32("expert_begin", cfg.expert_begin)?,
             expert_end: to_i32("expert_end", cfg.expert_end)?,
             dtype: cfg.dtype.abi_code(),
+            weight_dtype: cfg.weight_dtype.abi_code(),
+            w_gate_scale: self.optional_ptr("w_gate_scale", &ctx.extra.w_gate_scale)?,
+            w_up_scale: self.optional_ptr("w_up_scale", &ctx.extra.w_up_scale)?,
+            w_down_scale: self.optional_ptr("w_down_scale", &ctx.extra.w_down_scale)?,
+            act_static_scale: self
+                .optional_ptr("act_static_scale", &ctx.extra.act_static_scale)?
+                .cast(),
+            act_static_scale_down: self
+                .optional_ptr("act_static_scale_down", &ctx.extra.act_static_scale_down)?
+                .cast(),
+            b_gate: self.optional_ptr("b_gate", &ctx.extra.b_gate)?,
+            b_up: self.optional_ptr("b_up", &ctx.extra.b_up)?,
+            b_down: self.optional_ptr("b_down", &ctx.extra.b_down)?,
+            activation: cfg.activation.abi_code(),
+            gate_up_interleaved: i32::from(cfg.gate_up_interleaved),
+            clamp_limit: expert_clamp_limit(&cfg),
+            shared_w_gate: self.optional_ptr("shared_w_gate", &ctx.extra.shared_w_gate)?,
+            shared_w_up: self.optional_ptr("shared_w_up", &ctx.extra.shared_w_up)?,
+            shared_w_down: self.optional_ptr("shared_w_down", &ctx.extra.shared_w_down)?,
+            shared_gate_w: self.optional_ptr("shared_gate_w", &ctx.extra.shared_gate_w)?,
+            shared_inter: cfg.shared_inter.map_or(0, |s| s as i32),
         };
         self.run(OpKind::MoeExperts, &self.syms().moe_experts, &d, tokens * k)
     }
@@ -3893,9 +4030,13 @@ impl KernelProvider for ShimProvider {
             }
             OpConfig::MoeRoute(cfg) => {
                 (!cfg.bf16_logits || self.syms().v21.minor >= 2)
+                    && (!cfg.needs_v2_16() || self.syms().v21.minor >= MOE_V2_16_MINOR)
                     && lib.impl_supports(OpKind::MoeRoute, index, &moe_route_probe(cfg))
             }
             OpConfig::MoeExperts(cfg) => {
+                if cfg.needs_v2_16() && self.syms().v21.minor < MOE_V2_16_MINOR {
+                    return false;
+                }
                 let top_k = cfg.top_k.max(1);
                 let tokens = rows.map_or(1, |r| r.div_ceil(top_k));
                 let Ok(tokens) = i32::try_from(tokens) else {
@@ -4153,6 +4294,8 @@ pub(crate) mod tests {
             dtype: DType::BF16,
             block_tokens: Some(16),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let attn = provider.attention().expect("attention family");
         assert!(!attn.supports(&paged));
@@ -4202,6 +4345,46 @@ pub(crate) mod tests {
             matches!(&err, KernelError::InvalidArgument { message } if message.contains("execute_paged")),
             "{err:?}"
         );
+        // Phase 7 S-8: a window or sinks need the ABI v2.17 fields; this v2.0 library would
+        // ignore them, so the call is refused before any FFI call.
+        let i32s = Tensor::empty(&mem, &[2], DType::I32).expect("i32");
+        let sink_t = Tensor::empty(&mem, &[16], DType::F32).expect("sinks");
+        for (window, sinks) in [(Some(128), false), (None, true)] {
+            let cfg = AttentionConfig {
+                window,
+                sinks,
+                ..paged
+            };
+            assert!(!attn.supports(&cfg), "{cfg}");
+            let err = attn
+                .execute_paged(&mut PagedAttentionContext {
+                    cfg,
+                    q: t.view(),
+                    k_new: t.view(),
+                    v_new: t.view(),
+                    out: t.view(),
+                    kv_layer: t.view(),
+                    block_table: i32s.view(),
+                    q_indptr: i32s.view(),
+                    kv_lens: i32s.view(),
+                    max_q_len: 1,
+                    max_kv_len: 1,
+                    max_blocks_per_seq: 1,
+                    scale: 1.0,
+                    k_scale: 1.0,
+                    v_scale: 1.0,
+                    block_formats: None,
+                    classes: None,
+                    tq: None,
+                    rope: None,
+                    sinks: sinks.then(|| sink_t.view()),
+                })
+                .expect_err("window / sinks below minor 17");
+            assert!(
+                matches!(&err, KernelError::Unsupported { message } if message.contains("ABI minor 17")),
+                "{err:?}"
+            );
+        }
 
         let copy = KvCopyConfig {
             num_layers: 2,
@@ -4244,6 +4427,7 @@ pub(crate) mod tests {
             top_k: 8,
             renormalize: false,
             bf16_logits: false,
+            ..Default::default()
         };
         assert!(!moe.supports_route(&route));
         assert_eq!(moe.implementation_route(&route), "stub_moe_route");
@@ -4255,6 +4439,7 @@ pub(crate) mod tests {
             expert_begin: 0,
             expert_end: 64,
             dtype: DType::BF16,
+            ..Default::default()
         };
         assert!(!moe.supports_experts(&experts));
         assert_eq!(moe.implementation_experts(&experts), "stub_moe_experts");

@@ -774,6 +774,85 @@ async fn compare_without_batched_keys_falls_back_to_strict_bounds() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `--multi-gpu-bounds` judges every concurrency (c1 included) by the `_multi_gpu` keys: a 0.2-nat
+/// shift passes under multi-GPU bounds 0.30 / 0.90 while the strict (0.15) and batched (0.10)
+/// bounds reject it; keys absent fall back to the batched bounds; the token rule is unchanged;
+/// the flag excludes `--batched-bounds`. Breaks if the keys are ignored, apply only above c1,
+/// are not reported, or a missing key reads as 0 or unbounded.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_gpu_bounds_select_calibrated_keys() {
+    let (dir, reference) = captured_fixture(
+        "multi-gpu",
+        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5,"max_abs_logprob_diff_likely_batched":0.10,"max_abs_logprob_diff_tail_batched":0.40,"max_abs_logprob_diff_likely_multi_gpu":0.30,"max_abs_logprob_diff_tail_multi_gpu":0.90}"#,
+    )
+    .await;
+    let run_with = |variant: Variant, flags: &'static [&'static str], c: u32| {
+        let reference = reference.clone();
+        async move {
+            let addr = mock_server(variant).await;
+            let mut args = compare_args(addr, &reference, "json");
+            args.extend(strings(&["--concurrency", &c.to_string()]));
+            args.extend(strings(flags));
+            let run = golden(args).await;
+            let report: Value = serde_json::from_str(&run.stdout).unwrap_or(Value::Null);
+            (run.code, report, run.stderr)
+        }
+    };
+
+    for c in [1, 16] {
+        let (code, report, _) = run_with(Variant::ShiftP01, &["--multi-gpu-bounds"], c).await;
+        assert_eq!(code, Some(0), "c{c}: {report}");
+        assert_eq!(report["logprob_bounds"]["multi_gpu"], true, "{report}");
+        assert_close(
+            &report["logprob_bounds"]["max_abs_logprob_diff_likely"],
+            0.30,
+            &report,
+        );
+        assert_close(
+            &report["logprob_bounds"]["max_abs_logprob_diff_tail"],
+            0.90,
+            &report,
+        );
+    }
+    // Without the flag the same output violates the batched / strict bounds.
+    let (code, report, _) = run_with(Variant::ShiftP01, &[], 16).await;
+    assert_eq!(code, Some(1), "{report}");
+    assert_eq!(report["logprob_bounds"]["multi_gpu"], false, "{report}");
+    let (code, report, _) = run_with(Variant::ShiftP01, &["--batched-bounds"], 1).await;
+    assert_eq!(code, Some(1), "{report}");
+    // The token rule is unchanged: a flip on a 2-nat margin still fails.
+    let (code, report, _) = run_with(Variant::FlipP01, &["--multi-gpu-bounds"], 1).await;
+    assert_eq!(code, Some(1), "{report}");
+    // The two flags exclude each other (usage error).
+    let (code, _, err) = run_with(
+        Variant::Base,
+        &["--multi-gpu-bounds", "--batched-bounds"],
+        1,
+    )
+    .await;
+    assert_eq!(code, Some(2), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // Absent `_multi_gpu` keys: the batched bounds (0.25 / 0.75) apply, and absent those, the strict.
+    let (dir, reference) = captured_fixture(
+        "multi-gpu-fallback",
+        r#"{"min_identical_prefix":8,"min_prompts_passing":2,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5,"max_abs_logprob_diff_likely_batched":0.25,"max_abs_logprob_diff_tail_batched":0.75}"#,
+    )
+    .await;
+    let addr = mock_server(Variant::ShiftP01).await;
+    let mut args = compare_args(addr, &reference, "json");
+    args.extend(strings(&["--multi-gpu-bounds"]));
+    let run = golden(args).await;
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(run.code, Some(0), "{report}");
+    assert_close(
+        &report["logprob_bounds"]["max_abs_logprob_diff_likely"],
+        0.25,
+        &report,
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Phase 8 (S-3, S-4): `turbine-golden eval` and `eval-compare` against an in-process mock.
 mod phase8_eval {
     use std::path::{Path, PathBuf};

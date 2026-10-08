@@ -4242,8 +4242,7 @@ fn dp2_of_tp2_groups_serve() {
 /// holding half the tiny OLMoE's experts (P5 S-11).
 const EP2: &str = "parallel:\n  expert_parallel_size: 2\n  collective_backend: host\n";
 
-/// P5 S-11, S-12: the tiny OLMoE served at ep 2 with replicated attention (tp 1; OLMoE at
-/// ep 2 × tp 2 is refused, `olmoe_ep_tp_drift`) completes greedy prompts with exactly ep 1's tokens, alone and 8 at a time;
+/// P5 S-11, S-12: the tiny OLMoE served at ep 2 with replicated attention (tp 1) completes greedy prompts with exactly ep 1's tokens, alone and 8 at a time;
 /// `/turbine/v1/status` shows `ep` 2, the plan's reason codes and the contiguous placement
 /// (experts 0–3 on rank 0, 4–7 on rank 1), `/turbine/v1/scheduler` has the `expert` section
 /// with non-zero token counts for both ranks, and `turbine_expert_rank_tokens_total` counts
@@ -4274,8 +4273,7 @@ fn ep2_serves_like_ep1() {
         "1 2 3 4",
     ];
     let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
-    // OLMoE at ep 2 × tp 2 is refused (P5 exit, `olmoe_ep_tp_drift`; server_cli
-    // `olmoe_ep_tp_exits_2`), so only replicated attention is served here.
+    // Only replicated attention is served here; ep 2 × tp 2 is gated by the lab golden.
     {
         let (what, extra) = ("ep 2 tp 1", EP2);
         let two = olmoe(extra);

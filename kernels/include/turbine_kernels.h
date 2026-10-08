@@ -371,6 +371,18 @@ typedef struct turbine_attention_paged_desc {
   const float *rope_inv_freq;
   int32_t rope_rotary_dim;
   float rope_attn_factor;
+  /* v2.17 (Phase 7 S-8), read only by a library reporting minor >= 17 (a
+   * caller never sets them for an older one): a sliding window -- query
+   * position p attends keys p - window_left <= j <= p (with causal = 1);
+   * -1 = no window (every key <= p) -- and learned sink logits: sinks, device
+   * F32 [num_q_heads] in the scaled score domain (compared with scale * q.k),
+   * joins each row of head h as one more logit of the softmax that has no
+   * value: probabilities exp(s_j - m) / (sum_k exp(s_k - m) + exp(sinks[h] -
+   * m)) with m = max(max_k s_k, sinks[h]). NULL = no sinks. A zeroed
+   * descriptor must set window_left = -1. _supported reads sinks for its
+   * presence only. */
+  int32_t window_left;
+  const float *sinks;
 } turbine_attention_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_prefill_paged_desc;
 typedef turbine_attention_paged_desc turbine_attention_decode_paged_desc;
@@ -414,6 +426,9 @@ typedef struct turbine_copy_blocks_desc {
  * rounds each logit to BF16 (round to nearest even) before the softmax. */
 #define TURBINE_MOE_ROUTE_RENORMALIZE 1
 #define TURBINE_MOE_ROUTE_BF16_LOGITS 2
+/* v2.16: select the top_k of the logits (router_bias included), then softmax
+ * over those top_k only (gpt-oss); RENORMALIZE is ignored. */
+#define TURBINE_ROUTE_TOPK_THEN_SOFTMAX 4
 
 /* Softmax in F32, then the top_k experts PyTorch's CPU torch.topk selects:
  * libstdc++ std::nth_element (introselect) at top_k - 1 over (weight, id) in
@@ -433,10 +448,49 @@ typedef struct turbine_moe_route_desc {
   int32_t *sorted_rows;
   /* [num_experts + 1] */
   int32_t *expert_offsets;
+  /* v2.16 (read only by a library reporting minor >= 16): [num_experts] F32
+   * added to the logits (before the BF16 rounding), or NULL */
+  const void *router_bias;
 } turbine_moe_route_desc;
 
-/* out += sum_k w_k * down(silu(gate(x)) * up(x)) over the local experts,
- * accumulated in ascending expert order. */
+/* v2.16 weight_dtype */
+#define TURBINE_EXPERT_BF16 0
+#define TURBINE_EXPERT_FP8_BLOCK 1
+#define TURBINE_EXPERT_FP8_TENSOR 2
+#define TURBINE_EXPERT_MXFP4 3
+/* v2.16 activation */
+#define TURBINE_EXPERT_SWIGLU 0
+#define TURBINE_EXPERT_GPTOSS_CLAMP 1
+
+/* out += sum_k w_k * down(act(gate(x), up(x))) over the local experts,
+ * accumulated in ascending expert order; act is silu(gate) * up (SWIGLU).
+ *
+ * The fields after dtype are v2.16, read only by a library reporting minor >=
+ * 16 (zero / NULL they describe the BF16 SwiGLU experts above; a descriptor
+ * that needs them is reported unsupported by an older library):
+ * - weight_dtype: TURBINE_EXPERT_*. Quantized weights use the qgemm layouts
+ *   per expert: w_* = [experts, n, k] e4m3 bytes (FP8) or [experts, n, k/2]
+ *   bytes, low nibble first (MXFP4); w_*_scale = F32 [experts, ceil(n/128),
+ *   ceil(k/128)] (FP8_BLOCK), F32 [experts] (FP8_TENSOR) or E8M0 bytes
+ *   [experts, n, k/32] (MXFP4); x and out stay in dtype.
+ * - act_static_scale, act_static_scale_down: F32 [experts], FP8_TENSOR only,
+ *   nullable. act_static_scale set = W8A8: the input of gate/up is quantized
+ *   with that expert's scale; the input of down with act_static_scale_down's
+ *   expert scale, or per token with a dynamic scale when that is NULL; both
+ *   NULL = activations stay in dtype (act_static_scale_down alone is invalid).
+ * - b_gate, b_up, b_down: nullable [experts, n] in dtype, added to the
+ *   projection before the activation (b_down before the routing weight).
+ * - activation: SWIGLU, or GPTOSS_CLAMP: gate = min(gate, clamp_limit), up =
+ *   clamp(up, -clamp_limit, clamp_limit), act = (up + 1) * gate *
+ *   sigmoid(1.702 * gate) (clamp_limit 7.0 for gpt-oss).
+ * - gate_up_interleaved: 1 = w_gate is [experts, 2 * inter, hidden] with gate
+ *   column j in row 2j and up column j in row 2j + 1 (b_gate likewise
+ *   [experts, 2 * inter]); w_up, w_up_scale and b_up are then unused.
+ * - shared_w_gate, shared_w_up [shared_inter, hidden], shared_w_down [hidden,
+ *   shared_inter] (dtype), nullable together with shared_inter = 0: a shared
+ *   expert (SWIGLU) over every token, scaled by sigmoid(x . shared_gate_w)
+ *   (shared_gate_w [hidden], nullable = scale 1) and added to out once per
+ *   call. */
 typedef struct turbine_moe_experts_desc {
   /* [num_tokens, hidden] */
   const void *x;
@@ -458,6 +512,15 @@ typedef struct turbine_moe_experts_desc {
   /* local expert range [expert_begin, expert_end) */
   int32_t expert_begin, expert_end;
   int32_t dtype;
+  /* v2.16 */
+  int32_t weight_dtype;
+  const void *w_gate_scale, *w_up_scale, *w_down_scale;
+  const float *act_static_scale, *act_static_scale_down;
+  const void *b_gate, *b_up, *b_down;
+  int32_t activation, gate_up_interleaved;
+  float clamp_limit;
+  const void *shared_w_gate, *shared_w_up, *shared_w_down, *shared_gate_w;
+  int32_t shared_inter;
 } turbine_moe_experts_desc;
 
 /* v2 trios: attention_prefill_paged, attention_decode_paged, copy_blocks,
@@ -521,9 +584,13 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * act_static_scale; no new symbol); v2.14 the SwiGLU input of a GEMM
  * (turbine_gemm_desc's a_silu_mul / a_up_offset; no new symbol); v2.15 the
  * residual-add epilogue and RMSNorm input of a GEMM (turbine_gemm_desc's
- * c_residual / a_norm_weight / a_norm_eps; no new symbol); v2.18 Gated
- * DeltaNet and the causal conv1d (below; v2.16 and v2.17 are added by other
- * tasks of the same phase and carry no symbol of this group). */
+ * c_residual / a_norm_weight / a_norm_eps; no new symbol); v2.16 the expert
+ * weight dtypes, biases, activation variants and shared expert of
+ * turbine_moe_experts_desc and TURBINE_ROUTE_TOPK_THEN_SOFTMAX / router_bias
+ * of turbine_moe_route_desc (no new symbol); v2.17 the sliding window and sink
+ * logits of paged attention (turbine_attention_paged_desc's window_left /
+ * sinks; no new symbol) and head_dim 64 and 256 on its CK paths; v2.18 Gated
+ * DeltaNet and the causal conv1d (below). */
 #define TURBINE_ABI_MINOR 18u
 uint32_t turbine_abi_minor(void);
 

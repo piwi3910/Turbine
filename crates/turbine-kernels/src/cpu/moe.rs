@@ -4,12 +4,18 @@
 //! accumulation in ascending expert order).
 use turbine_core::types::DType;
 
+use super::quant;
+use super::topk::topk_then_softmax;
 use super::{
-    CpuReference, expect_rank, expect_shape, invalid, is_float, load, load_i32, math, round_to,
-    store, store_i32, torch_topk,
+    CpuReference, expect_rank, expect_shape, invalid, is_float, load, load_bytes, load_i32, math,
+    round_to, store, store_i32, torch_topk,
 };
 use crate::KernelError;
-use crate::ops::{MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig, MoeRouteContext};
+use crate::ops::{
+    ExpertActivation, ExpertDtype, MoeExpertsConfig, MoeExpertsContext, MoeKernel, MoeRouteConfig,
+    MoeRouteContext, RouteMode,
+};
+use crate::quant::{ActQuantDesc, QuantSchemeDesc};
 
 /// Softmax of one row of router logits in f32 (max-subtracted, sequential sum).
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -70,6 +76,13 @@ impl MoeKernel for CpuReference {
             && cfg.expert_begin < cfg.expert_end
             && cfg.expert_end <= cfg.num_experts
             && is_float(cfg.dtype)
+            && (cfg.weight_dtype != ExpertDtype::Mxfp4
+                || (cfg.hidden.is_multiple_of(32) && cfg.inter.is_multiple_of(32)))
+            && match cfg.activation {
+                ExpertActivation::SwiGlu => true,
+                ExpertActivation::GptOssClamp { limit } => limit > 0.0,
+            }
+            && cfg.shared_inter != Some(0)
     }
 
     fn implementation_route(&self, _cfg: &MoeRouteConfig) -> String {
@@ -106,16 +119,39 @@ impl MoeKernel for CpuReference {
             DType::I32,
         )?;
 
+        let bias = match (&ctx.router_bias, ctx.cfg.bias) {
+            (Some(b), true) => {
+                expect_typed("router_bias", b, &[experts], DType::F32)?;
+                Some(load(b)?)
+            }
+            (None, false) => None,
+            _ => {
+                return Err(invalid(
+                    "router_bias must be passed exactly when the config has bias".into(),
+                ));
+            }
+        };
         let logits = load(&ctx.router_logits)?;
         let mut ids = Vec::with_capacity(tokens * k);
         let mut weights = Vec::with_capacity(tokens * k);
         for row in logits.chunks_exact(experts) {
-            let p = if ctx.cfg.bf16_logits {
-                let rounded: Vec<f32> = row.iter().map(|&l| round_to(DType::BF16, l)).collect();
-                softmax(&rounded)
-            } else {
-                softmax(row)
+            // The router linear's output: the bias is part of it, so it is rounded with it.
+            let mut row: Vec<f32> = match &bias {
+                Some(b) => row.iter().zip(b).map(|(&l, &b)| l + b).collect(),
+                None => row.to_vec(),
             };
+            if ctx.cfg.bf16_logits {
+                for l in &mut row {
+                    *l = round_to(DType::BF16, *l);
+                }
+            }
+            if ctx.cfg.mode == RouteMode::TopkThenSoftmax {
+                let (chosen, w) = topk_then_softmax(&row, None, k);
+                ids.extend(chosen);
+                weights.extend(w);
+                continue;
+            }
+            let p = softmax(&row);
             let chosen = torch_topk(&p, k);
             let mut sum = 0f32;
             for &e in &chosen {
@@ -173,15 +209,14 @@ impl MoeKernel for CpuReference {
         }
         let (h, inter) = (cfg.hidden as usize, cfg.inter as usize);
         let (experts, k) = (cfg.num_experts as usize, cfg.top_k as usize);
-        let local = cfg.num_local_experts() as usize;
         let dt = cfg.dtype;
         expect_rank("x", &ctx.x, 2)?;
         let tokens = ctx.x.shape[0];
         expect_shape("x", &ctx.x, &[tokens, h])?;
         expect_shape("out", &ctx.out, &[tokens, h])?;
-        expect_shape("w_gate", &ctx.w_gate, &[local, inter, h])?;
-        expect_shape("w_up", &ctx.w_up, &[local, inter, h])?;
-        expect_shape("w_down", &ctx.w_down, &[local, h, inter])?;
+        for (name, view, shape, dtype) in ctx.weight_operands()? {
+            expect_typed(name, view, &shape, dtype)?;
+        }
         expect_typed("sorted_rows", &ctx.sorted_rows, &[tokens * k], DType::I32)?;
         expect_typed(
             "expert_offsets",
@@ -206,6 +241,14 @@ impl MoeKernel for CpuReference {
         let x = load(&ctx.x)?;
         let mut out = load(&ctx.out)?;
         let round = |v: f32| round_to(dt, v);
+        let gate_rows = if cfg.gate_up_interleaved {
+            2 * inter
+        } else {
+            inter
+        };
+        let ex = &ctx.extra;
+        let act_scales = ex.act_static_scale.as_ref().map(load).transpose()?;
+        let act_scales_down = ex.act_static_scale_down.as_ref().map(load).transpose()?;
 
         for (li, e) in (cfg.expert_begin as usize..cfg.expert_end as usize).enumerate() {
             let group = &sorted[offsets[e] as usize..offsets[e + 1] as usize];
@@ -213,9 +256,33 @@ impl MoeKernel for CpuReference {
                 continue;
             }
             // Only the weights of experts that received rows are read.
-            let w_gate = load(&ctx.w_gate.rows(li, 1))?;
-            let w_up = load(&ctx.w_up.rows(li, 1))?;
-            let w_down = load(&ctx.w_down.rows(li, 1))?;
+            let w_gate = expert_weight(
+                &cfg,
+                &ctx.w_gate,
+                ex.w_gate_scale.as_ref(),
+                li,
+                gate_rows,
+                h,
+            )?;
+            let w_up = if cfg.gate_up_interleaved {
+                Vec::new()
+            } else {
+                expert_weight(&cfg, &ctx.w_up, ex.w_up_scale.as_ref(), li, inter, h)?
+            };
+            let w_down = expert_weight(&cfg, &ctx.w_down, ex.w_down_scale.as_ref(), li, h, inter)?;
+            // FP8 block weights reach the GEMM as the BF16 the golden dequantized checkpoint holds
+            // (`bf16(e4m3(q) * s)`, qgemm_fp8_block's staging); the other formats' decoded values
+            // are exact in BF16 or (FP8 tensor, W8A8) multiplied as FP8.
+            let (w_gate, w_up, w_down) = if cfg.weight_dtype == ExpertDtype::Fp8Block {
+                let r = |v: Vec<f32>| v.into_iter().map(round).collect::<Vec<f32>>();
+                (r(w_gate), r(w_up), r(w_down))
+            } else {
+                (w_gate, w_up, w_down)
+            };
+            let bias = |b: &Option<turbine_tensor::TensorView<'_>>| {
+                b.as_ref().map(|v| load(&v.rows(li, 1))).transpose()
+            };
+            let (b_gate, b_up, b_down) = (bias(&ex.b_gate)?, bias(&ex.b_up)?, bias(&ex.b_down)?);
             let mut rows = Vec::with_capacity(group.len());
             let mut xs = Vec::with_capacity(group.len() * h);
             for &r in group {
@@ -227,26 +294,68 @@ impl MoeKernel for CpuReference {
                 xs.extend_from_slice(&x[(r / k) * h..(r / k + 1) * h]);
             }
             let n = rows.len();
-            let proj = |w: &[f32], cols: usize, depth: usize, a: &[f32]| {
+            // W8A8: the inputs of the quantized projections are FP8 round trips.
+            let w8a8 = cfg.weight_dtype == ExpertDtype::Fp8Tensor && act_scales.is_some();
+            if let (true, Some(s)) = (w8a8, &act_scales) {
+                quant::quantize_dequantize_activations(
+                    &mut xs,
+                    n,
+                    h,
+                    ActQuantDesc::Fp8Tensor,
+                    s[li],
+                );
+            }
+            let proj = |w: &[f32], bias: Option<&[f32]>, cols: usize, depth: usize, a: &[f32]| {
                 let shape = math::GemmShape {
                     m: n,
                     n: cols,
                     k: depth,
                     trans_b: true,
                 };
-                math::gemm(a, w, &[], &shape, 1.0, 0.0)
-                    .into_iter()
-                    .map(round)
-                    .collect::<Vec<f32>>()
+                let mut y = math::gemm(a, w, &[], &shape, 1.0, 0.0);
+                if let Some(b) = bias {
+                    // `x @ W + b` in the BF16 model: the matmul's output is rounded, then the
+                    // bias add rounds again (the kernels' qgemm output plus bias kernel).
+                    y = y.into_iter().map(round).collect();
+                    for row in y.chunks_exact_mut(cols) {
+                        for (v, &b) in row.iter_mut().zip(b) {
+                            *v += b;
+                        }
+                    }
+                }
+                y.into_iter().map(round).collect::<Vec<f32>>()
             };
-            let gate = proj(&w_gate, inter, h, &xs);
-            let up = proj(&w_up, inter, h, &xs);
-            let act: Vec<f32> = gate
+            let (gate, up) = if cfg.gate_up_interleaved {
+                let gu = proj(&w_gate, b_gate.as_deref(), gate_rows, h, &xs);
+                let gate = gu.chunks_exact(2).map(|p| p[0]).collect::<Vec<f32>>();
+                let up = gu.chunks_exact(2).map(|p| p[1]).collect::<Vec<f32>>();
+                (gate, up)
+            } else {
+                (
+                    proj(&w_gate, b_gate.as_deref(), inter, h, &xs),
+                    proj(&w_up, b_up.as_deref(), inter, h, &xs),
+                )
+            };
+            let mut act: Vec<f32> = gate
                 .iter()
                 .zip(&up)
-                .map(|(&g, &u)| round(round(math::silu(g)) * u))
+                .map(|(&g, &u)| match cfg.activation {
+                    ExpertActivation::GptOssClamp { limit } => gptoss_glu(round, g, u, limit),
+                    _ => round(round(math::silu(g)) * u),
+                })
                 .collect();
-            let down = proj(&w_down, h, inter, &act);
+            if w8a8 {
+                let (mode, scale) = match &act_scales_down {
+                    Some(s) => (ActQuantDesc::Fp8Tensor, s[li]),
+                    None => (ActQuantDesc::Fp8Token, 0.0),
+                };
+                quant::quantize_dequantize_activations(&mut act, n, inter, mode, scale);
+            }
+            let down = proj(&w_down, b_down.as_deref(), h, inter, &act);
+            // The BF16 expert scatter, as `moe_scatter_kernel` (moe.hip) and Hugging Face's
+            // `index_add_` do it: experts in ascending id order, and per expert and element
+            // `out = bf16(out + bf16(bf16(y) * bf16(w)))`, so the running sum is rounded to BF16
+            // after every top-k contribution (not accumulated in F32).
             for (i, &r) in rows.iter().enumerate() {
                 let t = r / k;
                 let w = round(weights[r]);
@@ -258,14 +367,111 @@ impl MoeKernel for CpuReference {
                 }
             }
         }
+
+        if let Some(si) = cfg.shared_inter {
+            let si = si as usize;
+            let shared = |v: &Option<turbine_tensor::TensorView<'_>>| {
+                v.as_ref()
+                    .map(load)
+                    .transpose()?
+                    .ok_or_else(|| invalid("shared expert weight missing".into()))
+            };
+            let (sg, su, sd) = (
+                shared(&ex.shared_w_gate)?,
+                shared(&ex.shared_w_up)?,
+                shared(&ex.shared_w_down)?,
+            );
+            let gate_w = ex.shared_gate_w.as_ref().map(load).transpose()?;
+            let proj = |w: &[f32], cols: usize, depth: usize, a: &[f32]| {
+                let shape = math::GemmShape {
+                    m: tokens,
+                    n: cols,
+                    k: depth,
+                    trans_b: true,
+                };
+                math::gemm(a, w, &[], &shape, 1.0, 0.0)
+                    .into_iter()
+                    .map(round)
+                    .collect::<Vec<f32>>()
+            };
+            let gate = proj(&sg, si, h, &x);
+            let up = proj(&su, si, h, &x);
+            let act: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(&g, &u)| round(round(math::silu(g)) * u))
+                .collect();
+            let down = proj(&sd, h, si, &act);
+            for t in 0..tokens {
+                let scale = gate_w.as_ref().map_or(1.0, |gw| {
+                    let mut dot = 0f32;
+                    for (a, b) in x[t * h..(t + 1) * h].iter().zip(gw) {
+                        dot += a * b;
+                    }
+                    round(1.0 / (1.0 + (-round(dot)).exp()))
+                });
+                for (o, &y) in out[t * h..(t + 1) * h]
+                    .iter_mut()
+                    .zip(&down[t * h..(t + 1) * h])
+                {
+                    *o = round(*o + round(y * scale));
+                }
+            }
+        }
         store(&ctx.out, &out)
     }
+}
+
+/// The gpt-oss gated activation of one element: gate clamped to `≤ limit`, up to `±limit`,
+/// `(up + 1) · gate · σ(1.702 · gate)`, rounded after each step as the BF16 model's ops are.
+fn gptoss_glu(round: impl Fn(f32) -> f32, gate: f32, up: f32, limit: f32) -> f32 {
+    let gate = gate.min(limit);
+    let up = up.clamp(-limit, limit);
+    let sig = round(1.0 / (1.0 + (-round(gate * 1.702)).exp()));
+    let glu = round(gate * sig);
+    round(round(up + 1.0) * glu)
+}
+
+/// One expert's `[n, k]` weight as F32: BF16 weights as stored, quantized ones dequantized with
+/// the expert's scales (the 6a layouts, [`quant::dequantize`]).
+fn expert_weight(
+    cfg: &MoeExpertsConfig,
+    w: &turbine_tensor::TensorView<'_>,
+    scale: Option<&turbine_tensor::TensorView<'_>>,
+    li: usize,
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, KernelError> {
+    let one = w.rows(li, 1);
+    let scale = |what: &str| {
+        scale
+            .map(|s| s.rows(li, 1))
+            .ok_or_else(|| invalid(format!("{what} experts need their scales")))
+    };
+    let scheme = match cfg.weight_dtype {
+        ExpertDtype::Bf16 => return load(&one),
+        ExpertDtype::Fp8Block => QuantSchemeDesc::Fp8Block {
+            block_n: 128,
+            block_k: 128,
+        },
+        ExpertDtype::Fp8Tensor => QuantSchemeDesc::Fp8Tensor,
+        ExpertDtype::Mxfp4 => QuantSchemeDesc::Mxfp4,
+    };
+    let data = load_bytes(&one)?;
+    let sv = scale(cfg.weight_dtype.as_str())?;
+    let scales = if scheme == QuantSchemeDesc::Mxfp4 {
+        quant::mxfp4_scales_as_f32(&load_bytes(&sv)?)
+    } else {
+        load(&sv)?
+    };
+    Ok(quant::dequantize(scheme, &data, &scales, None, n, k))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cpu::test_util::*;
+    use crate::ops::MoeExpertsExtra;
 
     /// Ties at the k-th place go where `torch.topk` puts them (here experts 2 and 3 of four
     /// equal weights, not the lower ids 0 and 1); the chosen set is listed by descending weight,
@@ -299,6 +505,7 @@ mod tests {
             expert_begin: 0,
             expert_end: experts as u32,
             dtype: DType::F32,
+            ..Default::default()
         };
         assert!(moe.supports_experts(&cfg));
         assert_eq!(moe.implementation_experts(&cfg), "cpu_moe_experts_f32acc");
@@ -322,6 +529,7 @@ mod tests {
             host_expert_offsets: &offsets,
             out: out.view(),
             workspace: None,
+            extra: Default::default(),
         })
         .expect("experts");
 
@@ -372,6 +580,7 @@ mod tests {
                 host_expert_offsets: &[0, 1, 3, 4],
                 out: out.view(),
                 workspace: None,
+                extra: Default::default(),
             })
             .expect_err("mismatched host offsets");
         assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
@@ -396,8 +605,468 @@ mod tests {
             host_expert_offsets: &[],
             out: again.view(),
             workspace: None,
+            extra: Default::default(),
         })
         .expect("experts without host offsets");
         assert_eq!(load(&again.view()).expect("out"), with_host);
+    }
+    fn bytes_tensor(
+        mem: &Arc<dyn DeviceMemory>,
+        shape: &[usize],
+        dtype: DType,
+        b: &[u8],
+    ) -> Tensor {
+        let mut t = Tensor::empty(mem, shape, dtype).expect("alloc");
+        t.storage.copy_from_host(0, b).expect("upload");
+        t
+    }
+
+    /// Routes `tokens` seeded logit rows (softmax then top-k, renormalised) over `experts`.
+    fn route(
+        mem: &Arc<dyn DeviceMemory>,
+        tokens: usize,
+        experts: usize,
+        top_k: usize,
+        seed: u64,
+    ) -> (Tensor, Tensor, Tensor) {
+        let moe = CpuReference.moe().expect("moe family");
+        let logits = tensor(
+            mem,
+            &[tokens, experts],
+            DType::F32,
+            &seeded(seed, tokens * experts),
+        );
+        let ids = Tensor::empty(mem, &[tokens, top_k], DType::I32).expect("alloc");
+        let weights = Tensor::empty(mem, &[tokens, top_k], DType::F32).expect("alloc");
+        let sorted = Tensor::empty(mem, &[tokens * top_k], DType::I32).expect("alloc");
+        let offsets = Tensor::empty(mem, &[experts + 1], DType::I32).expect("alloc");
+        moe.route(&mut MoeRouteContext {
+            cfg: MoeRouteConfig {
+                num_experts: experts as u32,
+                top_k: top_k as u32,
+                renormalize: true,
+                ..Default::default()
+            },
+            router_logits: logits.view(),
+            topk_ids: ids.view(),
+            topk_weights: weights.view(),
+            sorted_rows: sorted.view(),
+            expert_offsets: offsets.view(),
+            router_bias: None,
+        })
+        .expect("route");
+        (weights, sorted, offsets)
+    }
+
+    /// Quantizes an `n × k` matrix: `(data, f32 scales, E8M0 scales)`.
+    fn quantize(dt: ExpertDtype, w: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<f32>, Vec<u8>) {
+        let mut data = vec![
+            0u8;
+            if dt == ExpertDtype::Mxfp4 {
+                n * k / 2
+            } else {
+                n * k
+            }
+        ];
+        match dt {
+            ExpertDtype::Fp8Block | ExpertDtype::Fp8Tensor => {
+                let (bn, bk) = if dt == ExpertDtype::Fp8Block {
+                    (128, 128)
+                } else {
+                    (n, k)
+                };
+                let (nb, kb) = (n.div_ceil(bn), k.div_ceil(bk));
+                let mut scales = vec![0f32; nb * kb];
+                for (i, s) in scales.iter_mut().enumerate() {
+                    let (bi, bj) = (i / kb, i % kb);
+                    let mut amax = 0f32;
+                    for r in bi * bn..((bi + 1) * bn).min(n) {
+                        for c in bj * bk..((bj + 1) * bk).min(k) {
+                            amax = amax.max(w[r * k + c].abs());
+                        }
+                    }
+                    *s = (amax / quant::FP8_E4M3_MAX).max(quant::FP8_MIN_SCALE);
+                }
+                for r in 0..n {
+                    for c in 0..k {
+                        let s = scales[(r / bn) * kb + c / bk];
+                        data[r * k + c] = quant::fp8_e4m3_round(w[r * k + c] / s);
+                    }
+                }
+                (data, scales, Vec::new())
+            }
+            ExpertDtype::Mxfp4 => {
+                let mut e8 = vec![0u8; n * k / 32];
+                for r in 0..n {
+                    for g in 0..k / 32 {
+                        let mut grp = [0f32; 32];
+                        grp.copy_from_slice(&w[r * k + g * 32..r * k + (g + 1) * 32]);
+                        let (packed, e) = quant::mxfp4_quantize_group(&grp);
+                        let at = (r * k + g * 32) / 2;
+                        data[at..at + 16].copy_from_slice(&packed);
+                        e8[r * (k / 32) + g] = e;
+                    }
+                }
+                (data, Vec::new(), e8)
+            }
+            _ => unreachable!("quantized dtypes only"),
+        }
+    }
+
+    /// Runs `experts` over the shared routing with `out` starting at zero.
+    #[allow(clippy::too_many_arguments)]
+    fn run_experts(
+        mem: &Arc<dyn DeviceMemory>,
+        cfg: MoeExpertsConfig,
+        x: &Tensor,
+        w: [&Tensor; 3],
+        routing: &(Tensor, Tensor, Tensor),
+        extra: MoeExpertsExtra<'_>,
+    ) -> Result<Vec<f32>, KernelError> {
+        let moe = CpuReference.moe().expect("moe family");
+        let (tokens, h) = (x.shape[0], x.shape[1]);
+        let out = tensor(mem, &[tokens, h], DType::F32, &vec![0.0; tokens * h]);
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w[0].view(),
+            w_up: w[1].view(),
+            w_down: w[2].view(),
+            sorted_rows: routing.1.view(),
+            expert_offsets: routing.2.view(),
+            topk_weights: routing.0.view(),
+            host_expert_offsets: &[],
+            out: out.view(),
+            workspace: None,
+            extra,
+        })?;
+        load(&out.view())
+    }
+
+    /// Every expert dtype on a seeded 8-expert problem equals the BF16-weight reference over the
+    /// dequantized weights; with `act_static_scale` the FP8-tensor form is W8A8 and stays within
+    /// the FP8 activation error of the reference over FP8-round-tripped inputs.
+    #[test]
+    fn quant_experts_match_dequantized() {
+        let mem = host();
+        let (h, inter, experts, top_k, tokens) = (128usize, 64usize, 8usize, 2usize, 5usize);
+        let x = tensor(&mem, &[tokens, h], DType::F32, &seeded(7, tokens * h));
+        let routing = route(&mem, tokens, experts, top_k, 11);
+        let shapes = [(inter, h), (inter, h), (h, inter)];
+        for dt in [
+            ExpertDtype::Fp8Block,
+            ExpertDtype::Fp8Tensor,
+            ExpertDtype::Mxfp4,
+        ] {
+            let mx = dt == ExpertDtype::Mxfp4;
+            let (mut data, mut scale_t, mut deq) = (Vec::new(), Vec::new(), Vec::new());
+            for (pi, &(n, k)) in shapes.iter().enumerate() {
+                let (mut d, mut s_f32, mut s_e8, mut dq) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for e in 0..experts {
+                    let w: Vec<f32> = seeded(100 * pi as u64 + e as u64 + 1, n * k)
+                        .iter()
+                        .map(|v| v * 0.5)
+                        .collect();
+                    let (bytes, sf, se) = quantize(dt, &w, n, k);
+                    let scales = if mx {
+                        quant::mxfp4_scales_as_f32(&se)
+                    } else {
+                        sf.clone()
+                    };
+                    let scheme = match dt {
+                        ExpertDtype::Fp8Block => QuantSchemeDesc::Fp8Block {
+                            block_n: 128,
+                            block_k: 128,
+                        },
+                        ExpertDtype::Fp8Tensor => QuantSchemeDesc::Fp8Tensor,
+                        _ => QuantSchemeDesc::Mxfp4,
+                    };
+                    dq.extend(quant::dequantize(scheme, &bytes, &scales, None, n, k));
+                    d.extend(bytes);
+                    s_f32.extend(sf);
+                    s_e8.extend(se);
+                }
+                let sshape: Vec<usize> = match dt {
+                    ExpertDtype::Fp8Block => vec![experts, n.div_ceil(128), k.div_ceil(128)],
+                    ExpertDtype::Fp8Tensor => vec![experts],
+                    _ => vec![experts, n, k / 32],
+                };
+                let (wdt, kk) = if mx {
+                    (DType::U8, k / 2)
+                } else {
+                    (DType::F8E4M3, k)
+                };
+                data.push(bytes_tensor(&mem, &[experts, n, kk], wdt, &d));
+                scale_t.push(if mx {
+                    bytes_tensor(&mem, &sshape, DType::U8, &s_e8)
+                } else {
+                    tensor(&mem, &sshape, DType::F32, &s_f32)
+                });
+                deq.push(tensor(&mem, &[experts, n, k], DType::F32, &dq));
+            }
+            let base = MoeExpertsConfig {
+                hidden: h as u32,
+                inter: inter as u32,
+                num_experts: experts as u32,
+                top_k: top_k as u32,
+                expert_begin: 0,
+                expert_end: experts as u32,
+                dtype: DType::F32,
+                ..Default::default()
+            };
+            let want = run_experts(
+                &mem,
+                base,
+                &x,
+                [&deq[0], &deq[1], &deq[2]],
+                &routing,
+                MoeExpertsExtra::default(),
+            )
+            .expect("reference");
+            assert!(
+                want.iter().any(|v| v.abs() > 1e-3),
+                "{dt:?}: degenerate reference"
+            );
+            let cfg = MoeExpertsConfig {
+                weight_dtype: dt,
+                ..base
+            };
+            let extra = || MoeExpertsExtra {
+                w_gate_scale: Some(scale_t[0].view()),
+                w_up_scale: Some(scale_t[1].view()),
+                w_down_scale: Some(scale_t[2].view()),
+                ..Default::default()
+            };
+            let w = [&data[0], &data[1], &data[2]];
+            let got = run_experts(&mem, cfg, &x, w, &routing, extra()).expect("quantized");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-2 * w.abs() + 1e-4,
+                    "{dt:?} element {i}: got {g}, want {w}"
+                );
+            }
+            // A missing scale is refused, not read.
+            let mut missing = extra();
+            missing.w_up_scale = None;
+            let err = run_experts(&mem, cfg, &x, w, &routing, missing).expect_err("missing scale");
+            assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
+
+            if dt == ExpertDtype::Fp8Tensor {
+                // W8A8 with a static scale of 0.05: x goes through FP8 with it, the input of
+                // down per token. Against the reference over the pre-rounded x the only
+                // difference is the down input's FP8 round trip.
+                let act = tensor(&mem, &[experts], DType::F32, &[0.05; 8]);
+                let mut w8 = extra();
+                w8.act_static_scale = Some(act.view());
+                let got8 = run_experts(&mem, cfg, &x, w, &routing, w8).expect("w8a8");
+                assert!(
+                    got8.iter().zip(&got).any(|(a, b)| (a - b).abs() > 1e-6),
+                    "the static scale changes the result"
+                );
+                let mut xq = load(&x.view()).expect("x");
+                quant::quantize_dequantize_activations(
+                    &mut xq,
+                    tokens,
+                    h,
+                    ActQuantDesc::Fp8Tensor,
+                    0.05,
+                );
+                let xq_t = tensor(&mem, &[tokens, h], DType::F32, &xq);
+                let want8 = run_experts(
+                    &mem,
+                    base,
+                    &xq_t,
+                    [&deq[0], &deq[1], &deq[2]],
+                    &routing,
+                    MoeExpertsExtra::default(),
+                )
+                .expect("reference over rounded x");
+                let rms = (want8.iter().map(|v| v * v).sum::<f32>() / want8.len() as f32).sqrt();
+                for (g, w) in got8.iter().zip(&want8) {
+                    assert!(
+                        (g - w).abs() <= 0.1 * rms + 0.05 * w.abs(),
+                        "W8A8: got {g}, want {w}"
+                    );
+                }
+
+                // A static scale for down's input changes the result against the dynamic one
+                // and stays within the same bound; down's scale alone is refused.
+                let down = tensor(&mem, &[experts], DType::F32, &[0.5; 8]);
+                let mut w8s = extra();
+                w8s.act_static_scale = Some(act.view());
+                w8s.act_static_scale_down = Some(down.view());
+                let got8s = run_experts(&mem, cfg, &x, w, &routing, w8s).expect("static down");
+                assert!(
+                    got8s.iter().zip(&got8).any(|(a, b)| (a - b).abs() > 1e-6),
+                    "the static down scale changes the result"
+                );
+                for (g, w) in got8s.iter().zip(&want8) {
+                    assert!(
+                        (g - w).abs() <= 0.2 * rms + 0.1 * w.abs(),
+                        "W8A8 static down: got {g}, want {w}"
+                    );
+                }
+                let mut only_down = extra();
+                only_down.act_static_scale_down = Some(down.view());
+                let err = run_experts(&mem, cfg, &x, w, &routing, only_down).expect_err("alone");
+                assert!(matches!(err, KernelError::InvalidArgument { .. }), "{err}");
+            }
+        }
+    }
+
+    /// One token, one expert of weight 1, `hidden = 1`, `x = 1`: the expert's gate/up columns are
+    /// the weights themselves. Gate 8.0 clamps to 7 (only the upper side clamps: −8.0 stays and
+    /// 0.5 stays); up 9.0 clamps to 7, −9.0 to −7, 2.0 stays. Interleaved columns, biases on.
+    #[test]
+    fn gptoss_clamp_activation_matches_formula() {
+        let mem = host();
+        let moe = CpuReference.moe().expect("moe family");
+        let (gate, up) = ([8.0f32, -8.0, 0.5], [9.0f32, -9.0, 2.0]);
+        let mut w_gate = Vec::new();
+        for j in 0..3 {
+            w_gate.extend([gate[j], up[j]]);
+        }
+        let glu = |g: f64, u: f64| (u + 1.0) * g * (1.0 / (1.0 + (-1.702 * g).exp()));
+        let want_sum: f64 = glu(7.0, 7.0) + glu(-8.0, -7.0) + glu(0.5, 2.0);
+        // Hand-computed anchors: gate 7 saturates the sigmoid (8 · 7 · 0.999993 = 55.9996) and
+        // gate 0.5 with up 2 gives 3 · 0.5 · σ(0.851) = 1.5 · 0.70076.
+        assert!((glu(7.0, 7.0) - 55.9996).abs() < 1e-3, "{}", glu(7.0, 7.0));
+        assert!(
+            (glu(0.5, 2.0) - 1.5 * 0.700_76).abs() < 1e-3,
+            "{}",
+            glu(0.5, 2.0)
+        );
+        let w_gate_t = tensor(&mem, &[1, 6, 1], DType::F32, &w_gate);
+        let w_up_t = tensor(&mem, &[1, 3, 1], DType::F32, &[0.0; 3]); // unused: interleaved
+        let w_down_t = tensor(&mem, &[1, 1, 3], DType::F32, &[1.0; 3]);
+        let b_gate_t = tensor(&mem, &[1, 6], DType::F32, &[0.0; 6]);
+        let b_down_t = tensor(&mem, &[1, 1], DType::F32, &[0.25]);
+        let x = tensor(&mem, &[1, 1], DType::F32, &[1.0]);
+        let out = tensor(&mem, &[1, 1], DType::F32, &[0.0]);
+        let sorted = i32_tensor(&mem, &[0]);
+        let offsets = i32_tensor(&mem, &[0, 1]);
+        let weights = tensor(&mem, &[1, 1], DType::F32, &[1.0]);
+        let cfg = MoeExpertsConfig {
+            hidden: 1,
+            inter: 3,
+            num_experts: 1,
+            top_k: 1,
+            expert_begin: 0,
+            expert_end: 1,
+            dtype: DType::F32,
+            activation: ExpertActivation::GptOssClamp { limit: 7.0 },
+            biases: true,
+            gate_up_interleaved: true,
+            ..Default::default()
+        };
+        assert!(moe.supports_experts(&cfg));
+        moe.experts(&mut MoeExpertsContext {
+            cfg,
+            x: x.view(),
+            w_gate: w_gate_t.view(),
+            w_up: w_up_t.view(),
+            w_down: w_down_t.view(),
+            sorted_rows: sorted.view(),
+            expert_offsets: offsets.view(),
+            topk_weights: weights.view(),
+            host_expert_offsets: &[],
+            out: out.view(),
+            workspace: None,
+            extra: MoeExpertsExtra {
+                b_gate: Some(b_gate_t.view()),
+                b_down: Some(b_down_t.view()),
+                ..Default::default()
+            },
+        })
+        .expect("experts");
+        let got = f64::from(load(&out.view()).expect("out")[0]);
+        assert!(
+            (got - (want_sum + 0.25)).abs() < 1e-3,
+            "got {got}, want {}",
+            want_sum + 0.25
+        );
+    }
+
+    /// The shared expert adds `σ(x · shared_gate_w) · swiglu_expert(x)` to every token.
+    #[test]
+    fn shared_expert_gate_adds_sigmoid_scaled_output() {
+        let mem = host();
+        let (h, inter, experts, tokens, si) = (3usize, 2usize, 2usize, 2usize, 2usize);
+        let x_vals = [1.0f32, -2.0, 0.5, 0.25, 1.0, -1.0];
+        let x = tensor(&mem, &[tokens, h], DType::F32, &x_vals);
+        let mk = |seed, shape: &[usize]| {
+            tensor(
+                &mem,
+                shape,
+                DType::F32,
+                &seeded(seed, shape.iter().product()),
+            )
+        };
+        let wg = mk(1, &[experts, inter, h]);
+        let wu = mk(2, &[experts, inter, h]);
+        let wd = mk(3, &[experts, h, inter]);
+        let (sg, su, sd) = (seeded(4, si * h), seeded(5, si * h), seeded(6, h * si));
+        let gate_w = [0.3f32, -0.2, 0.7];
+        let sg_t = tensor(&mem, &[si, h], DType::F32, &sg);
+        let su_t = tensor(&mem, &[si, h], DType::F32, &su);
+        let sd_t = tensor(&mem, &[h, si], DType::F32, &sd);
+        let gw_t = tensor(&mem, &[h], DType::F32, &gate_w);
+        let routing = (
+            tensor(&mem, &[tokens, 1], DType::F32, &[0.5, 0.25]),
+            i32_tensor(&mem, &[0, 1]),
+            i32_tensor(&mem, &[0, 1, 2]),
+        );
+        let base = MoeExpertsConfig {
+            hidden: h as u32,
+            inter: inter as u32,
+            num_experts: experts as u32,
+            top_k: 1,
+            expert_begin: 0,
+            expert_end: experts as u32,
+            dtype: DType::F32,
+            ..Default::default()
+        };
+        let w = [&wg, &wu, &wd];
+        let without =
+            run_experts(&mem, base, &x, w, &routing, MoeExpertsExtra::default()).expect("without");
+        let with = run_experts(
+            &mem,
+            MoeExpertsConfig {
+                shared_inter: Some(si as u32),
+                ..base
+            },
+            &x,
+            w,
+            &routing,
+            MoeExpertsExtra {
+                shared_w_gate: Some(sg_t.view()),
+                shared_w_up: Some(su_t.view()),
+                shared_w_down: Some(sd_t.view()),
+                shared_gate_w: Some(gw_t.view()),
+                ..Default::default()
+            },
+        )
+        .expect("with shared expert");
+        for t in 0..tokens {
+            let xt = &x_vals[t * h..(t + 1) * h];
+            let dot = |w: &[f32]| (0..h).map(|c| xt[c] * w[c]).sum::<f32>();
+            let act: Vec<f32> = (0..si)
+                .map(|j| {
+                    let (g, u) = (dot(&sg[j * h..(j + 1) * h]), dot(&su[j * h..(j + 1) * h]));
+                    g * sigmoid(g) * u
+                })
+                .collect();
+            let scale = sigmoid(dot(&gate_w));
+            for c in 0..h {
+                let y: f32 = (0..si).map(|j| act[j] * sd[c * si + j]).sum();
+                let (a, b) = (with[t * h + c], without[t * h + c]);
+                assert!(
+                    (a - b - scale * y).abs() < 1e-5,
+                    "token {t} col {c}: {a} - {b} vs {}",
+                    scale * y
+                );
+            }
+        }
     }
 }

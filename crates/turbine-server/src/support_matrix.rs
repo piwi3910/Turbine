@@ -95,14 +95,6 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.starts_with("parallel OlmoeForCausalLM")
-                    && l.contains("ep+tp")
-                    && l.contains("unsupported olmoe_ep_tp_drift")),
-            "{text}"
-        );
-        assert!(
-            lines
-                .iter()
                 .any(|l| l.split_whitespace().collect::<Vec<_>>()[..7]
                     == [
                         "amd",

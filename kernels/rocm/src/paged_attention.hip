@@ -73,7 +73,7 @@ __global__ void paged_append_kernel(const Bf16 *k_new, const Bf16 *v_new,
                                     const int32_t *kv_lens, int32_t num_seqs,
                                     int32_t max_blocks, int32_t num_blocks,
                                     int32_t block_tokens, int32_t kv_heads,
-                                    int64_t new_stride) {
+                                    int32_t head_dim, int64_t new_stride) {
   const int32_t row = blockIdx.x;
   // Largest s with q_indptr[s] <= row.
   int32_t lo = 0;
@@ -102,7 +102,8 @@ __global__ void paged_append_kernel(const Bf16 *k_new, const Bf16 *v_new,
   if (block < 0 || block >= num_blocks)
     return;
   const int32_t slot = pos % block_tokens;
-  const int64_t token_elems = static_cast<int64_t>(kv_heads) * kHeadDim;
+  // head_dim: 128, or 64 / 256 for the CK paths (ABI v2.17).
+  const int64_t token_elems = static_cast<int64_t>(kv_heads) * head_dim;
   Bf16 *k_dst =
       kv_layer +
       (static_cast<int64_t>(block) * 2 * block_tokens + slot) * token_elems;
@@ -685,7 +686,7 @@ int32_t launch_paged_append(turbine_ctx *ctx,
       static_cast<const Bf16 *>(d->v_new), static_cast<Bf16 *>(d->kv_layer),
       d->block_table, d->q_indptr, d->kv_lens, d->num_seqs,
       d->max_blocks_per_seq, d->num_blocks, d->block_tokens, d->num_kv_heads,
-      d->new_stride_token);
+      d->head_dim, d->new_stride_token);
   return check_hip(ctx, hipGetLastError(), "paged append kernel launch");
 }
 
