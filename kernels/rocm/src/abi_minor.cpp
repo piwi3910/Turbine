@@ -43,8 +43,11 @@ uint32_t turbine_abi_minor(void) {
 #ifdef TURBINE_V23_BUILD
   return 3u;
 #else
-  // The v2.16 expert variants are refused by turbine_moe_*_supported until P7
-  // Task 16 implements them, so the library can report the header's minor.
+  // The v2.16 expert variants are implemented by turbine_hip_moe_quant (the
+  // FP8 block / FP8 tensor / MXFP4 experts, biases, the gpt-oss activation,
+  // interleaved gate_up, the shared expert) and TOPK_THEN_SOFTMAX / router_bias
+  // by moe_route; BF16 experts with those extras are refused by
+  // turbine_moe_experts_supported.
   return TURBINE_ABI_MINOR;
 #endif
 }

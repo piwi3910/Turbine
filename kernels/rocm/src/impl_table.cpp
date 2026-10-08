@@ -38,7 +38,9 @@
 //                                  of 256), 2 turbine_hip_moe_wmma
 //                                  (multiples of 64), 3 hipblaslt_grouped
 //                                  (only when hipBLASLt has a grouped
-//                                  solution), 4 hipblaslt_per_expert; 3 and 4
+//                                  solution), 4 hipblaslt_per_expert, 5
+//                                  turbine_hip_moe_quant (the v2.16 quantized
+//                                  experts: per-expert qgemm loop); 3, 4 and 5
 //                                  read host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
@@ -272,6 +274,8 @@ const ImplEntry kMoeExperts[] = {
                                      TURBINE_IMPL_NEEDS_HOST_OFFSETS),
     entry<Experts<MoePath::PerExpert>>("hipblaslt_per_expert", kHipblaslt,
                                        TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    entry<Experts<MoePath::Quant>>("turbine_hip_moe_quant", kTurbine,
+                                   TURBINE_IMPL_NEEDS_HOST_OFFSETS),
 };
 const ImplEntry kAddRmsnorm[] = {
     entry<AddNorm<true>>("ck_tile_rmsnorm2d", kCk),

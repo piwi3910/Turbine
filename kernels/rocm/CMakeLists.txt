@@ -185,6 +185,7 @@ set(TURBINE_SOURCES
   src/moe.hip
   src/moe_small_m.hip
   src/moe_grouped.hip
+  src/moe_quant.hip
   src/logits_reduce.hip
   src/sharded_norm.hip
   src/hostmem.hip

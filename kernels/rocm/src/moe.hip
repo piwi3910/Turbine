@@ -201,37 +201,46 @@ __device__ void topk_nth_element(TopkElem *v, int32_t nth, int32_t n) {
 // is not reordered), so the probabilities, the selection and its order are
 // those of the cpu reference.
 __global__ __launch_bounds__(kTopkLanes) void moe_topk_kernel(
-    const float *logits, int32_t num_experts, int32_t top_k, int32_t flags,
-    int32_t *topk_ids, float *topk_weights) {
+    const float *logits, const float *router_bias, int32_t num_experts,
+    int32_t top_k, int32_t flags, int32_t *topk_ids, float *topk_weights) {
   __shared__ TopkElem v[kMoeMaxExperts];
   __shared__ float total;
   const int64_t t = blockIdx.x;
   const int lane = static_cast<int>(threadIdx.x);
   const float *row = logits + t * num_experts;
   const bool bf16_logits = (flags & TURBINE_MOE_ROUTE_BF16_LOGITS) != 0;
+  // v2.16 gpt-oss routing: the top-k of the biased logits, then a softmax over
+  // those k only.
+  const bool topk_first = (flags & TURBINE_ROUTE_TOPK_THEN_SOFTMAX) != 0;
   float max = kNegInf;
   for (int32_t e = lane; e < num_experts; e += kTopkLanes) {
-    const float x = bf16_logits ? round_bf16(row[e]) : row[e];
+    // The router bias is part of the router linear's output: added before the
+    // BF16 rounding.
+    float x = router_bias != nullptr ? row[e] + router_bias[e] : row[e];
+    if (bf16_logits)
+      x = round_bf16(x);
     v[e].v = x;
     v[e].i = e;
     max = fmaxf(max, x);
   }
+  if (!topk_first) {
 #pragma unroll
-  for (int off = kTopkLanes / 2; off > 0; off /= 2)
-    max = fmaxf(max, __shfl_xor(max, off, kTopkLanes));
-  for (int32_t e = lane; e < num_experts; e += kTopkLanes)
-    v[e].v = expf(v[e].v - max);
-  __syncthreads();
-  if (lane == 0) {
-    float sum = 0.0f;
-    for (int32_t e = 0; e < num_experts; ++e)
-      sum += v[e].v;
-    total = sum;
+    for (int off = kTopkLanes / 2; off > 0; off /= 2)
+      max = fmaxf(max, __shfl_xor(max, off, kTopkLanes));
+    for (int32_t e = lane; e < num_experts; e += kTopkLanes)
+      v[e].v = expf(v[e].v - max);
+    __syncthreads();
+    if (lane == 0) {
+      float sum = 0.0f;
+      for (int32_t e = 0; e < num_experts; ++e)
+        sum += v[e].v;
+      total = sum;
+    }
+    __syncthreads();
+    const float sum = total;
+    for (int32_t e = lane; e < num_experts; e += kTopkLanes)
+      v[e].v = v[e].v / sum;
   }
-  __syncthreads();
-  const float sum = total;
-  for (int32_t e = lane; e < num_experts; e += kTopkLanes)
-    v[e].v = v[e].v / sum;
   __syncthreads();
   if (lane != 0)
     return;
@@ -255,6 +264,19 @@ __global__ __launch_bounds__(kTopkLanes) void moe_topk_kernel(
   for (int32_t slot = 0; slot < top_k; ++slot) {
     ids[slot] = v[slot].i;
     weights[slot] = v[slot].v;
+  }
+  if (topk_first) {
+    // The chosen are in descending order: slot 0 is the maximum. Sequential
+    // sum in slot order, as the reference.
+    const float top = weights[0];
+    float chosen_sum = 0.0f;
+    for (int32_t slot = 0; slot < top_k; ++slot) {
+      weights[slot] = expf(weights[slot] - top);
+      chosen_sum += weights[slot];
+    }
+    for (int32_t slot = 0; slot < top_k; ++slot)
+      weights[slot] /= chosen_sum;
+    return;
   }
   if ((flags & TURBINE_MOE_ROUTE_RENORMALIZE) != 0) {
     float chosen_sum = 0.0f;
@@ -406,8 +428,9 @@ int32_t launch_moe_route(turbine_ctx *ctx, const turbine_moe_route_desc *d) {
   if (d->num_tokens > 0) {
     hipLaunchKernelGGL(
         moe_topk_kernel, dim3(static_cast<unsigned>(d->num_tokens)),
-        dim3(kTopkLanes), 0, ctx->stream, d->router_logits, d->num_experts,
-        d->top_k, d->flags, d->topk_ids, d->topk_weights);
+        dim3(kTopkLanes), 0, ctx->stream, d->router_logits,
+        static_cast<const float *>(d->router_bias), d->num_experts, d->top_k,
+        d->flags, d->topk_ids, d->topk_weights);
     if (int32_t rc =
             check_hip(ctx, hipGetLastError(), "moe top-k kernel launch");
         rc != TURBINE_OK) {
