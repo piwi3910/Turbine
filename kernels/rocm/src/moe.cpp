@@ -39,6 +39,7 @@
 // otherwise in a context-owned scratch buffer grown on demand.
 #include <hipblaslt/hipblaslt-ext.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -61,6 +62,8 @@ constexpr const char *kImplSmallM = "turbine_hip_moe_small_m";
 constexpr const char *kImplWmmaPrefill = "turbine_hip_moe_wmma_prefill";
 constexpr const char *kImplWmma = "turbine_hip_moe_wmma";
 constexpr const char *kImplQuant = "turbine_hip_moe_quant";
+constexpr const char *kImplQuantLoop = "turbine_hip_moe_quant_loop";
+constexpr const char *kImplQuantGrouped = "turbine_hip_moe_quant_grouped";
 constexpr const char *kImplPerExpert = "hipblaslt_per_expert";
 constexpr const char *kImplGrouped = "hipblaslt_grouped";
 constexpr size_t kAlign = 256;
@@ -552,7 +555,57 @@ int32_t run_shared_expert(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
       ctx, d->x, sdown, d->shared_gate_w, d->out, d->num_tokens, d->hidden);
 }
 
-int32_t run_quant(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
+// Which of the two projection paths run_quant takes: Auto = the per-expert
+// loop below kGroupedMinRows routed rows and for the formats the grouped
+// kernel does not win on, the grouped kernel otherwise; Loop / Grouped force
+// one (impls turbine_hip_moe_quant_loop / _grouped).
+enum class QuantMode { Auto, Loop, Grouped };
+
+bool is_quant_path(turbine_hip::MoePath path) {
+  using turbine_hip::MoePath;
+  return path == MoePath::Quant || path == MoePath::QuantLoop ||
+         path == MoePath::QuantGrouped;
+}
+
+QuantMode quant_mode(turbine_hip::MoePath path) {
+  using turbine_hip::MoePath;
+  return path == MoePath::QuantLoop      ? QuantMode::Loop
+         : path == MoePath::QuantGrouped ? QuantMode::Grouped
+                                         : QuantMode::Auto;
+}
+
+// Routed rows from which Auto runs the grouped kernel.
+constexpr int64_t kGroupedMinRows = 64;
+
+// The formats Auto runs grouped, measured over the full op on the Task 14
+// shapes at 256 and 2048 tokens (perf-log "P7 grouped quantized experts"):
+// FP8 block (Qwen3, 128 small experts) 1445 / 3595 us vs the loop's 7873 /
+// 9585, MXFP4 (gpt-oss) 1585 / 6364 vs 3551 / 7381. FP8 tensor (Mixtral, 8
+// large experts, W8A8) stays on the loop: the loop's per-expert hipBLASLt FP8
+// GEMMs run the big matrices faster than the fp8_fp8 WMMA chain (4667 / 8083
+// us vs the grouped kernel's 4785 / 12856), and 8 launches save little.
+bool grouped_wins(int32_t weight_dtype) {
+  switch (weight_dtype) {
+  case TURBINE_EXPERT_FP8_BLOCK:
+    return true;
+  case TURBINE_EXPERT_MXFP4:
+    return true;
+  default: // TURBINE_EXPERT_FP8_TENSOR: the loop.
+    return false;
+  }
+}
+
+// What the grouped kernel needs of the shape: 64-wide column tiles over
+// gate_up and down, 64-deep k steps.
+bool grouped_shape(const turbine_moe_experts_desc *d) {
+  if (d->hidden % 64 != 0 || d->inter % 64 != 0)
+    return false;
+  return d->weight_dtype != TURBINE_EXPERT_FP8_BLOCK ||
+         (d->hidden % 128 == 0 && d->inter % 128 == 0);
+}
+
+int32_t run_quant(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
+                  QuantMode mode) {
   const int32_t *host = d->host_expert_offsets;
   const int64_t all_rows = static_cast<int64_t>(d->num_tokens) * d->top_k;
   if (host[0] != 0 || host[d->num_experts] != all_rows) {
@@ -679,7 +732,62 @@ int32_t run_quant(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
     const size_t up_code = weight_code_bytes(wd, inter, h);
     const size_t up_scale = weight_scale_bytes(wd, inter, h);
 
-    for (int32_t e = lo; e < hi; ++e) {
+    bool grouped = mode == QuantMode::Grouped ||
+                   (mode == QuantMode::Auto && rows >= kGroupedMinRows &&
+                    grouped_wins(wd) && grouped_shape(d));
+    if (grouped &&
+        (!grouped_shape(d) || !aligned16(d->w_gate) || !aligned16(d->w_down) ||
+         (!interleaved && !aligned16(d->w_up)))) {
+      if (mode == QuantMode::Grouped) {
+        return fail(ctx, TURBINE_E_UNSUPPORTED,
+                    "turbine_moe_experts: the grouped quantized experts need "
+                    "hidden and inter multiples of 64 (128 for FP8 block) and "
+                    "16-byte aligned weights");
+      }
+      grouped = false;
+    }
+    // Grouped W8A8 tiles read 64 activation bytes per row: a is the e4m3
+    // buffer of the gathered rows (quantized above).
+    int32_t active = 0;
+    for (int32_t e = lo; e < hi; ++e)
+      active += host[e + 1] > host[e] ? 1 : 0;
+    // 128-row tiles once every active expert averages ~96 rows; below that the
+    // 64-row tiles spread each expert's weights over more blocks.
+    const bool wide =
+        rows >= 96 * static_cast<int64_t>(active < 1 ? 1 : active);
+    if (grouped) {
+      turbine_hip::MoeQuantGrouped g{};
+      g.a = reinterpret_cast<const uint8_t *>(w8a8 ? xq : xs);
+      g.lda = h;
+      g.w[0] = reinterpret_cast<const uint8_t *>(w_gate);
+      g.s[0] = reinterpret_cast<const uint8_t *>(s_gate);
+      g.n[0] = static_cast<int32_t>(gate_n);
+      g.code_stride[0] = static_cast<int64_t>(gate_code);
+      g.scale_stride[0] = static_cast<int64_t>(gate_scale);
+      g.n_total = static_cast<int32_t>(gate_n);
+      if (!interleaved) {
+        g.w[1] = reinterpret_cast<const uint8_t *>(w_up);
+        g.s[1] = reinterpret_cast<const uint8_t *>(s_up);
+        g.n[1] = static_cast<int32_t>(inter);
+        g.code_stride[1] = static_cast<int64_t>(up_code);
+        g.scale_stride[1] = static_cast<int64_t>(up_scale);
+        g.n_total += static_cast<int32_t>(inter);
+      }
+      g.a_scale = d->act_static_scale;
+      g.a_scale_vec = 0;
+      g.offsets = d->expert_offsets;
+      g.expert_begin = lo;
+      g.num_local = hi - lo;
+      g.first = first32;
+      g.k = static_cast<int32_t>(h);
+      g.ldc = 2 * inter;
+      g.out = gu;
+      if (rc = turbine_hip::launch_moe_quant_grouped(ctx, wd, g, rows, wide);
+          rc != TURBINE_OK) {
+        return rc;
+      }
+    }
+    for (int32_t e = lo; e < hi && !grouped; ++e) {
       const int64_t count = host[e + 1] - host[e];
       if (count == 0)
         continue;
@@ -737,7 +845,31 @@ int32_t run_quant(turbine_ctx *ctx, const turbine_moe_experts_desc *d) {
     }
     const size_t down_code = weight_code_bytes(wd, h, inter);
     const size_t down_scale = weight_scale_bytes(wd, h, inter);
-    for (int32_t e = lo; e < hi; ++e) {
+    if (grouped) {
+      turbine_hip::MoeQuantGrouped g{};
+      g.a = reinterpret_cast<const uint8_t *>(w8a8 ? actq : act);
+      g.lda = inter;
+      g.w[0] = reinterpret_cast<const uint8_t *>(w_down);
+      g.s[0] = reinterpret_cast<const uint8_t *>(s_down);
+      g.n[0] = static_cast<int32_t>(h);
+      g.code_stride[0] = static_cast<int64_t>(down_code);
+      g.scale_stride[0] = static_cast<int64_t>(down_scale);
+      g.n_total = static_cast<int32_t>(h);
+      g.a_scale = static_down ? d->act_static_scale_down : asc;
+      g.a_scale_vec = static_down ? 0 : 1;
+      g.offsets = d->expert_offsets;
+      g.expert_begin = lo;
+      g.num_local = hi - lo;
+      g.first = first32;
+      g.k = static_cast<int32_t>(inter);
+      g.ldc = h;
+      g.out = down;
+      if (rc = turbine_hip::launch_moe_quant_grouped(ctx, wd, g, rows, wide);
+          rc != TURBINE_OK) {
+        return rc;
+      }
+    }
+    for (int32_t e = lo; e < hi && !grouped; ++e) {
       const int64_t count = host[e + 1] - host[e];
       if (count == 0)
         continue;
@@ -841,6 +973,10 @@ const char *moe_path_name(MoePath path) {
     return kImplPerExpert;
   case MoePath::Quant:
     return kImplQuant;
+  case MoePath::QuantLoop:
+    return kImplQuantLoop;
+  case MoePath::QuantGrouped:
+    return kImplQuantGrouped;
   }
   return kImplPerExpert;
 }
@@ -850,8 +986,10 @@ bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
     return false;
   // The quantized experts have their own path; the BF16 paths take only the
   // pre-v2.16 form (experts_supported admits nothing else of BF16).
-  if (path == MoePath::Quant)
+  if (path == MoePath::Quant || path == MoePath::QuantLoop)
     return quantized(d);
+  if (path == MoePath::QuantGrouped)
+    return quantized(d) && grouped_shape(d);
   if (quantized(d))
     return false;
   switch (path) {
@@ -866,6 +1004,8 @@ bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path) {
   case MoePath::PerExpert:
     return true;
   case MoePath::Quant:
+  case MoePath::QuantLoop:
+  case MoePath::QuantGrouped:
     return false;
   }
   return false;
@@ -903,15 +1043,14 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
   }
   if (d->num_tokens == 0)
     return TURBINE_OK;
-  const bool w_up_unused =
-      path == MoePath::Quant && d->gate_up_interleaved != 0;
+  const bool w_up_unused = is_quant_path(path) && d->gate_up_interleaved != 0;
   if (d->x == nullptr || d->w_gate == nullptr ||
       (d->w_up == nullptr && !w_up_unused) || d->w_down == nullptr ||
       d->sorted_rows == nullptr || d->topk_weights == nullptr ||
       d->out == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT, "turbine_moe_experts: NULL operand");
   }
-  if (path == MoePath::Quant && d->expert_offsets == nullptr) {
+  if (is_quant_path(path) && d->expert_offsets == nullptr) {
     return fail(ctx, TURBINE_E_ARGUMENT,
                 "turbine_moe_experts: expert_offsets is NULL");
   }
@@ -923,8 +1062,8 @@ int32_t moe_experts_run(turbine_ctx *ctx, const turbine_moe_experts_desc *d,
     return rc;
   if (device_offsets)
     return run_device_offsets(ctx, d, path);
-  if (path == MoePath::Quant)
-    return run_quant(ctx, d);
+  if (is_quant_path(path))
+    return run_quant(ctx, d, quant_mode(path));
   return run_experts(ctx, d, path == MoePath::Grouped);
 }
 

@@ -663,6 +663,112 @@ int main(int argc, char **argv) {
                     sh.name, fmt_name, T, (long long)rows, r.active.size(),
                     f8f8, f8bf, bfbf);
       }
+      // The quantized experts as turbine_moe_experts runs them (P7 Task 16:
+      // gate_up interleaved, SwiGLU, down, scatter; the full op incl. the
+      // activation, W8A8 quantize and scatter, so these rows are above the
+      // GEMM-only own_loop rows by that elementwise work), each path alone:
+      // the per-expert qgemm loop and the grouped prefill kernel.
+      for (const char *impl_name :
+           {"turbine_hip_moe_quant_loop", "turbine_hip_moe_quant_grouped"}) {
+        if (!listed(cands_arg, impl_name) || check_only)
+          continue;
+        int32_t impl_index = -1;
+        for (int32_t i = 0; i < turbine_impl_count(TURBINE_OP_MOE_EXPERTS);
+             ++i) {
+          turbine_impl_entry e{};
+          turbine_impl_info(TURBINE_OP_MOE_EXPERTS, i, &e);
+          if (std::string(e.name) == impl_name)
+            impl_index = i;
+        }
+        if (impl_index < 0) {
+          std::printf("%s %s %d %lld %zu fused %s - - missing\n", sh.name,
+                      fmt_name, T, (long long)rows, r.active.size(), impl_name);
+          continue;
+        }
+        int32_t *d_rows, *d_off;
+        float *d_w, *d_as;
+        check_hip(hipMalloc(&d_rows, r.sorted_rows.size() * 4), "m");
+        check_hip(hipMalloc(&d_off, r.offsets.size() * 4), "m");
+        check_hip(hipMalloc(&d_w, r.weights.size() * 4), "m");
+        check_hip(hipMalloc(&d_as, sh.experts * 4), "m");
+        hipMemcpy(d_rows, r.sorted_rows.data(), r.sorted_rows.size() * 4,
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_off, r.offsets.data(), r.offsets.size() * 4,
+                  hipMemcpyHostToDevice);
+        hipMemcpy(d_w, r.weights.data(), r.weights.size() * 4,
+                  hipMemcpyHostToDevice);
+        const std::vector<float> as_host(sh.experts, act_scale);
+        hipMemcpy(d_as, as_host.data(), sh.experts * 4, hipMemcpyHostToDevice);
+        auto make = [&](int copy) {
+          turbine_moe_experts_desc m{};
+          m.x = d_xgu;
+          m.w_gate = gu.d_codes[copy % gu.copies];
+          m.w_gate_scale = gu.d_scales[copy % gu.copies];
+          m.w_down = dn.d_codes[copy % dn.copies];
+          m.w_down_scale = dn.d_scales[copy % dn.copies];
+          m.sorted_rows = d_rows;
+          m.expert_offsets = d_off;
+          m.topk_weights = d_w;
+          m.host_expert_offsets = r.offsets.data();
+          m.out = d_odn;
+          m.num_tokens = T;
+          m.hidden = static_cast<int32_t>(H);
+          m.inter = static_cast<int32_t>(I);
+          m.top_k = sh.topk;
+          m.num_experts = sh.experts;
+          m.expert_begin = 0;
+          m.expert_end = sh.experts;
+          m.dtype = TURBINE_DTYPE_BF16;
+          m.weight_dtype = sh.fmt == Fmt::Fp8Block ? TURBINE_EXPERT_FP8_BLOCK
+                           : sh.fmt == Fmt::Fp8Tensor
+                               ? TURBINE_EXPERT_FP8_TENSOR
+                               : TURBINE_EXPERT_MXFP4;
+          m.activation = TURBINE_EXPERT_SWIGLU;
+          m.gate_up_interleaved = 1;
+          if (sh.fmt == Fmt::Fp8Tensor)
+            m.act_static_scale = m.act_static_scale_down = d_as;
+          return m;
+        };
+        turbine_moe_experts_desc m0 = make(0);
+        int32_t rc =
+            turbine_impl_run(ctx, TURBINE_OP_MOE_EXPERTS, impl_index, &m0);
+        if (rc == TURBINE_OK)
+          rc = turbine_stream_sync(ctx);
+        if (rc != TURBINE_OK) {
+          std::printf("%s %s %d %lld %zu fused %s - - error %s\n", sh.name,
+                      fmt_name, T, (long long)rows, r.active.size(), impl_name,
+                      last_err(ctx).c_str());
+        } else {
+          int copy = 1;
+          for (int i = 0; i < 3; ++i) {
+            turbine_moe_experts_desc m = make(copy++);
+            turbine_impl_run(ctx, TURBINE_OP_MOE_EXPERTS, impl_index, &m);
+          }
+          turbine_stream_sync(ctx);
+          std::vector<double> per;
+          for (int rd2 = 0; rd2 < rounds; ++rd2) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+              turbine_moe_experts_desc m = make(copy++);
+              turbine_impl_run(ctx, TURBINE_OP_MOE_EXPERTS, impl_index, &m);
+            }
+            turbine_stream_sync(ctx);
+            per.push_back(std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count() /
+                          iters);
+          }
+          std::printf("%s %s %d %lld %zu fused %s %.1f - - full op incl. "
+                      "activation + scatter\n",
+                      sh.name, fmt_name, T, (long long)rows, r.active.size(),
+                      impl_name, median(per));
+        }
+        std::fflush(stdout);
+        hipFree(d_rows);
+        hipFree(d_off);
+        hipFree(d_w);
+        hipFree(d_as);
+      }
       // BF16 fused MoE of the same shape (reference cost)
       if (listed(cands_arg, "bf16_moe_fused") && !check_only) {
         static void *wg = nullptr, *wu = nullptr, *wd = nullptr, *ws = nullptr;
