@@ -340,7 +340,7 @@ Interfaces:
 
 ## Task 16: HIP quantized experts and the quantized-MoE loader (S-4)
 
-Files: `kernels/rocm/src/moe_quant.hip` (new, or the vendored provider under `kernels/rocm/third_party/<provider>/` with its licence in `kernels/rocm/third_party/LICENSES/`, per Task 14's decision), `kernels/rocm/src/moe.cpp` (dispatch on `weight_dtype`, activation, biases, shared expert), `kernels/rocm/src/abi_minor.cpp` (16), `kernels/rocm/CMakeLists.txt`, `crates/turbine-kernels/tests/hip_moe_quant.rs` (new), `crates/turbine-kernels/tests/hip_batch_invariance.rs` (`quant_experts_batch_invariant` lives in `hip_moe_quant.rs` with the same conventions), `crates/turbine-model/src/weights/mod.rs` and the `hf_fp8` / `ct_fp8` / `openai_mxfp4` modules (expert tensors repacked to the expert layout), `crates/turbine-model/src/executor/decoder/mod.rs` (`quant_moe_phase7` refusal narrowed), `crates/turbine-model/tests/tiny_model.rs`
+Files: `kernels/rocm/src/moe_quant.hip` (new; own kernels per Task 14's decision, user 2026-10-08: B in C's order — the per-expert loop of `kernels/rocm/tools/moe_quant_eval/` lands first and serves decode and prefill, a grouped one-launch prefill kernel follows only after a measured gain), `kernels/rocm/src/moe.cpp` (dispatch on `weight_dtype`, activation, biases, shared expert), `kernels/rocm/src/abi_minor.cpp` (16), `kernels/rocm/CMakeLists.txt`, `crates/turbine-kernels/tests/hip_moe_quant.rs` (new), `crates/turbine-kernels/tests/hip_batch_invariance.rs` (`quant_experts_batch_invariant` lives in `hip_moe_quant.rs` with the same conventions), `crates/turbine-model/src/weights/mod.rs` and the `hf_fp8` / `ct_fp8` / `openai_mxfp4` modules (expert tensors repacked to the expert layout), `crates/turbine-model/src/executor/decoder/mod.rs` (`quant_moe_phase7` refusal narrowed), `crates/turbine-model/tests/tiny_model.rs`
 Interfaces:
 
 - Loader: expert slots `mlp.experts.N.{gate,up,down}_proj.weight` (+ `weight_scale_inv` / `weight_scale` / `input_scale`) stacked into `[experts, n, k]` per dtype; gpt-oss's fused `mlp.experts.gate_up_proj_{blocks,scales,bias}` and `down_proj_{blocks,scales,bias}` mapped to `gate_up_interleaved`
@@ -350,7 +350,8 @@ Interfaces:
   Depends on: Task 15
 
 - [ ] Write the four lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_moe_quant` — expect FAIL with "TURBINE_E_UNSUPPORTED" (library minor 15)
-- [ ] Implement the HIP dispatch over the decided provider — run, expect PASS.
+- [ ] Implement the HIP dispatch on the own per-expert loop (one `qgemm` launch per active expert for gate_up and down, fp8 block / fp8 tensor / mxfp4 inner loops reused, clamp, biases and interleaved gate_up in the epilogue) — run, expect PASS.
+- [ ] Grouped prefill kernel (decision B, C's order): add `turbine_moe_quant_grouped` in `kernels/rocm/src/moe_quant.hip` (one launch over all active experts, a tile-per-expert schedule as `turbine_moe_experts` wmma_prefill, same inner loops and epilogue), dispatched at ≥ 64 routed rows; extend the four lab tests to run both paths. Measure with `kernels/rocm/tools/moe_quant_eval/` on GPU 0 under the bench lock at 256 and 2048 tokens on the three Task 14 shapes; keep the grouped path only where it is faster than the loop (perf-log row "P7 grouped quantized experts" with both numbers per shape), else leave it unregistered for that format and record why in the same row.
 - [ ] Write failing host test `tiny_model quantized_moe_matches_dequantized_bf16` (tiny Qwen3-MoE FP8-block, tiny Mixtral FP8-tensor and tiny MXFP4-expert checkpoints written by the fixture writer; CPU executor output equals the dequantized BF16 checkpoint within the 6a host bound) and update `tiny_model`'s existing `quant_moe_phase7` assertion to an AWQ-expert case. Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model quantized_moe` — expect FAIL; implement the loader repack and narrow the refusal — expect PASS.
 - [ ] `grep -rn quant_moe_phase7 crates/` — expect only the narrowed refusal, its doc line and its test.
 - [ ] Gate: `scripts/gate.sh`, `scripts/lab-test.sh novanas --tier quick` and `scripts/lab-bench.sh --quick --model olmoe` — expect `gate: ok`, exit 0 and OLMoE BF16 tok/s within 1 % (perf-log row)
@@ -583,12 +584,12 @@ Interfaces:
 
 - [x] Build and run the harness on novanas under `scripts/bench-lock.sh`: correctness against the F32 recurrence (max |Δ| on outputs and final state) and median µs per shape for each candidate.
 - [x] Write the decisions.md entry "P7 Gated DeltaNet provider" with the timing table and options: A llama.cpp decode + AITER chunk-h prefill (+ own glue stages), B llama.cpp everywhere, C own kernels where measurably faster.
-- [ ] ASK THE USER for the decision; record it under the entry.
-- [ ] Commit: `docs(decisions): P7 Gated DeltaNet provider evaluation`
+- [x] ASK THE USER for the decision; record it under the entry (decision B, 2026-10-08).
+- [x] Commit: `docs(decisions): P7 Gated DeltaNet provider evaluation`
 
 ## Task 30: GDN and causal-conv ABI v2.18 and the HIP kernels (S-11)
 
-Files: `kernels/include/turbine_kernels.h` (`turbine_gdn_desc`, `turbine_gdn_prefill`, `turbine_gdn_decode`, `turbine_conv1d_desc`, `turbine_conv1d_prefill`, `turbine_conv1d_update`, each with `_supported`/`_impl`; `TURBINE_ABI_MINOR 18u`), `kernels/rocm/src/gdn.hip` / vendored providers per Task 29, `kernels/rocm/src/conv1d.hip`, `kernels/rocm/CMakeLists.txt`, `kernels/rocm/third_party/LICENSES/`, `crates/turbine-kernels/src/ffi.rs`, `crates/turbine-kernels/src/ops/mod.rs` (`GdnConfig`, `Conv1dConfig`), `crates/turbine-kernels/src/cpu/gdn.rs` (new reference), `crates/turbine-kernels/src/cpu/mod.rs`, `crates/turbine-kernels/tests/hip_gdn.rs` (new)
+Files: `kernels/include/turbine_kernels.h` (`turbine_gdn_desc`, `turbine_gdn_prefill`, `turbine_gdn_decode`, `turbine_conv1d_desc`, `turbine_conv1d_prefill`, `turbine_conv1d_update`, each with `_supported`/`_impl`; `TURBINE_ABI_MINOR 18u`), `kernels/rocm/src/gdn.hip` and `kernels/rocm/src/conv1d.hip` (decision B of Task 29, "P7 Gated DeltaNet provider": `kernels/rocm/third_party/llama.cpp/` `gated_delta_net` adapted to BF16 loads and transformers' `h / 2` value-to-key head pairing for decode and prefill, and `ssm_conv` for conv decode with the state read from the slot; `kernels/rocm/third_party/aiter/` `causal_conv1d_fwd_split_qkv` for conv prefill; pinned commits as in `kernels/rocm/tools/gdn_eval/build.sh`), `kernels/rocm/CMakeLists.txt`, `kernels/rocm/third_party/LICENSES/`, `crates/turbine-kernels/src/ffi.rs`, `crates/turbine-kernels/src/ops/mod.rs` (`GdnConfig`, `Conv1dConfig`), `crates/turbine-kernels/src/cpu/gdn.rs` (new reference), `crates/turbine-kernels/src/cpu/mod.rs`, `crates/turbine-kernels/tests/hip_gdn.rs` (new)
 Interfaces:
 
 - `turbine_gdn_desc { const void *q, *k, *v; const float *g, *beta; float *state /* [seqs, v_heads, k_dim, v_dim] F32, updated in place */; const int32_t *state_slots; const int32_t *cu_seqlens; void *out; float *boundary_states /* nullable: the state after every boundary_tokens tokens of each sequence (Task 32 snapshots) */; int32_t boundary_tokens; int32_t num_tokens, num_seqs, k_heads, v_heads, k_dim, v_dim; int32_t dtype; }`; `turbine_conv1d_desc { const void *x, *w, *bias; void *conv_state /* [seqs, channels, k-1] */; const int32_t *state_slots, *cu_seqlens; void *out; void *boundary_conv_states /* nullable, as boundary_states */; int32_t boundary_tokens; int32_t num_tokens, num_seqs, channels, kernel; int32_t activation /* 1 = SiLU */; int32_t dtype; }`
@@ -597,11 +598,13 @@ Interfaces:
   Covers: S-11 AC (`hip_gdn`), edge case "chunked prefill splitting a GDN chunk boundary"
   Depends on: Task 29
 
-- [ ] Write failing CPU tests `cpu::gdn::tests::recurrence_matches_naive` and `cpu::gdn::tests::split_prefill_equals_whole` (state carried across a split). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::gdn` — expect FAIL with "could not find `gdn`"; implement the reference — expect PASS.
-- [ ] Write the four lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_gdn` — expect FAIL with "TURBINE_E_UNSUPPORTED"
-- [ ] Implement header, FFI and HIP per the decision — run, expect PASS.
+As built (lead-approved changes to the interfaces above): the state is stored `[slots, v_heads, v_dim, k_dim]` (llama.cpp's layout, k contiguous, not `[k_dim, v_dim]`); callers treat it as opaque `v_heads · v_dim · k_dim` F32 blocks per slot, so `state_layout` byte counts are unchanged. `turbine_gdn_desc` and `turbine_conv1d_desc` gain token row strides in elements (`q_stride`, `k_stride`, `v_stride`, `out_stride`; `x_stride`, `out_stride`) so a conv1d output row `q | k | v` feeds the GDN in place with no split copy (the Rust contexts take `TensorView`s whose `strides[0]` is the row stride); `GdnConfig` and `Conv1dConfig` carry `dtype` next to `mode` (`GdnMode::{Prefill, Decode}` serves both; for conv1d `Decode` is the `conv1d_update` op). The op codes are appended: `GdnPrefill` 20, `GdnDecode` 21, `Conv1dPrefill` 22, `Conv1dUpdate` 23 (one trio each; `turbine_gdn_*` / `turbine_conv1d_*`), minor 18. The vendored kernels live inside `kernels/rocm/src/gdn.hip` and `conv1d.hip` between provenance markers (the repository's pattern for third-party device code, as `gemm_wvsplitk.hip`), with the licences in `kernels/rocm/third_party/LICENSES/` (`llama.cpp-LICENSE`, `aiter-LICENSE`), not as files under `third_party/<project>/`.
+
+- [x] Write failing CPU tests `cpu::gdn::tests::recurrence_matches_naive` and `cpu::gdn::tests::split_prefill_equals_whole` (state carried across a split). Run: `scripts/remote-cargo.sh test -p turbine-kernels cpu::gdn` — expect FAIL with "could not find `gdn`"; implement the reference — expect PASS.
+- [x] Write the four lab tests. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_gdn` — expect FAIL with "TURBINE_E_UNSUPPORTED"
+- [x] Implement header, FFI and HIP per the decision — run, expect PASS.
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0
-- [ ] Commit: `feat(kernels): gated delta net and causal conv1d (ABI v2.18)`
+- [x] Commit: `feat(kernels): gated delta net and causal conv1d (ABI v2.18)`
 
 ## Task 31: Qwen3.5 hybrid family (dense) on CPU and HIP (S-11, S-18 part 2)
 

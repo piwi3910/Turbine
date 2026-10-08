@@ -45,8 +45,8 @@ use turbine_tensor::{
 
 use crate::cards::CardProfile;
 use crate::ffi::{
-    self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, CopyBlocksDesc, CtxInfo,
-    EmbeddingDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
+    self, AddDesc, AddRmsnormDesc, AttentionDesc, AttentionPagedDesc, Conv1dDesc, CopyBlocksDesc,
+    CtxInfo, EmbeddingDesc, GdnDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
     MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc,
     QuantizeActDesc, RmsnormDesc, RmsnormShardedDesc, RopeDesc, RowSumsqDesc, ShimSymbols,
     SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent, TurbineGraph,
@@ -54,8 +54,9 @@ use crate::ffi::{
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
     AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel, AttentionKind,
-    ElementwiseConfig, ElementwiseContext, ElementwiseKernel, EmbeddingConfig, EmbeddingContext,
-    EmbeddingKernel, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel, ImplChoice,
+    Conv1dConfig, Conv1dContext, Conv1dKernel, ElementwiseConfig, ElementwiseContext,
+    ElementwiseKernel, EmbeddingConfig, EmbeddingContext, EmbeddingKernel, GdnConfig, GdnContext,
+    GdnKernel, GdnMode, GemmConfig, GemmContext, GemmFused, GemmFusion, GemmKernel, ImplChoice,
     ImplInfo, KernelProvider, KvCopyConfig, KvCopyContext, KvCopyKernel, KvTranscodeConfig,
     KvTranscodeContext, KvTranscodeDirection, KvTranscodeFormat, KvTranscodeKernel,
     KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
@@ -1684,6 +1685,55 @@ fn qgemm_bf16_acts_probe(cfg: &QGemmConfig, rows: usize, prefill: bool) -> QGemm
     d
 }
 
+fn gdn_probe(cfg: &GdnConfig) -> GdnDesc {
+    GdnDesc {
+        q: std::ptr::null(),
+        k: std::ptr::null(),
+        v: std::ptr::null(),
+        g: std::ptr::null(),
+        beta: std::ptr::null(),
+        state: std::ptr::null_mut(),
+        state_slots: std::ptr::null(),
+        cu_seqlens: std::ptr::null(),
+        out: null(),
+        boundary_states: std::ptr::null_mut(),
+        q_stride: i64::from(cfg.k_heads * cfg.k_dim),
+        k_stride: i64::from(cfg.k_heads * cfg.k_dim),
+        v_stride: i64::from(cfg.v_heads * cfg.v_dim),
+        out_stride: i64::from(cfg.v_heads * cfg.v_dim),
+        boundary_tokens: 0,
+        num_tokens: 1,
+        num_seqs: 1,
+        k_heads: cfg.k_heads as i32,
+        v_heads: cfg.v_heads as i32,
+        k_dim: cfg.k_dim as i32,
+        v_dim: cfg.v_dim as i32,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
+fn conv1d_probe(cfg: &Conv1dConfig) -> Conv1dDesc {
+    Conv1dDesc {
+        x: std::ptr::null(),
+        w: std::ptr::null(),
+        bias: std::ptr::null(),
+        conv_state: null(),
+        state_slots: std::ptr::null(),
+        cu_seqlens: std::ptr::null(),
+        out: null(),
+        boundary_conv_states: null(),
+        x_stride: i64::from(cfg.channels),
+        out_stride: i64::from(cfg.channels),
+        boundary_tokens: 0,
+        num_tokens: 1,
+        num_seqs: 1,
+        channels: cfg.channels as i32,
+        kernel: cfg.kernel as i32,
+        activation: 1,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
 fn kv_transcode_probe(cfg: &KvTranscodeConfig) -> KvTranscodeDesc {
     let direction = cfg.direction();
     let codec = cfg.codec();
@@ -2358,6 +2408,267 @@ impl KvTranscodeKernel for ShimProvider {
             ..probe
         };
         self.run(OpKind::KvTranscode, trio, &d, num_blocks)
+    }
+}
+
+impl ShimProvider {
+    /// The v2.18 Gated DeltaNet trio of `mode`; `KernelProvider::gdn` is `Some` exactly when
+    /// the group exists.
+    fn gdn_trio(&self, mode: GdnMode) -> Result<&OpTrio<GdnDesc>, KernelError> {
+        let fns = self
+            .syms()
+            .v21
+            .gdn
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.18 gdn group"))?;
+        Ok(match mode {
+            GdnMode::Prefill => &fns.prefill,
+            GdnMode::Decode => &fns.decode,
+        })
+    }
+
+    /// The v2.18 conv1d trio of `mode`.
+    fn conv1d_trio(&self, mode: GdnMode) -> Result<&OpTrio<Conv1dDesc>, KernelError> {
+        let fns = self
+            .syms()
+            .v21
+            .conv1d
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.18 conv1d group"))?;
+        Ok(match mode {
+            GdnMode::Prefill => &fns.prefill,
+            GdnMode::Decode => &fns.update,
+        })
+    }
+
+    /// The sequence arguments shared by both v2.18 ops: the slot list, the `cu_seqlens` of a
+    /// prefill (absent for decode) and the sequence count. The slot values and the offsets live
+    /// on the device: the caller keeps them in range (`cu_seqlens` monotone, ending at the token
+    /// count, slots below the state's slot count).
+    #[allow(clippy::type_complexity)]
+    fn sequence_args(
+        &self,
+        mode: GdnMode,
+        tokens: usize,
+        slots: &TensorView<'_>,
+        cu_seqlens: Option<&TensorView<'_>>,
+    ) -> Result<(*const i32, *const i32, usize), KernelError> {
+        let seqs = slots.shape.first().copied().unwrap_or(0);
+        dense("state_slots", slots, &[seqs], DType::I32)?;
+        let slots_ptr = self
+            .ctx
+            .device_ptr("state_slots", slots)?
+            .cast_const()
+            .cast();
+        let cu_ptr = match (mode, cu_seqlens) {
+            (GdnMode::Prefill, Some(cu)) => {
+                dense("cu_seqlens", cu, &[seqs + 1], DType::I32)?;
+                self.ctx.device_ptr("cu_seqlens", cu)?.cast_const().cast()
+            }
+            (GdnMode::Prefill, None) => return Err(invalid("prefill needs cu_seqlens".into())),
+            (GdnMode::Decode, None) => {
+                if tokens != seqs {
+                    return Err(invalid(format!(
+                        "decode takes one token per sequence, got {tokens} tokens for {seqs}"
+                    )));
+                }
+                std::ptr::null()
+            }
+            (GdnMode::Decode, Some(_)) => return Err(invalid("decode takes no cu_seqlens".into())),
+        };
+        Ok((slots_ptr, cu_ptr, seqs))
+    }
+}
+
+impl GdnKernel for ShimProvider {
+    fn supports(&self, cfg: &GdnConfig) -> bool {
+        cfg.heads_per_key().is_some()
+            && self
+                .gdn_trio(cfg.mode)
+                .is_ok_and(|t| Self::supported(t, &gdn_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &GdnConfig) -> String {
+        self.gdn_trio(cfg.mode)
+            .map(|t| self.implementation_of(cfg.op(), t, &gdn_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut GdnContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let trio = self.gdn_trio(cfg.mode)?;
+        let (kh, vh, kd, vd) = (
+            cfg.k_heads as usize,
+            cfg.v_heads as usize,
+            cfg.k_dim as usize,
+            cfg.v_dim as usize,
+        );
+        let tokens = ctx.q.shape.first().copied().unwrap_or(0);
+        let q_stride = row_stride("q", &ctx.q, 3)?;
+        let k_stride = row_stride("k", &ctx.k, 3)?;
+        let v_stride = row_stride("v", &ctx.v, 3)?;
+        let out_stride = row_stride("out", &ctx.out, 3)?;
+        for (name, v, want, stride) in [
+            ("q", &ctx.q, [tokens, kh, kd], q_stride),
+            ("k", &ctx.k, [tokens, kh, kd], k_stride),
+            ("v", &ctx.v, [tokens, vh, vd], v_stride),
+            ("out", &ctx.out, [tokens, vh, vd], out_stride),
+        ] {
+            if v.shape.as_slice() != want || v.dtype != cfg.dtype {
+                return Err(invalid(format!(
+                    "{name} must be {} {want:?}, has {} {:?}",
+                    cfg.dtype.as_str(),
+                    v.dtype.as_str(),
+                    v.shape.as_slice()
+                )));
+            }
+            if stride < want[1] as i64 * want[2] as i64 {
+                return Err(invalid(format!("{name} row stride {stride} overlaps rows")));
+            }
+        }
+        dense("g", &ctx.g, &[tokens, vh], DType::F32)?;
+        dense("beta", &ctx.beta, &[tokens, vh], DType::F32)?;
+        let slots = ctx.state.shape.first().copied().unwrap_or(0);
+        dense("state", &ctx.state, &[slots, vh, vd, kd], DType::F32)?;
+        let (slots_ptr, cu_ptr, seqs) =
+            self.sequence_args(cfg.mode, tokens, &ctx.state_slots, ctx.cu_seqlens.as_ref())?;
+        let boundary = match &ctx.boundary_states {
+            None => std::ptr::null_mut(),
+            Some(_) if cfg.mode == GdnMode::Decode => {
+                return Err(invalid("decode writes no boundary states".into()));
+            }
+            Some(_) if ctx.boundary_tokens == 0 => {
+                return Err(invalid("boundary_states without boundary_tokens".into()));
+            }
+            Some(b) => {
+                let rows = b.shape.first().copied().unwrap_or(0);
+                dense("boundary_states", b, &[rows, vh, vd, kd], DType::F32)?;
+                self.ctx.device_ptr("boundary_states", b)?.cast::<f32>()
+            }
+        };
+        if tokens == 0 || seqs == 0 {
+            return Ok(());
+        }
+        let d = GdnDesc {
+            q: self.ctx.device_ptr("q", &ctx.q)?.cast_const(),
+            k: self.ctx.device_ptr("k", &ctx.k)?.cast_const(),
+            v: self.ctx.device_ptr("v", &ctx.v)?.cast_const(),
+            g: self.ctx.device_ptr("g", &ctx.g)?.cast_const().cast(),
+            beta: self.ctx.device_ptr("beta", &ctx.beta)?.cast_const().cast(),
+            state: self.ctx.device_ptr("state", &ctx.state)?.cast(),
+            state_slots: slots_ptr,
+            cu_seqlens: cu_ptr,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            boundary_states: boundary,
+            q_stride,
+            k_stride,
+            v_stride,
+            out_stride,
+            boundary_tokens: to_i32("boundary_tokens", ctx.boundary_tokens)?,
+            num_tokens: to_i32("tokens", tokens)?,
+            num_seqs: to_i32("sequences", seqs)?,
+            k_heads: to_i32("k_heads", kh)?,
+            v_heads: to_i32("v_heads", vh)?,
+            k_dim: to_i32("k_dim", kd)?,
+            v_dim: to_i32("v_dim", vd)?,
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(cfg.op(), trio, &d, 0)
+    }
+}
+
+impl Conv1dKernel for ShimProvider {
+    fn supports(&self, cfg: &Conv1dConfig) -> bool {
+        self.conv1d_trio(cfg.mode)
+            .is_ok_and(|t| Self::supported(t, &conv1d_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &Conv1dConfig) -> String {
+        self.conv1d_trio(cfg.mode)
+            .map(|t| self.implementation_of(cfg.op(), t, &conv1d_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut Conv1dContext<'_>) -> Result<(), KernelError> {
+        let cfg = ctx.cfg;
+        let trio = self.conv1d_trio(cfg.mode)?;
+        let (ch, kernel) = (cfg.channels as usize, cfg.kernel as usize);
+        let tokens = ctx.x.shape.first().copied().unwrap_or(0);
+        let x_stride = row_stride("x", &ctx.x, 2)?;
+        let out_stride = row_stride("out", &ctx.out, 2)?;
+        for (name, v) in [("x", &ctx.x), ("out", &ctx.out)] {
+            if v.shape.as_slice() != [tokens, ch] || v.dtype != cfg.dtype {
+                return Err(invalid(format!(
+                    "{name} must be {} [{tokens}, {ch}], has {} {:?}",
+                    cfg.dtype.as_str(),
+                    v.dtype.as_str(),
+                    v.shape.as_slice()
+                )));
+            }
+        }
+        dense("weight", &ctx.weight, &[ch, kernel], cfg.dtype)?;
+        let bias = match &ctx.bias {
+            Some(b) => {
+                dense("bias", b, &[ch], cfg.dtype)?;
+                self.ctx.device_ptr("bias", b)?.cast_const()
+            }
+            None => std::ptr::null(),
+        };
+        let slots = ctx.conv_state.shape.first().copied().unwrap_or(0);
+        dense(
+            "conv_state",
+            &ctx.conv_state,
+            &[slots, ch, kernel.saturating_sub(1)],
+            cfg.dtype,
+        )?;
+        let (slots_ptr, cu_ptr, seqs) =
+            self.sequence_args(cfg.mode, tokens, &ctx.state_slots, ctx.cu_seqlens.as_ref())?;
+        let boundary = match &ctx.boundary_conv_states {
+            None => null(),
+            Some(_) if cfg.mode == GdnMode::Decode => {
+                return Err(invalid("update writes no boundary states".into()));
+            }
+            Some(_) if (ctx.boundary_tokens as usize) < kernel.saturating_sub(1) => {
+                return Err(invalid(format!(
+                    "boundary_tokens {} below the {}-input conv tail",
+                    ctx.boundary_tokens,
+                    kernel.saturating_sub(1)
+                )));
+            }
+            Some(b) => {
+                let rows = b.shape.first().copied().unwrap_or(0);
+                dense(
+                    "boundary_conv_states",
+                    b,
+                    &[rows, ch, kernel.saturating_sub(1)],
+                    cfg.dtype,
+                )?;
+                self.ctx.device_ptr("boundary_conv_states", b)?
+            }
+        };
+        if tokens == 0 || seqs == 0 {
+            return Ok(());
+        }
+        let d = Conv1dDesc {
+            x: self.ctx.device_ptr("x", &ctx.x)?.cast_const(),
+            w: self.ctx.device_ptr("weight", &ctx.weight)?.cast_const(),
+            bias,
+            conv_state: self.ctx.device_ptr("conv_state", &ctx.conv_state)?,
+            state_slots: slots_ptr,
+            cu_seqlens: cu_ptr,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            boundary_conv_states: boundary,
+            x_stride,
+            out_stride,
+            boundary_tokens: to_i32("boundary_tokens", ctx.boundary_tokens)?,
+            num_tokens: to_i32("tokens", tokens)?,
+            num_seqs: to_i32("sequences", seqs)?,
+            channels: to_i32("channels", ch)?,
+            kernel: to_i32("kernel", kernel)?,
+            activation: ctx.activation,
+            dtype: cfg.dtype.abi_code(),
+        };
+        self.run(cfg.op(), trio, &d, 0)
     }
 }
 
@@ -3504,6 +3815,21 @@ impl KernelProvider for ShimProvider {
             .then_some(self as &dyn KvTranscodeKernel)
     }
 
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        self.syms()
+            .v21
+            .gdn
+            .is_some()
+            .then_some(self as &dyn GdnKernel)
+    }
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        self.syms()
+            .v21
+            .conv1d
+            .is_some()
+            .then_some(self as &dyn Conv1dKernel)
+    }
+
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
     }
@@ -3605,6 +3931,8 @@ impl KernelProvider for ShimProvider {
                 cfg.direction().is_some()
                     && lib.impl_supports(OpKind::KvTranscode, index, &kv_transcode_probe(cfg))
             }
+            OpConfig::Gdn(cfg) => lib.impl_supports(cfg.op(), index, &gdn_probe(cfg)),
+            OpConfig::Conv1d(cfg) => lib.impl_supports(cfg.op(), index, &conv1d_probe(cfg)),
         }
     }
 }
@@ -4184,6 +4512,8 @@ pub(crate) mod tests {
             size_of::<ffi::QuantizeActDesc>(),
             size_of::<ffi::KvTranscodeDesc>(),
             size_of::<ffi::TqParamsDesc>(),
+            size_of::<ffi::GdnDesc>(),
+            size_of::<ffi::Conv1dDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

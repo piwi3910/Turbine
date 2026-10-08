@@ -285,6 +285,10 @@ pub enum SubmitError {
     ContextLengthExceeded,
     #[error("context exceeds KV capacity")]
     ContextExceedsKvCapacity,
+    /// `n` sequences need more per-sequence state than the whole allocation, which covers
+    /// `max_running_requests` sequences (P7 review fix).
+    #[error("the request's sequences need more state than the allocation holds")]
+    StateExceedsCapacity,
     #[error("prompt exceeds batch budget")]
     PromptTooLong,
     #[error("shutting down")]
@@ -305,6 +309,7 @@ impl SubmitError {
             SubmitError::QueueFull => "queue_full",
             SubmitError::ContextLengthExceeded => "context_length_exceeded",
             SubmitError::ContextExceedsKvCapacity => "context_exceeds_kv_capacity",
+            SubmitError::StateExceedsCapacity => "state_exceeds_capacity",
             SubmitError::PromptTooLong => "prompt_too_long",
             SubmitError::ShuttingDown => "shutting_down",
             SubmitError::Rejected { reason, .. } => reason.as_str(),
@@ -554,6 +559,7 @@ impl Scheduler {
     /// `IterationLimits::allow_preempt` (SURVIVAL).
     pub fn with_gate(mut self, gate: AdmissionGate) -> Scheduler {
         self.gate = Some(gate);
+        self.configure_state_capacity();
         self
     }
 
@@ -615,7 +621,23 @@ impl Scheduler {
     /// KV blocks and releases both together (finish, cancel, preemption).
     pub fn with_state_layout(mut self, state: StateLayout) -> Scheduler {
         self.state_bytes = state.bytes_per_sequence();
+        self.configure_state_capacity();
         self
+    }
+
+    /// The state allocation covers `max_running_requests` sequences (P7 review fix, decision
+    /// 2026-10-08 A); the gate's admission charges each request's `n × state` against it.
+    fn configure_state_capacity(&mut self) {
+        let capacity = u64::from(self.params.max_running_requests).saturating_mul(self.state_bytes);
+        if let Some(gate) = self.gate.as_mut() {
+            gate.admission_mut().set_state_capacity(capacity);
+        }
+    }
+
+    /// The state a request holds: one slot per sequence (`n` choices).
+    fn request_state_bytes(&self, r: &SchedRequest) -> u64 {
+        self.state_bytes
+            .saturating_mul(u64::try_from(r.seqs.len()).unwrap_or(u64::MAX))
     }
 
     /// The per-sequence state bytes each request reserves (0 for families without state).
@@ -660,7 +682,7 @@ impl Scheduler {
             self.count_rejection(r.id, e);
             return Err(e);
         }
-        r.estimate.state_bytes = self.state_bytes;
+        r.estimate.state_bytes = self.request_state_bytes(&r);
         let block_tokens = self.params.block_tokens;
         let submit_no = self.queue.next_order();
         let window = self.params.cache_aware_window;
@@ -711,7 +733,7 @@ impl Scheduler {
         pool_total_blocks: u32,
     ) -> Result<(), SubmitError> {
         self.check_submission(&r, pool_total_blocks)?;
-        r.estimate.state_bytes = self.state_bytes;
+        r.estimate.state_bytes = self.request_state_bytes(&r);
         let block_tokens = self.params.block_tokens;
         let reservation = match self.gate.as_ref() {
             Some(gate) => {
@@ -835,6 +857,12 @@ impl Scheduler {
         }
         if request_kv_blocks(r, p.block_tokens) > u64::from(pool_total_blocks) {
             return Err(SubmitError::ContextExceedsKvCapacity);
+        }
+        if self.state_bytes > 0
+            && self.request_state_bytes(r)
+                > u64::from(p.max_running_requests).saturating_mul(self.state_bytes)
+        {
+            return Err(SubmitError::StateExceedsCapacity);
         }
         // With a gate the admission queue has its own bound (C-1).
         if self.gate.is_none() && self.queue.len() >= p.max_queued_requests as usize {

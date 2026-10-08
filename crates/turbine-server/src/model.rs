@@ -885,12 +885,15 @@ fn prepare_with(
         &reliability,
         config.kv.gpu.max_bytes,
         0,
+        state_allocation(
+            scheduler.max_running_requests,
+            arch.state.bytes_per_sequence(),
+        ),
     )?;
     let pool = kv_pool_config(
         layout,
         budget.pool(PoolKind::Kv),
         scheduler.max_running_requests,
-        arch.state.bytes_per_sequence(),
     )?;
     tracing::info!(
         event = "memory_budget",
@@ -1040,12 +1043,15 @@ impl PreparedModel {
             &self.reliability,
             self.kv_cap,
             0,
+            state_allocation(
+                self.scheduler.max_running_requests,
+                self.arch.state.bytes_per_sequence(),
+            ),
         )?;
         self.pool = kv_pool_config(
             layout,
             self.budget.pool(PoolKind::Kv),
             self.scheduler.max_running_requests,
-            self.arch.state.bytes_per_sequence(),
         )?;
         tracing::info!(
             event = "device_shared",
@@ -1091,9 +1097,10 @@ pub(crate) fn measure_budget(
     reliability: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
     collective: u64,
+    state_allocation: u64,
 ) -> Result<DeviceBudget, StartupError> {
     let host = read_host(&FsProc::default()).sample.mem_available_bytes;
-    compute_budget(
+    let mut budget = compute_budget(
         &BudgetInputs {
             device,
             memory_kind,
@@ -1109,7 +1116,13 @@ pub(crate) fn measure_budget(
         reliability,
         kv_cap,
     )
-    .map_err(|e| StartupError::new(format!("startup: {e}")))
+    .map_err(|e| StartupError::new(format!("startup: {e}")))?;
+    // The state allocation (`max_running × state`, P7 review fix) is set aside inside the
+    // `kv` pool: the pool left is the physical KV block pool, the ledger's `kv` capacity.
+    if let Some((_, kv)) = budget.pools.iter_mut().find(|(k, _)| *k == PoolKind::Kv) {
+        *kv = kv.saturating_sub(state_allocation);
+    }
+    Ok(budget)
 }
 
 /// Logs a backend's note on the kernel selections at INFO: `event=<note.event>`, `block_tokens`
@@ -1129,28 +1142,27 @@ fn log_backend_note(note: &BackendNote, block_tokens: u32) {
     );
 }
 
+/// The fixed state allocation: the state of `max_running` sequences (P7 review fix; admission
+/// charges each request's `n × state` against it, apart from the KV pool).
+pub(crate) fn state_allocation(max_running: u32, state_bytes: u64) -> u64 {
+    u64::from(max_running).saturating_mul(state_bytes)
+}
+
 /// The L0 pool: as many blocks as the budget's `kv` pool (`bytes`: the budget remainder after
-/// weights, workspace, runtime overhead and the emergency reserve, capped by
-/// `kv.gpu.max_bytes`) holds once every running sequence's state is set aside
-/// (`max_running × state_bytes`, P7 S-1: the admission ledger's `kv` pool reserves each
-/// request's state beside its blocks). At least one block per running request.
+/// weights, workspace, runtime overhead, the emergency reserve and the state allocation,
+/// capped by `kv.gpu.max_bytes` — [`measure_budget`] — so the physical block pool the ledger's
+/// `kv` capacity stands for) holds. At least one block per running request.
 pub(crate) fn kv_pool_config(
     layout: KvLayout,
     bytes: u64,
     max_running: u32,
-    state_bytes: u64,
 ) -> Result<BlockPoolConfig, StartupError> {
-    let state = u64::from(max_running).saturating_mul(state_bytes);
-    let pool = BlockPoolConfig::for_bytes(layout, bytes.saturating_sub(state));
+    let pool = BlockPoolConfig::for_bytes(layout, bytes);
     if pool.num_blocks < max_running {
-        let state = if state == 0 {
-            String::new()
-        } else {
-            format!(" after the state of {max_running} running sequences ({state} B)")
-        };
         return Err(StartupError::new(format!(
-            "the kv pool of {bytes} B holds {} KV blocks of {} B{state}; at least one block per \
-             running request (scheduler.max_running_requests = {max_running}) is required",
+            "the kv pool of {bytes} B (after the state of {max_running} running sequences) holds \
+             {} KV blocks of {} B; at least one block per running request \
+             (scheduler.max_running_requests = {max_running}) is required",
             pool.num_blocks,
             pool.layout.block_bytes()
         )));
@@ -1395,6 +1407,10 @@ pub(crate) fn post_load_budget(
         &prepared.reliability,
         prepared.kv_cap,
         collective,
+        state_allocation(
+            prepared.scheduler.max_running_requests,
+            prepared.arch.state.bytes_per_sequence(),
+        ),
     )?;
     let ledger = Ledger::new(&budget);
     ledger.set_metrics(reliability.clone());
@@ -1473,7 +1489,6 @@ pub(crate) fn pool_blocks(
         prepared.pool.layout,
         budget.pool(PoolKind::Kv),
         prepared.scheduler.max_running_requests,
-        prepared.arch.state.bytes_per_sequence(),
     )?;
     Ok(measured.num_blocks.min(prepared.pool.num_blocks))
 }

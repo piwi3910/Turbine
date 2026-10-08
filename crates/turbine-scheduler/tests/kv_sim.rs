@@ -2163,8 +2163,8 @@ fn gated_with_state(
 
 /// P7 S-1 (`hybrid_reservation_includes_state`): a request's worst-case reservation is its KV
 /// pages plus its per-sequence state — 4 pages of 1 MiB and 3 MiB of state reserve exactly
-/// 7 MiB — a budget that holds the pages but not the state refuses it with the existing
-/// KV-capacity reason, and finishing or cancelling returns the ledger to 0. Breaks if the
+/// 7 MiB (4 MiB of pages in the ledger, 3 MiB in the state allocation) — a pool too small for
+/// the pages refuses it with the existing KV-capacity reason, and finishing or cancelling returns the ledger to 0. Breaks if the
 /// state is left out of the reservation, the admission check or the release.
 #[test]
 fn hybrid_reservation_includes_state() {
@@ -2191,9 +2191,13 @@ fn hybrid_reservation_includes_state() {
     )
     .unwrap();
     s.submit(req(1), 64).unwrap();
-    assert_eq!(held(&ledger), 7 << 20, "4 pages + 3 MiB of state");
+    assert_eq!(
+        held(&ledger),
+        4 << 20,
+        "4 pages; the state is charged apart"
+    );
     let res = s.reservation(rid(1)).expect("admitted with a reservation");
-    assert_eq!(res.bytes(), 7 << 20);
+    assert_eq!(res.bytes(), 4 << 20);
     assert_eq!(res.state_bytes(), 3 << 20);
     // Finishing releases KV and state.
     let plan = s.plan(&mut pool, &IterationLimits::default());
@@ -2211,13 +2215,13 @@ fn hybrid_reservation_includes_state() {
     assert_eq!(held(&ledger), 0, "finish releases the state");
     // Cancelling releases it too.
     s.submit(req(2), 64).unwrap();
-    assert_eq!(held(&ledger), 7 << 20);
+    assert_eq!(held(&ledger), 4 << 20);
     s.cancel(rid(2), CancelReason::ClientDisconnect);
     let _ = s.plan(&mut pool, &IterationLimits::default());
     assert_eq!(held(&ledger), 0, "cancel releases the state");
 
-    // 6 MiB holds the 4 pages but not the state as well.
-    let (mut small, ledger, _c) = gated_with_state(6, 3 << 20);
+    // 3 pages of KV do not hold the request's 4 pages.
+    let (mut small, ledger, _c) = gated_with_state(3, 3 << 20);
     match small.submit(req(3), 64) {
         Err(SubmitError::Rejected { reason, .. }) => {
             assert_eq!(reason, RejectionReason::ContextExceedsKvCapacity)
@@ -2225,4 +2229,68 @@ fn hybrid_reservation_includes_state() {
         other => panic!("expected a KV-capacity rejection, got {other:?}"),
     }
     assert_eq!(held(&ledger), 0);
+}
+
+/// P7 review fix 2: the ledger's `kv` capacity is the physical KV pool, and the per-sequence
+/// state is charged against its own fixed allocation (`max_running × state`), not against the
+/// KV pool. A 16-page pool with 3 MiB of state a sequence and 4 running slots: two 8-page
+/// requests fill the pool exactly (16 MiB held, 6 MiB of state), the third waits for pages.
+/// Breaks if admission counts the state against the KV pool (the pool then holds one request).
+#[test]
+fn state_is_charged_beside_the_kv_pool() {
+    use smallvec::smallvec;
+    use turbine_reliability::budget::PoolKind;
+    use turbine_scheduler::{SchedRequest, SeqId};
+
+    let (mut s, ledger, _c) = gated_with_state(16, 3 << 20);
+    let req = |n: u64| SchedRequest::new(rid(u128::from(n)), smallvec![SeqId(n)], 64, 64, 16);
+    for n in 1..=3 {
+        s.submit(req(n), 16).unwrap();
+    }
+    let u = ledger.usage(DeviceId(0), PoolKind::Kv);
+    assert_eq!(u.used + u.reserved, 16 << 20, "KV pages only");
+    assert!(s.reservation(rid(1)).is_some());
+    assert!(
+        s.reservation(rid(2)).is_some(),
+        "the pool holds two requests"
+    );
+    assert!(s.reservation(rid(3)).is_none(), "the third waits for pages");
+    assert_eq!(s.gate().unwrap().queue_len(), 1);
+    assert_eq!(s.reservation(rid(1)).unwrap().bytes(), 8 << 20);
+    assert_eq!(s.reservation(rid(1)).unwrap().state_bytes(), 3 << 20);
+}
+
+/// P7 review fix 3: a request's state covers every sequence (`n` choices); the allocation holds
+/// `max_running_requests` (4) sequences. n = 4 takes all 12 MiB, n = 5 is refused at submit with
+/// `state_exceeds_capacity`, and a request that only lacks free state waits and starts once the
+/// state is back. Breaks if the estimate charges one sequence's state for `n` choices.
+#[test]
+fn state_covers_every_sequence() {
+    use turbine_scheduler::{CancelReason, SchedRequest, SeqId, SubmitError};
+
+    let (mut s, _ledger, _c) = gated_with_state(64, 3 << 20);
+    let mut pool = BlockPool::new(
+        BlockPoolConfig {
+            layout: format().layout,
+            num_blocks: 64,
+        },
+        HostMemory::new(DeviceId(0), 64 * block_bytes()) as Arc<dyn DeviceMemory>,
+    )
+    .unwrap();
+    let req = |id: u64, n: u64| {
+        let seqs = (0..n).map(|i| SeqId(id * 10 + i)).collect();
+        SchedRequest::new(rid(u128::from(id)), seqs, 16, 16, 16)
+    };
+    assert_eq!(
+        s.submit(req(9, 5), 64),
+        Err(SubmitError::StateExceedsCapacity)
+    );
+    s.submit(req(1, 4), 64).unwrap();
+    assert_eq!(s.reservation(rid(1)).unwrap().state_bytes(), 12 << 20);
+    s.submit(req(2, 1), 64).unwrap();
+    assert!(s.reservation(rid(2)).is_none(), "no free state: it waits");
+    s.cancel(rid(1), CancelReason::ClientDisconnect);
+    let _ = s.plan(&mut pool, &IterationLimits::default());
+    let _ = s.plan(&mut pool, &IterationLimits::default());
+    assert_eq!(s.reservation(rid(2)).unwrap().state_bytes(), 3 << 20);
 }
