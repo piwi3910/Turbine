@@ -497,12 +497,28 @@ fn match_case(
         want[at]
     );
     assert_eq!(moe.implementation_experts(&cfg), "turbine_hip_moe_quant");
+    if ratio > 1.0 {
+        FAILURES.with(|f| {
+            f.borrow_mut().push(format!(
+                "{} {tag} tokens={tokens}: element {at}: hip {} vs cpu {} (ratio {ratio})",
+                spec.name, got[at], want[at]
+            ))
+        });
+    }
+}
+
+thread_local! {
+    /// Cases over the bound, collected so one run reports every case's ratio.
+    static FAILURES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Fails the test with every case that exceeded the bound.
+fn finish() {
+    let failures = FAILURES.with(|f| std::mem::take(&mut *f.borrow_mut()));
     assert!(
-        ratio <= 1.0,
-        "{} {tag} tokens={tokens}: element {at}: hip {} vs cpu {} (ratio {ratio})",
-        spec.name,
-        got[at],
-        want[at]
+        failures.is_empty(),
+        "cases over the 6a bound:\n{}",
+        failures.join("\n")
     );
 }
 
@@ -535,6 +551,7 @@ fn fp8_block_experts_match_reference() {
     );
     let s = sides(&p, &shared);
     match_case(&p, &mut rng, &shared, &s, 16, "shared");
+    finish();
 }
 
 #[test]
@@ -562,6 +579,7 @@ fn fp8_tensor_experts_match_reference() {
     );
     let s = sides(&p, &st);
     match_case(&p, &mut rng, &st, &s, 16, "w8a8 static down");
+    finish();
 }
 
 #[test]
@@ -590,6 +608,7 @@ fn mxfp4_experts_match_reference() {
     let plain = Host::new(&mut rng, GPT_OSS, Variant::default());
     let s = sides(&p, &plain);
     match_case(&p, &mut rng, &plain, &s, 16, "swiglu");
+    finish();
 }
 
 /// A small layer of each format (8 experts, top-2, hidden 512, inter 256, no routing structure

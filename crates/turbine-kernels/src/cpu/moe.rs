@@ -352,6 +352,10 @@ impl MoeKernel for CpuReference {
                 quant::quantize_dequantize_activations(&mut act, n, inter, mode, scale);
             }
             let down = proj(&w_down, b_down.as_deref(), h, inter, &act);
+            // The BF16 expert scatter, as `moe_scatter_kernel` (moe.hip) and Hugging Face's
+            // `index_add_` do it: experts in ascending id order, and per expert and element
+            // `out = bf16(out + bf16(bf16(y) * bf16(w)))`, so the running sum is rounded to BF16
+            // after every top-k contribution (not accumulated in F32).
             for (i, &r) in rows.iter().enumerate() {
                 let t = r / k;
                 let w = round(weights[r]);
