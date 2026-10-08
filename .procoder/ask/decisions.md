@@ -4423,6 +4423,9 @@ From the codex review of p7-stack (finding 3, verified) and the fix builder's pl
   larger `n` is rejected 400 for hybrid families.
 - C) Hybrid families reject `n > 1` (400 with a reason code) until Phase 8.
 
+**Decision (user, 2026-10-08): A** — state slots per sequence; `n × state` above the whole allocation is refused with
+a reason code, otherwise the request waits for free state.
+
 ## Phase 7 Task 11: Qwen3-4B golden misses (2026-10-08, open)
 
 From `p7-t11` (WIP 1c3f1b76; perf log "P7 Qwen3-4B gate"). Every prompt's greedy tokens equal the transformers
@@ -4434,3 +4437,6 @@ reference, but the logprob bounds (Llama's, 0.15 likely / 0.56 tail) miss: c1 9/
 - B) Build the fused single-rounding per-head QK-norm (deferred by Task 10's decision C) first, then re-gate on the
   Llama-derived bounds.
 - C) A then B: gate on self-spread bounds now, the fused norm stays a follow-up.
+
+**Decision (user, 2026-10-08): C** — Qwen3's own bounds from a transformers self-spread run now (documented in the
+slug README), re-gate; the fused single-rounding QK-norm stays a follow-up.
