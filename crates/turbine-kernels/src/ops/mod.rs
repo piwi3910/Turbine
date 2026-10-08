@@ -51,6 +51,15 @@ pub enum OpKind {
     /// ABI v2.11 (optional in a shim library): encode KV blocks into a lower tier's codec and
     /// decode them back (Phase 6b).
     KvTranscode,
+    /// ABI v2.18 (optional in a shim library): Gated DeltaNet over prefill sequences (Phase 7).
+    GdnPrefill,
+    /// ABI v2.18 (optional in a shim library): Gated DeltaNet, one token per sequence.
+    GdnDecode,
+    /// ABI v2.18 (optional in a shim library): causal conv1d over prefill sequences.
+    Conv1dPrefill,
+    /// ABI v2.18 (optional in a shim library): causal conv1d, one token per sequence, the state
+    /// read from and written back to the sequence's slot.
+    Conv1dUpdate,
 }
 
 impl OpKind {
@@ -77,6 +86,10 @@ impl OpKind {
         OpKind::QGemm,
         OpKind::QuantizeAct,
         OpKind::KvTranscode,
+        OpKind::GdnPrefill,
+        OpKind::GdnDecode,
+        OpKind::Conv1dPrefill,
+        OpKind::Conv1dUpdate,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -101,6 +114,10 @@ impl OpKind {
             OpKind::QGemm => "qgemm",
             OpKind::QuantizeAct => "quantize_act",
             OpKind::KvTranscode => "kv_transcode",
+            OpKind::GdnPrefill => "gdn_prefill",
+            OpKind::GdnDecode => "gdn_decode",
+            OpKind::Conv1dPrefill => "conv1d_prefill",
+            OpKind::Conv1dUpdate => "conv1d_update",
         }
     }
 
@@ -127,6 +144,10 @@ impl OpKind {
             OpKind::QGemm => 17,
             OpKind::QuantizeAct => 18,
             OpKind::KvTranscode => 19,
+            OpKind::GdnPrefill => 20,
+            OpKind::GdnDecode => 21,
+            OpKind::Conv1dPrefill => 22,
+            OpKind::Conv1dUpdate => 23,
         }
     }
 
@@ -138,6 +159,10 @@ impl OpKind {
             OpKind::RowSumsq | OpKind::RmsnormSharded => 6,
             OpKind::QGemm | OpKind::QuantizeAct => 9,
             OpKind::KvTranscode => 11,
+            OpKind::GdnPrefill
+            | OpKind::GdnDecode
+            | OpKind::Conv1dPrefill
+            | OpKind::Conv1dUpdate => 18,
             _ => 0,
         }
     }
@@ -753,6 +778,155 @@ pub struct QuantizeActContext<'a> {
     pub out: TensorView<'a>,
     pub scales: TensorView<'a>,
     pub static_scale: f32,
+}
+
+/// Which Gated DeltaNet / causal-conv call a config describes: a batch of prefill sequences
+/// (`cu_seqlens` delimits them) or a decode step (one token per sequence).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GdnMode {
+    Prefill,
+    Decode,
+}
+
+impl GdnMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GdnMode::Prefill => "prefill",
+            GdnMode::Decode => "decode",
+        }
+    }
+}
+
+/// Gated DeltaNet (ABI v2.18 `gdn_prefill` / `gdn_decode`, Phase 7): the delta-rule recurrence
+/// of transformers' `torch_recurrent_gated_delta_rule` with `use_qk_l2norm_in_kernel`, per
+/// (sequence, value head). Value head `h` reads key head `h / (v_heads / k_heads)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GdnConfig {
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    pub mode: GdnMode,
+    /// The dtype of q, k, v and the output (the state, `g` and `beta` are F32).
+    pub dtype: DType,
+}
+
+impl GdnConfig {
+    /// The op this config runs.
+    pub fn op(&self) -> OpKind {
+        match self.mode {
+            GdnMode::Prefill => OpKind::GdnPrefill,
+            GdnMode::Decode => OpKind::GdnDecode,
+        }
+    }
+
+    /// The `k_heads` a value head shares: `v_heads / k_heads`, `None` unless it divides.
+    pub fn heads_per_key(&self) -> Option<u32> {
+        (self.k_heads > 0 && self.v_heads.is_multiple_of(self.k_heads))
+            .then(|| self.v_heads / self.k_heads)
+    }
+}
+
+impl fmt::Display for GdnConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} k_heads={} v_heads={} k_dim={} v_dim={} dtype={}",
+            self.mode.as_str(),
+            self.k_heads,
+            self.v_heads,
+            self.k_dim,
+            self.v_dim,
+            self.dtype.as_str()
+        )
+    }
+}
+
+/// Causal depthwise conv1d with an optional SiLU (ABI v2.18 `conv1d_prefill` /
+/// `conv1d_update`, Phase 7): `out[t, c] = silu(bias[c] + Σ_i w[c, i] · x[t − (kernel − 1) + i, c])`
+/// with the inputs before a sequence start read from its state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Conv1dConfig {
+    pub channels: u32,
+    /// The window; the ABI supports 4.
+    pub kernel: u32,
+    pub mode: GdnMode,
+    /// The dtype of x, the weights, the state and the output.
+    pub dtype: DType,
+}
+
+impl Conv1dConfig {
+    /// The op this config runs.
+    pub fn op(&self) -> OpKind {
+        match self.mode {
+            GdnMode::Prefill => OpKind::Conv1dPrefill,
+            GdnMode::Decode => OpKind::Conv1dUpdate,
+        }
+    }
+}
+
+impl fmt::Display for Conv1dConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} channels={} kernel={} dtype={}",
+            self.mode.as_str(),
+            self.channels,
+            self.kernel,
+            self.dtype.as_str()
+        )
+    }
+}
+
+/// One Gated DeltaNet call over `num_tokens` tokens of `num_seqs` sequences. Row layout:
+/// `q`, `k`: `[tokens, k_heads, k_dim]`, `v`: `[tokens, v_heads, v_dim]` (each view's
+/// `strides[0]` is its token row stride, so the `q | k | v` columns of a conv output feed the
+/// kernel with no copy; the inner dimensions are dense); `g` (log decay, `exp(g)` multiplies
+/// the state) and `beta`: F32 `[tokens, v_heads]`; `state`: F32 `[slots, v_heads, v_dim, k_dim]`
+/// (k contiguous), the state of sequence `s` is slot `state_slots[s]`, read at the start and
+/// written back at the end of the call; `state_slots`: I32 `[seqs]`; `cu_seqlens`: I32
+/// `[seqs + 1]` token offsets (prefill; `None` for decode, which has one token per sequence);
+/// `out`: `[tokens, v_heads, v_dim]` of `cfg.dtype`; `boundary_states`: F32
+/// `[Σ floor(len_s / boundary_tokens), v_heads, v_dim, k_dim]` ordered by sequence then
+/// boundary, row `(s, j)` the state after token `(j + 1) · boundary_tokens` of this call's
+/// sequence `s` (`None` = no snapshots; prefill only). The layout of `state` is the kernel's
+/// own: callers move it between slots only as opaque `v_heads · v_dim · k_dim` F32 blocks.
+pub struct GdnContext<'a> {
+    pub cfg: GdnConfig,
+    pub q: TensorView<'a>,
+    pub k: TensorView<'a>,
+    pub v: TensorView<'a>,
+    pub g: TensorView<'a>,
+    pub beta: TensorView<'a>,
+    pub state: TensorView<'a>,
+    pub state_slots: TensorView<'a>,
+    pub cu_seqlens: Option<TensorView<'a>>,
+    pub out: TensorView<'a>,
+    pub boundary_states: Option<TensorView<'a>>,
+    pub boundary_tokens: u32,
+}
+
+/// One causal conv1d call. `x`: `[tokens, channels]` (token row stride = `strides[0]`);
+/// `weight`: `[channels, kernel]`; `bias`: `[channels]` or `None`; `conv_state`:
+/// `[slots, channels, kernel − 1]`, the last `kernel − 1` inputs before the sequence, oldest
+/// first (read at the start, the new tail written at the end; a new sequence's slot is zeroed
+/// by the caller); `state_slots`, `cu_seqlens` and `boundary_conv_states` as in
+/// [`GdnContext`] (`boundary_conv_states`: `[Σ floor(len_s / boundary_tokens), channels,
+/// kernel − 1]`, the tail after each boundary token, `boundary_tokens` ≥ `kernel − 1`); `out`:
+/// `[tokens, channels]`, may be strided.
+pub struct Conv1dContext<'a> {
+    pub cfg: Conv1dConfig,
+    pub x: TensorView<'a>,
+    pub weight: TensorView<'a>,
+    pub bias: Option<TensorView<'a>>,
+    pub conv_state: TensorView<'a>,
+    pub state_slots: TensorView<'a>,
+    pub cu_seqlens: Option<TensorView<'a>>,
+    pub out: TensorView<'a>,
+    pub boundary_conv_states: Option<TensorView<'a>>,
+    pub boundary_tokens: u32,
+    /// 1 = SiLU after the convolution (the only activation of the ABI), 0 = none.
+    pub activation: i32,
 }
 
 /// The host codecs a transcode runs on the CPU (the `cpu-reference` provider; a library
@@ -1402,6 +1576,20 @@ pub trait QuantizeActKernel: Send + Sync {
     fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError>;
 }
 
+/// Gated DeltaNet (ABI v2.18).
+pub trait GdnKernel: Send + Sync {
+    fn supports(&self, cfg: &GdnConfig) -> bool;
+    fn implementation(&self, cfg: &GdnConfig) -> String;
+    fn execute(&self, ctx: &mut GdnContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Causal conv1d (ABI v2.18).
+pub trait Conv1dKernel: Send + Sync {
+    fn supports(&self, cfg: &Conv1dConfig) -> bool;
+    fn implementation(&self, cfg: &Conv1dConfig) -> String;
+    fn execute(&self, ctx: &mut Conv1dContext<'_>) -> Result<(), KernelError>;
+}
+
 /// KV transcode (ABI v2.11).
 pub trait KvTranscodeKernel: Send + Sync {
     fn supports(&self, cfg: &KvTranscodeConfig) -> bool;
@@ -1465,6 +1653,14 @@ pub trait KernelProvider: Send + Sync {
     fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         None
     }
+    /// ABI v2.18: `None` (the default) for a provider without Gated DeltaNet.
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        None
+    }
+    /// ABI v2.18: `None` (the default) for a provider without the causal conv1d.
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        None
+    }
 
     /// The implementations of `op` the provider enumerates (kernel ABI v2.4), in its own order.
     /// Empty (the default) when the provider chooses the implementation of every call itself.
@@ -1526,7 +1722,11 @@ mod tests {
                 "rmsnorm_sharded",
                 "qgemm",
                 "quantize_act",
-                "kv_transcode"
+                "kv_transcode",
+                "gdn_prefill",
+                "gdn_decode",
+                "conv1d_prefill",
+                "conv1d_update"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -1686,7 +1886,7 @@ mod tests {
     }
 
     /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
-    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11. Breaks if a new op
+    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11, the v2.18 GDN and conv1d ops 18. Breaks if a new op
     /// is appended without saying which minor group adds it (an older library would be asked for
     /// an op code it does not know).
     #[test]
@@ -1697,7 +1897,8 @@ mod tests {
                 13 | 14 => 1,
                 15 | 16 => 6,
                 17 | 18 => 9,
-                _ => 11,
+                19 => 11,
+                _ => 18,
             };
             assert_eq!(op.abi_minor(), want, "{op}");
         }

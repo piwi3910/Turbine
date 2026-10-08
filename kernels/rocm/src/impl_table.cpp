@@ -67,8 +67,14 @@
 //                                  codec, BF16 pages), 1 turbine_hip_tq
 //                                  [turbine_hip] (TurboQuant tq4 / tq2,
 //                                  BF16 pages, head_dim 128)
+//   gdn_prefill, gdn_decode      0 llama_cpp_gated_delta_net [llama_cpp]
+//   (v2.18)                        (BF16, k_dim == v_dim in {32, 64, 128})
+//   conv1d_prefill (v2.18)       0 aiter_causal_conv1d_split_qkv [aiter]
+//   conv1d_update (v2.18)        0 llama_cpp_ssm_conv [llama_cpp] (BF16,
+//                                  window 4)
 #include <string>
 
+#include "gdn.hpp"
 #include "kv_transcode.hpp"
 #include "qgemm_fp8_block.hpp"
 #include "qgemm_impls.hpp"
@@ -330,6 +336,35 @@ const ImplEntry kKvTranscode[] = {
                kv_transcode_tq_run>>("turbine_hip_tq", kTurbine),
 };
 
+// A conv1d implementation: its supports / run pair for one mode.
+template <int32_t (*Run)(turbine_ctx *, const turbine_conv1d_desc *)>
+struct Conv {
+  static bool supports(const void *d) {
+    return conv1d_supports(static_cast<const turbine_conv1d_desc *>(d));
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return Run(ctx, static_cast<const turbine_conv1d_desc *>(d));
+  }
+};
+
+constexpr const char *kLlamaCpp = "llama_cpp";
+constexpr const char *kAiter = "aiter";
+
+const ImplEntry kGdnPrefill[] = {
+    entry<Impl<turbine_gdn_desc, gdn_supports, gdn_prefill_run>>(
+        "llama_cpp_gated_delta_net", kLlamaCpp),
+};
+const ImplEntry kGdnDecode[] = {
+    entry<Impl<turbine_gdn_desc, gdn_supports, gdn_decode_run>>(
+        "llama_cpp_gated_delta_net", kLlamaCpp),
+};
+const ImplEntry kConv1dPrefill[] = {
+    entry<Conv<conv1d_prefill_run>>("aiter_causal_conv1d_split_qkv", kAiter),
+};
+const ImplEntry kConv1dUpdate[] = {
+    entry<Conv<conv1d_update_run>>("llama_cpp_ssm_conv", kLlamaCpp),
+};
+
 struct OpImpls {
   const ImplEntry *entries;
   int32_t count;
@@ -361,14 +396,18 @@ const OpImpls kOps[] = {
     of(kQGemm),
     of(kQuantizeAct),
     of(kKvTranscode),
+    of(kGdnPrefill),
+    of(kGdnDecode),
+    of(kConv1dPrefill),
+    of(kConv1dUpdate),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_KV_TRANSCODE + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_CONV1D_UPDATE + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_KV_TRANSCODE) {
+  if (op < 0 || op > TURBINE_OP_CONV1D_UPDATE) {
     *count = 0;
     return nullptr;
   }

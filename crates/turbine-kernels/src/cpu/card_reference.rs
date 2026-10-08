@@ -29,9 +29,10 @@ use crate::KernelError;
 use crate::cards::CardProfile;
 use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionConfig, AttentionContext, AttentionKernel,
-    AttentionKind, ElementwiseKernel, EmbeddingKernel, GemmKernel, KernelProvider, KvCopyKernel,
-    KvTranscodeKernel, LogitsReduceKernel, MoeKernel, NormKernel, OpKind, PagedAttentionContext,
-    ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel, ShardedNormKernel,
+    AttentionKind, Conv1dKernel, ElementwiseKernel, EmbeddingKernel, GdnKernel, GemmKernel,
+    KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel, NormKernel,
+    OpKind, PagedAttentionContext, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel,
+    ShardedNormKernel,
 };
 
 /// The b1 decode kernel's implementation name in a card's decode-attention order.
@@ -165,6 +166,12 @@ impl KernelProvider for CardReference {
     }
     fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         CPU.kv_transcode()
+    }
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        CPU.gdn()
+    }
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        CPU.conv1d()
     }
 }
 

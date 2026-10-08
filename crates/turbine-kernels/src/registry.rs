@@ -19,12 +19,13 @@ use crate::KernelError;
 use crate::cards::CardProfile;
 use crate::ops::{
     ActivationConfig, ActivationKernel, AddRmsnormConfig, AddRmsnormKernel, AttentionConfig,
-    AttentionKernel, ElementwiseConfig, ElementwiseKernel, EmbeddingConfig, EmbeddingKernel,
-    GemmConfig, GemmKernel, ImplChoice, ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel,
-    KvTranscodeConfig, KvTranscodeKernel, LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig,
-    MoeKernel, MoeRouteConfig, NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig,
-    QGemmKernel, QuantizeActConfig, QuantizeActKernel, RmsnormShardedConfig, RopeConfig,
-    RopeKernel, RowSumsqConfig, RowTier, ShardedNormKernel,
+    AttentionKernel, Conv1dConfig, Conv1dKernel, ElementwiseConfig, ElementwiseKernel,
+    EmbeddingConfig, EmbeddingKernel, GdnConfig, GdnKernel, GemmConfig, GemmKernel, ImplChoice,
+    ImplInfo, KernelProvider, KvCopyConfig, KvCopyKernel, KvTranscodeConfig, KvTranscodeKernel,
+    LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
+    NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig, QGemmKernel, QuantizeActConfig,
+    QuantizeActKernel, RmsnormShardedConfig, RopeConfig, RopeKernel, RowSumsqConfig, RowTier,
+    ShardedNormKernel,
 };
 
 /// `reason_code` of a selection: the card profile's first listed implementation (that the
@@ -95,6 +96,10 @@ pub enum OpConfig {
     QuantizeAct(QuantizeActConfig),
     /// ABI v2.11; a shim library without the group has no provider for it.
     KvTranscode(KvTranscodeConfig),
+    /// ABI v2.18; a shim library without the group has no provider for it.
+    Gdn(GdnConfig),
+    /// ABI v2.18; a shim library without the group has no provider for it.
+    Conv1d(Conv1dConfig),
 }
 
 impl OpConfig {
@@ -117,6 +122,8 @@ impl OpConfig {
             OpConfig::QGemm(_) => OpKind::QGemm,
             OpConfig::QuantizeAct(_) => OpKind::QuantizeAct,
             OpConfig::KvTranscode(_) => OpKind::KvTranscode,
+            OpConfig::Gdn(cfg) => cfg.op(),
+            OpConfig::Conv1d(cfg) => cfg.op(),
         }
     }
 
@@ -140,6 +147,8 @@ impl OpConfig {
             OpConfig::QGemm(cfg) => cfg.to_string(),
             OpConfig::QuantizeAct(cfg) => cfg.to_string(),
             OpConfig::KvTranscode(cfg) => cfg.to_string(),
+            OpConfig::Gdn(cfg) => cfg.to_string(),
+            OpConfig::Conv1d(cfg) => cfg.to_string(),
         }
     }
 
@@ -214,6 +223,14 @@ impl OpConfig {
                 .map(|k| k.implementation(cfg)),
             OpConfig::KvTranscode(cfg) => provider
                 .kv_transcode()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::Gdn(cfg) => provider
+                .gdn()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::Conv1d(cfg) => provider
+                .conv1d()
                 .filter(|k| k.supports(cfg))
                 .map(|k| k.implementation(cfg)),
         }
@@ -710,6 +727,20 @@ impl KernelRegistry {
         self.provider(OpConfig::KvTranscode(*cfg))
             .kv_transcode()
             .expect("the selected provider implements kv_transcode")
+    }
+
+    /// The Gated DeltaNet kernel selected for `cfg` (ABI v2.18).
+    pub fn gdn(&self, cfg: &GdnConfig) -> &dyn GdnKernel {
+        self.provider(OpConfig::Gdn(*cfg))
+            .gdn()
+            .expect("the selected provider implements gdn")
+    }
+
+    /// The causal conv1d kernel selected for `cfg` (ABI v2.18).
+    pub fn conv1d(&self, cfg: &Conv1dConfig) -> &dyn Conv1dKernel {
+        self.provider(OpConfig::Conv1d(*cfg))
+            .conv1d()
+            .expect("the selected provider implements conv1d")
     }
 }
 

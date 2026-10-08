@@ -49,6 +49,8 @@ pub enum ErrorCode {
     QueueFull,
     QueueTimeout,
     ContextExceedsKvCapacity,
+    /// `n` sequences of a family with per-sequence state exceed the state allocation (400).
+    StateExceedsCapacity,
     InvalidJsonSchema,
     ToolsNotSupported,
     UnknownTool,
@@ -95,6 +97,7 @@ impl ErrorCode {
             ErrorCode::QueueFull => "queue_full",
             ErrorCode::QueueTimeout => "queue_timeout",
             ErrorCode::ContextExceedsKvCapacity => "context_exceeds_kv_capacity",
+            ErrorCode::StateExceedsCapacity => "state_exceeds_capacity",
             ErrorCode::InvalidJsonSchema => "invalid_json_schema",
             ErrorCode::ToolsNotSupported => "tools_not_supported",
             ErrorCode::UnknownTool => "unknown_tool",

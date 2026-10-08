@@ -445,6 +445,71 @@ pub(crate) struct KvTranscodeDesc {
     pub tq_params: *const TqParamsDesc,
 }
 
+/// `turbine_gdn_desc` (v2.18).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnDesc {
+    pub q: *const c_void,
+    pub k: *const c_void,
+    pub v: *const c_void,
+    pub g: *const f32,
+    pub beta: *const f32,
+    pub state: *mut f32,
+    pub state_slots: *const i32,
+    pub cu_seqlens: *const i32,
+    pub out: *mut c_void,
+    pub boundary_states: *mut f32,
+    pub q_stride: i64,
+    pub k_stride: i64,
+    pub v_stride: i64,
+    pub out_stride: i64,
+    pub boundary_tokens: i32,
+    pub num_tokens: i32,
+    pub num_seqs: i32,
+    pub k_heads: i32,
+    pub v_heads: i32,
+    pub k_dim: i32,
+    pub v_dim: i32,
+    pub dtype: i32,
+}
+
+/// `turbine_conv1d_desc` (v2.18).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Conv1dDesc {
+    pub x: *const c_void,
+    pub w: *const c_void,
+    pub bias: *const c_void,
+    pub conv_state: *mut c_void,
+    pub state_slots: *const i32,
+    pub cu_seqlens: *const i32,
+    pub out: *mut c_void,
+    pub boundary_conv_states: *mut c_void,
+    pub x_stride: i64,
+    pub out_stride: i64,
+    pub boundary_tokens: i32,
+    pub num_tokens: i32,
+    pub num_seqs: i32,
+    pub channels: i32,
+    pub kernel: i32,
+    pub activation: i32,
+    pub dtype: i32,
+}
+
+/// The v2.18 Gated DeltaNet group: the `gdn_prefill` and `gdn_decode` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct GdnFns {
+    pub prefill: OpTrio<GdnDesc>,
+    pub decode: OpTrio<GdnDesc>,
+}
+
+/// The v2.18 causal conv1d group: the `conv1d_prefill` and `conv1d_update` trios.
+#[derive(Clone, Copy)]
+pub(crate) struct Conv1dFns {
+    pub prefill: OpTrio<Conv1dDesc>,
+    pub update: OpTrio<Conv1dDesc>,
+}
+
 /// `turbine_tq_params` (v2.11): the TurboQuant tables, device pointers.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -693,7 +758,8 @@ pub(crate) struct ImplFns {
 /// `tensor_parallel` unless `minor` ≥ 6, `mapped` unless `minor` ≥ 7, and each only when the
 /// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
 /// from minor 10, `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
-/// (v2.5) groups resolved, and `copy_kernel` minor ≥ 11 with `copies`.
+/// (v2.5) groups resolved, `copy_kernel` minor ≥ 11 with `copies`, and `gdn` and `conv1d`
+/// minor ≥ 18.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -723,6 +789,10 @@ pub(crate) struct V21Symbols {
     pub kv_transcode: Option<OpTrio<KvTranscodeDesc>>,
     /// v2.11 host-to-device copy kernel (Phase 6b); needs the v2.5 group.
     pub copy_kernel: Option<CopyKernelFn>,
+    /// v2.18 Gated DeltaNet (Phase 7).
+    pub gdn: Option<GdnFns>,
+    /// v2.18 causal conv1d (Phase 7).
+    pub conv1d: Option<Conv1dFns>,
 }
 
 impl V21Symbols {
@@ -845,8 +915,28 @@ impl V21Symbols {
         } else {
             None
         };
+        let gdn = (|| {
+            if minor < 18 {
+                return None;
+            }
+            Some(GdnFns {
+                prefill: optional_trio(lib, "gdn_prefill")?,
+                decode: optional_trio(lib, "gdn_decode")?,
+            })
+        })();
+        let conv1d = (|| {
+            if minor < 18 {
+                return None;
+            }
+            Some(Conv1dFns {
+                prefill: optional_trio(lib, "conv1d_prefill")?,
+                update: optional_trio(lib, "conv1d_update")?,
+            })
+        })();
         V21Symbols {
             minor,
+            gdn,
+            conv1d,
             rope_attn_factor: minor >= 10,
             kv_transcode,
             copy_kernel,
