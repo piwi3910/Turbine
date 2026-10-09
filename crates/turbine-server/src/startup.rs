@@ -359,6 +359,11 @@ pub fn run(cli: Cli) -> ExitCode {
         {
             return startup_failed(r, &e);
         }
+        // P7 S-15: FP8 KV on a checkpoint without K/V scales gets calibrated ones, before the
+        // KV namespace (which hashes them) is built.
+        if let Err(e) = model::calibrate_kv_scales(&mut prepared) {
+            return startup_failed(r, &e);
+        }
         let mut workers = Vec::with_capacity(group.ranks.len().saturating_sub(1));
         let local_workers = if static_rank.is_some() || pipeline.is_some() {
             0
