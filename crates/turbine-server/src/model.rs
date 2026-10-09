@@ -636,12 +636,23 @@ pub fn prepare_replica(
     prepare_with(config, inventory, &base.kernel_metrics, Some(base), part)
 }
 
-/// The device bytes `slots` take (BF16, the only weight dtype tensor parallelism serves; a
-/// stacked slot is its part of the stack; a padded vocabulary shard counts its padding rows).
-fn slot_bytes(slots: &[turbine_model::WeightSlot]) -> u64 {
+/// The device bytes `slots` take in `format` (a stacked slot is its part of the stack; a padded
+/// vocabulary shard counts its padding rows): each slot expanded through
+/// [`turbine_model::weights::WeightFormat::slots`] — a quantized layer's packed data, scales,
+/// zero points and activation scales — at its shape and
+/// [`turbine_model::weights::WeightFormat::slot_dtype`], exactly the bytes the loader uploads
+/// (the sharded counterpart of `ModelArchConfig::shape().weight_bytes`).
+fn slot_bytes(
+    format: &dyn turbine_model::weights::WeightFormat,
+    slots: &[turbine_model::WeightSlot],
+) -> u64 {
     slots
         .iter()
-        .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+        .flat_map(|s| format.slots(s))
+        .map(|s| {
+            s.shape.iter().map(|&d| d as u64).product::<u64>()
+                * format.slot_dtype(&s).size_bytes() as u64
+        })
         .sum()
 }
 
@@ -746,6 +757,9 @@ fn prepare_with(
         (None, Some(s)) => tp::weight_slots(&arch, s).map_err(tp_error)?,
     };
     turbine_model::weights::resolve_for_providers(&mut arch, &device_slots, &ordered);
+    // The rank's weight bytes in the format the selected kernels serve (a block-scaled FP8 layer
+    // none runs counts its BF16 decode): the budget's weight term for every sharded placement.
+    let weight_bytes = slot_bytes(arch.weight_format.get(), &device_slots);
     // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
     // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns). An
     // expert-parallel rank (S-11): its experts' (one `moe_experts` config per run of them) and
@@ -764,7 +778,7 @@ fn prepare_with(
                 .map_err(pp_error)?,
                 pp::workspace_bytes(&arch, s, limits).map_err(pp_error)?,
                 pp::kv_layout(&arch, &s.layers, block_tokens).map_err(pp_error)?,
-                slot_bytes(&pp::weight_slots(&arch, s).map_err(pp_error)?),
+                weight_bytes,
             )
         }
         (Some(e), _) => (
@@ -779,7 +793,7 @@ fn prepare_with(
             .map_err(ep_error)?,
             ep::workspace_bytes(&arch, e.shard, &e.placement, limits).map_err(ep_error)?,
             ep::kv_layout(&arch, e.shard, block_tokens).map_err(ep_error)?,
-            slot_bytes(&ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?),
+            weight_bytes,
         ),
         (None, None) => (
             executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
@@ -797,7 +811,7 @@ fn prepare_with(
                 .map_err(tp_error)?,
             tp::workspace_bytes(&arch, s, limits).map_err(tp_error)?,
             tp::kv_layout(&arch, s, block_tokens).map_err(tp_error)?,
-            slot_bytes(&tp::weight_slots(&arch, s).map_err(tp_error)?),
+            weight_bytes,
         ),
     };
     // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
@@ -1936,5 +1950,102 @@ mod tests {
         assert_eq!(resolve_tool_call_parser(None, &Qwen3, false), OFF);
         assert_eq!(resolve_tool_call_parser(hermes, &Llama, true), hermes);
         assert_eq!(resolve_tool_call_parser(mistral, &Qwen3, true), mistral);
+    }
+
+    /// P7: the sharded budget counts a quantized rank's stored bytes — the weight format's
+    /// packed data, scales, zero points and activation scales at their dtypes — not BF16's two
+    /// bytes per element. Qwen3-30B-A3B FP8 at tp 2 was refused at startup at about twice its
+    /// per-rank stored size (`weights=… bytes`). The tiny FP8-block Qwen3-MoE (whole 128 blocks
+    /// per rank) and the tiny Mixtral FP8 (per-tensor scales, static activations) budget below
+    /// the BF16 count the old code returned and above the 1-byte-per-element data floor (the
+    /// scales are real device bytes), and the BF16 twin still budgets two bytes per element.
+    #[test]
+    fn sharded_budget_counts_quantized_weight_bytes() {
+        let old_bf16 = |slots: &[turbine_model::WeightSlot]| -> u64 {
+            slots
+                .iter()
+                .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+                .sum()
+        };
+        // HF `quant_method: fp8`, block scales of 128 × 128 (Qwen3-30B-A3B-FP8's packaging);
+        // the tiny Qwen3-MoE at expert width 256 so a tp rank holds whole blocks.
+        let tmp = turbine_model::testing::TempDir::new("budget-fp8-block-shards");
+        let q = serde_json::json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128], "modules_to_not_convert": ["mlp.gate"]});
+        let fixture = turbine_model::testing::tiny::write_tiny_qwen3moe_quantized(
+            tmp.path(),
+            12,
+            &q,
+            128,
+            256,
+        );
+        let spec = fixture.quantized;
+        let slots = tp::weight_slots(&spec.config, ShardSpec { rank: 0, world: 2 })
+            .expect("qwen3_moe tp slots");
+        let format = spec.config.weight_format.get();
+        let quantized = slot_bytes(format, &slots);
+        let bf16 = old_bf16(&slots);
+        assert!(
+            quantized < bf16,
+            "fp8-block budget {quantized} not below the BF16 count {bf16}"
+        );
+        assert!(
+            quantized > bf16 / 2,
+            "fp8-block budget {quantized} not above the 1-byte data floor of {bf16}"
+        );
+        // The expansion stores e4m3 data and F32 scales — the budget priced them, not the
+        // family slots alone.
+        let expanded: Vec<turbine_model::WeightSlot> =
+            slots.iter().flat_map(|s| format.slots(s)).collect();
+        assert!(
+            expanded
+                .iter()
+                .any(|s| format.slot_dtype(s) == DType::F8E4M3)
+        );
+        assert!(expanded.iter().any(|s| format.slot_dtype(s) == DType::F32));
+
+        // The BF16 twin: the budget is unchanged, two bytes per element.
+        let twin = fixture.twin;
+        let twin_slots = tp::weight_slots(&twin.config, ShardSpec { rank: 0, world: 2 })
+            .expect("bf16 twin tp slots");
+        assert_eq!(
+            slot_bytes(twin.config.weight_format.get(), &twin_slots),
+            old_bf16(&twin_slots)
+        );
+
+        // Compressed-tensors `float-quantized`, per-tensor weight scales and static input
+        // scales (RedHatAI's FP8 Mixtral packaging).
+        let tmp = turbine_model::testing::TempDir::new("budget-fp8-tensor-shards");
+        let q = serde_json::json!({
+            "quant_method": "compressed-tensors", "format": "float-quantized",
+            "ignore": [
+                "model.layers.0.block_sparse_moe.gate",
+                "model.layers.1.block_sparse_moe.gate", "lm_head",
+            ],
+            "config_groups": {"group_0": {"targets": ["Linear"],
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                                      "dynamic": false, "symmetric": true},
+                "weights": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                            "dynamic": false, "symmetric": true}}}});
+        let fixture = turbine_model::testing::tiny::write_tiny_family_quantized(
+            tmp.path(),
+            "mixtral",
+            22,
+            &q,
+        );
+        let spec = fixture.quantized;
+        let slots = tp::weight_slots(&spec.config, ShardSpec { rank: 0, world: 2 })
+            .expect("mixtral tp slots");
+        let format = spec.config.weight_format.get();
+        let quantized = slot_bytes(format, &slots);
+        let bf16 = old_bf16(&slots);
+        assert!(
+            quantized < bf16,
+            "fp8-tensor budget {quantized} not below the BF16 count {bf16}"
+        );
+        assert!(
+            quantized > bf16 / 2,
+            "fp8-tensor budget {quantized} not above the 1-byte data floor of {bf16}"
+        );
     }
 }
