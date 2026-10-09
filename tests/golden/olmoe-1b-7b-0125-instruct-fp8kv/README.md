@@ -93,12 +93,12 @@ itself, so the most the noise justifies); proposed = max(today, observed), cappe
 The token-identity rule (`min_identical_prefix`, `min_prompts_passing`, `margin_nats`) is unchanged.
 Decision A (user, 2026-10-06): the proposed column is applied to `tolerance.json` (unchanged where proposed = today).
 
-| bound | today | observed | triangle | proposed |
-|---|---|---|---|---|
-| likely | 1.10 | 1.14 | 2.06 | 1.14 **changed** |
-| tail | 2.01 | 5.25 (over cap) | 3.42 | 3.42 **changed** |
-| likely batched | 1.10 | 1.14 | 2.06 | 1.14 **changed** |
-| tail batched | 2.01 | 5.25 (over cap) | 3.42 | 3.42 **changed** |
+| bound          | today | observed        | triangle | proposed         |
+| -------------- | ----- | --------------- | -------- | ---------------- |
+| likely         | 1.10  | 1.14            | 2.06     | 1.14 **changed** |
+| tail           | 2.01  | 5.25 (over cap) | 3.42     | 3.42 **changed** |
+| likely batched | 1.10  | 1.14            | 2.06     | 1.14 **changed** |
+| tail batched   | 2.01  | 5.25 (over cap) | 3.42     | 3.42 **changed** |
 
 Default server c1 against the reference: prefix ok 16/16, likely 0.951 (p13),
 tail 5.162 (p03). All of this section was measured on the scale-1.0 reference.
@@ -118,3 +118,23 @@ likely 1.0663 at position 5, tail 2.0606 at position 18 — order noise at the b
 systematic offset). The full-GSM8K pair with the calibrated scales passes (0.6603 vs 0.6573, drop
 0.0030). Follow-up: the engine-spread re-run against this reference to re-derive the bounds
 (20 captures), then the gate again.
+
+## Engine summation-order spread, calibrated-scale reference (2026-10-09)
+
+The spread was re-run against the regenerated reference (`golden-engine-spread.sh p7t36-fp8kv
+olmoe-1b-7b-0125-instruct-fp8kv`, 20 captures at 171d243c, novanas GPU 0; data
+`engine_spread.json`). Every variant is prefix ok 16/16 — with matching scales the engine and the
+reference agree on the greedy tokens everywhere, and the old p03 systematic tail offset (a
+scale-1.0 artifact) is gone: worst tail vs the reference is 1.3190 (p16), worst likely 1.1450
+(p10). Engine noise: likely 0.9390 (p09 position 15), tail 1.4970 (p16 position 30).
+
+| bound          | old  | observed | triangle | proposed         |
+| -------------- | ---- | -------- | -------- | ---------------- |
+| likely         | 1.14 | 1.15     | 2.08     | 1.15 **changed** |
+| tail           | 3.42 | 2.08     | 4.92     | 3.42 unchanged   |
+| likely batched | 1.14 | 1.15     | 2.08     | 1.15 **changed** |
+| tail batched   | 3.42 | 2.08     | 4.92     | 3.42 unchanged   |
+
+Decision A ("5p golden tolerance vs engine summation order") applied: strict and batched likely
+1.14 → 1.15, tail 3.42 unchanged.
+x
