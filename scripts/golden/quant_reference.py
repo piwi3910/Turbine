@@ -63,7 +63,7 @@ Usage:
         [--act-quant auto|none|fp8_token|fp8_tensor|fp8_group128|mxfp4] [--top-logprobs 20] \
         [--work-dir /dev/shm] [--dequantized <dir>] [--keep-dequantized] [--model-name <hub-id>]
         [--input-scale fused-max|per-part] [--chat-template <file.jinja>]
-        [--kv-quant none|fp8_e4m3]
+        [--kv-quant none|fp8_e4m3] [--kv-scales <kv-scales-v1-*.json>]
     uv run scripts/golden/quant_reference.py --self-test
 """
 
@@ -128,6 +128,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "(a base checkpoint without one; the served config names the same file)",
     )
     p.add_argument("--kv-quant", choices=KV_MODES, default="none")
+    p.add_argument(
+        "--kv-scales",
+        type=Path,
+        help="per-layer KV scales for --kv-quant: the server's calibration cache file "
+        "(~/.cache/turbine/kv-scales-v1-*.json, exact f32 `k_bits` / `v_bits`) instead of "
+        "the checkpoint's own scales (a checkpoint with none, e.g. OLMoE)",
+    )
     args = p.parse_args(argv)
     if not args.self_test:
         missing = [
@@ -319,6 +326,63 @@ def kv_scales(model_dir: Path, num_layers: int) -> list[tuple[float, float]]:
             f"the checkpoint stores {found} of the {2 * num_layers} per-layer KV scales"
         )
     return out
+
+
+def load_kv_scales_file(path: Path, num_layers: int) -> list[tuple[float, float]]:
+    """Per-layer (k_scale, v_scale) from a Turbine KV-scale cache file
+    (turbine_server::model::calibrate_kv_scales): the f32 bit patterns `k_bits` / `v_bits`,
+    so the emulation uses exactly the scales the server served with."""
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if doc.get("layers") != num_layers:
+        raise ValueError(
+            f"{path}: {doc.get('layers')} layers, the model has {num_layers}"
+        )
+    out = []
+    for half in ("k", "v"):
+        bits = doc.get(f"{half}_bits")
+        if not isinstance(bits, list) or len(bits) != num_layers:
+            raise ValueError(f"{path}: {half}_bits is not a list of {num_layers}")
+    for layer in range(num_layers):
+        pair = (_from_bits(doc["k_bits"][layer]), _from_bits(doc["v_bits"][layer]))
+        for v in pair:
+            if not (math.isfinite(v) and v > 0.0):
+                raise ValueError(
+                    f"{path}: layer {layer} scale {v} not finite and positive"
+                )
+        out.append(pair)
+    return out
+
+
+def kv_scales_file_self_test() -> None:
+    import tempfile
+
+    k = [0.0535714291036129, 0.02678571455180645]
+    v = [0.00034877232974395156, 0.0027901786379516125]
+    doc = {
+        "layers": 2,
+        "k": k,
+        "v": v,
+        "k_bits": [_bits(x) for x in k],
+        "v_bits": [_bits(x) for x in v],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "scales.json"
+        f.write_text(json.dumps(doc), encoding="utf-8")
+        got = load_kv_scales_file(f, 2)
+        assert got == [(_f32(k[0]), _f32(v[0])), (_f32(k[1]), _f32(v[1]))], got
+        for bad in (
+            dict(doc, layers=3),
+            dict(doc, k_bits=doc["k_bits"][:1]),
+            dict(doc, v_bits=[0, 0]),
+        ):
+            f.write_text(json.dumps(bad), encoding="utf-8")
+            try:
+                load_kv_scales_file(f, 2)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"accepted {bad}")
+    print("quant_reference.py: kv scales file self-test ok", file=sys.stderr)
 
 
 class _Fp8KvCache:
@@ -691,6 +755,7 @@ def self_test() -> None:
             f"{mode} rows differ"
         )
     print(f"quant_reference.py: self-test ok ({len(xs)} inputs)", file=sys.stderr)
+    kv_scales_file_self_test()
     kv_self_test()
 
 
@@ -745,11 +810,16 @@ def run(args: argparse.Namespace) -> None:
             torch, model, record["layers"], mode, args.input_scale == "fused-max"
         )
         if args.kv_quant != "none":
-            scales = kv_scales(args.model_dir, model.config.num_hidden_layers)
+            n_layers = model.config.num_hidden_layers
+            scales = (
+                load_kv_scales_file(args.kv_scales, n_layers)
+                if args.kv_scales is not None
+                else kv_scales(args.model_dir, n_layers)
+            )
             attn = install_kv_quant(torch, model, scales)
             print(
                 f"{attn}: FP8 KV with {len(scales)} layer scale pairs "
-                f"({'checkpoint' if any(p != (1.0, 1.0) for p in scales) else 'all 1.0'})",
+                f"({'file' if args.kv_scales is not None else 'checkpoint' if any(p != (1.0, 1.0) for p in scales) else 'all 1.0'})",
                 file=sys.stderr,
             )
         source = "" if unquantized else f"-dequant-{record['packaging']}"

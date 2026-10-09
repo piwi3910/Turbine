@@ -6,8 +6,10 @@
 
 use turbine_core::registry::{Module, Registry};
 
+pub mod harmony;
 pub mod qwen_think;
 
+pub use harmony::Harmony;
 pub use qwen_think::QwenThink;
 
 /// One way a model marks its reasoning.
@@ -61,7 +63,7 @@ pub struct ReasoningSample {
 }
 
 static REASONING_PARSERS: Registry<dyn ReasoningParser> =
-    Registry::new("reasoning_parser", &[&QwenThink]);
+    Registry::new("reasoning_parser", &[&QwenThink, &Harmony]);
 
 /// Every reasoning parser, in registration order.
 pub fn registry() -> &'static Registry<dyn ReasoningParser> {
@@ -105,7 +107,7 @@ mod registry_conformance {
     fn names() {
         let reg = super::registry();
         assert_eq!(reg.point(), "reasoning_parser");
-        assert_eq!(reg.names(), ["qwen_think"]);
+        assert_eq!(reg.names(), ["qwen_think", "harmony"]);
     }
 
     /// The held-back suffix is the longest proper marker prefix, on char boundaries.

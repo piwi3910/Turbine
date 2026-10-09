@@ -386,11 +386,12 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     ),
     // FP8 KV on gfx1201 (Phase 6a S-13, S-14). Llama: `supported` after the Task 24 proof, full
     // GSM8K at c16 (1,319 items) BF16 KV 0.7801, FP8 KV 0.7885, golden c1 / c16 16/16 against
-    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `experimental` for 6a (user
-    // decision 2026-09-30, "OLMoE FP8 KV: golden against the emulated-KV reference misses", B):
-    // full GSM8K 0.6603 vs 0.6459 (drop 0.0144, accepted as noise 2026-09-29), but golden c1 / c16
-    // 13/16 against tests/golden/olmoe-1b-7b-0125-instruct-fp8kv (need 14; p03 tail 5.38). The
-    // checkpoint ships no K/V scales; calibrated V scales and the golden miss are a Phase 7 item.
+    // tests/golden/llama-3.2-3b-instruct-fp8kv (7ad4b03). OLMoE: `supported` after the P7 Task 36
+    // proof (decision 2026-10-08 "P7 OLMoE FP8 KV golden reference", A): the server calibrates
+    // per-layer K/V scales for the scale-less checkpoint (`kv_scales::calibrate`), the emulated-KV
+    // reference was regenerated with them, the tolerance was re-derived from the engine spread
+    // against that reference (likely 1.15, tail 3.42; README + engine_spread.json), full GSM8K at
+    // c16 is 0.6603 vs 0.6573 (drop 0.0030) and golden c1 / c16 are 16/16 (p7-t36d).
     row(
         Some("amd"),
         Some("gfx1201"),
@@ -407,7 +408,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Fp8E4m3),
         NO_SPEC,
-        SupportStatus::Experimental,
+        SupportStatus::Supported,
     ),
     // FP8 weights on gfx1201 Llama (Phase 6a Task 14): `supported`. The one `fp8` column covers
     // both checkpoints the proof ran. Dynamic per-token (RedHatAI FP8-dynamic): full GSM8K at c16
@@ -1493,9 +1494,11 @@ mod tests {
             }
             if r.key.kv_format == Some(K::Fp8E4m3) {
                 assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
-                assert_eq!(
-                    r.key.architecture,
-                    Some("LlamaForCausalLM"),
+                assert!(
+                    matches!(
+                        r.key.architecture,
+                        Some("LlamaForCausalLM") | Some("OlmoeForCausalLM")
+                    ),
                     "{:?}",
                     r.view()
                 );
@@ -1547,11 +1550,12 @@ mod tests {
                 "{k}: {status:?}"
             );
         }
-        // FP8 KV: supported on gfx1201 Llama after the Task 24 proof, experimental on gfx1201
-        // OLMoE (golden miss, user decision 2026-09-30 B), refused naming the track anywhere else.
+        // FP8 KV: supported on gfx1201 Llama (Task 24 proof) and gfx1201 OLMoE (P7 Task 36:
+        // calibrated scales, regenerated reference, re-derived tolerance, golden 16/16),
+        // refused naming the track anywhere else.
         for (architecture, expected) in [
             ("LlamaForCausalLM", "supported"),
-            ("OlmoeForCausalLM", "experimental"),
+            ("OlmoeForCausalLM", "supported"),
         ] {
             let k = key("amd", "gfx1201", architecture, W::Bf16, K::Fp8E4m3, S::None);
             assert_eq!(resolve(&k).as_str(), expected, "{k}");

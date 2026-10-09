@@ -8,9 +8,12 @@ use std::sync::Arc;
 
 use half::{bf16, f16};
 use turbine_core::types::DType;
+use turbine_kernels::cpu::quant::fp8_e4m3_value;
 use turbine_kernels::{TqEncodeFn, TqPaged, TqParams};
+use turbine_tensor::DeviceMemory;
 
 use crate::ModelError;
+use crate::executor::{ModelExecutor, SequenceKv};
 use crate::safetensors::{Dtype, SafetensorsIndex, TensorEntry, io_err, open_regular};
 
 /// How the paged KV pool stores K and V ([`crate::ModelArchConfig::kv_cache`]).
@@ -143,6 +146,132 @@ impl KvCache {
         let (k, v) = scales.split_at(num_layers as usize);
         Ok(KvCache::fp8_e4m3(k.to_vec(), v.to_vec()))
     }
+}
+
+/// True when the checkpoint stores at least one per-layer K or V scale (then
+/// [`KvCache::fp8_from_checkpoint`] reads or refuses them; calibration is for the others).
+pub fn checkpoint_has_scales(index: &SafetensorsIndex, num_layers: u32) -> bool {
+    ["k", "v"].iter().any(|half| {
+        (0..num_layers).any(|layer| {
+            scale_names(layer, half)
+                .iter()
+                .any(|n| index.get(n).is_some())
+        })
+    })
+}
+
+/// The largest magnitude an e4m3 page element holds: a calibrated scale maps a layer's
+/// absolute maximum onto it.
+pub const E4M3_MAX: f32 = 448.0;
+
+/// The longest calibration prompt, in tokens: a longer one is cut (one prefill step).
+pub const CALIBRATION_MAX_TOKENS: usize = 256;
+
+/// Per-layer FP8 KV dequantization scales measured by [`calibrate`] (P7 S-15).
+#[derive(Clone, PartialEq, Debug)]
+pub struct KvScales {
+    /// K scale of every layer: its absolute maximum / [`E4M3_MAX`].
+    pub k: Vec<f32>,
+    /// V scale of every layer.
+    pub v: Vec<f32>,
+}
+
+impl KvScales {
+    /// FP8 e4m3 pages with these scales.
+    pub fn into_cache(self) -> KvCache {
+        KvCache::fp8_e4m3(self.k, self.v)
+    }
+}
+
+/// The fixed calibration prompt set (`tests/fixtures/kv_calibration_prompts.jsonl`: 32
+/// prompts, none from the golden set or GSM8K), as texts in file order.
+pub fn calibration_prompts() -> Vec<String> {
+    include_str!("../tests/fixtures/kv_calibration_prompts.jsonl")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).expect("calibration fixture");
+            v["prompt"].as_str().expect("calibration prompt").to_owned()
+        })
+        .collect()
+}
+
+/// Measures per-layer K and V scales for a checkpoint that stores none (P7 S-15; kernel
+/// agnostic: the executor's own pages are read back). Each of `prompts` (cut at
+/// [`CALIBRATION_MAX_TOKENS`], empty ones skipped) is prefilled alone from position 0 on a
+/// private pool of the executor's layout; the K (after RoPE) and V of every written position are
+/// read back and the scale of a layer's half is `absmax / 448` over all prompts (1.0 for an
+/// all-zero half). Deterministic: the same executor numerics and prompts give the same scales.
+///
+/// The executor's pages are BF16 (exact) or FP8 e4m3 built with unit scales (read back as
+/// `e4m3 * 1`, within the e4m3 rounding of the absmax; the server's choice, so no second set of
+/// weights is loaded). The caller keeps each prompt within the executor's `max_batch_tokens`.
+pub fn calibrate(
+    executor: &mut dyn ModelExecutor,
+    mem: &Arc<dyn DeviceMemory>,
+    prompts: &[Vec<u32>],
+) -> Result<KvScales, ModelError> {
+    let layout = *executor.kv_layout();
+    let elem_bytes = match layout.dtype {
+        DType::BF16 => 2usize,
+        DType::F8E4M3 => 1,
+        other => {
+            return Err(ModelError::Kernel(
+                turbine_kernels::KernelError::InvalidArgument {
+                    message: format!("KV calibration reads BF16 or FP8 pages, not {other:?}"),
+                },
+            ));
+        }
+    };
+    let layers = layout.num_layers as usize;
+    let row = (layout.num_kv_heads * layout.head_dim) as usize;
+    let block_tokens = layout.block_tokens as usize;
+    let half_bytes = block_tokens * row * elem_bytes;
+    let longest = prompts
+        .iter()
+        .map(|p| p.len().min(CALIBRATION_MAX_TOKENS))
+        .max()
+        .unwrap_or(0);
+    let mut k_max = vec![0.0f32; layers];
+    let mut v_max = vec![0.0f32; layers];
+    if longest > 0 {
+        let mut kv = SequenceKv::new(mem, layout, longest as u32)?;
+        let mut bytes = vec![0u8; layout.layer_block_bytes() as usize];
+        for prompt in prompts {
+            let tokens = &prompt[..prompt.len().min(CALIBRATION_MAX_TOKENS)];
+            if tokens.is_empty() {
+                continue;
+            }
+            let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+            kv.forward(executor, tokens, &positions)?;
+            let view = kv.view();
+            for layer in 0..layers {
+                for block in 0..tokens.len().div_ceil(block_tokens) {
+                    let valid = (tokens.len() - block * block_tokens).min(block_tokens);
+                    let offset = layer as u64 * view.layer_stride_bytes
+                        + block as u64 * layout.layer_block_bytes();
+                    view.storage.copy_to_host(offset as usize, &mut bytes)?;
+                    for (maxes, start) in [(&mut k_max, 0), (&mut v_max, half_bytes)] {
+                        let page = &bytes[start..start + valid * row * elem_bytes];
+                        let m = page
+                            .chunks_exact(elem_bytes)
+                            .map(|e| match layout.dtype {
+                                DType::BF16 => bf16::from_le_bytes([e[0], e[1]]).to_f32().abs(),
+                                _ => fp8_e4m3_value(e[0]).abs(),
+                            })
+                            .filter(|v| v.is_finite())
+                            .fold(0.0f32, f32::max);
+                        maxes[layer] = maxes[layer].max(m);
+                    }
+                }
+            }
+        }
+    }
+    let scale = |m: f32| if m > 0.0 { m / E4M3_MAX } else { 1.0 };
+    Ok(KvScales {
+        k: k_max.into_iter().map(scale).collect(),
+        v: v_max.into_iter().map(scale).collect(),
+    })
 }
 
 impl Default for KvCache {

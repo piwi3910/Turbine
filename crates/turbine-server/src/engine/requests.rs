@@ -72,6 +72,9 @@ pub(crate) struct Submission {
     pub echo_text: Option<String>,
     /// The reasoning parser of a chat request (P7 S-10); `None` when off.
     pub reasoning: Option<ReasoningStart>,
+    /// The ids of the served tool format's declared markers; the detokenizer emits their
+    /// text (P7 decision "Harmony marker visibility").
+    pub marker_ids: Vec<u32>,
 }
 
 /// What starts each choice's reasoning stream.
@@ -131,6 +134,7 @@ impl From<GenerationRequest> for Submission {
             tools: ToolOutput::None,
             echo_text: None,
             reasoning: None,
+            marker_ids: Vec::new(),
         }
     }
 }
@@ -223,6 +227,7 @@ impl ActiveRequest {
             tools,
             echo_text,
             reasoning,
+            marker_ids,
         } = submission;
         let end_ids = end_ids(&request.stop);
         let mut matchers = matchers.into_iter();
@@ -237,10 +242,11 @@ impl ActiveRequest {
                     &request.prompt_tokens,
                     &end_ids,
                 ),
-                detok: IncrementalDetokenizer::new(Arc::clone(tokenizer)),
                 held_text: String::new(),
                 matcher: matchers.next(),
                 echo: echo_text.clone(),
+                detok: IncrementalDetokenizer::new(Arc::clone(tokenizer))
+                    .emitting_specials(marker_ids.iter().copied()),
                 tool_text: match tools {
                     ToolOutput::None => ToolText::Streaming,
                     ToolOutput::Auto(_) => ToolText::Undecided(String::new()),

@@ -38,7 +38,10 @@ fn weather_tools() -> Vec<Value> {
                 "required": ["location"]
             }
         }}),
-        json!({"type": "function", "function": {"name": "get_time"}}),
+        // The description keeps gpt-oss's real template (which renders `tool.description`)
+        // able to render the fixture.
+        json!({"type": "function", "function": {"name": "get_time",
+            "description": "Get the current time."}}),
     ]
 }
 
@@ -637,6 +640,7 @@ fn family_template_fixture(family: &str) -> Option<&'static str> {
         "qwen3_moe" => Some("qwen3-30b-a3b"),
         "mistral" => Some("mistral-7b-instruct-v0.3"),
         "mixtral" => Some("mixtral-8x7b-instruct-v0.1"),
+        "gpt_oss" => Some("gpt-oss-20b"),
         _ => None,
     }
 }
@@ -649,9 +653,11 @@ fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'
         "olmoe" => (None, &[]),
         "qwen3" | "qwen3_moe" => (Some(hermes::HERMES), &["<|im_end|>"]),
         "mistral" | "mixtral" => (Some(mistral::MISTRAL), &[mistral::TOOL_CALLS, "</s>"]),
-        // Harmony is registered with Phase 7 Task 25, which adds the template round trip; until
-        // then the name alone is asserted.
-        "gpt_oss" => (Some("harmony"), &[]),
+        // The seven Harmony markers are declared `required: false` like Hermes's and Mistral's:
+        // the conformance suite binds every format to the tiny tokenizer, which defines none of
+        // them. The served gpt-oss tokenizer defines all seven, and (P7 decision "Harmony marker
+        // visibility") the detokenizer emits them, so the parser sees them all.
+        "gpt_oss" => (Some(harmony::HARMONY), &[]),
         other => panic!("family {other} has no expected default tool format"),
     }
 }
@@ -683,12 +689,14 @@ fn family_default_tool_calls_round_trip() {
         let Some(dir) = family_template_fixture(family.name()) else {
             continue;
         };
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(dir);
-        // As the server resolves it: the checkpoint's own template, or the family's tool-aware
-        // replacement when that renders neither `tools` nor `tool_calls` (Mixtral's does not).
-        let template = crate::ChatTemplate::resolve_for(&path, None, family)
+        // As the server resolves it: the checkpoint's own template (`resolve` prefers a
+        // `chat_template.jinja` beside the tokenizer config, gpt-oss's layout; the others carry
+        // it in the config), or the family's tool-aware replacement when that renders neither
+        // `tools` nor `tool_calls` (Mixtral's does not).
+        let template = crate::ChatTemplate::resolve_for(&fixture, None, family)
             .unwrap_or_else(|e| panic!("{}: {dir} template: {e}", family.name()));
         let kwargs = serde_json::Map::new();
         let prompt = template
@@ -735,9 +743,146 @@ fn family_default_tool_calls_round_trip() {
         checked += 1;
     }
     assert_eq!(
-        checked, 4,
-        "qwen3, qwen3_moe, mistral and mixtral have template fixtures"
+        checked, 5,
+        "qwen3, qwen3_moe, mistral, mixtral and gpt_oss have template fixtures"
     );
+}
+
+/// The tool calls of `parse`, or `None` when it returned content.
+fn maybe_calls(parse: ToolParse) -> Option<Vec<(String, String)>> {
+    match parse {
+        ToolParse::Calls(calls) => Some(calls.into_iter().map(|c| (c.name, c.arguments)).collect()),
+        ToolParse::Content(_) => None,
+    }
+}
+
+/// The Harmony call forms: `one`/`time`/`two` are the generation form (commentary channel,
+/// recipient after it), `turn` is what gpt-oss's template renders for a call in the history
+/// (recipient before the channel, no `<|constrain|>`), `truncated` a call cut off mid-output.
+const HARMONY_ONE: &str = "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
+const HARMONY_TIME: &str = "<|start|>assistant<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{}<|call|>";
+const HARMONY_TURN: &str = "<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
+
+/// S-9 (part 1): the `harmony` format's own cases over the generation-form calls, plus the
+/// template's assistant-turn form. The checks every format must pass are
+/// `conformance::formats_suite` (`registry_conformance::tool_formats`).
+#[test]
+fn harmony_conformance() {
+    let two = format!("{HARMONY_ONE}{HARMONY_TIME}");
+    enveloped_conformance(
+        "harmony",
+        &Samples {
+            one: HARMONY_ONE,
+            two: &two,
+            time: HARMONY_TIME,
+            bad: "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"unit\": \"kelvin\"}<|call|>",
+            unknown: "<|start|>assistant<|channel|>commentary to=functions.get_stock <|constrain|>json<|message|>{}<|call|>",
+            texts: &["The weather in Oslo is sunny.", "<"],
+        },
+    );
+    let parser = registry().get("harmony").expect("registered").parser();
+    // The template's assistant-turn form (recipient before the channel, no `<|constrain|>`)
+    // parses back into the same call.
+    assert_eq!(
+        maybe_calls(parser.parse(HARMONY_TURN)),
+        Some(vec![(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )])
+    );
+    // A call cut off before `<|call|>` stays content (a partial form parses as nothing).
+    let truncated = &HARMONY_ONE[..HARMONY_ONE.len() - harmony::CALL.len()];
+    assert_eq!(maybe_calls(parser.parse(truncated)), None);
+}
+
+/// S-9 (part 2): a Harmony output splits into the analysis reasoning and the final content, a
+/// commentary tool call is withheld for the tool parser, markers split across pushes change
+/// nothing, and `reasoning_effort` reaches the gpt-oss template context (default `medium`).
+#[test]
+fn harmony_round_trip() {
+    let split_of = |pieces: &[&str]| {
+        use crate::reasoning::ReasoningDelta;
+        let parser = crate::reasoning::registry()
+            .get("harmony")
+            .expect("registered");
+        let mut stream = parser.start("<|start|>assistant");
+        let mut split = ReasoningDelta::default();
+        for piece in pieces {
+            split.append(stream.push(piece));
+        }
+        split.append(stream.finish());
+        split
+    };
+    let parse = |text: &str| {
+        registry()
+            .get("harmony")
+            .expect("registered")
+            .parser()
+            .parse(text)
+    };
+
+    // (1) analysis reasoning, then a commentary-channel call: the reasoning is `reasoning`,
+    // the withheld call text is released at the finish for the tool parser.
+    let call_output = format!("<|channel|>analysis<|message|>think<|end|>{HARMONY_ONE}");
+    let split = split_of(&[&call_output]);
+    assert_eq!(split.reasoning, "think");
+    assert_eq!(
+        maybe_calls(parse(&split.content)),
+        Some(vec![(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )])
+    );
+    // The plain call text parses the same (what the engine's tool parser holds).
+    assert_eq!(
+        maybe_calls(parse(HARMONY_ONE)),
+        maybe_calls(parse(&split.content))
+    );
+
+    // (2) analysis then final: reasoning `a`, content `b`.
+    let answer = "<|channel|>analysis<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>b<|return|>";
+    let split = split_of(&[answer]);
+    assert_eq!(
+        (split.reasoning.as_str(), split.content.as_str()),
+        ("a", "b"),
+        "{answer}"
+    );
+
+    // (3) the same output one char per push, and split inside `<|chan` / `nel|>`.
+    let chars: Vec<String> = answer.chars().map(String::from).collect();
+    let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+    let per_char = split_of(&pieces);
+    assert_eq!(
+        (per_char.reasoning.as_str(), per_char.content.as_str()),
+        ("a", "b"),
+        "one char per push"
+    );
+    let at = answer.find("<|channel|>").expect("channel marker") + "<|chan".len();
+    let mid_marker = split_of(&[&answer[..at], &answer[at..]]);
+    assert_eq!(
+        (mid_marker.reasoning.as_str(), mid_marker.content.as_str()),
+        ("a", "b"),
+        "split inside the channel marker"
+    );
+
+    // (4) `reasoning_effort` reaches the gpt-oss template context; without it the template
+    // sees `medium` (the checkpoint's own default, also the render's).
+    let template = crate::ChatTemplate::resolve(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gpt-oss-20b"),
+        None,
+    )
+    .expect("gpt-oss template");
+    let messages = [json!({"role": "user", "content": "What is the weather in Oslo?"})];
+    let mut kwargs = serde_json::Map::new();
+    kwargs.insert("reasoning_effort".into(), json!("high"));
+    let high = template
+        .render(&messages, None, true, &kwargs)
+        .expect("render high");
+    assert!(high.contains("Reasoning: high"), "{high}");
+    let medium = template
+        .render(&messages, None, true, &serde_json::Map::new())
+        .expect("render medium");
+    assert!(medium.contains("Reasoning: medium"), "{medium}");
 }
 
 /// P7 S-6: the `mistral` parser's call ids are 9 alphanumerics, so a parsed call sent back as

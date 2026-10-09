@@ -19,10 +19,12 @@ use crate::tokenizer::Tokenizer;
 use crate::tools::{ToolCallParser, ToolChoice};
 
 mod envelope;
+pub mod harmony;
 pub mod hermes;
 pub mod llama3_json;
 pub mod mistral;
 
+pub use harmony::{Harmony, HarmonyParser};
 pub use hermes::{Hermes, HermesParser};
 pub use llama3_json::{Llama3Json, Llama3JsonParser};
 pub use mistral::{Mistral, MistralParser};
@@ -97,6 +99,11 @@ impl BoundTokens {
             .find(|(t, _)| *t == text)
             .and_then(|&(_, id)| id)
     }
+
+    /// Every id the format's declared tokens resolved to on this tokenizer.
+    pub fn resolved_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.ids.iter().filter_map(|&(_, id)| id)
+    }
 }
 
 /// What an `auto` output is, as far as its opening shows.
@@ -149,7 +156,7 @@ pub fn bind(
 }
 
 static TOOL_FORMATS: Registry<dyn ToolFormat> =
-    Registry::new("tool_format", &[&Llama3Json, &Hermes, &Mistral]);
+    Registry::new("tool_format", &[&Llama3Json, &Hermes, &Mistral, &Harmony]);
 
 /// Every tool-call format, in registration order.
 pub fn registry() -> &'static Registry<dyn ToolFormat> {

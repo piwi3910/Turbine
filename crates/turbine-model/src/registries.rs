@@ -88,7 +88,11 @@ mod registry_conformance {
     #[test]
     fn tool_formats() {
         let reg = crate::formats::registry();
-        names_are(reg, "tool_format", &["llama3_json", "hermes", "mistral"]);
+        names_are(
+            reg,
+            "tool_format",
+            &["llama3_json", "hermes", "mistral", "harmony"],
+        );
         passes(formats_suite(reg));
     }
 
