@@ -3201,10 +3201,12 @@ fn lab_perf_dry_run_phase7_placements() {
     }
 }
 
-/// Plan Task 9 (decision 2026-10-08 B): each two-card family scenario renders the two-GPU Job and
-/// its dry run prints the in-Job Turbine legs — the server on the placement's config, the
-/// batched-bounds golden at c1 and c16, the GSM8K eval and its compare against the committed vLLM
-/// baseline, the c16 bench — and no vLLM leg; the eval result is copied back before cleanup.
+/// Plan Task 9 (decision 2026-10-08 B), Task 18 (decision 2026-10-08 A): each two-card family
+/// scenario renders the two-GPU Job and its dry run prints the in-Job Turbine legs — the server
+/// on the placement's config, the multi-gpu-bounds golden at c1 and c16 (the two-card MoE rows of
+/// S-13; falls back to the batched bounds while tolerance.json carries no `_multi_gpu` keys), the
+/// GSM8K eval and its compare against the committed vLLM baseline, the c16 bench — and no vLLM
+/// leg; the eval result is copied back before cleanup.
 /// Breaks if a scenario is missing, a leg is dropped, or a vLLM leg reappears in the pod.
 #[test]
 fn lab_cluster_dry_run_family_scenarios() {
@@ -3230,8 +3232,8 @@ fn lab_cluster_dry_run_family_scenarios() {
                     &format!(
                         "turbine-server --config scripts/lab/phase7-novanas-{short}-{placement}.yaml"
                     ),
-                    &format!("{golden} --concurrency 1 --batched-bounds"),
-                    &format!("{golden} --concurrency 16 --batched-bounds"),
+                    &format!("{golden} --concurrency 1 --multi-gpu-bounds"),
+                    &format!("{golden} --concurrency 16 --multi-gpu-bounds"),
                     "turbine-golden eval --url http://127.0.0.1:18000 --tasks \
                      tests/eval/gsm8k-200.jsonl --concurrency 16 --output json",
                     &format!("/results/turbine-{placement}.json"),
