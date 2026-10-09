@@ -636,12 +636,19 @@ pub fn prepare_replica(
     prepare_with(config, inventory, &base.kernel_metrics, Some(base), part)
 }
 
-/// The device bytes `slots` take (BF16, the only weight dtype tensor parallelism serves; a
-/// stacked slot is its part of the stack; a padded vocabulary shard counts its padding rows).
-fn slot_bytes(slots: &[turbine_model::WeightSlot]) -> u64 {
+/// The device bytes `slots` take: each slot's (sharded) shape priced at the dtype the resolved
+/// weight format stores it in on the device (`WeightFormat::slot_dtype`, the loader's own
+/// accounting) — a quantized checkpoint's served slots count their device bytes (FP8 one byte
+/// per element), not a BF16 worst case, which refused a fitting Mixtral FP8 placement at the
+/// pre-load budget. A stacked slot is its part of the stack; a padded vocabulary shard counts
+/// its padding rows.
+fn slot_bytes(arch: &turbine_model::ModelArchConfig, slots: &[turbine_model::WeightSlot]) -> u64 {
+    let format = arch.weight_format.get();
     slots
         .iter()
-        .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+        .map(|s| {
+            s.shape.iter().product::<usize>() as u64 * format.slot_dtype(s).size_bytes() as u64
+        })
         .sum()
 }
 
@@ -764,7 +771,7 @@ fn prepare_with(
                 .map_err(pp_error)?,
                 pp::workspace_bytes(&arch, s, limits).map_err(pp_error)?,
                 pp::kv_layout(&arch, &s.layers, block_tokens).map_err(pp_error)?,
-                slot_bytes(&pp::weight_slots(&arch, s).map_err(pp_error)?),
+                slot_bytes(&arch, &pp::weight_slots(&arch, s).map_err(pp_error)?),
             )
         }
         (Some(e), _) => (
@@ -779,7 +786,10 @@ fn prepare_with(
             .map_err(ep_error)?,
             ep::workspace_bytes(&arch, e.shard, &e.placement, limits).map_err(ep_error)?,
             ep::kv_layout(&arch, e.shard, block_tokens).map_err(ep_error)?,
-            slot_bytes(&ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?),
+            slot_bytes(
+                &arch,
+                &ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?,
+            ),
         ),
         (None, None) => (
             executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
@@ -797,7 +807,7 @@ fn prepare_with(
                 .map_err(tp_error)?,
             tp::workspace_bytes(&arch, s, limits).map_err(tp_error)?,
             tp::kv_layout(&arch, s, block_tokens).map_err(tp_error)?,
-            slot_bytes(&tp::weight_slots(&arch, s).map_err(tp_error)?),
+            slot_bytes(&arch, &tp::weight_slots(&arch, s).map_err(tp_error)?),
         ),
     };
     // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
@@ -1936,5 +1946,56 @@ mod tests {
         assert_eq!(resolve_tool_call_parser(None, &Qwen3, false), OFF);
         assert_eq!(resolve_tool_call_parser(hermes, &Llama, true), hermes);
         assert_eq!(resolve_tool_call_parser(mistral, &Qwen3, true), mistral);
+    }
+
+    /// P7 Task 22: the pre-load budget prices the slots of a quantized checkpoint at the dtype
+    /// the format stores them in (`WeightFormat::slot_dtype`), not a BF16 worst case — the BF16
+    /// pricing refused a fitting Mixtral FP8 tp 2 (46.7 GB counted on each rank against 31.6 GiB)
+    /// before any byte was loaded. The tiny FP8 Mixtral's tp-2 slots: every quantized slot one
+    /// byte per element, about half of the BF16 pricing.
+    #[test]
+    fn startup_budget_prices_quantized_slots_at_their_dtype() {
+        let tmp = turbine_model::testing::TempDir::new("tiny-server-slot-bytes");
+        let quant = serde_json::json!({
+            "quant_method": "compressed-tensors", "format": "float-quantized",
+            "ignore": ["model.layers.0.block_sparse_moe.gate", "lm_head"],
+            "config_groups": {"group_0": {"targets": ["Linear"],
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                                      "dynamic": false, "symmetric": true},
+                "weights": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                            "dynamic": false, "symmetric": true}}}}
+        );
+        let fixture = turbine_model::testing::tiny::write_tiny_family_quantized(
+            tmp.path(),
+            "mixtral",
+            22,
+            &quant,
+        );
+        let cfg = &fixture.quantized.config;
+        let slots = turbine_model::tp::weight_slots(
+            cfg,
+            turbine_distributed::tp::ShardSpec { rank: 0, world: 2 },
+        )
+        .expect("tp slots");
+        let dtype_bytes = |s: &turbine_model::WeightSlot| {
+            cfg.weight_format.get().slot_dtype(s).size_bytes() as u64
+        };
+        let bytes = slot_bytes(cfg, &slots);
+        let expected: u64 = slots
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>() as u64 * dtype_bytes(s))
+            .sum();
+        assert_eq!(bytes, expected);
+        // Some slots are served quantized (one byte per element), the rest BF16.
+        assert!(slots.iter().any(|s| dtype_bytes(s) == 1));
+        assert!(slots.iter().any(|s| dtype_bytes(s) == 2));
+        let bf16_priced: u64 = slots
+            .iter()
+            .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+            .sum();
+        assert!(
+            bytes < bf16_priced,
+            "dtype pricing {bytes} is not below the BF16 pricing {bf16_priced}"
+        );
     }
 }
