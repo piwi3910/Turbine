@@ -871,4 +871,91 @@ mod tests {
         let unedited = model_dir("sw-none", fixture("mistral-7b-instruct-v0.3"));
         assert!(model_feature_refusal(unedited.path()).is_ok());
     }
+
+    /// P7 S-7: a placement whose gate failed is refused before any port is bound (a
+    /// configuration error, exit 2) with its `PARALLEL_REFUSALS` reason code: a synthetic
+    /// Mixtral row inserted through the test-only [`turbine_core::support::
+    /// with_parallel_refusals`] seam makes `parallel::check_executable` refuse
+    /// `MixtralForCausalLM` at tp 2 (which its hooks otherwise split), and without the seam
+    /// the plan passes. The committed table's Mixtral entries, if any, carry a `mixtral_`
+    /// code (Task 22 records a failing placement here). Breaks if the tensor-parallel path
+    /// skips `parallel_refusal` or the seam leaks past its guard.
+    #[test]
+    fn mixtral_placement_refusal() {
+        use turbine_core::support::{PARALLEL_REFUSALS, ParallelRefusal, with_parallel_refusals};
+        use turbine_distributed::plan::{ParallelPlan, RankSlot, ReplicaGroup};
+
+        let dir = TempDir::new("mixtral-placement");
+        let spec = turbine_model::testing::tiny::write_tiny_family(dir.path(), "mixtral", 3);
+        assert_eq!(spec.config.family.0.name(), "mixtral");
+        let mut cfg = config("cpu", dir.path());
+        cfg.parallel.tensor_parallel_size = turbine_core::config::SizeOrAuto::Size(2);
+        let plan = |tp: u32| ParallelPlan {
+            tp,
+            dp: 1,
+            pp: 1,
+            ep: 1,
+            backend: "host",
+            mode: turbine_core::config::RankMode::Local,
+            vendor: None,
+            excluded_devices: Vec::new(),
+            groups: vec![ReplicaGroup {
+                replica: turbine_core::types::ReplicaId(0),
+                ranks: (0..tp)
+                    .map(|rank| RankSlot {
+                        rank,
+                        device: turbine_core::types::DeviceId(rank),
+                        host: "local".into(),
+                    })
+                    .collect(),
+            }],
+            reasons: Vec::new(),
+            experts: None,
+            stages: Vec::new(),
+        };
+
+        // Without the refusal the tiny Mixtral splits at tp 2 (its hooks are tensor-parallel).
+        let mut ok = plan(2);
+        assert!(
+            crate::parallel::check_executable(&mut ok, &cfg).is_ok(),
+            "tiny Mixtral tp 2 must pass without a refusal"
+        );
+
+        static MIXTRAL_TP2: [ParallelRefusal; 1] = [ParallelRefusal {
+            architecture: "MixtralForCausalLM",
+            modes: "tp",
+            reason: "mixtral_tp2_gate: test refusal (synthetic row)",
+        }];
+        let _guard = with_parallel_refusals(&MIXTRAL_TP2);
+        let mut refused = plan(2);
+        let err = crate::parallel::check_executable(&mut refused, &cfg)
+            .expect_err("the synthetic refusal fires");
+        let crate::parallel::PlanFailure::Config(message) = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(message.contains("mixtral_tp2_gate"), "{message}");
+        assert!(message.contains("MixtralForCausalLM"), "{message}");
+        // And it does not refuse another architecture or tp 1.
+        assert!(
+            crate::parallel::check_executable(&mut plan(1), &cfg).is_ok(),
+            "tp 1 is never refused"
+        );
+        drop(_guard);
+        assert!(
+            crate::parallel::check_executable(&mut plan(2), &cfg).is_ok(),
+            "the seam's guard cleared its rows"
+        );
+
+        // The real table's Mixtral entries, if any, carry a `mixtral_` code.
+        for r in PARALLEL_REFUSALS
+            .iter()
+            .filter(|r| r.architecture == "MixtralForCausalLM")
+        {
+            assert!(
+                r.reason.starts_with("mixtral_"),
+                "Mixtral refusal {} must name its mixtral_ code",
+                r.reason
+            );
+        }
+    }
 }

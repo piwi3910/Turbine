@@ -1886,6 +1886,7 @@ mod tests {
             pipeline: None,
             jump_forward: true,
             jump_forward_max_tokens: 32,
+            ranks: Vec::new(),
         });
         (engine, tx, shared, reg)
     }

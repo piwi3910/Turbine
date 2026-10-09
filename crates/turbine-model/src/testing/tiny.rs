@@ -357,6 +357,42 @@ pub fn write_tiny_qwen3moe_quantized(
     }
 }
 
+/// [`write_tiny_quantized`] for the tiny checkpoint of the Phase 7 family `family` (see
+/// [`write_tiny_family`]; hidden 64, expert width 32): the checkpoint quantized as
+/// `quantization_config` says in `dir/quantized` and its dequantized BF16 twin in `dir/twin`
+/// (Phase 7 S-7 fixtures: the tiny Mixtral with FP8 tensor experts, static W8A8). Formats
+/// without block scales only: the tiny dims are not multiples of 128. Panics when the format
+/// refuses the checkpoint or has no tiny writer.
+pub fn write_tiny_family_quantized(
+    dir: &Path,
+    family: &str,
+    seed: u64,
+    quantization_config: &serde_json::Value,
+) -> TinyQuantized {
+    let opts = TinyOptions {
+        tied: family == "qwen3",
+        template_with_tools: false,
+        ..TinyOptions::default()
+    };
+    let (qdir, tdir) = (dir.join("quantized"), dir.join("twin"));
+    write_tiny(&qdir, seed, &family_config_json(family), &opts);
+    let format = crate::weights::detect(&json!({ "quantization_config": quantization_config }))
+        .unwrap_or_else(|e| panic!("{quantization_config}: {e}"));
+    let written = format
+        .write_tiny(&qdir, Some(&tdir))
+        .unwrap_or_else(|e| panic!("{}: write_tiny: {e}", format.name()));
+    assert!(written, "{} has no tiny writer", format.name());
+    let spec = |dir: PathBuf| TinySpec {
+        config: load_model_config(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())),
+        dir,
+        vocab: TINY_VOCAB,
+    };
+    TinyQuantized {
+        quantized: spec(qdir),
+        twin: spec(tdir),
+    }
+}
+
 /// Writes the tiny `GptOssForCausalLM` checkpoint into `dir` (Phase 7 S-8): 4 layers alternating
 /// a sliding window of `sliding_window` positions (layers 0 and 2) and full attention, hidden
 /// 64, 4 query / 2 KV heads of dimension 64 with biased projections and one sink logit per

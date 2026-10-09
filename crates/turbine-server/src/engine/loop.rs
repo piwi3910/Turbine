@@ -165,6 +165,8 @@ pub(crate) struct EngineParts {
     pub jump_forward: bool,
     /// `structured_output.jump_forward_max_tokens`: the longest forced run fed in one step.
     pub jump_forward_max_tokens: u32,
+    /// Every rank's KV headroom, published in the KV document (P7 S-7).
+    pub ranks: Vec<turbine_kv::KvRankDocument>,
 }
 
 /// The message of the `slow_client` error event.
@@ -303,6 +305,8 @@ pub(crate) struct EngineLoop {
     jump_forward: bool,
     /// `structured_output.jump_forward_max_tokens`.
     jump_forward_max_tokens: u32,
+    /// [`EngineParts::ranks`].
+    ranks: Vec<turbine_kv::KvRankDocument>,
 }
 
 /// A micro-batch launched into the pipeline's stages before the last, waiting for its last
@@ -480,6 +484,7 @@ impl EngineLoop {
             last_collect: None,
             jump_forward: p.jump_forward,
             jump_forward_max_tokens: p.jump_forward_max_tokens,
+            ranks: p.ranks,
         };
         engine.publish(false);
         engine.publish_stats();
@@ -3262,7 +3267,8 @@ impl EngineLoop {
         if let Some(p) = &self.pipeline {
             scheduler.pipeline = Some(p.snapshot(self.pipe.len() as u32));
         }
-        let kv = self.kv.document(&self.pool);
+        let mut kv = self.kv.document(&self.pool);
+        kv.ranks.clone_from(&self.ranks);
         self.metrics.kv.record(&self.pool);
         self.stages.mark(Stage::Complete);
         let stages = std::mem::replace(&mut self.stages, StageClock::start()).finish();
@@ -3758,6 +3764,7 @@ mod tests {
             pipeline,
             jump_forward: true,
             jump_forward_max_tokens: 32,
+            ranks: Vec::new(),
         });
         TestEngine {
             engine,

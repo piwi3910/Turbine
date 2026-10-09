@@ -685,9 +685,10 @@ fn family_default_tool_calls_round_trip() {
         };
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
-            .join(dir)
-            .join("tokenizer_config.json");
-        let template = crate::ChatTemplate::load(&path)
+            .join(dir);
+        // As the server resolves it: the checkpoint's own template, or the family's tool-aware
+        // replacement when that renders neither `tools` nor `tool_calls` (Mixtral's does not).
+        let template = crate::ChatTemplate::resolve_for(&path, None, family)
             .unwrap_or_else(|e| panic!("{}: {dir} template: {e}", family.name()));
         let kwargs = serde_json::Map::new();
         let prompt = template
@@ -726,15 +727,6 @@ fn family_default_tool_calls_round_trip() {
         let format = registry()
             .get(default.expect("a family with a template fixture has a default format"))
             .expect("registered default format");
-        if family.name() == "mixtral" {
-            // Mixtral-8x7B-Instruct-v0.1's template (also the pinned RedHatAI FP8 revision's)
-            // renders an assistant turn's `content` only: it drops `tool_calls`, so no call can
-            // round-trip through it. Kept as an explicit case so a template that starts
-            // rendering calls is noticed.
-            assert!(!text.contains("get_weather"), "mixtral: {text:?}");
-            checked += 1;
-            continue;
-        }
         let calls = names_and_args(format.parser().parse(&text));
         assert_eq!(calls.len(), 1, "{}: {text:?}", family.name());
         assert_eq!(calls[0].0, "get_weather", "{}: {text:?}", family.name());

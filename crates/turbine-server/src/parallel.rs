@@ -176,7 +176,26 @@ pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), 
             "parallel.tensor_parallel_size: {} ranks cannot split {}: {e}",
             plan.tp, arch.hf_architecture
         ))
-    })
+    })?;
+    // Combinations the support matrix refuses for this architecture (`PARALLEL_REFUSALS`),
+    // like the expert-parallel path below.
+    if let Some(r) =
+        turbine_core::support::parallel_refusal(&arch.hf_architecture, plan.tp, plan.ep)
+    {
+        let code = r.reason.split(':').next().unwrap_or(r.reason);
+        tracing::error!(
+            event = "parallel_plan_failed",
+            reason = code,
+            tp = plan.tp,
+            error = %r.reason,
+            "the placement is refused by the support matrix"
+        );
+        return Err(PlanFailure::Config(format!(
+            "parallel.tensor_parallel_size: {} (tensor_parallel_size {} on {})",
+            r.reason, plan.tp, arch.hf_architecture
+        )));
+    }
+    Ok(())
 }
 
 /// [`check_executable`] of an expert-parallel plan.

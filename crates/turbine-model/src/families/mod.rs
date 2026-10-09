@@ -82,6 +82,13 @@ pub trait ModelFamily: Module {
     fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
         None
     }
+    /// A chat template (`(name, Jinja source)`) the family substitutes when the checkpoint's own
+    /// template renders neither `tools` nor an assistant turn's `tool_calls` and the operator
+    /// set no `model.chat_template` ([`crate::ChatTemplate::resolve_for`]); `None` (the default):
+    /// the checkpoint's template is always used.
+    fn chat_template_override(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
     /// Writes a tiny synthetic checkpoint of this family into `dir` (weights from a ChaCha8
     /// stream seeded by `seed`; the tiny tokenizer): the checkpoint the family's conformance
     /// suite ([`crate::conformance::families_suite`]) runs on the CPU provider. A test

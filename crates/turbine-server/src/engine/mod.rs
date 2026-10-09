@@ -47,6 +47,7 @@ use turbine_kv::tier::L2NvmeTier;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
 use turbine_model::executor::ModelExecutor;
+use turbine_reliability::budget::PoolKind;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError, policy};
 
@@ -350,6 +351,19 @@ pub fn spawn(
                 let ledger = Arc::clone(&loaded.ledger);
                 // P5 S-8: a tensor-parallel group admits against every rank's ledger.
                 let group = std::mem::take(&mut loaded.group);
+                // P7 S-7: each rank's KV headroom for the KV document: its budget's KV pool
+                // (after the weights, workspace, collective, runtime and emergency reserve),
+                // at most the L0 pool the engine runs.
+                let pool_bytes = u64::from(pool.total_blocks()) * pool.layout().block_bytes();
+                let ranks: Vec<turbine_kv::KvRankDocument> = std::iter::once(&loaded.budget)
+                    .chain(group.iter().map(|(b, _)| b))
+                    .enumerate()
+                    .map(|(rank, b)| turbine_kv::KvRankDocument {
+                        rank: rank as u32,
+                        device: b.device.0,
+                        headroom_bytes: b.pool(PoolKind::Kv).min(pool_bytes),
+                    })
+                    .collect();
                 let probe_group = group
                     .iter()
                     .map(|(b, l)| (b.device, Arc::clone(l)))
@@ -478,6 +492,7 @@ pub fn spawn(
                     pipeline: stats,
                     jump_forward: structured_output.jump_forward,
                     jump_forward_max_tokens: structured_output.jump_forward_max_tokens,
+                    ranks,
                 });
                 backend.set_ready(
                     replica,

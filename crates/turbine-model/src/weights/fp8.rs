@@ -695,7 +695,7 @@ pub fn check_block(field: &str, block: (u32, u32)) -> Result<Fp8Weights, ModelEr
 /// The static activation scale the tiny writer gives layer `module` (BF16-exact, different per
 /// projection so a fused projection's largest-part rule is exercised).
 fn tiny_input_scale(module: &str) -> f32 {
-    const BY_PROJ: [(&str, f32); 7] = [
+    const BY_PROJ: [(&str, f32); 10] = [
         ("q_proj", 0.031_25),
         ("k_proj", 0.062_5),
         ("v_proj", 0.093_75),
@@ -703,6 +703,10 @@ fn tiny_input_scale(module: &str) -> f32 {
         ("gate_proj", 0.062_5),
         ("up_proj", 0.031_25),
         ("down_proj", 0.078_125),
+        // Mixtral's experts: `w1` gate, `w3` up, `w2` down.
+        ("w1", 0.062_5),
+        ("w3", 0.031_25),
+        ("w2", 0.078_125),
     ];
     BY_PROJ
         .iter()

@@ -3822,6 +3822,7 @@ impl KvHierarchy {
         }
         KvDocument {
             tiers,
+            ranks: Vec::new(),
             summary: Some(KvSummary {
                 policy: self.policy.name(),
                 prefix_sharing: self.cfg.prefix_sharing,
