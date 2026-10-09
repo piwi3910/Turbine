@@ -156,6 +156,10 @@ impl ChatTemplate {
         for (k, v) in kwargs {
             ctx.insert(k.clone(), v.clone());
         }
+        // P7 S-9: the reasoning effort defaults to `medium` when neither the request's
+        // `reasoning_effort` nor `chat_template_kwargs` carries one.
+        ctx.entry("reasoning_effort")
+            .or_insert(serde_json::Value::String("medium".into()));
         ctx.insert("messages".into(), messages.to_vec().into());
         match tools {
             Some(tools) => {

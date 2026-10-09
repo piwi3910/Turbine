@@ -50,6 +50,9 @@ pub struct OpenAiRequest {
     pub ignore_eos: Option<bool>,
     pub return_tokens_as_token_ids: Option<bool>,
     pub chat_template_kwargs: Option<Map<String, Value>>,
+    /// Chat only (Harmony, P7 S-9): `low`, `medium` (the default) or `high`; any other value
+    /// is rejected with 400 naming the field.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// `-2..=2`, default 0 (P2).
     pub presence_penalty: Option<f32>,
     /// `-2..=2`, default 0 (P2).
@@ -87,6 +90,44 @@ pub struct OpenAiRequest {
 pub enum PromptInput {
     Text(String),
     Tokens(Vec<u32>),
+}
+
+/// Chat only (Harmony, P7 S-9): how hard the model reasons. Any other value is a 400 naming
+/// the field (the custom `Deserialize`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// The template-context spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "low" => Ok(ReasoningEffort::Low),
+            "medium" => Ok(ReasoningEffort::Medium),
+            "high" => Ok(ReasoningEffort::High),
+            other => Err(serde::de::Error::custom(format!(
+                "reasoning_effort must be one of `low`, `medium`, `high`, got `{other}`"
+            ))),
+        }
+    }
 }
 
 /// One chat message: roles `system`, `user`, `assistant` (optionally with `tool_calls`) and
@@ -255,6 +296,17 @@ impl OpenAiRequest {
             Some(key) => crate::kv::validate_session_id(key),
             None => Ok(()),
         }
+    }
+
+    /// The template context kwargs (P7 S-9): `chat_template_kwargs` with the request's
+    /// `reasoning_effort` merged in — the request field wins over a `chat_template_kwargs`
+    /// entry of the same name.
+    pub fn chat_template_kwargs_merged(&self) -> Map<String, Value> {
+        let mut kwargs = self.chat_template_kwargs.clone().unwrap_or_default();
+        if let Some(effort) = self.reasoning_effort {
+            kwargs.insert("reasoning_effort".into(), json!(effort.as_str()));
+        }
+        kwargs
     }
 
     fn check_unsupported(&self, chat: bool) -> Result<(), ApiError> {
