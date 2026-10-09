@@ -72,6 +72,8 @@ TWO_GPU_TESTS=(
 	tp_forward_profile
 	# crates/turbine-model/tests/olmoe_ep_tp_lab.rs (P7 Task 12)
 	olmoe_routing_trace_ep2_tp2
+	# crates/turbine-model/tests/golden.rs (P7 Task 17)
+	hip_trace_vs_cpu_qwen3moe
 )
 
 # Lab tests whose expectation follows the Job's R9700 count (TURBINE_EXPECT_AMD = --gpus): they

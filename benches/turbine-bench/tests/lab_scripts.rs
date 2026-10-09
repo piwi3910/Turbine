@@ -526,6 +526,8 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "tp_forward_profile",
             "--skip",
             "olmoe_routing_trace_ep2_tp2",
+            "--skip",
+            "hip_trace_vs_cpu_qwen3moe",
         ]
     );
 }
@@ -558,6 +560,7 @@ fn lab_test_routes_two_gpu_tests_to_the_gpus_2_leg() {
         "tp2_collective_failure_recovers_on_gpu",
         "tp_forward_profile",
         "olmoe_routing_trace_ep2_tp2",
+        "hip_trace_vs_cpu_qwen3moe",
     ];
     let gpu_count = [
         "inventory_matches_expectation",
@@ -705,6 +708,8 @@ fn lab_test_forwards_cargo_features() {
             "tp_forward_profile",
             "--skip",
             "olmoe_routing_trace_ep2_tp2",
+            "--skip",
+            "hip_trace_vs_cpu_qwen3moe",
         ]
     );
     for args in [
@@ -789,6 +794,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "tp_forward_profile".to_string(),
         "--skip".to_string(),
         "olmoe_routing_trace_ep2_tp2".to_string(),
+        "--skip".to_string(),
+        "hip_trace_vs_cpu_qwen3moe".to_string(),
     ];
     for t in slow {
         want.push("--skip".to_string());
@@ -827,6 +834,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
         "tp_forward_profile".to_string(),
         "--skip".to_string(),
         "olmoe_routing_trace_ep2_tp2".to_string(),
+        "--skip".to_string(),
+        "hip_trace_vs_cpu_qwen3moe".to_string(),
     ];
     for t in slow {
         want.push(t.to_string());
@@ -866,6 +875,8 @@ fn lab_test_tier_selects_or_skips_the_slow_tests() {
             "tp_forward_profile",
             "--skip",
             "olmoe_routing_trace_ep2_tp2",
+            "--skip",
+            "hip_trace_vs_cpu_qwen3moe",
         ]
     );
 
@@ -928,6 +939,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "tp_forward_profile",
             "--skip",
             "olmoe_routing_trace_ep2_tp2",
+            "--skip",
+            "hip_trace_vs_cpu_qwen3moe",
         ]
     );
     assert!(
@@ -983,6 +996,8 @@ fn lab_test_passes_a_subset_and_opts_into_the_hf_reference() {
             "tp_forward_profile",
             "--skip",
             "olmoe_routing_trace_ep2_tp2",
+            "--skip",
+            "hip_trace_vs_cpu_qwen3moe",
             "hf_reference",
         ]
     );

@@ -46,7 +46,7 @@ use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_with_head_dim, write_tiny_llama,
     write_tiny_llama_with, write_tiny_olmoe, write_tiny_olmoe_quantized,
-    write_tiny_olmoe_with_head_dim, write_tiny_quantized,
+    write_tiny_olmoe_with_head_dim, write_tiny_quantized, write_tiny_qwen3moe_quantized,
 };
 use turbine_model::testing::trace::{
     DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
@@ -5351,6 +5351,130 @@ fn tp2_matches_tp1_on_host_every_tp_family() {
     );
 }
 
+/// Seed of the tiny FP8-block Qwen3-MoE. The tiny random weights give near-uniform logits, so a
+/// greedy step can be a near-tie (0.01 nat) that tensor parallelism's all-reduce rounding flips,
+/// as for Mistral at tp 4 (`mistral_tp2_matches_tp1_on_host`): about half the seeds flip one
+/// (seed 7: step 9, margin 0.012 nat, logits within 0.005 of one device); this one has none, the
+/// largest |Δ logprob| at tp 2 being about 0.04.
+const QWEN3MOE_SEED: u64 = 12;
+
+/// The tiny FP8-block Qwen3-MoE of P7 S-5 (hidden 128, 4 / 2 heads of 128, 8 experts of 256 so
+/// that two tensor-parallel ranks hold whole 128 blocks, top-2, `norm_topk_prob: true`), in the
+/// Hugging Face `fp8` block packaging of Qwen3-30B-A3B-Instruct-2507-FP8.
+fn qwen3moe_fp8_block(tmp: &TempDir) -> TinySpec {
+    let q = serde_json::json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128], "modules_to_not_convert": ["mlp.gate"]});
+    let fixture = write_tiny_qwen3moe_quantized(tmp.path(), QWEN3MOE_SEED, &q, 128, 256);
+    let spec = fixture.quantized;
+    assert_eq!(spec.config.family.0.name(), "qwen3_moe");
+    assert!(spec.config.moe.expect("experts").norm_topk_prob);
+    spec
+}
+
+/// The bound of a quantized group against one device: the strict golden bounds, the far tail
+/// (logprob < -2) unbounded when the activations are quantized (as in
+/// `tp2_quantized_matches_tp1_on_host`).
+fn quantized_bound(spec: &TinySpec) -> TpBound {
+    let act = spec.config.weight_format.get().activation()
+        != turbine_model::weights::ActivationQuant::None;
+    TpBound::Golden(GoldenLogprobBounds {
+        tail: if act {
+            f64::INFINITY
+        } else {
+            GoldenLogprobBounds::llama().tail
+        },
+        ..GoldenLogprobBounds::llama()
+    })
+}
+
+/// P7 S-5: the tiny FP8-block Qwen3-MoE (per-head Q/K norm, experts column-split under tensor
+/// parallelism, `norm_topk_prob` routing on the all-reduced hidden row) at tp 1 and 2 over the
+/// host collective gives one device's greedy tokens, with every row's top-5 logprobs within the
+/// golden bounds (a group of one bitwise). Breaks if `Qwen3Moe::tp_decoder_spec` is missing (tp
+/// refused naming the family) or a quantized expert's data or block scales are sharded along the
+/// wrong axis.
+#[test]
+fn qwen3moe_tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-qwen3moe-tp");
+    let spec = qwen3moe_fp8_block(&tmp);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = cpu_model(&spec, &host, 64);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&host, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    for world in [1u32, 2] {
+        let ranks = tp_group(&spec, world, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let what = format!("qwen3moe tp {world}");
+        let bound = if world == 1 {
+            TpBound::Bitwise
+        } else {
+            quantized_bound(&spec)
+        };
+        let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
+        println!("qwen3moe_tp2_matches_tp1_on_host {what}: worst / golden bound {worst:.3}");
+    }
+}
+
+/// P7 S-5: the same tiny FP8-block Qwen3-MoE in an expert-parallel group (replicated attention
+/// and tp = ep, contiguous placement: each rank holds whole experts, the FP8 data and block
+/// scales of its range only) gives one device's greedy tokens and top-5 logprobs within the
+/// golden bounds, with the router choices equal on every rank, every routed row counted once and
+/// every rank computing some (a group of one bitwise). Breaks if `Qwen3Moe` is not an EP family
+/// or a rank loads another rank's quantized experts.
+#[test]
+fn qwen3moe_ep2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-qwen3moe-ep");
+    let spec = qwen3moe_fp8_block(&tmp);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("experts");
+    let layers = ep::moe_layers(cfg);
+    let host = |rank: u32| -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) {
+        (
+            HostMemory::new(DeviceId(rank), 1 << 30),
+            cpu_reference_provider(),
+        )
+    };
+    let (mem, _) = host(0);
+    let mut one = cpu_model(&spec, &mem, 64);
+    let layout = cfg.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    let rows = u64::from((20 + 13 + 2 * TP_STEPS as u32) * moe.experts_per_token);
+    use ep::EpAttention::{Replicated, TensorParallel};
+    for (world, attention) in [(1, Replicated), (2, Replicated), (2, TensorParallel)] {
+        let placement = Arc::new(
+            ExpertPlacement::contiguous(moe.num_experts, &layers, world).expect("placement"),
+        );
+        let ranks = ep_group(
+            &spec,
+            world,
+            attention,
+            &placement,
+            host,
+            |exec, kv, counts| ep_greedy_pair(exec, kv, counts, spec.vocab),
+        );
+        let what = format!("qwen3moe ep {world} {attention:?}");
+        let bound = if world == 1 {
+            TpBound::Bitwise
+        } else {
+            quantized_bound(&spec)
+        };
+        let worst = check_ep_group(&what, &ranks, &want, bound, rows);
+        let per_rank = &ranks[0].counts.per_rank;
+        assert!(
+            per_rank.iter().all(|&r| r > 0),
+            "{what}: every rank computes some rows: {per_rank:?}"
+        );
+        println!(
+            "qwen3moe_ep2_matches_tp1_on_host {what}: worst / golden bound {worst:.3}, rows per \
+             rank {per_rank:?}"
+        );
+    }
+}
+
 /// P7 S-6: the tiny Mistral (the Llama layer under `MistralForCausalLM`) at tp 1 and 2 over
 /// the host collective on the cpu-reference provider gives one device's greedy tokens, with
 /// every row's top-5 logprobs within the strict golden bounds (a group of one bitwise). Breaks
@@ -6066,7 +6190,14 @@ fn ep_decoder(
     let opts = ExecutorOptions::default();
     let index = SafetensorsIndex::open(&spec.dir).expect("open tiny index");
     let slots = ep::weight_slots(cfg, s, placement).expect("rank slots");
-    let weights = WeightLoader::load(&index, &slots, mem, MAX_STAGING_BYTES).expect("load rank");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &slots,
+        mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load rank");
     let reqs = ep::available_requirements(
         cfg,
         s,
