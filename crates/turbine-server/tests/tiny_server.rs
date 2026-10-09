@@ -3811,6 +3811,32 @@ fn reasoning_content_follows_enable_thinking() {
     panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
 }
 
+/// P7 S-9: `reasoning_effort` accepts only `low` / `medium` / `high`; any other value is a
+/// 400 naming the field (before any model work). Breaks if the request deserialization stops
+/// naming it.
+#[test]
+fn reasoning_effort_rejects_unknown() {
+    let server = TinyServer::start("");
+    let body = json!({
+        "model": server.model,
+        "max_tokens": 4,
+        "reasoning_effort": "extreme",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let resp = request(
+        server.addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&body.to_string()),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert!(
+        resp.body.contains("reasoning_effort"),
+        "the 400 does not name reasoning_effort: {}",
+        resp.body
+    );
+}
+
 /// P5 S-7: two data-parallel replicas of the tiny model share the cpu "device"
 /// (`allow_device_sharing`, each with half the device budget); 32 concurrent requests all
 /// succeed, the router sends work to both replicas (`turbine_dp_routed_total` non-zero for
