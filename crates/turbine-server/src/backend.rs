@@ -229,6 +229,9 @@ pub struct ModelBackend {
     grammars: GrammarService,
     /// The format of `model.tool_call_parser`; `None` when it resolved to `none`.
     tool_parser: Option<ToolParser>,
+    /// The ids of the format's declared markers (the detokenizer emits their text, P7
+    /// decision "Harmony marker visibility").
+    marker_ids: Vec<u32>,
     /// The resolved `model.reasoning_parser` (P7 S-10); `None` when off.
     reasoning_parser: Option<&'static dyn ReasoningParser>,
     metrics: ServerMetrics,
@@ -355,6 +358,13 @@ impl ModelBackend {
             parser: Arc::from(bound.format.parser()),
             label: bound.format.name(),
         });
+        // P7 decision "Harmony marker visibility": the declared markers of the served tool
+        // format are emitted by the streaming detokenizer, so the harmony parsers see them.
+        let marker_ids: Vec<u32> = model
+            .tool_format
+            .as_ref()
+            .map(|bound| bound.tokens.resolved_ids().collect())
+            .unwrap_or_default();
         ModelBackend {
             state: AtomicU8::new(STATE_LOADING),
             loading: AtomicU8::new(loading_code(NotReadyReason::LoadingModel)),
@@ -383,6 +393,7 @@ impl ModelBackend {
                 metrics.model.clone(),
             ),
             tool_parser,
+            marker_ids,
             reasoning_parser: model.reasoning_parser,
             metrics: metrics.server.clone(),
             admission: metrics.scheduler.clone(),
@@ -595,11 +606,10 @@ impl ModelBackend {
         let mut rendered = None;
         let tokens = match req.endpoint {
             Endpoint::ChatCompletions => {
-                let empty = serde_json::Map::new();
-                let kwargs = req.body.chat_template_kwargs.as_ref().unwrap_or(&empty);
+                let kwargs = req.body.chat_template_kwargs_merged();
                 let text = self
                     .template
-                    .render(&req.body.messages_json(), tools, true, kwargs)
+                    .render(&req.body.messages_json(), tools, true, &kwargs)
                     .map_err(|e| ApiError::template_error(e.to_string()))?;
                 let tokens = self
                     .tokenizer
@@ -754,6 +764,7 @@ impl ModelBackend {
             tools: tool_output,
             echo_text,
             reasoning,
+            marker_ids: self.marker_ids.clone(),
         })
     }
 

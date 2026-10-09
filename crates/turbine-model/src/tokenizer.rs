@@ -77,9 +77,14 @@ impl Tokenizer {
 
 /// Turns a stream of generated token ids into text chunks without ever emitting a partial UTF-8
 /// sequence: the window `ids[prefix_offset..]` is re-decoded on each push and only the text past
-/// the previously emitted part is returned, and only once it no longer ends in U+FFFD.
+/// the previously emitted part is returned, and only once it no longer ends in U+FFFD. Special
+/// ids declared through [`emitting_specials`](IncrementalDetokenizer::emitting_specials) also
+/// emit their text (P7 decision "Harmony marker visibility").
 pub struct IncrementalDetokenizer {
     tokenizer: Arc<Tokenizer>,
+    /// Special token ids whose text is emitted (the bound tool format's markers, P7 decision
+    /// "Harmony marker visibility").
+    keep: Vec<u32>,
     ids: Vec<u32>,
     prefix_offset: usize,
     read_offset: usize,
@@ -89,16 +94,48 @@ impl IncrementalDetokenizer {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
         IncrementalDetokenizer {
             tokenizer,
+            keep: Vec::new(),
             ids: Vec::new(),
             prefix_offset: 0,
             read_offset: 0,
         }
     }
 
+    /// Declares the special ids whose text the stream emits (the bound tool format's declared
+    /// markers). Ids that already decode to text are ignored; ids not in the vocabulary too.
+    /// The window decodes stay free of the markers because each one closes the segment before
+    /// it ([`IncrementalDetokenizer::flush`]).
+    pub fn emitting_specials(mut self, ids: impl IntoIterator<Item = u32>) -> Self {
+        for id in ids {
+            let skipped = self
+                .tokenizer
+                .decode(&[id], true)
+                .is_ok_and(|text| text.is_empty());
+            if skipped && !self.keep.contains(&id) {
+                self.keep.push(id);
+            }
+        }
+        self
+    }
+
     /// Adds one token; returns the text it completes, or `None` while the pending bytes are an
-    /// incomplete UTF-8 sequence (or the token decodes to nothing, e.g. a skipped special token).
+    /// incomplete UTF-8 sequence (or the token decodes to nothing, e.g. a skipped special token
+    /// that is not in the emit-list).
     pub fn push(&mut self, token: u32) -> Option<String> {
         self.ids.push(token);
+        if self.keep.contains(&token) {
+            // A declared marker: its own text is emitted on its own. Close the segment before
+            // it first, in order (the flush is lossy on an incomplete UTF-8 sequence, as at
+            // the end of generation), then emit the marker text.
+            let held = self.flush();
+            self.prefix_offset = self.ids.len();
+            self.read_offset = self.ids.len();
+            let text = self.tokenizer.id_to_token(token)?;
+            return match held {
+                Some(held) => Some(format!("{held}{text}")),
+                None => Some(text),
+            };
+        }
         let prefix_text = self.decode(self.prefix_offset, self.read_offset)?;
         let new_text = self.decode(self.prefix_offset, self.ids.len())?;
         if new_text.len() <= prefix_text.len() || new_text.ends_with('\u{FFFD}') {
@@ -215,6 +252,30 @@ mod tests {
         let out: String = ids.iter().filter_map(|&id| detok.push(id)).collect();
         assert_eq!(out, "A B");
         assert_eq!(detok.flush(), None);
+    }
+
+    /// A declared marker id emits its text mid-stream, in order with the text around it.
+    #[test]
+    fn declared_marker_is_emitted_in_stream() {
+        let tokenizer = Arc::new(fixture_tokenizer());
+        let eot = tokenizer.token_to_id("<|eot_id|>").expect("eot id");
+        let ids = tokenizer.encode("A<|eot_id|>B", false).expect("encode");
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tokenizer)).emitting_specials([eot]);
+        let out: String = ids.iter().filter_map(|&id| detok.push(id)).collect();
+        assert_eq!(out, "A<|eot_id|>B");
+        assert_eq!(detok.flush(), None);
+    }
+
+    /// `emitting_specials` only keeps ids that actually skip: a token that already decodes
+    /// to text is left to the normal window path.
+    #[test]
+    fn emitting_specials_ignores_text_ids() {
+        let tokenizer = Arc::new(fixture_tokenizer());
+        let plain = tokenizer.encode("A", false).expect("encode")[0];
+        let detok =
+            IncrementalDetokenizer::new(Arc::clone(&tokenizer)).emitting_specials([plain, 128_009]);
+        assert_eq!(detok.keep, vec![128_009]);
     }
 
     /// With every pushed token already emitted, `flush` is a no-op: `None`, and it leaves the

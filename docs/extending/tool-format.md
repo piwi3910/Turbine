@@ -1,6 +1,6 @@
 # Adding a tool-call format
 
-A tool format is how a model writes tool calls: the special tokens it needs, the llguidance grammar that constrains `tool_choice` `auto` / `required` / named output, the parser that turns a finished output into `tool_calls`, and the `auto`-mode test of whether an output opens like a call. Point name `tool_format`; selected by `model.tool_call_parser`, else the family's `default_tool_format()`; bound to the served tokenizer once at startup (`formats::bind`). Registered: `llama3_json`, `hermes`, `mistral`.
+A tool format is how a model writes tool calls: the special tokens it needs, the llguidance grammar that constrains `tool_choice` `auto` / `required` / named output, the parser that turns a finished output into `tool_calls`, and the `auto`-mode test of whether an output opens like a call. Point name `tool_format`; selected by `model.tool_call_parser`, else the family's `default_tool_format()`; bound to the served tokenizer once at startup (`formats::bind`). Registered: `llama3_json`, `hermes`, `mistral`, `harmony`.
 
 ## The trait
 
