@@ -536,7 +536,18 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         SupportStatus::Experimental,
     ),
     // Phase 7 model families (S-13): `experimental` (P7_PENDING_REASON) until each row's gate
-    // closes; `PHASE7_ROWS` lists the gated placements.
+    // closes; `PHASE7_ROWS` lists the gated placements. Qwen3 BF16 on gfx1201 is `supported`
+    // since its gate closed (Task 11, 2026-10-08: golden c1/c16 on the self-spread bounds,
+    // GSM8K-200 c16 and throughput, one R9700; perf-log "P7 Qwen3-4B gate").
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("Qwen3ForCausalLM"),
+        BF16,
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     family_row("Qwen3ForCausalLM", WeightFormatColumn::Bf16),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Bf16),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Fp8Block),
@@ -1595,11 +1606,31 @@ mod tests {
                 .contains("phase-8-speculative-decoding"),
             "{status:?}"
         );
+        // Qwen3 BF16 on gfx1201 is supported since its gate closed (Task 11, 2026-10-08); the
+        // pending family_row still covers every other arch, and the CPU reference stays
+        // experimental.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "Qwen3ForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        let k = key(
+            "amd",
+            "gfx942",
+            "Qwen3ForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
         // Phase 7 families (S-13): experimental on AMD (any arch) until their gate closes, the
         // row view naming the pending gate; experimental on the CPU reference; another weight
         // format stays refused by its format row.
         for (architecture, w) in [
-            ("Qwen3ForCausalLM", W::Bf16),
             ("Qwen3MoeForCausalLM", W::Bf16),
             ("Qwen3MoeForCausalLM", W::Fp8Block),
             ("MixtralForCausalLM", W::Bf16),
@@ -1787,9 +1818,14 @@ mod tests {
         assert!(k.is_partial());
         assert_eq!(check(k).unwrap().status, SupportStatus::Supported);
 
-        // A Phase 7 family is experimental on the GPU vendor (S-13), naming its pending gate;
-        // an architecture with no row is refused naming the checkpoint.
+        // Qwen3 BF16 is supported since its gate closed (Task 11, 2026-10-08), before
+        // discovery too; another Phase 7 family is still experimental on the GPU vendor
+        // (S-13), naming its pending gate; an architecture with no row is refused naming
+        // the checkpoint.
         let k = SupportKey::before_discovery("amd", Some("Qwen3ForCausalLM"), W::Bf16, K::Bf16);
+        let d = check(k).unwrap();
+        assert_eq!(d.status, SupportStatus::Supported);
+        let k = SupportKey::before_discovery("amd", Some("Qwen3MoeForCausalLM"), W::Bf16, K::Bf16);
         let d = check(k).unwrap();
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(d.view().reason.as_deref(), Some(P7_PENDING_REASON));

@@ -730,13 +730,21 @@ mod tests {
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(after_discovery(&cpu, &none, d.clone()).unwrap(), d);
 
-        // A Phase 7 family is experimental on the GPU vendor before discovery until its gate
-        // closes (S-13), and served on the host.
+        // Qwen3 BF16 is supported since its gate closed (Task 11, 2026-10-08), before
+        // discovery too; another Phase 7 family is still experimental on the GPU vendor
+        // (S-13), naming its pending gate; both are served on the host.
         let qwen = model_dir(
             "qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
         );
         let d = before_discovery(&config("hip", qwen.path())).unwrap();
+        assert_eq!(d.status, SupportStatus::Supported);
+        assert!(before_discovery(&config("cpu", qwen.path())).is_ok());
+        let moe = model_dir(
+            "qwen-moe",
+            serde_json::json!({"architectures": ["Qwen3MoeForCausalLM"]}),
+        );
+        let d = before_discovery(&config("hip", moe.path())).unwrap();
         assert_eq!(d.status, SupportStatus::Experimental);
         assert!(
             d.view()
@@ -744,7 +752,7 @@ mod tests {
                 .is_some_and(|r| r.contains("phase-7-model-families")),
             "{d:?}"
         );
-        assert!(before_discovery(&config("cpu", qwen.path())).is_ok());
+        assert!(before_discovery(&config("cpu", moe.path())).is_ok());
 
         // No config.json: the architecture is unknown.
         let empty = TempDir::new("empty");
