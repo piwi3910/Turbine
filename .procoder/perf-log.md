@@ -2049,6 +2049,60 @@ Cause (S-3): the near-tie hypothesis holds, and nothing is specific to ep × tp.
 
 `scripts/lab-cluster.sh --bench-lock olmoe-spread-novanas`, run `1008081228-24302d18` (both R9700s): 69 free-running top-20 captures of OLMoE-1B-7B-0125-Instruct (one GPU c1-cold/c1-warm/par-00..15; tp2, ep2 and ep2×tp2 at c1 and c16). Placements against the committed reference (likely / tail): one GPU 0.517 / 1.461, tp2 1.006 / 1.309, ep2 0.962 / 1.149, ep2×tp2 1.056 / 0.902 (prefix ok 15/16, `min_prompts_passing` 14); a placement's c1 and c16 captures are bitwise equal. `engine_spread.py` (`mg-*` captures): `max_abs_logprob_diff_likely_multi_gpu` 1.06 (old 1.01, triangle 2.39), `_tail_multi_gpu` 1.72 (old 1.72, observed 1.47, triangle 3.45) written to `tests/golden/olmoe-1b-7b-0125-instruct/tolerance.json`; derivation in its README. The `olmoe_ep_tp_drift` refusal is removed; `ep2-novanas` gates ep2×tp2 at c1 and c16 with `--multi-gpu-bounds` against the committed reference. Gate run `1008082229-115db0e8`: `ep2-novanas` PASS, ep2×tp2 golden c1 and c16 15/16 prompts passing (need 14), multi-GPU bounds 1.06 / 1.72 hold; ep2 and ep2 hostmem pass the strict and batched bounds against the one-GPU capture.
 
+### P7 OLMoE FP8 KV — calibrated K/V scales (plan Task 36, branch `p7-t36`, 2026-10-08)
+
+- P7 closed: OlmoeForCausalLM/bf16/fp8_e4m3/tp1 — calibrated scales (`kv_scales::calibrate`), emulated-KV reference regenerated with them, tolerance re-derived from the engine spread against that reference (likely 1.14 → 1.15, tail 3.42 unchanged), full-GSM8K pair 0.6603 vs 0.6573 (drop 0.0030, PASS), golden c1 / c16 16/16 (p7-t36d, BENCH tok/s=564.0).
+
+`kv_scales::calibrate` runs the 32 prompts of `crates/turbine-model/tests/fixtures/kv_calibration_prompts.jsonl` on the served FP8 executor with unit scales (no second BF16 weight load; the pool is read back, so a layer's scale is the absmax of the e4m3 pages / 448, within one e4m3 step of the BF16 absmax) and caches the set under `$TURBINE_CACHE_DIR` / `~/.cache/turbine` keyed by the checkpoint identity and the prompt set. Served OLMoE-1B-7B-0125-Instruct (`event="kv_scales_calibrated" layers=16`):
+
+| half | scale range over the 16 layers         | layer 0 | layer 15 |
+| ---- | -------------------------------------- | ------- | -------- |
+| K    | 0.0268 – 0.0536 (absmax 12 – 24)       | 0.0536  | 0.0268   |
+| V    | 0.00024 – 0.00279 (absmax 0.11 – 1.25) | 0.00035 | 0.00279  |
+
+Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36 -- --set kv.dtype=fp8_e4m3` (the `olmoe-fp8kv` slug is the reference `tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/`, emulated with the served scales — which were 1.0 when it was made):
+
+- `BENCH p7-t36 olmoe-fp8kv commit=afcaa4b0 gpu=0 tests=skipped golden1=FAIL: golden16=FAIL: client=novanas weight_format=bf16 kv=fp8_e4m3 conc=16 host_share=0.0219 ok=200 failed=0 tok/s=559.9 itl_p50=26.4 ttft_p50=142 decode_fwd_ms=25.5`
+- golden c1 and c16 are identical: 10/16 prompts pass (need 14; the unit-scale run was 13/16). Every logprob bound holds (worst likely 1.097 on p14 against 1.14, worst tail 3.05 against 3.42); the six misses are all the token rule, a first divergence with a margin above the 0.5 excuse or an unexcused one, i.e. the calibrated run picks different tokens than a reference that quantizes V with scale 1.0:
+
+| prompt | identical prefix | first divergence margin                       | worst likely / tail |
+| ------ | ---------------- | --------------------------------------------- | ------------------- |
+| p02    | 4/32             | 0.544                                         | 0.369 / 0.726       |
+| p05    | 18/32            | 1.423                                         | 0.293 / 1.709       |
+| p06    | 23/32            | 0.262 (missing top-k token 107 at position 7) | 0.848 / 1.609       |
+| p10    | 11/32            | 0.668                                         | 0.655 / 2.556       |
+| p13    | 10/32            | 0.807                                         | 0.376 / 0.919       |
+| p16    | 12/32            | 0.582                                         | 0.424 / 1.404       |
+
+Per-position |Δ| was not collected: no bound is exceeded, so the misses carry no position to explain. The reference is the wrong yardstick for calibrated scales (it quantizes K with scale 1.0 and V with 1.0; the served run now uses the table above), so the next step is a reference regenerated with `quant_reference.py --kv-quant fp8_e4m3` using these per-layer scales, a CPU fixture job under `fixture.lock`, plus the full-GSM8K OLMoE pair (BF16 KV 0.6603, unit-scale FP8 KV 0.6459) with the calibrated scales. The `OlmoeForCausalLM` fp8_e4m3 row stays `experimental`.
+
+### P7 OLMoE FP8 KV — golden against the regenerated calibrated-scale reference (plan Task 36, decision "P7 OLMoE FP8 KV golden reference" A, 2026-10-08)
+
+`quant_reference.py` gained `--kv-scales <kv-scales-v1-*.json>`: per-layer (k, v) scales from the server's calibration cache file, read through the f32 bit patterns (`k_bits` / `v_bits`) so the emulation quantizes with exactly the served scales; checked by a `--self-test` section (`kv_scales_file_self_test`). The reference `tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/reference.jsonl` was regenerated on `novanas` as a `fixture.lock` CPU fixture job (`nice -n 19`, self-test ok, `FP8 KV with 16 layer scale pairs (file)`, engine `transformers-4.57.1-bf16-cpu-act-none-kv-fp8_e4m3-fp32-logits`, revision `b89a7c4b…`); all 16 prompts differ from the scale-1.0 reference. The README describes the flag and the regeneration.
+
+Full-GSM8K OLMoE pair with the calibrated scales (1,319 items, c16, `eval-compare --max-drop 0.01`): BF16 KV 0.6603 (871), calibrated-scale FP8 KV **0.6573** (867, `tests/eval/olmoe-1b-7b-0125-instruct/turbine-fp8_e4m3-calibrated-full.json`): drop **0.0030**, PASS — the unit-scale run was 0.6459 (drop 0.0144, accepted as noise 2026-09-29), so calibration recovers most of the gap. (Measured at the pre-merge worktree state `f4d07957`; the later p7-stack merge, Task 16, only restructures the expert dispatch — golden below shows BF16 numerics unchanged.)
+
+Lab: `scripts/lab-bench.sh --model olmoe-fp8kv --golden16 --label p7-t36c` (post-merge `cde71da3`, GPU 0):
+
+- `BENCH p7-t36c olmoe-fp8kv commit=cde71da3 gpu=0 tests=skipped golden1=FAIL: golden16=FAIL: client=novanas weight_format=bf16 kv=fp8_e4m3 conc=16 host_share=0.0210 ok=200 failed=0 tok/s=560.9 itl_p50=26.4 ttft_p50=142 decode_fwd_ms=25.6`
+- golden c1 and c16 are again identical, now **15/16 prompts pass the token rule (need 14)**: the calibrated run and the calibrated reference agree on the greedy tokens nearly everywhere. The FAIL verdict is one bound miss: **p10's strict likely |Δ| 1.1450 against the 1.14 bound** (tail 1.1187 against 3.42); every other prompt is well inside (worst others: p14 likely 0.9381, p16 tail 1.3190).
+- `turbine-golden positions --prompt-id p10` (teacher-forced re-run, fresh server): worst likely |Δ| **1.0663 at position 5** (the reference #2 candidate 1223 ref −1.3008 vs got −2.3670), worst tail |Δ| **2.0606 at position 18**; the free-running compare's 1.1450 and the teacher-forced 1.0663 straddle the 1.14 bound, which is today's **observed engine order noise** (max likely noise 1.14, measured on the scale-1.0 reference, decision 2026-10-06 A) — p10's miss is order noise at the bound's edge, not a systematic offset like the old p03 tail (−17.78 every capture).
+
+Row verdict (2026-10-08): **stayed `experimental`** — the gate was not green (a bound miss, 0.005 over). The follow-up the slug's README already prescribes, the engine-spread re-run against the calibrated-scale reference, ran the next day (below).
+
+### P7 OLMoE FP8 KV — spread re-run against the calibrated-scale reference; row `supported` (plan Task 36 follow-up, 2026-10-09)
+
+`golden-engine-spread.sh p7t36-fp8kv olmoe-1b-7b-0125-instruct-fp8kv` (20 captures at `171d243c`, novanas GPU 0; data `tests/golden/olmoe-1b-7b-0125-instruct-fp8kv/engine_spread.json`): every variant prefix ok 16/16 — with matching scales the engine and the reference agree on the greedy tokens everywhere, and the scale-1.0 systematic tail offset (old p03, 5.16) is gone: worst tail vs the reference is 1.3190 (p16), worst likely 1.1450 (p10). Engine noise: likely 0.9390 (p09 position 15), tail 1.4970 (p16 position 30).
+
+| bound          | old  | observed | triangle | proposed (applied, decision 2026-10-06 A) |
+| -------------- | ---- | -------- | -------- | ----------------------------------------- |
+| likely         | 1.14 | 1.15     | 2.08     | **1.15** (was 1.14)                       |
+| tail           | 3.42 | 2.08     | 4.92     | 3.42 unchanged                            |
+| likely batched | 1.14 | 1.15     | 2.08     | **1.15** (was 1.14)                       |
+| tail batched   | 3.42 | 2.08     | 4.92     | 3.42 unchanged                            |
+
+Re-gate: `BENCH p7-t36d olmoe-fp8kv commit=171d243c gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=fp8_e4m3 conc=16 host_share=0.0156 ok=200 failed=0 tok/s=564.0 itl_p50=26.2 ttft_p50=141 decode_fwd_ms=25.5` — golden c1 and c16 **16/16** (strict bounds, likely 1.15 / tail 3.42). The row `OlmoeForCausalLM/bf16/fp8_e4m3/tp1` flips to `supported`; `support::tests::phase7_rows` enforces the `- P7 closed:` line above. Throughput unchanged (564.0 vs 560.9 / 559.9 tok/s across the three runs, within run noise).
+
 ## Phase 7 Task 23 — attention ABI v2.17 (window, sinks, d64 / d256), 2026-10-08
 
 Lab-bench `--quick` (64 requests, concurrency 16, client on novanas, GPU 0) on d4542e81, both golden c1 PASS. The d128 plain path's arguments are unchanged; the rows sit +2.5 % and +2.9 % above the last full rows (p5p-exit, 200 requests, local client), which is the quick tier's client and sample difference, not a change of the path.

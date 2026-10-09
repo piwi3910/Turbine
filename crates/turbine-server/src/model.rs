@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1278,6 +1278,157 @@ pub(crate) fn install_decode_graphs(prepared: &PreparedModel, executor: &mut dyn
     }
 }
 
+/// Where calibrated KV scales are cached: `$TURBINE_CACHE_DIR`, else `$XDG_CACHE_HOME/turbine`,
+/// else `$HOME/.cache/turbine`; `None` when none of them is set (no cache, calibration reruns).
+fn kv_scales_cache_dir() -> Option<PathBuf> {
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    var("TURBINE_CACHE_DIR")
+        .or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("turbine")))
+        .or_else(|| var("HOME").map(|d| d.join(".cache").join("turbine")))
+}
+
+/// The cache file of `prepared`'s scale set: the checkpoint's identity (config, safetensors
+/// index, RoPE), the calibration prompts, the page layout, and the format revision.
+fn kv_scales_cache_file(prepared: &PreparedModel) -> Option<PathBuf> {
+    let id = &prepared.identity;
+    let hex = |h: &[u8; 32]| blake3::Hash::from_bytes(*h).to_hex().to_string()[..16].to_owned();
+    let mut prompts = blake3::Hasher::new();
+    for p in turbine_model::kv_scales::calibration_prompts() {
+        prompts.update(&(p.len() as u64).to_le_bytes());
+        prompts.update(p.as_bytes());
+    }
+    let prompts = prompts.finalize().to_hex().to_string();
+    Some(kv_scales_cache_dir()?.join(format!(
+        "kv-scales-v1-{}-{}-{}-{}.json",
+        hex(&id.config_hash),
+        hex(&id.weights_index_hash),
+        hex(&id.rope_hash),
+        &prompts[..16]
+    )))
+}
+
+fn read_kv_scales_cache(path: &Path, layers: usize) -> Option<turbine_model::kv_scales::KvScales> {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let bits = |key: &str| -> Option<Vec<f32>> {
+        let v: Option<Vec<f32>> = doc[key]
+            .as_array()?
+            .iter()
+            .map(|b| Some(f32::from_bits(u32::try_from(b.as_u64()?).ok()?)))
+            .collect();
+        v.filter(|v| v.len() == layers && v.iter().all(|s| s.is_finite() && *s > 0.0))
+    };
+    Some(turbine_model::kv_scales::KvScales {
+        k: bits("k_bits")?,
+        v: bits("v_bits")?,
+    })
+}
+
+fn write_kv_scales_cache(path: &Path, scales: &turbine_model::kv_scales::KvScales) {
+    let doc = serde_json::json!({
+        "layers": scales.k.len(),
+        "k": scales.k,
+        "v": scales.v,
+        "k_bits": scales.k.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+        "v_bits": scales.v.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+    });
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, doc.to_string()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            event = "kv_scales_cache",
+            path = %path.display(),
+            error = %e,
+            "calibrated KV scales not cached"
+        );
+    }
+}
+
+/// P7 S-15: `kv.dtype: fp8_e4m3` on a checkpoint that stores no K/V scales runs with scales
+/// measured over the fixed calibration prompts (`absmax / 448` per layer) instead of 1.0
+/// (user decision 2026-09-28 Q10 kept for checkpoints that have scales). Replaces the unit
+/// scales of `prepared.arch.kv_cache` before anything reads them (the KV namespace hashes them);
+/// a cached set (see [`kv_scales_cache_file`]) skips the pass, which otherwise loads the weights
+/// once more, prefills the prompts on the FP8 executor with unit scales and frees both. One
+/// device only: a tensor, expert or pipeline rank keeps the unit scales.
+pub fn calibrate_kv_scales(prepared: &mut PreparedModel) -> Result<(), StartupError> {
+    let arch = &prepared.arch;
+    if !arch.kv_cache.is_fp8()
+        || prepared.shard.is_some()
+        || prepared.expert.is_some()
+        || prepared.stage.is_some()
+        || turbine_model::kv_scales::checkpoint_has_scales(&prepared.index, arch.num_layers)
+    {
+        return Ok(());
+    }
+    let layers = arch.num_layers as usize;
+    let file = kv_scales_cache_file(prepared);
+    let started = Instant::now();
+    let cached = file
+        .as_deref()
+        .and_then(|f| read_kv_scales_cache(f, layers));
+    let (scales, from_cache) = match cached {
+        Some(s) => (s, true),
+        None => {
+            let limit = turbine_model::kv_scales::CALIBRATION_MAX_TOKENS
+                .min(prepared.scheduler.max_batch_tokens as usize);
+            let prompts = turbine_model::kv_scales::calibration_prompts()
+                .iter()
+                .map(|text| {
+                    let mut ids = prepared
+                        .tokenizer
+                        .encode(text, true)
+                        .map_err(|e| model_error("kv scale calibration prompt", e))?;
+                    ids.truncate(limit);
+                    Ok(ids)
+                })
+                .collect::<Result<Vec<_>, StartupError>>()?;
+            let mem = Arc::clone(&prepared.provider.opened.mem);
+            let weights = load_weights(prepared)?;
+            let mut executor = build_executor(
+                &prepared.arch,
+                weights,
+                Arc::clone(&prepared.registry),
+                Arc::clone(&mem),
+                prepared.block_tokens,
+                prepared.scheduler.max_batch_tokens,
+                prepared.scheduler.max_running_requests,
+                prepared.executor_options,
+            )
+            .map_err(|e| model_error("kv scale calibration", e))?;
+            let scales = turbine_model::kv_scales::calibrate(executor.as_mut(), &mem, &prompts)
+                .map_err(|e| model_error("kv scale calibration", e))?;
+            drop(executor);
+            if let Some(f) = &file {
+                write_kv_scales_cache(f, &scales);
+            }
+            (scales, false)
+        }
+    };
+    let old = &prepared.arch.kv_cache;
+    prepared.arch.kv_cache = KvCache {
+        k_scales: Arc::from(scales.k),
+        v_scales: Arc::from(scales.v),
+        ..old.clone()
+    };
+    tracing::info!(
+        event = "kv_scales_calibrated",
+        layers,
+        cached = from_cache,
+        seconds = started.elapsed().as_secs_f64(),
+        "FP8 KV scales calibrated for a checkpoint without K/V scales"
+    );
+    Ok(())
+}
+
 /// Steps 8–10: upload the weights; re-measure the memory budget (P3 S-2: dedicated memory
 /// free now plus the weights Turbine holds, or unified `MemAvailable`); open the reservation
 /// ledger with the weights and the executor workspace committed; build the executor for
@@ -1856,6 +2007,26 @@ mod tests {
         );
         // Not a cache layout: `snapshots` without the `models--<org>--<name>` parent.
         assert_eq!(default_served_name(Path::new("/x/snapshots/abc")), "abc");
+    }
+
+    /// A cached scale set reads back bit for bit; one of another layer count, or a corrupt or
+    /// non-positive one, is ignored (recomputed). Breaks if the cache returns stale scales.
+    #[test]
+    fn kv_scales_cache_round_trips_bit_exact() {
+        let dir = std::env::temp_dir().join(format!("turbine-kv-scales-{}", std::process::id()));
+        let path = dir.join("nested").join("scales.json");
+        let scales = turbine_model::kv_scales::KvScales {
+            k: vec![0.123_456_79, 1.0 / 3.0],
+            v: vec![f32::MIN_POSITIVE, 7.5e-3],
+        };
+        write_kv_scales_cache(&path, &scales);
+        assert_eq!(read_kv_scales_cache(&path, 2), Some(scales));
+        assert_eq!(read_kv_scales_cache(&path, 3), None);
+        std::fs::write(&path, b"{\"k_bits\":[0,0],\"v_bits\":[1,1]}").unwrap();
+        assert_eq!(read_kv_scales_cache(&path, 2), None);
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(read_kv_scales_cache(&path, 2), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A single-file checkpoint whose header is shorter than its length prefix is refused, not
