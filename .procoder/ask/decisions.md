@@ -4619,8 +4619,19 @@ gated against: the act-quant gap, not engine noise, moves those prompts.
 B additionally: regenerate the reference with the act-quant and re-measure the tolerance against it.
 The old reference stays in git history; the captures (Turbine behavior) are reusable unchanged.
 
-As built (2026-10-13, in progress): cpuhost chain `p7_tol2_mixtral.sh` — evidence self-spread
-finished, then `quant_reference.py --act-quant fp8_tensor --dequantized mixtral-bf16` (out
+As built (2026-10-13/14, in progress): cpuhost chain `p7_tol3_mixtral.sh` (guarded; the first
+evidence run `p7_tol2_mixtral.sh`/`p7_spread_mixtral.sh` was killed deliberately — see the standing
+rule below) — then `quant_reference.py --act-quant fp8_tensor --dequantized mixtral-bf16` (out
 `reference-actquant.jsonl`), then `self_spread.py` (4 bf16 variants, `--act-quant fp8_tensor`)
 against the new reference (`self_spread_v2.json`). Reference commit, tolerance.json, README and the
 mg-bound derivation follow on p7-t22 once the chain ends.
+
+Standing rule for cpuhost fixture jobs (root cause of the 2026-10-13 iSCSI LUN wedge, coordinator
+2026-10-14): it is not free-RAM-at-start but ~92 GB model *residency* that matters — the residency
+squeezes the ARC to ~10 GB, and an ARC-squeezed zvol cannot coexist with a concurrent LUN write
+storm (e.g. a remote-cargo build into `turbine-ci/remote` on novanas); the zvol taskq threads pile
+up in D and the LUN fails reads of freshly written blocks. Rule: **no resident model on cpuhost
+while anything else drives the novanas LUN** — serialize LUN-heavy novanas builds against cpuhost
+model jobs, and gate each stage on MemAvailable >= 80 GB with a D-state watchdog
+(`p7_tol3_mixtral.sh`: two consecutive samples of >= 6 D-state txg/zvol/zpool/pvc threads, or a
+failed 4 KB write+read probe on cpuhost local disk, abort the stage cleanly).
