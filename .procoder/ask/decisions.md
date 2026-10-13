@@ -4588,3 +4588,39 @@ gpt-oss's Harmony control tokens (`<|channel|>`, `<|message|>`, `<|call|>`, `<|s
 - A) Emit the declared format's markers: at load/bind, clear the special flag (or an emit-list in `IncrementalDetokenizer`) for the tokens the bound tool format declares. Text-level parsers keep working; changes what un-parsed streams look like for that model.
 - B) Token-id-level Harmony parsing (vLLM's way): push token ids into the reasoning/tool parsers. Most robust; an engine API change and a Task 25 rewrite of the parser interface.
 - C) Keep specials dropped, parse heuristically (regex on `commentary to=`, leading channel word). Not recommended: the analysis→final boundary is ambiguous when reasoning text contains the word "final".
+
+## P7 Mixtral golden tolerance base (2026-10-13)
+
+Task 22's committed Mixtral-8x7B-Instruct-FP8 reference was generated from the dequantized BF16 copy
+WITHOUT activation fake-quantization (plan fixture step: "dequantize, hf_reference.py"), unlike the
+llama-fp8 fixture whose reference carries `--act-quant fp8_tensor`. Task 22's spread evidence (34
+captures: c1-cold and mg-{tp2,ep2}×{c1,c16×16}): every capture — including Turbine's own tp2-c1
+reference capture — fails token identity on the same 7/16 prompts (p01, p06, p10, p11, p13, p14, p16)
+at reference margins > 0.5 nats, tail |Δ logprob| up to 20.1 (p12), likely up to 3.5, with 2-4
+reference top-5 candidates missing from the captures' top-20; the spread is nearly deterministic
+across placements and concurrencies. The cpuhost self-spread of transformers itself with the same
+`--act-quant fp8_tensor` hooks (teacher-forced, 4 bf16 variants) diverges unexcused on the same
+prompts (bf16-sdpa-incremental: p01, p06, p10, p13, p14, p16; max likely 3.007, max tail 19.007) —
+so the committed reference is not a baseline any FP8-serving run, Turbine's or transformers', can be
+gated against: the act-quant gap, not engine noise, moves those prompts.
+
+- A) Keep the committed reference; derive the tolerance base from the self-spread with
+  `--act-quant fp8_tensor` on the dequantized copy (llama-fp8's base method), bounds from the
+  measured spread. Keeps a reference no quantized implementation matches; the gate would need
+  multi-nat bounds and a lowered `min_prompts_passing` to pass what the reference implementation
+  itself fails.
+- B) Regenerate the reference with the act-quant in it (`quant_reference.py --act-quant
+  fp8_tensor`, the llama-fp8 fixture recipe, `--dequantized` reusing the existing BF16 copy on
+  cpuhost), then calibrate the tolerance against the new reference (self-spread, same 4-bf16-variant
+  restriction: fp32 needs ~187 GB, cpuhost has 125 GB).
+
+**Decision (user, 2026-10-13):** A for the tolerance-base method (self-spread with
+`--act-quant fp8_tensor` on the dequantized copy), then — once the spread evidence above landed —
+B additionally: regenerate the reference with the act-quant and re-measure the tolerance against it.
+The old reference stays in git history; the captures (Turbine behavior) are reusable unchanged.
+
+As built (2026-10-13, in progress): cpuhost chain `p7_tol2_mixtral.sh` — evidence self-spread
+finished, then `quant_reference.py --act-quant fp8_tensor --dequantized mixtral-bf16` (out
+`reference-actquant.jsonl`), then `self_spread.py` (4 bf16 variants, `--act-quant fp8_tensor`)
+against the new reference (`self_spread_v2.json`). Reference commit, tolerance.json, README and the
+mg-bound derivation follow on p7-t22 once the chain ends.
