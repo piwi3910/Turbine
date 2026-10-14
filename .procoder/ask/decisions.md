@@ -4645,3 +4645,29 @@ Derived bounds: likely 3.35 / tail 7.05 (strict = batched), `min_prompts_passing
 placement captures; `_multi_gpu` 5.50 / 10.89. The deferral and the revisit condition are recorded
 in `tests/golden/mixtral-8x7b-instruct-v0.1-fp8/README.md`; if the deferred variant's completion
 moves the bounds materially, revisit.
+
+## P7 Mixtral ep2 gate (2026-10-14)
+
+Task 22's ep2 gate run `1014064111-0cdd15af` failed only golden c16, and only on `missing_top_k`:
+at p06 position 16 a reference top-5 candidate (token 28743) is absent from the run's top-20 —
+every judged |Δ logprob| sits inside the calibrated `_multi_gpu` bounds (worst p14: likely 2.97 of
+5.5, tail 7.21 of 10.89). GSM8K 0.585 vs the vLLM baseline 0.56, throughput 2.54× vLLM, bench
+200/200, zero `device_oom` all PASS. The phenomenon is systematic in the banked spread captures:
+6/16 of `mg-ep2-c16-*`, 0/16 of `mg-tp2-c16-*`, no c1 capture — an EP-specific near-tie whose
+top-20 membership flips with batch composition. The plan's "add a `mixtral_<placement>_gate`
+refusal for a failing placement" is not expressible in the committed code: `PARALLEL_REFUSALS`
+modes cover only `ep+tp` (tp>1 AND ep>1) and `tp` (tp>1), `support::tests::phase7_rows` asserts
+every `PHASE7_ROWS` row is not `unsupported`, and the arch×weight×kv `SUPPORT_MATRIX` row cannot
+close for tp2 while ep2 is open (a flip would mark both placements `supported` and the test would
+demand a `- P7 closed:` line for both).
+
+- A) Close nothing: both rows stay `experimental`; record tp2's full PASS evidence and ep2's
+  failure as `- P7 open:` perf-log lines; land the fixtures, eval JSONs and config sizing.
+  A later decision extends the refusal vocabulary and the test semantics (or investigates the
+  ep2 top-20 instability) before either row closes.
+- B) Extend `PARALLEL_REFUSALS` with an ep-only mode and relax `phase7_rows` to allow refused
+  rows, closing tp2 (`- P7 closed:`) and refusing ep2 (`mixtral_ep2_gate`) in one commit.
+
+**Decision (user, 2026-10-14):** A. The deferred `bf16-eager-full` self-spread variant stays
+deferred (13/16 banked; its maxima sit under the committed bounds) — not resumed without the
+user's word.

@@ -1,6 +1,8 @@
-# turbine-server configuration for the Phase 7 two-card gate of Mixtral-8x7B-Instruct-v0.1-FP8 (~48 GB: ~24 GB per card; KV and
-#   scheduler.max_running_requests are provisional until Task 21 sizes them from the measured
-#   per-rank headroom),
+# turbine-server configuration for the Phase 7 two-card gate of Mixtral-8x7B-Instruct-v0.1-FP8 (~48 GB: ~24 GB per card; KV pool and
+#   scheduler.max_running_requests sized 2026-10-14 (T22): the gate measured 4 GiB per-rank
+#   headroom (/turbine/v1/kv ranks), the worst-case reservation at the gate shape (512+256 tokens
+#   per request) is ~3 GiB/rank (KV replicated across ranks), so 32 running requests fit; zero
+#   device_oom — golden c16 gate open (missing_top_k, perf-log "P7 Mixtral gate")),
 # expert parallel over both R9700s (expert_parallel_size 2), on novanas:
 #   scripts/lab-cluster.sh [--bench-lock] mixtral-ep2-novanas   (golden, GSM8K, bench; pod loopback)
 #   scripts/lab-perf.sh novanas mixtral --placement ep2 [--eval]  (vs vLLM-ROCm; listen overridden)

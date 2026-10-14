@@ -2139,3 +2139,41 @@ ok=200 failed=0 tok/s=413.5 itl_p50=30.4 ttft_p50=508 decode_fwd_ms=30.0` — c1
 | mixtral_8x7b (8e top-2)    | FP8 tensor W8A8 | 4666.7 / 4784.6                 | 8082.6 / 12856.3                 | loop                   |
 
 FP8 tensor stays on the loop: with 8 large experts the per-expert launch cost the grouped kernel removes is small, and the loop's per-expert hipBLASLt FP8 GEMMs run the big matrices well past the fp8_fp8 WMMA chain (1.6x at 2048 tokens). Correctness (`hip_moe_quant`, run 1008185932-06731898, 8 tests PASS): both paths on every format and case — each stage alone under the 6a bound (worst 0.951, qgemm FP8 block up n=768 k=2048 m=64; activation and scatter 0.000, bit-exact), the chained end-to-end output under 4x (worst 0.583, Qwen3 FP8 block 256 tokens; Mixtral 0.426, gpt-oss 0.387; the loop, the grouped kernel and the default dispatch read the same worst case in every chained case), and batch invariance within each path (a row alone vs batches 1..63: 0 differing elements, all four format variants). OLMoE BF16 bench unchanged: `scripts/lab-bench.sh --quick --model olmoe --label p7t16b` (GPU 0, 64 requests, c16, quick tier; the quick-tier run had one load flake, `pinned_copy_kernel_is_bit_exact` at 5.25 GB/s against the copy engine's 8.60, which passed on its rerun): `BENCH p7t16b olmoe commit=7b68a940 golden1=PASS tok/s=650.1 itl_p50=23.3 ttft_p50=135 decode_fwd_ms=22.9`, against 650.3 tok/s at `p7t16` (d11161ed) — the BF16 MoE paths, which this kernel does not touch, are unchanged.
+
+### P7 Mixtral gate — Mixtral-8x7B-Instruct-v0.1-FP8 tp2/ep2 (plan Task 22, branch `p7-t22`, 2026-10-14)
+
+Fixture: the reference was regenerated with the checkpoint's FP8 per-tensor activation
+fake-quantization (`quant_reference.py --act-quant fp8_tensor`, user decision 2026-10-13 B) — the
+dequantized-BF16-only reference matched no FP8-serving run — and the tolerance derives from the
+three completed self-spread variants (likely 3.35 / tail 7.05, strict = batched;
+`min_prompts_passing` 10; the fourth variant is deferred per the no-oversized-fixture rule) plus
+the calibrated `_multi_gpu` bounds 5.50 / 10.89 from the 34 spread captures of run
+`1013172007-1c724adf` (`tests/golden/mixtral-8x7b-instruct-v0.1-fp8/README.md`).
+
+- tp2 — every leg PASS. Throughput (`scripts/lab-perf.sh novanas mixtral --placement tp2`, run
+  `20261009T080307Z`, vLLM-ROCm on the same card): turbine 204.9 vs vLLM 64.6 tok/s, ratio 3.17 —
+  PASS (>= 0.75). Gate (`scripts/lab-cluster.sh --bench-lock mixtral-tp2-novanas`, run
+  `1014050253-1e2db74f`): `lab-cluster: mixtral-tp2-novanas PASS golden1=PASS golden16=PASS
+gsm8k=PASS tok_s=181` — golden c1 and c16 under the multi-GPU bounds, GSM8K c16 0.60 vs the
+  vLLM-tp2 baseline 0.59 (`eval-compare --max-drop 0.02` PASS), bench 200/200 with zero
+  `device_oom`, headroom 4294967296 bytes on each rank (`/turbine/v1/kv` `ranks`).
+- ep2 — golden16 FAIL. Throughput (`lab-perf --placement ep2`, run `20261013T194819Z`): 162.2 vs
+  63.9 tok/s, ratio 2.54 — PASS. Gate (run `1014064111-0cdd15af`): golden1 PASS, GSM8K c16 0.585
+  vs the vLLM-ep2 baseline 0.56 (PASS), bench 200/200, zero `device_oom`, headroom 4 GiB/rank,
+  194 tok/s — but golden c16 fails on `missing_top_k`, not on any |Δ|: at p06 position 16 a
+  reference top-5 candidate (token 28743) is absent from the run's top-20; every judged |Δ| sits
+  inside the multi-GPU bounds (worst p14: likely 2.97 of 5.5, tail 7.21 of 10.89). Systematic in
+  the banked captures: 6/16 of `mg-ep2-c16-*` show the same missing-1, 0/16 of `mg-tp2-c16-*` and
+  no c1 capture — an EP-specific near-tie whose membership in the top-20 flips with batch
+  composition.
+- Decision A (user, 2026-10-14, `.procoder/ask/decisions.md` "P7 Mixtral ep2 gate"): close
+  nothing. `PARALLEL_REFUSALS` cannot express an ep-only refusal, `phase7_rows` forbids an
+  `unsupported` `PHASE7_ROWS` row, and the shared arch×weight×kv matrix row cannot close for tp2
+  while ep2 is open. Both rows stay `experimental`; `scheduler.max_running_requests: 32` in
+  `scripts/lab/phase7-novanas-mixtral-{tp2,ep2}.yaml` is sized from the measured 4 GiB/rank
+  headroom (worst-case reservations ~1.5 GiB/rank at tp2, ~3 GiB/rank at ep2 at the gate shape);
+  the tp2 config is copied to `scripts/lab/phase7-novanas-mixtral.yaml` (the faster passing
+  placement).
+
+- P7 open: MixtralForCausalLM/fp8/bf16/tp2 — every gate leg passed (3.17× vLLM, GSM8K 0.60 vs 0.59, golden c1/c16 under the multi-GPU bounds, zero OOM, headroom 4 GiB/rank); the row stays `experimental` because the shared matrix row cannot close for tp2 while ep2 is open
+- P7 open: MixtralForCausalLM/fp8/bf16/ep2 — golden16 FAIL on `missing_top_k` (p06 token 28743 at position 16; all |Δ| inside the multi-GPU bounds; 6/16 banked ep2 c16 captures, 0/16 tp2), GSM8K and throughput PASS
