@@ -551,6 +551,19 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     ),
     family_row("Qwen3ForCausalLM", WeightFormatColumn::Bf16),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Bf16),
+    // Qwen3-MoE FP8 block closed its S-13 gate on gfx1201 (perf-log "P7 Qwen3-MoE gate",
+    // 2026-10-14: tp2 4.37x vLLM at 400.8 tok/s median and ep2 2.32x at 208.3, both
+    // placements golden c1/c16 16/16 on the multi-GPU bounds and GSM8K 0.94 vs vLLM's
+    // 0.945/0.94); other amd archs stay pending.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("Qwen3MoeForCausalLM"),
+        Some(WeightFormatColumn::Fp8Block),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     family_row("Qwen3MoeForCausalLM", WeightFormatColumn::Fp8Block),
     // Mistral BF16 closed its S-13 gate on gfx1201 (perf-log "P7 Mistral gate", 2026-10-08:
     // throughput 0.99× vLLM, GSM8K +0.02, golden c1/c16 16/16); other amd archs stay pending.
@@ -1466,9 +1479,12 @@ mod tests {
                 }
             }
         }
-        // Nothing but the AMD BF16 baseline, the proven gfx1201 Llama FP8 KV row (Task 24) and the
+        // Nothing but the AMD BF16 baseline, the proven gfx1201 Llama FP8 KV row (Task 24), the
         // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
-        // awq_int4 and gptq_int4, Task 18) are supported before the tracks add rows.
+        // awq_int4 and gptq_int4, Task 18), the Phase 7 families that closed their S-13 gates
+        // (Qwen3 and Mistral BF16 tp1; Qwen3-MoE fp8_block tp2 and ep2, Task 18) and the proven
+        // OLMoE rows (fp8_e4m3 KV; tq4 L0 stays `experimental`) are supported before the tracks
+        // add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
@@ -1484,9 +1500,11 @@ mod tests {
                     r.view()
                 );
                 assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
-                assert_eq!(
-                    r.key.architecture,
-                    Some("LlamaForCausalLM"),
+                assert!(
+                    matches!(
+                        r.key.architecture,
+                        Some("LlamaForCausalLM") | Some("Qwen3MoeForCausalLM")
+                    ),
                     "{:?}",
                     r.view()
                 );
@@ -1666,12 +1684,31 @@ mod tests {
             S::None,
         );
         assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+        // Qwen3-MoE FP8 block closed its gate on gfx1201 (perf-log "P7 Qwen3-MoE gate"): supported
+        // there, still experimental on the other AMD archs (family row, any arch).
+        let k = key(
+            "amd",
+            "gfx1201",
+            "Qwen3MoeForCausalLM",
+            W::Fp8Block,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        let k = key(
+            "amd",
+            "gfx942",
+            "Qwen3MoeForCausalLM",
+            W::Fp8Block,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
         // Phase 7 families (S-13): experimental on AMD (any arch) until their gate closes, the
         // row view naming the pending gate; experimental on the CPU reference; another weight
         // format stays refused by its format row.
         for (architecture, w) in [
             ("Qwen3MoeForCausalLM", W::Bf16),
-            ("Qwen3MoeForCausalLM", W::Fp8Block),
             ("MixtralForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Fp8),
             ("GptOssForCausalLM", W::Mxfp4),

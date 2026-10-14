@@ -2000,7 +2000,7 @@ Every Phase 7 gate result (S-13) is one list line in this section, naming one `t
 - a closed gate starts with `P7 closed:` and the entry, e.g. `MistralForCausalLM/bf16/bf16/tp1 <labbook run ids>`; the entry's `SUPPORT_MATRIX` row flips to `supported` in the same commit;
 - a missed or deferred gate starts with `P7 open:`, the entry and the reason; the row stays `experimental`.
 
-`support::tests::phase7_rows` (crates/turbine-core) reads the `P7 closed:` lines and fails when a closed entry is not `supported`, a `supported` entry has no closed line, or a closed line names no `PHASE7_ROWS` entry. No gate has closed yet.
+`support::tests::phase7_rows` (crates/turbine-core) reads the `P7 closed:` lines and fails when a closed entry is not `supported`, a `supported` entry has no closed line, or a closed line names no `PHASE7_ROWS` entry.
 
 ### P7 Qwen3-4B gate (Task 11, 2026-10-08, branch `p7-t11` on `p7-stack` 7d382541)
 
@@ -2177,3 +2177,19 @@ gsm8k=PASS tok_s=181` — golden c1 and c16 under the multi-GPU bounds, GSM8K c1
 
 - P7 open: MixtralForCausalLM/fp8/bf16/tp2 — every gate leg passed (3.17× vLLM, GSM8K 0.60 vs 0.59, golden c1/c16 under the multi-GPU bounds, zero OOM, headroom 4 GiB/rank); the row stays `experimental` because the shared matrix row cannot close for tp2 while ep2 is open
 - P7 open: MixtralForCausalLM/fp8/bf16/ep2 — golden16 FAIL on `missing_top_k` (p06 token 28743 at position 16; all |Δ| inside the multi-GPU bounds; 6/16 banked ep2 c16 captures, 0/16 tp2), GSM8K and throughput PASS
+
+### P7 Qwen3-MoE gate — Qwen3-30B-A3B-Instruct-2507-FP8 closes tp2 and ep2 (plan Task 18, branch `p7-t18`, 2026-10-14)
+
+- Throughput, tp2 (`scripts/lab-perf.sh novanas qwen3moe --placement tp2`, run `20261014T083123Z`, 3 runs each, vLLM-ROCm tp2 on the same two R9700s):
+  Turbine 400.8 tok/s median (403.9 / 400.8 / 401.1, ITL p50 31.7 ms, TTFT p50 583 ms) vs vLLM 91.6 (91.4 / 91.7 / 91.6), ratio 4.37 — PASS (>= 0.75), 0 failed requests.
+- Throughput, ep2 (run `20261014T091243Z`, same shape): Turbine 208.3 tok/s median (209.8 / 207.0 / 208.3, ITL p50 71.3 ms, TTFT p50 445 ms) vs vLLM 89.7 (89.7 / 89.8 / 89.1), ratio 2.32 — PASS, 0 failed requests.
+- GSM8K-200 c16 (`tests/eval/gsm8k-200.jsonl`): vLLM baselines `tests/eval/qwen3-30b-a3b-instruct-2507-fp8/vllm-tp2.json` 0.945 and `vllm-ep2.json` 0.94; the gate runs' Turbine evals
+  (`turbine-tp2.json`, `turbine-ep2.json`) both 0.94 — drops 0.005 / 0.0, `eval-compare --max-drop 0.02` (the 6a FP8 bound of `gate.json`) PASS on both placements. The tp2 baseline came from a
+  follow-up serve session (that run's own eval step failed on a client-side path bug before writing its report; the throughput numbers above are that run's).
+- Golden (`tests/golden/qwen3-30b-a3b-instruct-2507-fp8/`, strict 0.54/2.59, batched and `_multi_gpu` 1.32/6.23; the gate judges with `--multi-gpu-bounds`): both placements
+  `lab-cluster: qwen3moe-<p>-novanas PASS golden1=PASS golden16=PASS gsm8k=PASS` —
+  tp2 run `1014103630-34ebd3fd` (tok_s=399.9), ep2 run `1014110554-08371519` (tok_s=163.6).
+- Faster passing placement: tp2 (399.9 vs 163.6 tok/s); `scripts/lab/phase7-novanas-qwen3moe.yaml` is the tp2 config.
+
+- P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/tp2 20261014T083123Z 1014103630-34ebd3fd
+- P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/ep2 20261014T091243Z 1014110554-08371519
