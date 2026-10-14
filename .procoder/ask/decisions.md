@@ -4610,7 +4610,7 @@ gated against: the act-quant gap, not engine noise, moves those prompts.
   multi-nat bounds and a lowered `min_prompts_passing` to pass what the reference implementation
   itself fails.
 - B) Regenerate the reference with the act-quant in it (`quant_reference.py --act-quant
-  fp8_tensor`, the llama-fp8 fixture recipe, `--dequantized` reusing the existing BF16 copy on
+fp8_tensor`, the llama-fp8 fixture recipe, `--dequantized` reusing the existing BF16 copy on
   cpuhost), then calibrate the tolerance against the new reference (self-spread, same 4-bf16-variant
   restriction: fp32 needs ~187 GB, cpuhost has 125 GB).
 
@@ -4627,7 +4627,7 @@ against the new reference (`self_spread_v2.json`). Reference commit, tolerance.j
 mg-bound derivation follow on p7-t22 once the chain ends.
 
 Standing rule for cpuhost fixture jobs (root cause of the 2026-10-13 iSCSI LUN wedge, coordinator
-2026-10-14): it is not free-RAM-at-start but ~92 GB model *residency* that matters — the residency
+2026-10-14): it is not free-RAM-at-start but ~92 GB model _residency_ that matters — the residency
 squeezes the ARC to ~10 GB, and an ARC-squeezed zvol cannot coexist with a concurrent LUN write
 storm (e.g. a remote-cargo build into `turbine-ci/remote` on novanas); the zvol taskq threads pile
 up in D and the LUN fails reads of freshly written blocks. Rule: **no resident model on cpuhost
@@ -4635,3 +4635,13 @@ while anything else drives the novanas LUN** — serialize LUN-heavy novanas bui
 model jobs, and gate each stage on MemAvailable >= 80 GB with a D-state watchdog
 (`p7_tol3_mixtral.sh`: two consecutive samples of >= 6 D-state txg/zvol/zpool/pvc threads, or a
 failed 4 KB write+read probe on cpuhost local disk, abort the stage cleanly).
+
+Final (user, 2026-10-14): the tolerance derives from 3 of the 4 self-spread variants per the
+user's no-oversized-fixture rule — never load fixture models that do not fit comfortably in host
+RAM. The ~93 GB `bf16-eager-full` variant thrashed against the Pool0 write storm and is deferred
+(per-prompt checkpoint at 13/16 prompts, resumed by a demoted watcher in genuinely quiet windows
+only — no aggressive retries, no thrash); its maxima so far sit under the completed variants'.
+Derived bounds: likely 3.35 / tail 7.05 (strict = batched), `min_prompts_passing` 10 from the
+placement captures; `_multi_gpu` 5.50 / 10.89. The deferral and the revisit condition are recorded
+in `tests/golden/mixtral-8x7b-instruct-v0.1-fp8/README.md`; if the deferred variant's completion
+moves the bounds materially, revisit.
