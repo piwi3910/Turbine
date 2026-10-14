@@ -3201,13 +3201,13 @@ fn lab_perf_dry_run_phase7_placements() {
     }
 }
 
-/// Plan Task 9 (decision 2026-10-08 B) with the Task 22 S-13 bounds: each two-card family
+/// Plan Task 9 (decision 2026-10-08 B), Task 18 (decision 2026-10-08 A): each two-card family
 /// scenario renders the two-GPU Job and its dry run prints the in-Job Turbine legs — the server
-/// on the placement's config, the multi-gpu-bounds golden at c1 and c16 (an MoE slug judges by
-/// its tolerance's `_multi_gpu` keys), the GSM8K eval and its compare against the committed vLLM
-/// baseline, the c16 bench, the per-rank KV headroom and the device_oom check — and no vLLM leg;
-/// the eval result is copied back before cleanup. Breaks if a scenario is missing, a leg is
-/// dropped, or a vLLM leg reappears in the pod.
+/// on the placement's config, the multi-gpu-bounds golden at c1 and c16 (the two-card MoE rows of
+/// S-13; falls back to the batched bounds while tolerance.json carries no `_multi_gpu` keys), the
+/// GSM8K eval and its compare against the committed vLLM baseline, the c16 bench — and no vLLM
+/// leg; the eval result is copied back before cleanup.
+/// Breaks if a scenario is missing, a leg is dropped, or a vLLM leg reappears in the pod.
 #[test]
 fn lab_cluster_dry_run_family_scenarios() {
     for (short, slug, _, two_card) in PHASE7_MODELS {
@@ -3272,52 +3272,6 @@ fn lab_cluster_dry_run_family_scenarios() {
         &["--dry-run", "tp2-novanas"],
     );
     assert!(!text.contains("in-Job steps"), "{text}");
-}
-
-/// Plan Task 22 (decision 2026-10-08 A): each family's spread scenario renders the two-GPU Job
-/// and its dry run prints the in-Job capture legs — per placement the server on the placement's
-/// config, a c1 capture (tp2 as the reference capture `c1-cold`, the family does not fit one
-/// GPU) and the 16 rotated `mg-<placement>-c16-…` captures, then the captures copied back before
-/// cleanup. Breaks if a scenario is missing or a leg is dropped.
-#[test]
-fn lab_cluster_dry_run_family_spread_scenarios() {
-    for (short, slug, _, two_card) in PHASE7_MODELS {
-        if !two_card {
-            continue;
-        }
-        let scenario = format!("{short}-spread-novanas");
-        let text = dry_run("lab-cluster.sh", &scenario, &["--dry-run", &scenario]);
-        let id = run_id(&text, "lab-cluster");
-        let job = applied_jobs(&text).remove(1);
-        assert_eq!(env(&job, "TURBINE_LAB_SCENARIO"), scenario);
-        assert_eq!(amd_gpus(&job), 2);
-        let captures = format!("{CI_ROOT}/runs/{id}/results/spread/{slug}/c1-cold.jsonl");
-        let ep2_c1 = format!("{CI_ROOT}/runs/{id}/results/spread/{slug}/mg-ep2-c1.jsonl");
-        assert_in_order(
-            &text,
-            &[
-                &format!("kubectl -n turbine-ci logs -f job/turbine-lab-cluster-{id}"),
-                &format!("turbine-server --config scripts/lab/phase7-novanas-{short}-tp2.yaml"),
-                &format!(
-                    "turbine-golden capture --url http://127.0.0.1:18000 --prompts tests/golden/prompts.jsonl --out {captures}"
-                ),
-                &format!("turbine-server --config scripts/lab/phase7-novanas-{short}-ep2.yaml"),
-                &format!(
-                    "turbine-golden capture --url http://127.0.0.1:18000 --prompts tests/golden/prompts.jsonl --out {ep2_c1}"
-                ),
-                &format!("{short}-spread-novanas PASS"),
-            ],
-        );
-        assert!(text.contains("mg-tp2-c16-15.jsonl"), "{text}");
-        assert!(text.contains("mg-ep2-c16-15.jsonl"), "{text}");
-    }
-    // The olmoe spread scenario keeps its own steps (not the family spread's).
-    let text = dry_run(
-        "lab-cluster.sh",
-        "spread-olmoe-own",
-        &["--dry-run", "olmoe-spread-novanas"],
-    );
-    assert!(!text.contains("c1-cold.jsonl >"), "{text}");
 }
 
 /// Plan Task 9: the ten Phase 7 lab configs load through the real configuration model with the

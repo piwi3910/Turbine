@@ -1142,7 +1142,7 @@ fn hermes_config_loads() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("(registered: llama3_json, hermes, mistral)"),
+        stderr.contains("(registered: llama3_json, hermes, mistral, harmony)"),
         "{stderr}"
     );
 }
