@@ -4671,3 +4671,22 @@ demand a `- P7 closed:` line for both).
 **Decision (user, 2026-10-14):** A. The deferred `bf16-eager-full` self-spread variant stays
 deferred (13/16 banked; its maxima sit under the committed bounds) — not resumed without the
 user's word.
+
+## P7 novanas GPU held by Kuvryn Scout workloads
+
+Two `kuvryn-ai-workloads` pods (vLLM-omni `qwen3-tts-base` on 8105, audio.cpp; ~14 GB VRAM each) held both R9700s on novanas from 2026-10-09 evening, blocking every Phase 7 lab run.
+
+- **A. Stop the pods:** delete them by name in the `kuvryn-ai-workloads` namespace; Phase 7 resumes immediately.
+- **B. Leave them:** builders park on CPU-only work until the pods exit on their own.
+
+**Decision (user, 2026-10-13): A — stop them.** Both deployments scaled to zero; restart with `--replicas=1` when needed.
+
+## P7 LUN stall root-cause method
+
+Three iSCSI session drops (2026-10-13/14) took the ext4 on novanas's TrueNAS LUN read-only. Root-cause facts: novanas's jbd2 journal thread blocked >120 s on target sync writes; cpuhost's since-boot pool latency histogram carries 17-34 s sync-write buckets (from the incident windows — fresh windows measure ≤ 0.5 s); the network is 10 Gb/s and clean. Fixes landed: novanas NIC MTU 1500 → 9000 (the lab's 10G is all-jumbo; persisted in /etc/network/interfaces), iSCSI initiator stall timeouts raised (noop 30/90 s, abort 60 s), and the TrueNAS zvol `Pool0/novanas-turbine/novanas-turbine` set `sync=disabled` (user decision below). An instrumented soak (45 min bound, cargo-shaped load, both-end telemetry) was approved for the residual trigger question.
+
+- **A. Instrumented soak now:** synthetic cargo-shaped load with both-end telemetry; each outcome conclusive (target silence → zvol/ZIL; retransmits first → network; no repro → add real co-factors).
+- **B. Instrument only:** debug logging live; wait for the next real incident.
+- **C. Mitigate and move on:** add a 2.5G multipath failover path; does not cover target-side stalls.
+
+**Decision (user, 2026-10-14):** A, run after the storage changes; the first run was cut short by the sync flip and its telemetry sampler was faulty — rerun against the flipped zvol when wanted. Also (user, 2026-10-14): `sync=disabled` on the zvol — everything on the LUN is regenerable; measured 20× on the small-file-fsync pattern (12 m 25 s → 38 s for 2 000 synced files) and 1.6× on big writes (334 → 532 MB/s).
