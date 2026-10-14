@@ -11,6 +11,7 @@ use turbine_core::registry::Module;
 use super::*;
 use crate::structured::GrammarLimits;
 use crate::structured::tests::feed_text;
+use crate::structured::{TokenMask, step_mask};
 use crate::testing::TempDir;
 use crate::testing::tiny::{PYTHON_TAG as TINY_PYTHON_TAG, TINY_EOS, write_tiny_llama};
 use crate::tools::{ToolCallOut, ToolCallParser, ToolChoice, ToolParse, tool_call_grammar};
@@ -811,6 +812,69 @@ fn harmony_conformance() {
     // A call cut off before `<|call|>` stays content (a partial form parses as nothing).
     let truncated = &HARMONY_ONE[..HARMONY_ONE.len() - harmony::CALL.len()];
     assert_eq!(maybe_calls(parser.parse(truncated)), None);
+}
+
+/// The harmony `<|call|>` is an EOS id of gpt-oss AND the literal terminator the required
+/// grammar forces after the arguments. The constraint's mask must keep allowing it there —
+/// stripping an EOS id whose grammar still needs it dead-ended the served `required` call
+/// with "the constraint allows no token" exactly when the arguments were complete — and
+/// committing it completes the constraint. Mid-grammar, an EOS id still ends nothing.
+#[test]
+fn harmony_call_terminator_is_an_eos_id() {
+    let format = registry().get("harmony").expect("registered");
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-harmony-eos");
+    let mut tokenizer = Arc::unwrap_or_clone(tokenizer);
+    // The format's marker atoms as special tokens (the conformance suite does the same); the
+    // terminator then has an id of its own.
+    tokenizer
+        .add_special_tokens(
+            &format
+                .special_tokens()
+                .iter()
+                .map(|t| t.text)
+                .filter(|t| envelope::is_marker_atom(t))
+                .collect::<Vec<_>>(),
+        )
+        .expect("add markers");
+    let tokenizer = Arc::new(tokenizer);
+    let call_id = tokenizer
+        .token_to_id(harmony::CALL)
+        .expect("<|call|> gets an id");
+    // gpt-oss's checkpoint lists `<|call|>` among its EOS tokens.
+    let eos = [TINY_EOS.as_slice(), &[call_id]].concat();
+    let compiler = GrammarCompiler::new(&tokenizer, &eos).expect("token trie");
+
+    // The model's own call goes through the required grammar, terminator included.
+    let ok = |text: &str| {
+        accepts(
+            &compiler,
+            &tokenizer,
+            &eos,
+            format,
+            &ToolChoice::Required,
+            false,
+            text,
+        )
+    };
+    assert_eq!(ok(HARMONY_ONE), Ok(true), "the complete call is accepted");
+
+    // Mid-grammar (the arguments incomplete) the terminator and the other EOS ids are still
+    // refused: the mask keeps EOS ids out where the grammar does not literally need them.
+    let limits = GrammarLimits {
+        max_schema_bytes: 64 * 1024,
+    };
+    let spec = format
+        .grammar(&weather_tools(), &ToolChoice::Required, false)
+        .expect("grammar");
+    let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+    let partial = &HARMONY_ONE[..HARMONY_ONE.len() - harmony::CALL.len() - 1];
+    feed_text(matcher.as_mut(), &tokenizer, &eos, partial).expect("the partial call walks");
+    let mut mask = TokenMask::new_none(tokenizer.vocab_size() as usize);
+    step_mask(matcher.as_mut(), &eos, &mut mask).expect("the mask is not empty mid-call");
+    assert!(
+        !mask.is_allowed(call_id),
+        "the terminator must stay disallowed while the arguments are incomplete"
+    );
 }
 
 /// S-9 (part 2): a Harmony output splits into the analysis reasoning and the final content, a

@@ -2,6 +2,7 @@
 //! tokenizer. Run on novanas with
 //! `TURBINE_GPT_OSS_TOKENIZER=/home/piwi/turbine-models/gpt-oss-20b/tokenizer.json`.
 
+use turbine_model::conformance::feed_text;
 use turbine_model::formats::Harmony;
 use turbine_model::structured::{GrammarCompiler, GrammarLimits, TokenMask, step_mask};
 use turbine_model::tokenizer::Tokenizer;
@@ -85,4 +86,47 @@ fn required_mask_probe() {
             return;
         }
     }
+}
+
+/// The served failure, host-side: the sample call, token by token, through the mask (the
+/// engine's step path) with the checkpoint's EOS list — `<|call|>` (200002) is one of
+/// gpt-oss's EOS ids AND the literal terminator the grammar forces after the arguments.
+#[test]
+#[ignore = "needs the gpt-oss tokenizer.json (see required_mask_probe)"]
+fn required_sample_call_through_the_mask() {
+    let path = std::env::var("TURBINE_GPT_OSS_TOKENIZER")
+        .or_else(|_| {
+            std::env::var("TURBINE_TEST_GPT_OSS_MODEL_DIR")
+                .map(|dir| format!("{dir}/tokenizer.json"))
+        })
+        .unwrap_or_else(|_| "/home/piwi/turbine-models/gpt-oss-20b/tokenizer.json".to_string());
+    let tokenizer =
+        Tokenizer::from_file(std::path::Path::new(&path)).expect("gpt-oss tokenizer.json");
+    let eos = [200002u32, 199999u32, 200012u32];
+    let compiler = GrammarCompiler::new(&tokenizer, &eos).expect("trie");
+    let limits = GrammarLimits {
+        max_schema_bytes: 64 * 1024,
+    };
+    let tools = vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        }
+    })];
+    let spec = Harmony
+        .grammar(&tools, &ToolChoice::Required, false)
+        .expect("grammar");
+    let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+    let text = Harmony.sample_call();
+    let ids = tokenizer.encode(text, false).expect("encode");
+    println!("sample call {text:?} = {ids:?}");
+    let got = feed_text(matcher.as_mut(), &tokenizer, &eos, text);
+    println!("sample call through the mask: {got:?}");
+    assert_eq!(got, Ok(true), "the grammar accepts the model's own call");
 }

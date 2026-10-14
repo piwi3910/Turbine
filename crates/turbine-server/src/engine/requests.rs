@@ -464,10 +464,16 @@ impl ActiveRequest {
         let generated = c.generated.len() as u32;
         let detokenize_started = Instant::now();
 
-        // EOS (unless ignored) and `stop_token_ids` end the choice; their text is not output.
+        // EOS (unless ignored) and `stop_token_ids` end the choice; their text is not output —
+        // unless the choice holds its output for the tool parser: a terminator the grammar
+        // required (the harmony `<|call|>`, an EOS id of gpt-oss) must reach the parser, or
+        // the finished output fails to parse with its end cut off. Held text never streams
+        // directly, so the marker stays out of the client's content either way.
         let is_end = (!stop.ignore_eos && stop.eos_token_ids.contains(&token))
             || stop.stop_token_ids.contains(&token);
-        if !is_end && let Some(chunk) = c.detok.push(token) {
+        if (!is_end || matches!(c.tool_text, ToolText::Holding(_)))
+            && let Some(chunk) = c.detok.push(token)
+        {
             c.held_text.push_str(&chunk);
         }
         let length = generated >= stop.max_tokens || prompt_len + generated >= max_seq_len;
@@ -1228,6 +1234,91 @@ mod tests {
         let (streamed, last) = feed(&mut r, vocab, call, 260);
         assert_eq!(streamed, call);
         assert_eq!(last.finish, Some(FinishReason::Stop));
+    }
+
+    /// The harmony required call ends at `<|call|>` — an EOS id of gpt-oss AND a declared
+    /// marker whose text the detokenizer emits. The choice must finish as tool calls (the
+    /// parser needs the terminator in the held output; the mask keeps it samplable only where
+    /// the grammar literally needs it, see the turbine-model side of this defect), and the
+    /// terminator's text stays out of the client's content. Without tools the terminator's
+    /// text is still not output.
+    #[test]
+    fn harmony_terminator_ends_constrained_call_as_tool_calls() {
+        let (_dir, tokenizer) = tiny_tokenizer("turbine-engine-requests-harmony-eos");
+        let mut tokenizer = Arc::unwrap_or_clone(Arc::clone(&tokenizer));
+        tokenizer
+            .add_special_tokens(&["<|call|>"])
+            .expect("markers");
+        let tokenizer = Arc::new(tokenizer);
+        let vocab = tokenizer.vocab_size() as usize;
+        let call_id = tokenizer.token_to_id("<|call|>").expect("<|call|> id");
+        let format = turbine_model::formats::registry()
+            .get("harmony")
+            .expect("registered");
+        let parser = ToolParser {
+            format: Arc::new(turbine_model::formats::bind(format, &tokenizer).expect("bind")),
+            parser: Arc::from(format.parser()),
+            label: format.name(),
+        };
+        let prefix = "<|call|>";
+        let call = format.sample_call();
+        let body = call
+            .strip_suffix(prefix)
+            .expect("the sample call ends with its terminator");
+
+        // Constrained: the call is held; its terminator ends the choice and parses.
+        let mut req = request(&[256], 512, &[]);
+        req.endpoint = Endpoint::ChatCompletions;
+        req.stop.eos_token_ids = SmallVec::from_slice(&[call_id]);
+        let (tx, _rx) = mpsc::channel(256);
+        drop(_rx);
+        let mut r = ActiveRequest::new(
+            Submission {
+                tools: ToolOutput::Constrained(parser.clone()),
+                marker_ids: vec![call_id],
+                ..req.clone().into()
+            },
+            tx,
+            &[SeqId(1)],
+            &tokenizer,
+        );
+        let (streamed, last) = feed(&mut r, vocab, body, call_id);
+        assert_eq!(streamed, "", "held text never streams");
+        assert_eq!(last.finish, Some(FinishReason::ToolCalls));
+        match &last.events[..] {
+            [
+                GenerationEvent::Token { text, .. },
+                GenerationEvent::ToolCalls { choice: 0, calls },
+            ] => {
+                assert!(text.is_empty());
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "get_weather");
+                assert_eq!(
+                    calls[0].arguments,
+                    r#"{"location":"Oslo","unit":"celsius"}"#
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Without tools the terminator's text is not output either.
+        let (tx, _rx) = mpsc::channel(256);
+        drop(_rx);
+        let mut r = ActiveRequest::new(
+            Submission {
+                marker_ids: vec![call_id],
+                ..req.into()
+            },
+            tx,
+            &[SeqId(2)],
+            &tokenizer,
+        );
+        let (streamed, last) = feed(&mut r, vocab, body, call_id);
+        assert_eq!(last.finish, Some(FinishReason::Stop));
+        assert!(
+            !streamed.contains(prefix),
+            "the terminator must stay out of the content: {streamed:?}"
+        );
     }
 
     /// Allows only `ids`; `fail` makes the mask computation fail.
