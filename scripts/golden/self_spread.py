@@ -31,10 +31,15 @@ quantization (Phase 6a S-13). The emulation hooks the KV cache, so both decode s
 `use_cache=True`.
 
 usage: self_spread.py <model-dir> <reference.jsonl> <out.json> [variant,...] [--act-quant <mode>]
-                      [--kv-quant none|fp8_e4m3]
+                      [--kv-quant none|fp8_e4m3] [--only-ids p01,p02,...]
+
+`--only-ids` runs a subset of the reference prompts; combined with the per-prompt checkpointing
+(out.json is rewritten atomically after every prompt, resuming from an existing file) a long
+variant survives a killed run on a shared fixture host.
 """
 
 import json
+import os
 import sys
 import time
 
@@ -62,6 +67,11 @@ if "--kv-quant" in argv:
     del argv[i : i + 2]
     if kv_quant not in ("none", "fp8_e4m3"):
         sys.exit(f"--kv-quant: none or fp8_e4m3, got {kv_quant}")
+only_ids = None
+if "--only-ids" in argv:
+    i = argv.index("--only-ids")
+    only_ids = set(argv[i + 1].split(","))
+    del argv[i : i + 2]
 model_dir, ref_path, out_path = argv[0], argv[1], argv[2]
 layers = None
 if act_quant != "none" or kv_quant != "none":
@@ -81,6 +91,11 @@ ALL = [
 variants = argv[3].split(",") if len(argv) > 3 else ALL
 with open(ref_path) as f:
     refs = [json.loads(line) for line in f]
+if only_ids is not None:
+    refs = [r for r in refs if r["id"] in only_ids]
+    missing = only_ids - {r["id"] for r in refs}
+    if missing:
+        sys.exit(f"--only-ids: ids not in the reference: {sorted(missing)}")
 
 
 def hidden_states(model, ref, mode):
@@ -148,8 +163,20 @@ def judge(ref, lps):
 
 
 results = {}
+if os.path.exists(out_path):
+    with open(out_path) as f:
+        results = json.load(f)
 loaded = None
 model = head = None
+
+
+def write_results():
+    tmp = f"{out_path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(results, f, indent=1)
+    os.replace(tmp, out_path)
+
+
 for variant in variants:
     dt, attn, mode = variant.split("-")
     if loaded != (dt, attn):
@@ -173,16 +200,17 @@ for variant in variants:
         loaded = (dt, attn)
         print(f"loaded {dt} {attn} in {time.time() - t0:.0f}s", flush=True)
     t0 = time.time()
-    rows = []
+    done = {r["id"] for r in results.get(variant, [])}
     for ref in refs:
+        if ref["id"] in done:
+            print(variant, ref["id"], "cached", flush=True)
+            continue
         lps = torch.log_softmax(hidden_states(model, ref, mode) @ head.T, dim=-1)
         v = judge(ref, lps)
-        rows.append(v)
+        results.setdefault(variant, []).append(v)
         print(variant, json.dumps(v), flush=True)
-    results[variant] = rows
+        write_results()
     print(f"{variant}: {time.time() - t0:.0f}s", flush=True)
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=1)
 
 print("variant                 prefix_ok  max_likely  max_tail  missing")
 for variant, rows in results.items():
