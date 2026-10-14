@@ -2941,9 +2941,9 @@ fn fetch_checkpoint_dry_run_pins_revision() {
             "/home/piwi/turbine-models",
             "hf download openai/gpt-oss-20b --revision 6cee5e81ee83917806bbde320786a8fb61efebee \
              --local-dir /home/piwi/turbine-models/gpt-oss-20b --include \
-             'model-0000*-of-00002.safetensors' --include 'model.safetensors.index.json' \
-             --include 'config.json' --include 'generation_config.json' \
-             --include 'special_tokens_map.json' --include 'tokenizer*' \
+             'model-0000*-of-00002.safetensors' --include model.safetensors.index.json \
+             --include config.json --include generation_config.json \
+             --include special_tokens_map.json --include 'tokenizer*' \
              --include chat_template.jinja",
         ],
     );
