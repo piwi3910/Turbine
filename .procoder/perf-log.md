@@ -2000,7 +2000,7 @@ Every Phase 7 gate result (S-13) is one list line in this section, naming one `t
 - a closed gate starts with `P7 closed:` and the entry, e.g. `MistralForCausalLM/bf16/bf16/tp1 <labbook run ids>`; the entry's `SUPPORT_MATRIX` row flips to `supported` in the same commit;
 - a missed or deferred gate starts with `P7 open:`, the entry and the reason; the row stays `experimental`.
 
-`support::tests::phase7_rows` (crates/turbine-core) reads the `P7 closed:` lines and fails when a closed entry is not `supported`, a `supported` entry has no closed line, or a closed line names no `PHASE7_ROWS` entry. No gate has closed yet.
+`support::tests::phase7_rows` (crates/turbine-core) reads the `P7 closed:` lines and fails when a closed entry is not `supported`, a `supported` entry has no closed line, or a closed line names no `PHASE7_ROWS` entry.
 
 ### P7 Qwen3-4B gate (Task 11, 2026-10-08, branch `p7-t11` on `p7-stack` 7d382541)
 
@@ -2139,3 +2139,19 @@ ok=200 failed=0 tok/s=413.5 itl_p50=30.4 ttft_p50=508 decode_fwd_ms=30.0` — c1
 | mixtral_8x7b (8e top-2)    | FP8 tensor W8A8 | 4666.7 / 4784.6                 | 8082.6 / 12856.3                 | loop                   |
 
 FP8 tensor stays on the loop: with 8 large experts the per-expert launch cost the grouped kernel removes is small, and the loop's per-expert hipBLASLt FP8 GEMMs run the big matrices well past the fp8_fp8 WMMA chain (1.6x at 2048 tokens). Correctness (`hip_moe_quant`, run 1008185932-06731898, 8 tests PASS): both paths on every format and case — each stage alone under the 6a bound (worst 0.951, qgemm FP8 block up n=768 k=2048 m=64; activation and scatter 0.000, bit-exact), the chained end-to-end output under 4x (worst 0.583, Qwen3 FP8 block 256 tokens; Mixtral 0.426, gpt-oss 0.387; the loop, the grouped kernel and the default dispatch read the same worst case in every chained case), and batch invariance within each path (a row alone vs batches 1..63: 0 differing elements, all four format variants). OLMoE BF16 bench unchanged: `scripts/lab-bench.sh --quick --model olmoe --label p7t16b` (GPU 0, 64 requests, c16, quick tier; the quick-tier run had one load flake, `pinned_copy_kernel_is_bit_exact` at 5.25 GB/s against the copy engine's 8.60, which passed on its rerun): `BENCH p7t16b olmoe commit=7b68a940 golden1=PASS tok/s=650.1 itl_p50=23.3 ttft_p50=135 decode_fwd_ms=22.9`, against 650.3 tok/s at `p7t16` (d11161ed) — the BF16 MoE paths, which this kernel does not touch, are unchanged.
+
+### P7 Qwen3-MoE gate — Qwen3-30B-A3B-Instruct-2507-FP8 closes tp2 and ep2 (plan Task 18, branch `p7-t18`, 2026-10-14)
+
+- Throughput, tp2 (`scripts/lab-perf.sh novanas qwen3moe --placement tp2`, run `20261014T083123Z`, 3 runs each, vLLM-ROCm tp2 on the same two R9700s):
+  Turbine 400.8 tok/s median (403.9 / 400.8 / 401.1, ITL p50 31.7 ms, TTFT p50 583 ms) vs vLLM 91.6 (91.4 / 91.7 / 91.6), ratio 4.37 — PASS (>= 0.75), 0 failed requests.
+- Throughput, ep2 (run `20261014T091243Z`, same shape): Turbine 208.3 tok/s median (209.8 / 207.0 / 208.3, ITL p50 71.3 ms, TTFT p50 445 ms) vs vLLM 89.7 (89.7 / 89.8 / 89.1), ratio 2.32 — PASS, 0 failed requests.
+- GSM8K-200 c16 (`tests/eval/gsm8k-200.jsonl`): vLLM baselines `tests/eval/qwen3-30b-a3b-instruct-2507-fp8/vllm-tp2.json` 0.945 and `vllm-ep2.json` 0.94; the gate runs' Turbine evals
+  (`turbine-tp2.json`, `turbine-ep2.json`) both 0.94 — drops 0.005 / 0.0, `eval-compare --max-drop 0.02` (the 6a FP8 bound of `gate.json`) PASS on both placements. The tp2 baseline came from a
+  follow-up serve session (that run's own eval step failed on a client-side path bug before writing its report; the throughput numbers above are that run's).
+- Golden (`tests/golden/qwen3-30b-a3b-instruct-2507-fp8/`, strict 0.54/2.59, batched and `_multi_gpu` 1.32/6.23; the gate judges with `--multi-gpu-bounds`): both placements
+  `lab-cluster: qwen3moe-<p>-novanas PASS golden1=PASS golden16=PASS gsm8k=PASS` —
+  tp2 run `1014103630-34ebd3fd` (tok_s=399.9), ep2 run `1014110554-08371519` (tok_s=163.6).
+- Faster passing placement: tp2 (399.9 vs 163.6 tok/s); `scripts/lab/phase7-novanas-qwen3moe.yaml` is the tp2 config.
+
+- P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/tp2 20261014T083123Z 1014103630-34ebd3fd
+- P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/ep2 20261014T091243Z 1014110554-08371519
