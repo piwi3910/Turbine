@@ -422,7 +422,14 @@ impl ActiveRequest {
                 let mask = self
                     .mask
                     .get_or_insert_with(|| TokenMask::new_none(logits.len()));
-                step_mask(matcher.as_mut(), &stop.eos_token_ids, mask)?;
+                step_mask(matcher.as_mut(), &stop.eos_token_ids, mask).map_err(|e| {
+                    ModelError::Constraint(format!(
+                        "{e} (choice {choice} at generated {} tokens: \
+                     {:?}…)",
+                        c.generated.len(),
+                        &c.generated[..c.generated.len().min(12)]
+                    ))
+                })?;
                 if let Some(m) = metrics {
                     m.observe_token_mask(started.elapsed().as_secs_f64());
                 }

@@ -105,11 +105,16 @@ impl ToolFormat for Harmony {
         let allowed = allowed_tools(tools, choice)?;
         let repeat = parallel && matches!(choice, ToolChoice::Auto | ToolChoice::Required);
         let calls = if repeat { "call (call)*" } else { "call" };
+        // The call anchors at the channel: the generation prompt already ends with
+        // `<|start|>assistant`, so the model writes `<|channel|>commentary to=functions.…`
+        // from there (`CALL_OPENER_SHORT`); the `<|...|>` markers are special tokens of the
+        // gpt-oss tokenizer, which the grammar references as bare atoms (`lark_envelope`) —
+        // a quoted literal is plain text and can never match a special token.
         let rules = call_rules(
             &allowed,
-            "<|start|>assistant<|channel|>commentary to=functions.",
-            " <|constrain|>json<|message|>",
-            "<|call|>",
+            &format!("{CHANNEL}commentary {TO_FUNCTIONS}"),
+            &format!(" {CONSTRAIN}json{MESSAGE}"),
+            CALL,
         );
         let start = match choice {
             ToolChoice::Auto => format!(
@@ -151,7 +156,10 @@ impl ToolFormat for Harmony {
 
     /// The commentary-channel form of `get_weather`.
     fn sample_call(&self) -> &'static str {
-        "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>"
+        // The generation form: the prompt ends with `<|start|>assistant`, so the constrained
+        // model writes the call from the channel on (the parser also accepts the full
+        // `<|start|>assistant`-prefixed form).
+        "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>"
     }
 }
 

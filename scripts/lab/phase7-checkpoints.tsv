@@ -3,6 +3,6 @@ qwen3-4b-instruct-2507	Qwen/Qwen3-4B-Instruct-2507	cdbee75f17c01a7cc42f958dc6509
 qwen3-30b-a3b-instruct-2507-fp8	Qwen/Qwen3-30B-A3B-Instruct-2507-FP8	5a5a776300a41aaa681dd7ff0106608ef2bc90db	*	32
 mistral-7b-instruct-v0.3	mistralai/Mistral-7B-Instruct-v0.3	c170c708c41dac9275d15a8fff4eca08d52bab71	model-*.safetensors,*.json,tokenizer*	15
 mixtral-8x7b-instruct-v0.1-fp8	RedHatAI/Mixtral-8x7B-Instruct-v0.1-FP8	9a978d5cc7dabc37b3d13d6501426081c99c4cbd	*	48
-gpt-oss-20b	openai/gpt-oss-20b	6cee5e81ee83917806bbde320786a8fb61efebee	model-0000*-of-00002.safetensors,*.json,tokenizer*,chat_template.jinja	14
+gpt-oss-20b	openai/gpt-oss-20b	6cee5e81ee83917806bbde320786a8fb61efebee	model-0000*-of-00002.safetensors,model.safetensors.index.json,config.json,generation_config.json,special_tokens_map.json,tokenizer*,chat_template.jinja	14
 qwen3.5-9b	Qwen/Qwen3.5-9B	c202236235762e1c871ad0ccb60c8ee5ba337b9a	*	20
 qwen3.6-35b-a3b-fp8	Qwen/Qwen3.6-35B-A3B-FP8	95a723d08a9490559dae23d0cff1d9466213d989	*	38

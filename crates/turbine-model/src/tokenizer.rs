@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::ModelError;
 
 /// A loaded `tokenizer.json` (wraps `tokenizers::Tokenizer`).
+#[derive(Clone)]
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
     path: PathBuf,
@@ -60,6 +61,22 @@ impl Tokenizer {
 
     pub fn id_to_token(&self, id: u32) -> Option<String> {
         self.inner.id_to_token(id)
+    }
+
+    /// Adds `tokens` as special added tokens (new ids past the vocabulary): the conformance
+    /// suite carries a format's declared markers this way, so its grammars can reference them
+    /// as llguidance special-token atoms on the fixture tokenizer.
+    pub fn add_special_tokens(&mut self, tokens: &[&str]) -> Result<(), ModelError> {
+        let added: Vec<tokenizers::AddedToken> = tokens
+            .iter()
+            .map(|&text| tokenizers::AddedToken {
+                content: text.to_string(),
+                special: true,
+                ..Default::default()
+            })
+            .collect();
+        let _count = self.inner.add_tokens(&added);
+        Ok(())
     }
 
     /// The wrapped `tokenizers::Tokenizer` (Phase 2 builds the llguidance token trie from it).

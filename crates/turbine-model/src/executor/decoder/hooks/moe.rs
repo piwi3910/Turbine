@@ -614,6 +614,20 @@ impl FfnHook for Moe {
         let top_k = moe.experts_per_token as usize;
         run.linear(run.normed(), w.0[ROUTER].view(), rows(&b[ROUTER_LOGITS], t))?;
         run.trace("router_logits", &rows(&b[ROUTER_LOGITS], t))?;
+        // gpt-oss only: the trace's one window into what the route consumed besides the logits
+        // (a `[1, experts]` row of the F32 bias, widened to f32 it already is).
+        if self.style == Style::GptOss {
+            let bias = w.0[G_ROUTER_BIAS].view();
+            run.trace(
+                "router_bias",
+                &TensorView {
+                    slice: bias.slice,
+                    shape: (&[1usize, bias.shape[0]][..]).into(),
+                    strides: (&[bias.shape[0], 1usize][..]).into(),
+                    dtype: bias.dtype,
+                },
+            )?;
+        }
         let route = route_cfg(d, &moe, self.style);
         let slot = if d.ep.is_some() { run.layer } else { 0 };
         let offsets = TensorView::contiguous(

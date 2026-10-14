@@ -18,7 +18,7 @@ use crate::ModelError;
 use crate::tokenizer::Tokenizer;
 use crate::tools::{ToolCallParser, ToolChoice};
 
-mod envelope;
+pub(crate) mod envelope;
 pub mod harmony;
 pub mod hermes;
 pub mod llama3_json;

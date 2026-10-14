@@ -426,6 +426,20 @@ fn enveloped_conformance(name: &str, s: &Samples<'_>) {
     // above; a broken schema, an unlisted tool or a second call where one is allowed is
     // refused.
     let (_dir, tokenizer) = tiny_tokenizer(&format!("turbine-formats-{name}"));
+    // The format's marker atoms must exist as special tokens for the compile (the conformance
+    // suite does the same for every registered format).
+    let mut tokenizer = Arc::unwrap_or_clone(tokenizer);
+    tokenizer
+        .add_special_tokens(
+            &format
+                .special_tokens()
+                .iter()
+                .map(|t| t.text)
+                .filter(|t| envelope::is_marker_atom(t))
+                .collect::<Vec<_>>(),
+        )
+        .expect("add markers");
+    let tokenizer = Arc::new(tokenizer);
     let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).expect("token trie");
     let ok = |choice: &ToolChoice, parallel, text: &str| {
         accepts(
@@ -759,8 +773,12 @@ fn maybe_calls(parse: ToolParse) -> Option<Vec<(String, String)>> {
 /// The Harmony call forms: `one`/`time`/`two` are the generation form (commentary channel,
 /// recipient after it), `turn` is what gpt-oss's template renders for a call in the history
 /// (recipient before the channel, no `<|constrain|>`), `truncated` a call cut off mid-output.
-const HARMONY_ONE: &str = "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
-const HARMONY_TIME: &str = "<|start|>assistant<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{}<|call|>";
+// The generation form of a harmony call: the generation prompt ends with `<|start|>assistant`,
+// so the constrained model writes the call from the channel on (the parser also accepts the
+// `<|start|>assistant`-prefixed form; HARMONY_TURN below is the template's assistant-turn form).
+const HARMONY_ONE: &str = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
+const HARMONY_TIME: &str =
+    "<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{}<|call|>";
 const HARMONY_TURN: &str = "<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
 
 /// S-9 (part 1): the `harmony` format's own cases over the generation-form calls, plus the
@@ -775,8 +793,8 @@ fn harmony_conformance() {
             one: HARMONY_ONE,
             two: &two,
             time: HARMONY_TIME,
-            bad: "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"unit\": \"kelvin\"}<|call|>",
-            unknown: "<|start|>assistant<|channel|>commentary to=functions.get_stock <|constrain|>json<|message|>{}<|call|>",
+            bad: "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"unit\": \"kelvin\"}<|call|>",
+            unknown: "<|channel|>commentary to=functions.get_stock <|constrain|>json<|message|>{}<|call|>",
             texts: &["The weather in Oslo is sunny.", "<"],
         },
     );
