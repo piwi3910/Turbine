@@ -402,17 +402,35 @@ pub fn write_tiny_family_quantized(
 /// shaped as `openai/gpt-oss-20b` stores them (`mlp.experts.gate_up_proj_blocks` and so on).
 /// Same files and determinism as [`write_tiny_llama_with`].
 pub fn write_tiny_gpt_oss(dir: &Path, seed: u64, sliding_window: u32) -> TinySpec {
+    write_tiny_gpt_oss_with(dir, seed, sliding_window, 32)
+}
+
+/// [`write_tiny_gpt_oss`] with an explicit `intermediate_size`. The default 32 keeps the tiny
+/// gpt-oss checkpoints of the transformers trace fixtures; the HIP executor tests need 64
+/// instead: the expert MXFP4 qgemm kernel takes k in steps of 64, so the down projection
+/// (k = `inter`) refuses an expert width of 32 (`NoProvider` at registry build).
+pub fn write_tiny_gpt_oss_with(
+    dir: &Path,
+    seed: u64,
+    sliding_window: u32,
+    expert_inter: i64,
+) -> TinySpec {
     let opts = TinyOptions {
         tied: false,
         template_with_tools: false,
         head_dim: 64,
         ..TinyOptions::default()
     };
-    write_tiny(dir, seed, &gpt_oss_config_json(sliding_window), &opts)
+    write_tiny(
+        dir,
+        seed,
+        &gpt_oss_config_json(sliding_window, expert_inter),
+        &opts,
+    )
 }
 
 /// `config.json` of [`write_tiny_gpt_oss`]: the keys of `openai/gpt-oss-20b` at tiny size.
-fn gpt_oss_config_json(sliding_window: u32) -> serde_json::Value {
+fn gpt_oss_config_json(sliding_window: u32, inter: i64) -> serde_json::Value {
     json!({
         "architectures": ["GptOssForCausalLM"],
         "model_type": "gpt_oss",
@@ -426,7 +444,7 @@ fn gpt_oss_config_json(sliding_window: u32) -> serde_json::Value {
         "hidden_size": 64,
         "initial_context_length": 128,
         "initializer_range": 0.02,
-        "intermediate_size": 32,
+        "intermediate_size": inter,
         "layer_types": [
             "sliding_attention", "full_attention", "sliding_attention", "full_attention"
         ],

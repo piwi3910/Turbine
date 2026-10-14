@@ -544,12 +544,12 @@ Interfaces:
 Files: `crates/turbine-model/src/families/gpt_oss.rs` (`requirements` over the v2.16 experts and v2.17 attention), `crates/turbine-model/src/executor/decoder/hooks/` (HIP path of `ATTENTION_SINKS_WINDOW`; attention biases fused as GEMM bias where the gemm desc supports it, else `turbine_add`), `crates/turbine-model/tests/golden.rs` (lab test `hip_trace_vs_cpu_gpt_oss`), `crates/turbine-model/tests/tiny_model.rs` (lab test `hip_trace_vs_cpu_gpt_oss_tiny`)
 Interfaces:
 
-- `golden hip_trace_vs_cpu_gpt_oss` (`TURBINE_TEST_MODEL_DIR=/models/gpt-oss-20b`, release build): HIP vs CPU per op on p01 within the Phase 1 trace bounds, including a decode step past position 128 (window active) through splitkv
+- `golden hip_trace_vs_cpu_gpt_oss` (`TURBINE_TEST_GPT_OSS_MODEL_DIR=/models/gpt-oss-20b`, set by the lab test Job like the Qwen3 var, release build): HIP vs CPU per op on p01 within the Phase 1 trace bounds, including a decode step past position 128 (window active) through splitkv
   Covers: S-8 AC (`hip_ops` and `golden hip_trace_vs_cpu_gpt_oss` lab commands)
   Depends on: Tasks 16, 23, 24, 25
 
 - [ ] Lab (ask the user first): `scripts/fetch-checkpoint.sh novanas gpt-oss-20b` — expect `ok` and no `original/` directory
-- [ ] Write both lab tests. Run: `TURBINE_TEST_MODEL_DIR=/models/gpt-oss-20b scripts/lab-test.sh novanas -- -p turbine-model --test golden hip_trace_vs_cpu_gpt_oss` — expect FAIL with "kernel_op_unavailable" or a trace mismatch
+- [ ] Write both lab tests. Run: `scripts/lab-test.sh novanas -- --release -p turbine-model --test golden -- hip_trace_vs_cpu_gpt_oss` — expect FAIL with "kernel_op_unavailable" or a trace mismatch
 - [ ] Implement the HIP path — run the lab command and `scripts/lab-test.sh novanas -- -p turbine-kernels --test hip_ops attention_sinks_window_match_reference attention_sinks_batch_invariant` — expect exit 0 each.
 - [ ] Lab: `scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-gpt-oss-20b.yaml`, `TURBINE_LAB_URL=http://192.168.10.203:18000 scripts/remote-cargo.sh test -p turbine-server --test lab_openai harmony_channels -- --ignored` — expect PASS; `scripts/lab-serve.sh novanas --stop`
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0

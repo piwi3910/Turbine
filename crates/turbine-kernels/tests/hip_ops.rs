@@ -1,6 +1,8 @@
 //! Lab only (novanas R9700, P1 AC S-7/S-13, P2 S-5/S-16): every op the Llama and OLMoE
 //! executors use, run through `libturbine_hip.so` via the Rust shim bindings, matches the
 //! `cpu-reference` provider on seeded random inputs at the Llama-3.2-3B and OLMoE-1B-7B shapes.
+//! executors use, run through `libturbine_hip.so` via the Rust shim bindings, matches the
+//! `cpu-reference` provider on seeded random inputs at the Llama-3.2-3B and OLMoE-1B-7B shapes.
 //! Run by `scripts/lab-test.sh novanas`, which sets `TURBINE_TEST_BACKEND=hip`,
 //! `TURBINE_KERNEL_LIBRARY` and `TURBINE_AMD_SMI_LIBRARY`.
 //!
@@ -10,6 +12,11 @@
 //! `logits_reduce` (ABI v2.1) top-n ids are exact, its lse within 1e-5 relative and its draws
 //! identical except within 1e-6 of a CDF boundary; the sharded RMSNorm (ABI v2.6) as stated at
 //! `sharded_norm_ops`.
+// Pinned-literal note: some fixtures spell exact f32/bf16 values in full (e.g.
+// -0.330078125); clippy::excessive_precision would truncate them to a different
+// f32, so this file allows it.
+#![allow(clippy::excessive_precision)]
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -29,7 +36,7 @@ use turbine_kernels::{
     KvTranscodeTables, LogitsReduceConfig, LogitsReduceContext, LogitsReduceKernel,
     MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
     OpConfig, OpKind, PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext,
-    RopeConfig, RopeContext, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
+    RopeConfig, RopeContext, RouteMode, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
     TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged,
     TqParams, cpu_reference_provider, shim_provider,
 };
@@ -2170,8 +2177,15 @@ struct Routing {
     expert_offsets: Vec<f32>,
 }
 
-/// `moe_route` on both providers; the selections, grouping and offsets must be identical.
-fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> Routing {
+/// `moe_route` on both providers; the selections, grouping and offsets must be identical. The
+/// router `bias` (empty: none) rides the v2.16 gpt-oss path; the config must agree (`bias`).
+fn route_case(
+    p: &Pair,
+    cfg: MoeRouteConfig,
+    tokens: usize,
+    logits: &[f32],
+    bias: &[f32],
+) -> Routing {
     let hip = p.hip.moe().expect("hip moe");
     assert!(hip.supports_route(&cfg), "hip must support moe_route {cfg}");
     let impl_name = hip.implementation_route(&cfg);
@@ -2181,14 +2195,18 @@ fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> R
     let (w_hip, w_cpu) = twin(p, &[tokens, k], DType::F32, &vec![0.0; tokens * k]);
     let (s_hip, s_cpu) = twin(p, &[tokens * k], DType::I32, &vec![0.0; tokens * k]);
     let (off_hip, off_cpu) = twin(p, &[e + 1], DType::I32, &vec![0.0; e + 1]);
+    let bias_pair = (!bias.is_empty()).then(|| twin(p, &[e], DType::F32, bias));
+    let hip_bias = bias_pair.as_ref().map(|(h, _)| h.view());
+    let cpu_bias = bias_pair.as_ref().map(|(_, c)| c.view());
     let runs = [
-        (hip, [&l_hip, &id_hip, &w_hip, &s_hip, &off_hip]),
+        (hip, [&l_hip, &id_hip, &w_hip, &s_hip, &off_hip], hip_bias),
         (
             p.cpu.moe().expect("cpu moe"),
             [&l_cpu, &id_cpu, &w_cpu, &s_cpu, &off_cpu],
+            cpu_bias,
         ),
     ];
-    for (kernel, [l, id, w, s, off]) in runs {
+    for (kernel, [l, id, w, s, off], router_bias) in runs {
         let mut ctx = MoeRouteContext {
             cfg,
             router_logits: l.view(),
@@ -2196,7 +2214,7 @@ fn route_case(p: &Pair, cfg: MoeRouteConfig, tokens: usize, logits: &[f32]) -> R
             topk_weights: w.view(),
             sorted_rows: s.view(),
             expert_offsets: off.view(),
-            router_bias: None,
+            router_bias,
         };
         kernel.route(&mut ctx).expect("moe_route");
     }
@@ -2299,7 +2317,7 @@ fn experts_case(p: &Pair, rng: &mut Rng, w: &ExpertWeights, case: &ExpertsCase<'
         bf16_logits: true,
         ..Default::default()
     };
-    let routing = route_case(p, route_cfg, tokens, case.logits);
+    let routing = route_case(p, route_cfg, tokens, case.logits, &[]);
     let host_offsets: Vec<i32> = routing.expert_offsets.iter().map(|&o| o as i32).collect();
     let empty = (begin..end)
         .filter(|&e| host_offsets[e] == host_offsets[e + 1])
@@ -3440,12 +3458,12 @@ fn paged_and_moe_ops() {
         bf16_logits: true,
         ..Default::default()
     };
-    route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0));
+    route_case(&p, olmoe, 37, &rng.normal(37 * MOE_EXPERTS, 2.0), &[]);
     let mut ties = vec![0f32; 3 * MOE_EXPERTS];
     ties[0] = 1.0;
     ties[1] = 1.0;
     ties[MOE_EXPERTS + 40] = 2.0;
-    route_case(&p, olmoe, 3, &ties);
+    route_case(&p, olmoe, 3, &ties, &[]);
     // Few distinct levels plus sub-BF16 jitter: ties at the 8th place in most rows.
     let near_ties: Vec<f32> = rng
         .normal(64 * MOE_EXPERTS, 1.0)
@@ -3457,7 +3475,7 @@ fn paged_and_moe_ops() {
             bf16_logits,
             ..olmoe
         };
-        route_case(&p, cfg, 64, &near_ties);
+        route_case(&p, cfg, 64, &near_ties, &[]);
     }
     let small = MoeRouteConfig {
         num_experts: 8,
@@ -3466,7 +3484,7 @@ fn paged_and_moe_ops() {
         bf16_logits: false,
         ..Default::default()
     };
-    route_case(&p, small, 13, &rng.normal(13 * 8, 1.0));
+    route_case(&p, small, 13, &rng.normal(13 * 8, 1.0), &[]);
     let wide = MoeRouteConfig {
         num_experts: 256,
         top_k: 4,
@@ -3479,7 +3497,111 @@ fn paged_and_moe_ops() {
         .iter()
         .map(|v| (v * 2.0).round() / 2.0)
         .collect();
-    route_case(&p, wide, 9, &wide_ties);
+    route_case(&p, wide, 9, &wide_ties, &[]);
+
+    // gpt-oss routing (v2.16): 32 experts, top-4, a router bias, the top-k then softmax mode —
+    // none of the cases above take that path. Many rows over several distributions: the 20b
+    // golden trace caught one mis-selection in ~1500 routed rows (hip_trace_vs_cpu_gpt_oss,
+    // step 0 layer 1 token 97: expert 21 selected over 27, a 0.30 biased-logit gap), which one
+    // 2048-row sweep did not reproduce. The biased values of the real model are BF16-rounded,
+    // so their lower ranks tie at the BF16 step; the quantised and the wide cases make such
+    // ties common.
+    let gptoss = MoeRouteConfig {
+        num_experts: 32,
+        top_k: 4,
+        bf16_logits: true,
+        mode: RouteMode::TopkThenSoftmax,
+        bias: true,
+        ..Default::default()
+    };
+    let router_bias = rng.normal(32, 1.0);
+    route_case(&p, gptoss, 4096, &rng.normal(4096 * 32, 2.0), &router_bias);
+    // Real-model magnitudes: logits to ±8 and beyond, where one BF16 step is 1/16 or more.
+    route_case(&p, gptoss, 4096, &rng.normal(4096 * 32, 8.0), &router_bias);
+    // Coarse levels plus jitter: biased logits that round onto the same BF16 value in packs.
+    let coarse: Vec<f32> = rng
+        .normal(4096 * 32, 1.0)
+        .iter()
+        .map(|v| (v * 8.0).round() / 8.0 + v * 1e-3)
+        .collect();
+    route_case(&p, gptoss, 4096, &coarse, &router_bias);
+    // The exact row of golden hip_trace_vs_cpu_gpt_oss step 0 layer 1 token 97 (run
+    // 1014101047): the HIP provider traced these F32 router logits; with the layer's real
+    // checkpoint bias (below) the biased-BF16 fourth slot is expert 21 (0.7578125) against
+    // expert 27's 0.75390625 - the kernel must keep 21 over 27, and the cpu reference, fed the
+    // same row, must agree.
+    let gptoss_row: Vec<f32> = vec![
+        -0.75597143,
+        -0.48783863,
+        0.42832112,
+        0.106025696,
+        -0.77398944,
+        -0.04650761,
+        -0.8674261,
+        -0.30425557,
+        -0.49517393,
+        0.1435514,
+        0.30875564,
+        -0.17393172,
+        0.034162715,
+        -0.017009411,
+        -0.043775845,
+        0.33032015,
+        2.08214,
+        -1.1041367,
+        0.0029925061,
+        0.43500754,
+        1.2377844,
+        0.6649841,
+        0.36136898,
+        -1.3062099,
+        0.3992576,
+        -0.037190136,
+        1.9404403,
+        0.98020464,
+        -0.3329685,
+        -0.7422123,
+        0.037152573,
+        -0.04915432,
+    ];
+    // The checkpoint's real layer-1 router bias (`model.layers.1.mlp.router.bias`, BF16):
+    // with it, expert 21 (0.7578125) beats expert 27 (0.75390625) for the row's fourth slot -
+    // the biased-BF16 ranking the serving golden now judges the flip by.
+    let gptoss_bias: Vec<f32> = vec![
+        -0.265625,
+        -0.1484375,
+        0.1435546875,
+        0.05493164,
+        -0.03149414,
+        -0.018066406,
+        0.0009765625,
+        0.15136719,
+        0.09521484,
+        0.046142578,
+        -0.36523438,
+        0.33789062,
+        -0.115722656,
+        -0.29492188,
+        -0.18261719,
+        0.107421875,
+        -0.25,
+        0.13964844,
+        -0.33203125,
+        0.04248047,
+        -0.12597656,
+        0.09277344,
+        0.07128906,
+        -0.13867188,
+        0.017822266,
+        0.18554688,
+        0.015380859,
+        -0.22460938,
+        -0.06933594,
+        -0.064941406,
+        0.044921875,
+        0.08154297,
+    ];
+    route_case(&p, gptoss, 1, &gptoss_row, &gptoss_bias);
 
     // moe_experts at the OLMoE shapes.
     let w = expert_weights(&p, &mut rng);
@@ -6173,7 +6295,13 @@ fn prefill_shapes_match_cpu() {
         ..Default::default()
     };
     for tokens in [680, 2048] {
-        route_case(&p, olmoe, tokens, &rng.normal(tokens * MOE_EXPERTS, 2.0));
+        route_case(
+            &p,
+            olmoe,
+            tokens,
+            &rng.normal(tokens * MOE_EXPERTS, 2.0),
+            &[],
+        );
     }
     // Every token on the same 8 experts: 2,048 rows per expert.
     let mut skewed = rng.normal(256 * MOE_EXPERTS, 0.1);
@@ -6182,7 +6310,7 @@ fn prefill_shapes_match_cpu() {
             *v += 10.0;
         }
     }
-    route_case(&p, olmoe, 256, &skewed);
+    route_case(&p, olmoe, 256, &skewed, &[]);
 }
 
 /// Prefill chunk sizes of the prefill benchmarks: a ~680-token prompt, the default
@@ -6963,7 +7091,7 @@ fn every_implementation_matches_cpu() {
             OpConfig::MoeRoute(olmoe_route),
             Box::new(move |p, _name, rng| {
                 let logits = rng.normal(37 * MOE_EXPERTS, 2.0);
-                route_case(p, olmoe_route, 37, &logits);
+                route_case(p, olmoe_route, 37, &logits, &[]);
             }),
         ),
         case(

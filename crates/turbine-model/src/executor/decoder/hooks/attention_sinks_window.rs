@@ -42,15 +42,27 @@ pub const ATTENTION_SINKS_WINDOW: &dyn AttentionHook = &AttentionSinksWindow;
 /// `x[r] += bias` for every row of the `[tokens, n]` view `x` (rows may be strided).
 fn add_bias(run: &LayerRun<'_>, x: &TensorView<'_>, bias: &Tensor) -> Result<(), ModelError> {
     let add = run.dims.add();
+    if x.strides.last() != Some(&1) {
+        return Err(invalid(format!(
+            "add_bias needs a last-dim-contiguous view; {:?} strides {:?}",
+            x.shape.as_slice(),
+            x.strides.as_slice()
+        )));
+    }
+    let n: usize = x.shape[1..].iter().product();
     for r in 0..run.tokens {
         let row = x.rows(r, 1);
+        // The row's elements are contiguous (last-dim stride 1); present the row flat so the
+        // ABI's flat n-element add takes it despite the strided parent (the q slice of a fused
+        // QKV projection's [tokens, q + kv + kv] output).
+        let flat = TensorView::contiguous(row.slice, 0, &[n], row.dtype);
         run.op(OpConfig::Add(add), || {
             run.registry
                 .elementwise(&add)
                 .execute(&mut ElementwiseContext {
-                    a: row.clone(),
+                    a: flat.clone(),
                     b: bias.view(),
-                    out: row.clone(),
+                    out: flat.clone(),
                 })
         })?;
     }

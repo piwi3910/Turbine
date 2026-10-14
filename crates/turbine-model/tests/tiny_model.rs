@@ -3448,8 +3448,17 @@ fn greedy_diffs(cpu: &mut Single, hip: &mut Single, vocab: u32) -> (Vec<f32>, Ve
 }
 
 /// Asserts a [`greedy_diffs`] run of `hip`: every step within `bound`, no greedy token
-/// differing, decode graphs replayed. Prints every step's diff first.
-fn assert_greedy_run(name: &str, hip: &Single, run: (Vec<f32>, Vec<usize>), bound: f32) {
+/// differing and, when `want_graphs`, decode graphs replayed. Prints every step's diff first.
+/// Families whose experts the quant MoE paths serve pass `false`: every quant implementation
+/// needs the expert offsets on the host (`TURBINE_IMPL_NEEDS_HOST_OFFSETS`), so the FFN hook
+/// refuses graph capture for the whole family (a perf follow-up, not a numerics one).
+fn assert_greedy_run(
+    name: &str,
+    hip: &Single,
+    run: (Vec<f32>, Vec<usize>),
+    bound: f32,
+    want_graphs: bool,
+) {
     let (diffs, greedy_differs) = run;
     println!("{name}: per-step max abs logit diff {diffs:?}; greedy differs at {greedy_differs:?}");
     for (step, &diff) in diffs.iter().enumerate() {
@@ -3463,10 +3472,12 @@ fn assert_greedy_run(name: &str, hip: &Single, run: (Vec<f32>, Vec<usize>), boun
         "{name}: greedy tokens differ at {greedy_differs:?}"
     );
     let graphs = hip.graph_counters();
-    assert!(
-        graphs.replayed > 0 && graphs.capture_failed == 0,
-        "{name}: decode graphs were used: {graphs:?}"
-    );
+    if want_graphs {
+        assert!(
+            graphs.replayed > 0 && graphs.capture_failed == 0,
+            "{name}: decode graphs were used: {graphs:?}"
+        );
+    }
     let worst = diffs.iter().copied().fold(0f32, f32::max);
     println!("{name}: max abs logit diff over 32 steps {worst}; graphs {graphs:?}");
 }
@@ -3498,7 +3509,7 @@ fn hip_matches_cpu() {
     let mut hip = executor_on(&spec, provider, mem, Some(card));
     hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
     let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
-    assert_greedy_run("hip_matches_cpu", &hip, run, HIP_MAX_ABS_LOGIT_DIFF);
+    assert_greedy_run("hip_matches_cpu", &hip, run, HIP_MAX_ABS_LOGIT_DIFF, true);
 }
 
 /// Lab only (user decision 2026-10-06 A1): the b1 leg of [`hip_matches_cpu`]. The library's
@@ -3529,7 +3540,13 @@ fn hip_b1_matches_cpu() {
     let mut hip = executor(&spec, provider, mem);
     hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
     let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
-    assert_greedy_run("hip_b1_matches_cpu", &hip, run, HIP_B1_MAX_ABS_LOGIT_DIFF);
+    assert_greedy_run(
+        "hip_b1_matches_cpu",
+        &hip,
+        run,
+        HIP_B1_MAX_ABS_LOGIT_DIFF,
+        true,
+    );
 }
 
 /// Decode steps of [`hip_decode_graph_matches_eager`] per batch.
@@ -4126,6 +4143,77 @@ fn hip_trace_vs_cpu_qwen3_tiny() {
         &hip,
         run,
         HIP_QWEN3_MAX_ABS_LOGIT_DIFF,
+        true,
+    );
+}
+
+/// Max |Δ logit| of the tiny gpt-oss greedy leg of [`hip_trace_vs_cpu_gpt_oss_tiny`] (HIP against
+/// the cpu-reference in the card's class). Calibration (lab, R9700, run 1013172833): steps sit at
+/// ~2.4e-7 until one CK attention output rounds to the neighbouring BF16 value that enters the KV
+/// cache, then one step at 0.0037; greedy tokens are identical for all 32 steps. 0.005 is ~1.35x
+/// the measured worst (the `hip_b1_matches_cpu` margin); the identical greedy tokens stay the
+/// sharp check.
+const HIP_GPT_OSS_MAX_ABS_LOGIT_DIFF: f32 = 0.005;
+
+/// Expert width of the tiny gpt-oss checkpoint of [`hip_trace_vs_cpu_gpt_oss_tiny`]. The HIP
+/// MXFP4 expert path needs the down projection's k (= the expert width) in steps of 64, so the
+/// fixture takes 64 where the transformers-traced tiny gpt-oss keeps 32.
+const GPT_OSS_INTER: i64 = 64;
+
+/// Lab only (P7 S-8, Task 26): the tiny gpt-oss checkpoint (head_dim 64, biased projections,
+/// sinks, a sliding window of 4 on the even layers so the 20-token prompt and every decode step
+/// run with the window active, MXFP4 experts of width 64 with biases and the clamped activation
+/// behind a top-k-then-softmax router) on the HIP provider against the cpu-reference in the
+/// card's class: the op-by-op table of the prefill and 3 decode steps is printed, then 32 greedy
+/// tokens must be identical and every step's logits within [`HIP_GPT_OSS_MAX_ABS_LOGIT_DIFF`]
+/// with decode graphs set (never captured: every quant MoE implementation needs the expert
+/// offsets on the host, so the FFN hook refuses capture for the family). Breaks if the HIP path
+/// drops a bias or the sinks, ignores the window, or reads the fused expert layout wrongly.
+#[test]
+#[ignore = "needs a HIP device and TURBINE_KERNEL_LIBRARY"]
+fn hip_trace_vs_cpu_gpt_oss_tiny() {
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let ctx = hip_context();
+    let provider = shim_provider(ctx.clone());
+    // gpt-oss decodes on CK split-KV (head_dim 64 with sinks; the b1 kernel takes neither), so
+    // the card's decode order binds CK first (`ck_decode_card`) and the helper's preference
+    // assert sees the kernel production picks through the b1 refusal all the same.
+    let card = ck_decode_card(
+        provider
+            .card_profile()
+            .expect("the HIP context's card profile"),
+    );
+    let tmp = TempDir::new("tiny-model-hip-gpt-oss");
+    let spec =
+        turbine_model::testing::tiny::write_tiny_gpt_oss_with(tmp.path(), SEED, 4, GPT_OSS_INTER);
+    let mut cpu = hip_reference_executor(&spec, &ctx);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = executor_on(&spec, provider, mem.clone(), Some(card));
+    let (traces, _starts) = traced_run(&mut [&mut cpu, &mut hip], &prompt(spec.vocab), 3);
+    let mut accumulated = Vec::new();
+    for (step, (c, h)) in traces[0].iter().zip(&traces[1]).enumerate() {
+        accumulated.extend(compare_traces(step, c, h));
+    }
+    println!(
+        "{}",
+        render(
+            "tiny gpt-oss window 4: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+
+    let mut cpu = hip_reference_executor(&spec, &ctx);
+    let mut hip = executor_on(&spec, shim_provider(ctx.clone()), mem, Some(card));
+    hip.set_decode_graphs(Some(hip_graphs(&ctx, MAX_SEQS)));
+    let run = greedy_diffs(&mut cpu, &mut hip, spec.vocab);
+    assert_greedy_run(
+        "hip_trace_vs_cpu_gpt_oss_tiny",
+        &hip,
+        run,
+        HIP_GPT_OSS_MAX_ABS_LOGIT_DIFF,
+        false,
     );
 }
 

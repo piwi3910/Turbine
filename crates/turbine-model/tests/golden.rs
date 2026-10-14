@@ -1017,6 +1017,252 @@ fn hip_trace_vs_cpu_qwen3() {
     );
 }
 
+// ------------------------------------------------------------------------------ gpt-oss
+
+/// Layers of gpt-oss-20b the trace runs (the cpu-reference executor is scalar): two sliding
+/// layers and two full ones.
+const GPT_OSS_TRACE_LAYERS: u32 = 4;
+
+/// Positions the traced gpt-oss prompt reaches before its decode steps: past the 128-position
+/// window, so the sliding layers drop positions in the prefill and in every decode step.
+const GPT_OSS_MIN_PROMPT: usize = 130;
+
+/// The decoder of the first [`GPT_OSS_TRACE_LAYERS`] layers of the gpt-oss checkpoint in
+/// `model_dir` on `provider` (the MXFP4 experts stay packed), with the single-sequence KV.
+fn build_gpt_oss_executor(
+    model_dir: &Path,
+    provider: Arc<dyn KernelProvider>,
+    mem: Arc<dyn DeviceMemory>,
+    max_seq_len: u32,
+) -> Runner {
+    let mut cfg = load_model_config(model_dir).expect("config.json");
+    assert_eq!(
+        cfg.family.0.name(),
+        "gpt_oss",
+        "TURBINE_TEST_GPT_OSS_MODEL_DIR must hold a gpt-oss checkpoint"
+    );
+    assert!(cfg.num_layers > GPT_OSS_TRACE_LAYERS);
+    cfg.num_layers = GPT_OSS_TRACE_LAYERS;
+    let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
+        &index,
+        &cfg.family.0.weight_slots(&cfg),
+        &mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load weights");
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let order = [provider.id()];
+    let card = provider.card_profile();
+    let opts = ExecutorOptions::default();
+    let registry = KernelRegistry::build(
+        vec![provider],
+        &order,
+        &executor::requirements(&cfg, BLOCK_TOKENS, opts),
+        &metrics,
+        card,
+    )
+    .expect("every op has a provider");
+    let kv = SequenceKv::new(&mem, cfg.kv_layout(BLOCK_TOKENS), max_seq_len).expect("kv");
+    let exec = DecoderExecutor::new(
+        &cfg,
+        families::gpt_oss::decoder_spec(),
+        weights,
+        Arc::new(registry),
+        mem,
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: max_seq_len,
+            max_seqs: 1,
+        },
+        opts,
+    )
+    .expect("executor");
+    Runner { exec, kv }
+}
+
+/// The router-logit gap under which two experts count as a tie: the same absolute bound the
+/// per-op comparison uses. The providers' router logits differ by at most their own trace |d|
+/// (measured 1.6e-3 on run 1013172834), so a flip between experts whose logits tie this closely
+/// is rounding; a gap above the bound cannot be closed by rounding and is a routing bug.
+const GPT_OSS_ROUTER_TIE: f32 = 2e-2;
+
+/// The gpt-oss router selects on the biased logits rounded to BF16, so the tie gap is measured
+/// there too: the raw logits' gap can be large where the bias pulls two experts to the same
+/// BF16 value (run 1014101047: token 97 flipped between experts whose raw-logit gap was 0.316
+/// while their biased, rounded scores were half a BF16 ulp apart — the flip was rounding, not
+/// routing). `bias` is the layer's `router_bias` trace (`[1, experts]`).
+fn gpt_oss_router_score(logits: &TraceTensor, tok: usize, e: usize, bias: &TraceTensor) -> f32 {
+    half::bf16::from_f32(logits.data[tok * logits.shape[1] + e] + bias.data[e]).to_f32()
+}
+
+/// The routed experts of one step and layer: a flip of a token's expert set is tolerated only
+/// between experts whose biased, BF16-rounded router scores tie within [`GPT_OSS_ROUTER_TIE`]
+/// in BOTH providers (rounding may swap them); any larger gap is a routing bug and fails.
+/// Multiset pairing: a token's expert ids are distinct, so the symmetric difference pairs
+/// one-to-one in id order.
+fn check_routing(
+    step: usize,
+    c: &TraceTensor,
+    h: &TraceTensor,
+    cl: &TraceTensor,
+    hl: &TraceTensor,
+    bias: &TraceTensor,
+    failures: &mut Vec<String>,
+) {
+    let tokens = c.shape[0];
+    let topk = c.shape[1];
+    let experts = cl.shape[1];
+    for tok in 0..tokens {
+        let (cs, hs) = (
+            &c.data[tok * topk..(tok + 1) * topk],
+            &h.data[tok * topk..(tok + 1) * topk],
+        );
+        let cpu_only: Vec<f32> = cs.iter().filter(|x| !hs.contains(x)).copied().collect();
+        let hip_only: Vec<f32> = hs.iter().filter(|y| !cs.contains(y)).copied().collect();
+        for (x, y) in cpu_only.iter().zip(&hip_only) {
+            let (x, y) = (*x as usize, *y as usize);
+            let gap_c = (gpt_oss_router_score(cl, tok, x, bias)
+                - gpt_oss_router_score(cl, tok, y, bias))
+            .abs();
+            let gap_h = (gpt_oss_router_score(hl, tok, x, bias)
+                - gpt_oss_router_score(hl, tok, y, bias))
+            .abs();
+            if gap_c > GPT_OSS_ROUTER_TIE || gap_h > GPT_OSS_ROUTER_TIE {
+                failures.push(format!(
+                    "step {step} layer {:?} token {tok}: routed experts {x} vs {y} differ by a \
+                     biased-BF16 router-score gap {gap_c} (cpu) / {gap_h} (hip) > \
+                     {GPT_OSS_ROUTER_TIE}\n\
+                     cpu ids {cs:?}\nhip ids {hs:?}\ncpu logits {:?}\nhip logits {:?}\n\
+                     cpu logits all {:?}\nhip logits all {:?}",
+                    c.layer,
+                    &cl.data[tok * experts..(tok + 1) * experts],
+                    &hl.data[tok * experts..(tok + 1) * experts],
+                    cl.data,
+                    hl.data,
+                ));
+            }
+        }
+    }
+}
+/// Job sets to `/models/gpt-oss-20b`, and a HIP device; a no-op in a debug build: the
+/// cpu-reference is scalar). The checkpoint's first [`GPT_OSS_TRACE_LAYERS`] layers (two
+/// sliding-window layers,
+/// two full) run prompt p01 of `tests/golden/prompts.jsonl`, its Harmony-rendered tokens
+/// repeated to at least [`GPT_OSS_MIN_PROMPT`] positions so the window is active in the
+/// prefill, then 2 teacher-forced decode steps past position 128 (the cpu-reference's greedy
+/// tokens, decode through CK split-KV with the window and the sinks), on the HIP and the
+/// cpu-reference providers, traced. Prints the op-by-op HIP-vs-CPU table and asserts every op
+/// within the Phase 1 trace bound: max |d| at most 2e-2 or a quarter of the op's largest value
+/// (the bound of `tiny_model gpt_oss_against_transformers`; the routed experts may flip only
+/// between experts whose biased, BF16-rounded router scores tie within the trace bound). Breaks
+/// if the HIP path drops a bias, the sinks or the window, reads the fused expert layout wrongly
+/// or routes to other experts.
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_GPT_OSS_MODEL_DIR, release"]
+fn hip_trace_vs_cpu_gpt_oss() {
+    let _gpu = gpu_model_lock();
+    const TRACE_DECODE: usize = 2;
+    if cfg!(debug_assertions) {
+        println!("hip_trace_vs_cpu_gpt_oss: debug build, nothing traced (run it with --release)");
+        return;
+    }
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir =
+        turbine_kernels::test_support::require_env_dir("TURBINE_TEST_GPT_OSS_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let p01 = prompts.iter().find(|p| p.id == "p01").expect("prompt p01");
+    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    let template = ChatTemplate::resolve(&model_dir, None).expect("chat template");
+    let base = prompt_token_ids(&tokenizer, &template, p01);
+    let ids: Vec<u32> = base
+        .iter()
+        .cycle()
+        .take(base.len().max(GPT_OSS_MIN_PROMPT))
+        .copied()
+        .collect();
+    let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
+    let host = HostMemory::new(turbine_core::types::DeviceId(0), 32 << 30);
+    let mut cpu = build_gpt_oss_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_gpt_oss_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    cpu.exec.set_trace(true);
+    hip.exec.set_trace(true);
+
+    let mut accumulated = Vec::new();
+    let mut failures = Vec::new();
+    let mut batch = ids;
+    let mut p0 = 0usize;
+    for step in 0..=TRACE_DECODE {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let mut rows = Vec::new();
+        for r in [&mut cpu, &mut hip] {
+            let logits =
+                r.kv.forward(&mut r.exec, &batch, &positions)
+                    .expect("forward");
+            rows.push(logits.row(0).to_vec());
+        }
+        let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
+        assert_eq!(c.len(), h.len(), "step {step}: op counts");
+        for (w, g) in c.iter().zip(&h) {
+            if w.name == "topk_ids" {
+                let Some(cl) = c
+                    .iter()
+                    .find(|t| t.name == "router_logits" && t.layer == w.layer)
+                else {
+                    failures.push(format!("step {step}: no router_logits trace"));
+                    continue;
+                };
+                let Some(hl) = h
+                    .iter()
+                    .find(|t| t.name == "router_logits" && t.layer == w.layer)
+                else {
+                    failures.push(format!("step {step}: no HIP router_logits trace"));
+                    continue;
+                };
+                let Some(bias) = c
+                    .iter()
+                    .find(|t| t.name == "router_bias" && t.layer == w.layer)
+                else {
+                    failures.push(format!("step {step}: no router_bias trace"));
+                    continue;
+                };
+                check_routing(step, w, g, cl, hl, bias, &mut failures);
+            }
+        }
+        accumulated.extend(compare_traces(step, &c, &h));
+        p0 += batch.len();
+        let next = rows[0]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .map(|(i, _)| i as u32)
+            .expect("a row");
+        batch = vec![next];
+    }
+    println!(
+        "{}",
+        render(
+            "gpt-oss-20b (4 layers) p01 past position 128: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+    for r in &accumulated {
+        let s = &r.stats;
+        if r.name != "topk_ids" && s.max_abs > 2e-2 && s.max_abs > s.max_ref / 4.0 {
+            failures.push(format!(
+                "step {} layer {:?} {}: max |d| {} ({} ulps), max |ref| {}",
+                r.step, r.layer, r.name, s.max_abs, s.max_ulps, s.max_ref
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // ------------------------------------------------------------------------------- OLMoE
 
 /// An executor of any architecture (through [`executor::build_executor`]) and the
