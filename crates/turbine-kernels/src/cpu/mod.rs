@@ -21,7 +21,7 @@ use crate::ops::{
     ActivationKernel, AddRmsnormKernel, AttentionKernel, Conv1dKernel, ElementwiseKernel,
     EmbeddingKernel, GdnKernel, GemmKernel, KernelProvider, KvCopyKernel, KvTranscodeKernel,
     LogitsReduceKernel, MoeKernel, NormKernel, ProviderId, QGemmKernel, QuantizeActKernel,
-    RopeKernel, ShardedNormKernel,
+    RopeKernel, ShardedNormKernel, SigmoidMulKernel,
 };
 
 // One file per op family (Phase 2m S-5); `math`, `paged` and `topk` hold the shared numerics.
@@ -358,6 +358,9 @@ impl KernelProvider for CpuReference {
         Some(self)
     }
     fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        Some(self)
+    }
+    fn sigmoid_mul(&self) -> Option<&dyn SigmoidMulKernel> {
         Some(self)
     }
 }

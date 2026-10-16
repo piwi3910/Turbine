@@ -25,7 +25,7 @@ use crate::ops::{
     LogitsReduceConfig, LogitsReduceKernel, MoeExpertsConfig, MoeKernel, MoeRouteConfig,
     NormConfig, NormKernel, OpKind, ProviderId, QGemmConfig, QGemmKernel, QuantizeActConfig,
     QuantizeActKernel, RmsnormShardedConfig, RopeConfig, RopeKernel, RowSumsqConfig, RowTier,
-    ShardedNormKernel,
+    ShardedNormKernel, SigmoidMulConfig, SigmoidMulKernel,
 };
 
 /// `reason_code` of a selection: the card profile's first listed implementation (that the
@@ -100,6 +100,8 @@ pub enum OpConfig {
     Gdn(GdnConfig),
     /// ABI v2.18; a shim library without the group has no provider for it.
     Conv1d(Conv1dConfig),
+    /// ABI v2.19; a shim library without the group has no provider for it.
+    SigmoidMul(SigmoidMulConfig),
 }
 
 impl OpConfig {
@@ -124,6 +126,7 @@ impl OpConfig {
             OpConfig::KvTranscode(_) => OpKind::KvTranscode,
             OpConfig::Gdn(cfg) => cfg.op(),
             OpConfig::Conv1d(cfg) => cfg.op(),
+            OpConfig::SigmoidMul(_) => OpKind::SigmoidMul,
         }
     }
 
@@ -149,6 +152,7 @@ impl OpConfig {
             OpConfig::KvTranscode(cfg) => cfg.to_string(),
             OpConfig::Gdn(cfg) => cfg.to_string(),
             OpConfig::Conv1d(cfg) => cfg.to_string(),
+            OpConfig::SigmoidMul(cfg) => cfg.to_string(),
         }
     }
 
@@ -231,6 +235,10 @@ impl OpConfig {
                 .map(|k| k.implementation(cfg)),
             OpConfig::Conv1d(cfg) => provider
                 .conv1d()
+                .filter(|k| k.supports(cfg))
+                .map(|k| k.implementation(cfg)),
+            OpConfig::SigmoidMul(cfg) => provider
+                .sigmoid_mul()
                 .filter(|k| k.supports(cfg))
                 .map(|k| k.implementation(cfg)),
         }
@@ -741,6 +749,13 @@ impl KernelRegistry {
         self.provider(OpConfig::Conv1d(*cfg))
             .conv1d()
             .expect("the selected provider implements conv1d")
+    }
+
+    /// The sigmoid-multiply kernel selected for `cfg` (ABI v2.19).
+    pub fn sigmoid_mul(&self, cfg: &SigmoidMulConfig) -> &dyn SigmoidMulKernel {
+        self.provider(OpConfig::SigmoidMul(*cfg))
+            .sigmoid_mul()
+            .expect("the selected provider implements sigmoid_mul")
     }
 }
 

@@ -1,7 +1,11 @@
-//! `silu_mul` on the cpu-reference provider (SiLU rounded before the multiply).
+//! `silu_mul` and `sigmoid_mul` on the cpu-reference provider (the nonlinearity rounded before
+//! the multiply).
 use super::{CpuReference, expect_rank, expect_shape, is_float, load, math, round_to, store};
 use crate::KernelError;
-use crate::ops::{ActivationConfig, ActivationContext, ActivationKernel};
+use crate::ops::{
+    ActivationConfig, ActivationContext, ActivationKernel, SigmoidMulConfig, SigmoidMulContext,
+    SigmoidMulKernel,
+};
 
 impl ActivationKernel for CpuReference {
     fn supports(&self, cfg: &ActivationConfig) -> bool {
@@ -24,6 +28,32 @@ impl ActivationKernel for CpuReference {
             .iter()
             .zip(&up)
             .map(|(&g, &u)| round_to(dt, math::silu(g)) * u)
+            .collect();
+        store(&ctx.out, &out)
+    }
+}
+
+impl SigmoidMulKernel for CpuReference {
+    fn supports(&self, cfg: &SigmoidMulConfig) -> bool {
+        is_float(cfg.dtype)
+    }
+
+    fn implementation(&self, _cfg: &SigmoidMulConfig) -> String {
+        "cpu_sigmoid_mul".into()
+    }
+
+    fn execute(&self, ctx: &mut SigmoidMulContext<'_>) -> Result<(), KernelError> {
+        expect_rank("a", &ctx.a, 2)?;
+        let shape = ctx.a.shape.clone();
+        expect_shape("gate", &ctx.gate, &shape)?;
+        expect_shape("out", &ctx.out, &shape)?;
+        let dt = ctx.out.dtype;
+        let a = load(&ctx.a)?;
+        let gate = load(&ctx.gate)?;
+        let out: Vec<f32> = a
+            .iter()
+            .zip(&gate)
+            .map(|(&a, &g)| round_to(dt, math::sigmoid(g)) * a)
             .collect();
         store(&ctx.out, &out)
     }

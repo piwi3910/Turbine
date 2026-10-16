@@ -122,6 +122,21 @@ pub(crate) struct SiluMulDesc {
     pub dtype: i32,
 }
 
+/// `turbine_sigmoid_mul_desc` (v2.19).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SigmoidMulDesc {
+    pub a: *const c_void,
+    pub gate: *const c_void,
+    pub out: *mut c_void,
+    pub rows: i64,
+    pub cols: i64,
+    pub a_stride_row: i64,
+    pub gate_stride_row: i64,
+    pub out_stride_row: i64,
+    pub dtype: i32,
+}
+
 /// `turbine_embedding_desc`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -783,7 +798,7 @@ pub(crate) struct ImplFns {
 /// library exports the whole group; `rope_attn_factor` (a descriptor field, no symbol) is set
 /// from minor 10, `kv_transcode` needs minor ≥ 11 with the `quant` (v2.9) and `copies`
 /// (v2.5) groups resolved, `copy_kernel` minor ≥ 11 with `copies`, and `gdn` and `conv1d`
-/// minor ≥ 18.
+/// minor ≥ 18, `sigmoid_mul` minor ≥ 19.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct V21Symbols {
     pub minor: u32,
@@ -817,6 +832,8 @@ pub(crate) struct V21Symbols {
     pub gdn: Option<GdnFns>,
     /// v2.18 causal conv1d (Phase 7).
     pub conv1d: Option<Conv1dFns>,
+    /// v2.19 gated-attention sigmoid-multiply (Phase 7).
+    pub sigmoid_mul: Option<OpTrio<SigmoidMulDesc>>,
 }
 
 impl V21Symbols {
@@ -957,10 +974,16 @@ impl V21Symbols {
                 update: optional_trio(lib, "conv1d_update")?,
             })
         })();
+        let sigmoid_mul = if minor >= 19 {
+            optional_trio(lib, "sigmoid_mul")
+        } else {
+            None
+        };
         V21Symbols {
             minor,
             gdn,
             conv1d,
+            sigmoid_mul,
             rope_attn_factor: minor >= 10,
             kv_transcode,
             copy_kernel,

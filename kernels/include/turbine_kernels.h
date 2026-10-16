@@ -590,8 +590,9 @@ turbine_moe_experts_needs_host_offsets(const turbine_moe_experts_desc *d);
  * of turbine_moe_route_desc (no new symbol); v2.17 the sliding window and sink
  * logits of paged attention (turbine_attention_paged_desc's window_left /
  * sinks; no new symbol) and head_dim 64 and 256 on its CK paths; v2.18 Gated
- * DeltaNet and the causal conv1d (below). */
-#define TURBINE_ABI_MINOR 18u
+ * DeltaNet and the causal conv1d (below); v2.19 the gated-attention
+ * sigmoid-multiply op (below). */
+#define TURBINE_ABI_MINOR 19u
 uint32_t turbine_abi_minor(void);
 
 /* Context options (int64 values). Unknown options return
@@ -1389,6 +1390,34 @@ const char *turbine_conv1d_prefill_impl(const turbine_conv1d_desc *d);
 int32_t turbine_conv1d_update(turbine_ctx *ctx, const turbine_conv1d_desc *d);
 int32_t turbine_conv1d_update_supported(const turbine_conv1d_desc *d);
 const char *turbine_conv1d_update_impl(const turbine_conv1d_desc *d);
+
+/* ======== v2.19 (additive, optional): sigmoid-multiply ========
+ * Phase 7 (Qwen3.5 / Qwen3.6 hybrids, decision 2026-10-16 "P7 Qwen3.5/Qwen3.6
+ * hybrid kernel-ABI gaps" A). Resolved only when turbine_abi_minor() >= 19 and
+ * the trio's three functions exist; a library without them is a fallback, not
+ * an error (a family that needs the op is then refused at startup).
+ *
+ * turbine_sigmoid_mul computes the gated-attention output gate Qwen3.5 applies
+ * after attention, per element and row-strided like turbine_silu_mul:
+ *   out[r, j] = round(round(sigmoid(gate[r, j])) * a[r, j])
+ * with sigmoid(g) = 1 / (1 + exp(-g)) evaluated in F32 and rounded to dtype
+ * once (the round_to of the SiLU-and-multiply op), the product in F32 rounded
+ * to dtype once (the store). a and gate are [rows, cols] with their own row
+ * strides, out is [rows, cols] with its own; dtype is the same for all three. */
+#define TURBINE_OP_SIGMOID_MUL 24
+
+/* out = a * sigmoid(gate) */
+typedef struct turbine_sigmoid_mul_desc {
+  const void *a;
+  const void *gate;
+  void *out;
+  int64_t rows, cols, a_stride_row, gate_stride_row, out_stride_row;
+  int32_t dtype;
+} turbine_sigmoid_mul_desc;
+
+int32_t turbine_sigmoid_mul(turbine_ctx *ctx, const turbine_sigmoid_mul_desc *d);
+int32_t turbine_sigmoid_mul_supported(const turbine_sigmoid_mul_desc *d);
+const char *turbine_sigmoid_mul_impl(const turbine_sigmoid_mul_desc *d);
 
 #ifdef __cplusplus
 }
