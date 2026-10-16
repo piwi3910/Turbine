@@ -60,6 +60,9 @@ pub enum OpKind {
     /// ABI v2.18 (optional in a shim library): causal conv1d, one token per sequence, the state
     /// read from and written back to the sequence's slot.
     Conv1dUpdate,
+    /// ABI v2.19 (optional in a shim library): the gated-attention sigmoid-multiply
+    /// `out = a · sigmoid(gate)` (Phase 7).
+    SigmoidMul,
 }
 
 impl OpKind {
@@ -90,6 +93,7 @@ impl OpKind {
         OpKind::GdnDecode,
         OpKind::Conv1dPrefill,
         OpKind::Conv1dUpdate,
+        OpKind::SigmoidMul,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -118,6 +122,7 @@ impl OpKind {
             OpKind::GdnDecode => "gdn_decode",
             OpKind::Conv1dPrefill => "conv1d_prefill",
             OpKind::Conv1dUpdate => "conv1d_update",
+            OpKind::SigmoidMul => "sigmoid_mul",
         }
     }
 
@@ -148,6 +153,7 @@ impl OpKind {
             OpKind::GdnDecode => 21,
             OpKind::Conv1dPrefill => 22,
             OpKind::Conv1dUpdate => 23,
+            OpKind::SigmoidMul => 24,
         }
     }
 
@@ -163,6 +169,7 @@ impl OpKind {
             | OpKind::GdnDecode
             | OpKind::Conv1dPrefill
             | OpKind::Conv1dUpdate => 18,
+            OpKind::SigmoidMul => 19,
             _ => 0,
         }
     }
@@ -397,6 +404,19 @@ pub struct ActivationConfig {
 }
 
 impl fmt::Display for ActivationConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cols={} dtype={}", self.cols, self.dtype.as_str())
+    }
+}
+
+/// `a · sigmoid(gate)` over rows of `cols` elements (ABI v2.19, Phase 7 gated attention).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SigmoidMulConfig {
+    pub cols: u64,
+    pub dtype: DType,
+}
+
+impl fmt::Display for SigmoidMulConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "cols={} dtype={}", self.cols, self.dtype.as_str())
     }
@@ -1622,6 +1642,13 @@ pub struct ActivationContext<'a> {
     pub out: TensorView<'a>,
 }
 
+/// `out = a · sigmoid(gate)`, all `[rows, cols]` (ABI v2.19).
+pub struct SigmoidMulContext<'a> {
+    pub a: TensorView<'a>,
+    pub gate: TensorView<'a>,
+    pub out: TensorView<'a>,
+}
+
 /// `out[t] = table[ids[t] − vocab_offset]`, zero when that row is outside `[0, vocab_rows)`;
 /// `ids`: `[tokens]` I32; `table`: `[vocab_rows, hidden]`; `out`: `[tokens, hidden]`.
 pub struct EmbeddingContext<'a> {
@@ -1846,6 +1873,13 @@ pub trait ActivationKernel: Send + Sync {
     fn execute(&self, ctx: &mut ActivationContext<'_>) -> Result<(), KernelError>;
 }
 
+/// Sigmoid-multiply `a · sigmoid(gate)` (ABI v2.19, Phase 7 gated attention).
+pub trait SigmoidMulKernel: Send + Sync {
+    fn supports(&self, cfg: &SigmoidMulConfig) -> bool;
+    fn implementation(&self, cfg: &SigmoidMulConfig) -> String;
+    fn execute(&self, ctx: &mut SigmoidMulContext<'_>) -> Result<(), KernelError>;
+}
+
 /// Embedding gather.
 pub trait EmbeddingKernel: Send + Sync {
     fn supports(&self, cfg: &EmbeddingConfig) -> bool;
@@ -2018,6 +2052,10 @@ pub trait KernelProvider: Send + Sync {
     fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
         None
     }
+    /// ABI v2.19: `None` (the default) for a provider without the sigmoid-multiply.
+    fn sigmoid_mul(&self) -> Option<&dyn SigmoidMulKernel> {
+        None
+    }
 
     /// The implementations of `op` the provider enumerates (kernel ABI v2.4), in its own order.
     /// Empty (the default) when the provider chooses the implementation of every call itself.
@@ -2083,7 +2121,8 @@ mod tests {
                 "gdn_prefill",
                 "gdn_decode",
                 "conv1d_prefill",
-                "conv1d_update"
+                "conv1d_update",
+                "sigmoid_mul"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -2197,6 +2236,14 @@ mod tests {
             "cols=8192 dtype=bf16"
         );
         assert_eq!(
+            SigmoidMulConfig {
+                cols: 4096,
+                dtype: DType::BF16
+            }
+            .to_string(),
+            "cols=4096 dtype=bf16"
+        );
+        assert_eq!(
             EmbeddingConfig {
                 hidden: 3072,
                 vocab_rows: 128256,
@@ -2245,9 +2292,10 @@ mod tests {
     }
 
     /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
-    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11, the v2.18 GDN and conv1d ops 18. Breaks if a new op
-    /// is appended without saying which minor group adds it (an older library would be asked for
-    /// an op code it does not know).
+    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11, the v2.18 GDN and
+    /// conv1d ops 18, the v2.19 sigmoid-multiply 19. Breaks if a new op is appended without
+    /// saying which minor group adds it (an older library would be asked for an op code it does
+    /// not know).
     #[test]
     fn op_minor_revisions() {
         for &op in OpKind::ALL {
@@ -2257,9 +2305,79 @@ mod tests {
                 15 | 16 => 6,
                 17 | 18 => 9,
                 19 => 11,
-                _ => 18,
+                20..=23 => 18,
+                _ => 19,
             };
             assert_eq!(op.abi_minor(), want, "{op}");
+        }
+    }
+
+    /// `sigmoid_mul` on the cpu-reference provider against the hand-written `a · sigmoid(gate)`
+    /// (the sigmoid and the product each rounded to the output dtype), over a couple of shapes
+    /// and gate extremes (large positive → ≈1, large negative → ≈0, 0 → 0.5).
+    #[test]
+    fn sigmoid_mul_matches_reference() {
+        use std::sync::Arc;
+
+        use turbine_core::types::DeviceId;
+        use turbine_tensor::host::HostMemory;
+        use turbine_tensor::{DeviceMemory, Tensor};
+
+        use crate::cpu::{CpuReference, load, round_to, store};
+
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 16);
+        let kernel = CpuReference
+            .sigmoid_mul()
+            .expect("cpu-reference implements sigmoid_mul");
+        for (rows, cols) in [(1usize, 7usize), (2, 4)] {
+            let n = rows * cols;
+            // Gates covering both saturations, the midpoint, and a spread of finite values.
+            let gate_v: Vec<f32> = (0..n)
+                .map(|i| match i % 4 {
+                    0 => 40.0,
+                    1 => -40.0,
+                    2 => 0.0,
+                    _ => i as f32 * 0.5 - 3.0,
+                })
+                .collect();
+            let a_v: Vec<f32> = (0..n).map(|i| 0.25 + i as f32 * 0.5).collect();
+            for dtype in [DType::BF16, DType::F32] {
+                let cfg = SigmoidMulConfig {
+                    cols: cols as u64,
+                    dtype,
+                };
+                assert!(kernel.supports(&cfg), "cpu supports {cfg}");
+                let a = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc a");
+                let gate = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc gate");
+                let out = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc out");
+                store(&a.view(), &a_v).expect("store a");
+                store(&gate.view(), &gate_v).expect("store gate");
+                kernel
+                    .execute(&mut SigmoidMulContext {
+                        a: a.view(),
+                        gate: gate.view(),
+                        out: out.view(),
+                    })
+                    .expect("sigmoid_mul");
+                let a_r = load(&a.view()).expect("load a");
+                let g_r = load(&gate.view()).expect("load gate");
+                let got = load(&out.view()).expect("load out");
+                let want: Vec<f32> = a_r
+                    .iter()
+                    .zip(&g_r)
+                    .map(|(&a, &g)| {
+                        let sig = round_to(dtype, 1.0 / (1.0 + (-g).exp()));
+                        round_to(dtype, sig * a)
+                    })
+                    .collect();
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-6,
+                        "{} [{rows},{cols}] element {i}: got {g}, want {w}",
+                        dtype.as_str()
+                    );
+                }
+            }
         }
     }
 }

@@ -49,8 +49,8 @@ use crate::ffi::{
     CtxInfo, EmbeddingDesc, GdnDesc, GemmDesc, KvPageClassDesc, KvTranscodeDesc, LogitsReduceDesc,
     MOE_ROUTE_BF16_LOGITS, MOE_ROUTE_RENORMALIZE, MoeExpertsDesc, MoeRouteDesc, OpTrio, QGemmDesc,
     QuantizeActDesc, ROUTE_TOPK_THEN_SOFTMAX, RmsnormDesc, RmsnormShardedDesc, RopeDesc,
-    RowSumsqDesc, ShimSymbols, SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx, TurbineEvent,
-    TurbineGraph,
+    RowSumsqDesc, ShimSymbols, SigmoidMulDesc, SiluMulDesc, StagingFns, TqParamsDesc, TurbineCtx,
+    TurbineEvent, TurbineGraph,
 };
 use crate::ops::{
     ActivationConfig, ActivationContext, ActivationKernel, AddRmsnormConfig, AddRmsnormContext,
@@ -65,7 +65,8 @@ use crate::ops::{
     MoeRouteContext, NormConfig, NormContext, NormKernel, OpKind, PagedAttentionContext,
     ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig, QuantizeActContext,
     QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig, RopeContext,
-    RopeKernel, RouteMode, RowSumsqConfig, RowSumsqContext, ShardedNormKernel,
+    RopeKernel, RouteMode, RowSumsqConfig, RowSumsqContext, ShardedNormKernel, SigmoidMulConfig,
+    SigmoidMulContext, SigmoidMulKernel,
 };
 use crate::pinned::PinnedState;
 use crate::quant::{ActQuantDesc, QuantSchemeDesc};
@@ -1597,6 +1598,21 @@ fn silu_mul_probe(cfg: &ActivationConfig) -> SiluMulDesc {
     }
 }
 
+fn sigmoid_mul_probe(cfg: &SigmoidMulConfig) -> SigmoidMulDesc {
+    let cols = cfg.cols as i64;
+    SigmoidMulDesc {
+        a: null(),
+        gate: null(),
+        out: null(),
+        rows: 1,
+        cols,
+        a_stride_row: cols,
+        gate_stride_row: cols,
+        out_stride_row: cols,
+        dtype: cfg.dtype.abi_code(),
+    }
+}
+
 fn embedding_probe(cfg: &EmbeddingConfig) -> EmbeddingDesc {
     let hidden = cfg.hidden as i64;
     EmbeddingDesc {
@@ -2507,6 +2523,16 @@ impl ShimProvider {
             GdnMode::Prefill => &fns.prefill,
             GdnMode::Decode => &fns.update,
         })
+    }
+
+    /// The v2.19 sigmoid-multiply trio; `KernelProvider::sigmoid_mul` is `Some` exactly when
+    /// the group exists.
+    fn sigmoid_mul_trio(&self) -> Result<&OpTrio<SigmoidMulDesc>, KernelError> {
+        self.syms()
+            .v21
+            .sigmoid_mul
+            .as_ref()
+            .ok_or_else(|| self.ctx.lib.lacks("the ABI v2.19 sigmoid_mul group"))
     }
 
     /// The sequence arguments shared by both v2.18 ops: the slot list, the `cu_seqlens` of a
@@ -3824,6 +3850,35 @@ impl ActivationKernel for ShimProvider {
     }
 }
 
+impl SigmoidMulKernel for ShimProvider {
+    fn supports(&self, cfg: &SigmoidMulConfig) -> bool {
+        self.sigmoid_mul_trio()
+            .is_ok_and(|t| Self::supported(t, &sigmoid_mul_probe(cfg)))
+    }
+
+    fn implementation(&self, cfg: &SigmoidMulConfig) -> String {
+        self.sigmoid_mul_trio()
+            .map(|t| self.implementation_of(OpKind::SigmoidMul, t, &sigmoid_mul_probe(cfg)))
+            .unwrap_or_default()
+    }
+
+    fn execute(&self, ctx: &mut SigmoidMulContext<'_>) -> Result<(), KernelError> {
+        let trio = self.sigmoid_mul_trio()?;
+        let d = SigmoidMulDesc {
+            a_stride_row: row_stride("a", &ctx.a, 2)?,
+            gate_stride_row: row_stride("gate", &ctx.gate, 2)?,
+            out_stride_row: row_stride("out", &ctx.out, 2)?,
+            a: self.ctx.device_ptr("a", &ctx.a)?,
+            gate: self.ctx.device_ptr("gate", &ctx.gate)?,
+            out: self.ctx.device_ptr("out", &ctx.out)?,
+            rows: to_i64("rows", ctx.a.shape[0])?,
+            cols: to_i64("cols", ctx.a.shape[1])?,
+            dtype: ctx.out.dtype.abi_code(),
+        };
+        self.run(OpKind::SigmoidMul, trio, &d, 0)
+    }
+}
+
 impl EmbeddingKernel for ShimProvider {
     fn supports(&self, cfg: &EmbeddingConfig) -> bool {
         Self::supported(&self.syms().embedding, &embedding_probe(cfg))
@@ -3974,6 +4029,14 @@ impl KernelProvider for ShimProvider {
             .then_some(self as &dyn Conv1dKernel)
     }
 
+    fn sigmoid_mul(&self) -> Option<&dyn SigmoidMulKernel> {
+        self.syms()
+            .v21
+            .sigmoid_mul
+            .is_some()
+            .then_some(self as &dyn SigmoidMulKernel)
+    }
+
     fn implementations(&self, op: OpKind) -> Vec<ImplInfo> {
         self.ctx.lib.implementations(op)
     }
@@ -4081,6 +4144,9 @@ impl KernelProvider for ShimProvider {
             }
             OpConfig::Gdn(cfg) => lib.impl_supports(cfg.op(), index, &gdn_probe(cfg)),
             OpConfig::Conv1d(cfg) => lib.impl_supports(cfg.op(), index, &conv1d_probe(cfg)),
+            OpConfig::SigmoidMul(cfg) => {
+                lib.impl_supports(OpKind::SigmoidMul, index, &sigmoid_mul_probe(cfg))
+            }
         }
     }
 }
@@ -4706,6 +4772,7 @@ pub(crate) mod tests {
             size_of::<ffi::TqParamsDesc>(),
             size_of::<ffi::GdnDesc>(),
             size_of::<ffi::Conv1dDesc>(),
+            size_of::<ffi::SigmoidMulDesc>(),
         ];
         for (which, rust) in rust_sizes.into_iter().enumerate() {
             assert_eq!(c_size(which as i32), rust, "descriptor {which}");

@@ -232,6 +232,11 @@ pub(crate) fn silu(g: f32) -> f32 {
     g / (1.0 + (-g).exp())
 }
 
+/// `sigmoid(g) = 1 / (1 + e^{-g})`, in f32 (ABI v2.19 `sigmoid_mul`).
+pub(crate) fn sigmoid(g: f32) -> f32 {
+    1.0 / (1.0 + (-g).exp())
+}
+
 // Logits reduction (ABI v2.1 `logits_reduce`). These mirror the host sampler of
 // `turbine-model` operation for operation — including its f64 sums, taken sequentially in id
 // order — so a row reduced here finishes on the host exactly as the whole row would.
