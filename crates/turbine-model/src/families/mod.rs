@@ -454,8 +454,8 @@ mod tests {
         } else {
             // The Gated DeltaNet state of a hybrid family: the linear layers' dimensions come
             // from the raw config, the state bytes from them.
-            let k_heads = text["linear_num_key_heads"].as_u64().unwrap() as u64;
-            let v_heads = text["linear_num_value_heads"].as_u64().unwrap() as u64;
+            let k_heads = text["linear_num_key_heads"].as_u64().unwrap();
+            let v_heads = text["linear_num_value_heads"].as_u64().unwrap();
             let k_dim = text["linear_key_head_dim"].as_u64().unwrap();
             let v_dim = text["linear_value_head_dim"].as_u64().unwrap();
             let conv_kernel = text["linear_conv_kernel_dim"].as_u64().unwrap();

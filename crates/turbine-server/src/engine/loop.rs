@@ -4702,14 +4702,14 @@ mod tests {
         requests: &[GenerationRequest],
         overlap: bool,
     ) -> (Vec<Vec<ChoiceStream>>, u64) {
-        let t = engine_with(
-            tiny_reducing_executor(spec, 8),
-            Arc::clone(tokenizer),
-            params(4, 8),
-            overlap,
-        );
+        let exec = tiny_reducing_executor(spec, 8);
+        // A hybrid family's executor cannot overlap (its Gated DeltaNet layers read `g`/`beta`
+        // back on the host), so the engine leaves overlap off however it is requested.
+        let can = exec.overlaps() && exec.reduces_logits();
+        let t = engine_with(exec, Arc::clone(tokenizer), params(4, 8), overlap);
         assert_eq!(
-            t.engine.overlap, overlap,
+            t.engine.overlap,
+            overlap && can,
             "the reducing CPU executor can overlap"
         );
         let streams: Vec<_> = requests.iter().map(|r| submit(&t.tx, r.clone())).collect();
@@ -4873,8 +4873,14 @@ mod tests {
                 .collect();
             let (serial, none) = run_streams(&spec, &tokenizer, &requests, false);
             assert_eq!(none, 0, "{}", family.name());
+            let can = {
+                let probe = tiny_reducing_executor(&spec, 8);
+                probe.overlaps() && probe.reduces_logits()
+            };
             let (overlapped, ahead) = run_streams(&spec, &tokenizer, &requests, true);
-            assert!(ahead > 0, "{}: no iteration launched ahead", family.name());
+            if can {
+                assert!(ahead > 0, "{}: no iteration launched ahead", family.name());
+            }
             assert_eq!(overlapped, serial, "{}", family.name());
             for (choices, max) in serial.iter().zip([10, 7, 12, 5]) {
                 assert_eq!(choices[0].tokens.len(), max, "{}", family.name());

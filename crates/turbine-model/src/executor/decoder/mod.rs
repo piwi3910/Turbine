@@ -985,17 +985,20 @@ struct Layer {
 
 /// The token mixer of a layer (P7 S-11): full attention, or a Gated DeltaNet linear attention.
 enum Mixer {
-    Attention {
-        /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V (a gated layer's stack is
-        /// `[q_all | gate_all | k | v]`, de-interleaved by the loader).
-        w_qkv: Linear,
-        wo: Linear,
-        attention: HookWeights,
-        /// `attn_output_gate`: the attention output is multiplied by `sigmoid(gate)` before the
-        /// O projection (kernel ABI v2.19 `TURBINE_OP_SIGMOID_MUL`).
-        gated: bool,
-    },
+    Attention(Box<AttentionLayer>),
     Gdn(Box<GdnLayer>),
+}
+
+/// A full-attention layer's parameters, and the attention hook's.
+struct AttentionLayer {
+    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V (a gated layer's stack is
+    /// `[q_all | gate_all | k | v]`, de-interleaved by the loader).
+    w_qkv: Linear,
+    wo: Linear,
+    attention: HookWeights,
+    /// `attn_output_gate`: the attention output is multiplied by `sigmoid(gate)` before the
+    /// O projection (kernel ABI v2.19 `TURBINE_OP_SIGMOID_MUL`).
+    gated: bool,
 }
 
 /// A Gated DeltaNet layer's parameters (Qwen3.5).
@@ -1678,12 +1681,12 @@ impl DecoderExecutor {
                         &[d.hidden, d.q_dim],
                     )?;
                     let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
-                    Mixer::Attention {
+                    Mixer::Attention(Box::new(AttentionLayer {
                         w_qkv,
                         wo,
                         attention,
                         gated: cfg.attn_output_gate,
-                    }
+                    }))
                 }
             };
             let ffn = spec.ffn.load_layer(&d, i, &p, &mut weights, opts)?;
@@ -2282,17 +2285,11 @@ impl DecoderExecutor {
         let Some(l) = self.layers.first() else {
             return false;
         };
-        let Mixer::Attention {
-            w_qkv,
-            wo,
-            attention,
-            ..
-        } = &l.mixer
-        else {
+        let Mixer::Attention(a) = &l.mixer else {
             return false;
         };
-        if w_qkv.view().q.is_some()
-            || wo.view().q.is_some()
+        if a.w_qkv.view().q.is_some()
+            || a.wo.view().q.is_some()
             || !self
                 .spec
                 .ffn
@@ -2300,7 +2297,6 @@ impl DecoderExecutor {
         {
             return false;
         }
-        let _ = attention;
         let d = &self.dims;
         let fuses = |w: &Linear, fusion: GemmFusion| {
             let w = w.view();
@@ -2315,7 +2311,7 @@ impl DecoderExecutor {
             residual: true,
             ..GemmFusion::default()
         };
-        fuses(w_qkv, norm) && fuses(wo, residual)
+        fuses(&a.w_qkv, norm) && fuses(&a.wo, residual)
     }
 
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
@@ -2565,7 +2561,7 @@ impl DecoderExecutor {
         }
         match &self.layers[i].mixer {
             Mixer::Gdn(_) => self.gdn_part(i, &w)?,
-            Mixer::Attention { .. } => self.attention_part(i, &w, kv, false)?,
+            Mixer::Attention(_) => self.attention_part(i, &w, kv, false)?,
         }
         self.all_reduce(&rows(&b.proj, t))?;
         self.record(li, "o_proj", rows(&b.proj, t))?;
@@ -2591,16 +2587,10 @@ impl DecoderExecutor {
         fused: bool,
     ) -> Result<(), ModelError> {
         let l = &self.layers[i];
-        let Mixer::Attention {
-            w_qkv,
-            wo,
-            attention,
-            gated,
-        } = &l.mixer
-        else {
+        let Mixer::Attention(a) = &l.mixer else {
             return Err(invalid(format!("layer {i} is not a full-attention layer")));
         };
-        let (gated, attention) = (*gated, attention);
+        let (gated, attention) = (a.gated, &a.attention);
         let b = &self.bufs;
         let d = &self.dims;
         let (p, t) = (w.p, w.p.total_q);
@@ -2622,18 +2612,18 @@ impl DecoderExecutor {
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.gemm_fused(
                 at(&b.x),
-                w_qkv.view(),
+                a.w_qkv.view(),
                 whole,
                 None,
                 Some(&l.input_norm),
                 None,
             )?;
         } else if self.qkv.fused() {
-            let wq = w_qkv.view();
+            let wq = a.w_qkv.view();
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.linear(at(&b.h), wq, whole)?;
         } else {
-            let wq = |r, n| w_qkv.view().rows(r, n);
+            let wq = |r, n| a.w_qkv.view().rows(r, n);
             self.linear(at(&b.h), wq(0, d.q_dim), q())?;
             if gated {
                 self.linear(at(&b.h), wq(d.q_dim, d.q_dim), gate())?;
@@ -2764,9 +2754,16 @@ impl DecoderExecutor {
         self.record(li, "attn", at(&b.attn))?;
         if fused {
             // The fused decode form: the residual add runs in the o_proj GEMV's epilogue.
-            return self.gemm_fused(at(&b.attn), wo.view(), at(&b.x), None, None, Some(at(&b.x)));
+            return self.gemm_fused(
+                at(&b.attn),
+                a.wo.view(),
+                at(&b.x),
+                None,
+                None,
+                Some(at(&b.x)),
+            );
         }
-        self.linear(at(&b.attn), wo.view(), at(&b.proj))?;
+        self.linear(at(&b.attn), a.wo.view(), at(&b.proj))?;
         self.spec
             .attention
             .after_o_proj(&run, attention, &at(&b.proj))

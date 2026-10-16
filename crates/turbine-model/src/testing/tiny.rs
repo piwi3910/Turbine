@@ -989,7 +989,7 @@ fn write_weights(
     for slot in slots {
         // A family whose checkpoint stores some tensors packed (gpt-oss's MXFP4 experts) names
         // them U8 in its weight format.
-        let (dtype, data) = if format.slot_dtype(&slot) == turbine_core::types::DType::U8 {
+        let (dtype, data) = if format.slot_dtype(slot) == turbine_core::types::DType::U8 {
             (Dtype::U8, random_u8(&mut rng, &slot.name, &slot.shape))
         } else {
             let data = random_named_bf16(&mut rng, &slot.name, &slot.shape)

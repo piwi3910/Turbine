@@ -7559,7 +7559,7 @@ fn weights_skipped_logged_for_vision_and_mtp() {
         &cfg.family.0.weight_slots(cfg),
         cfg.family.0.skipped_prefixes(),
         &mem,
-        MAX_STAGING_BYTES as usize,
+        MAX_STAGING_BYTES,
     )
     .expect("load");
     // One [64] BF16 tensor is 128 bytes.
