@@ -91,7 +91,7 @@ mod registry_conformance {
         names_are(
             reg,
             "tool_format",
-            &["llama3_json", "hermes", "mistral", "harmony"],
+            &["llama3_json", "hermes", "mistral", "harmony", "qwen3_xml"],
         );
         passes(formats_suite(reg));
     }

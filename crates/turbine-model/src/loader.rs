@@ -149,6 +149,73 @@ pub(crate) fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<Weigh
     )
 }
 
+/// The fused `[2·q_dim + 2·kv_dim, hidden]` Q/K/V-and-output-gate projection of a Qwen3.5
+/// full-attention layer `layer`, laid out `[q_all | gate_all | k | v]` (P7 S-11).
+pub fn q_gate_kv_proj_name(layer: u32) -> String {
+    format!("model.layers.{layer}.self_attn.q_gate_kv_proj.weight")
+}
+
+/// [`q_gate_kv_proj_name`]`(i)`'s slots (P7 S-11): the checkpoint's `q_proj` is per-head
+/// interleaved `[q_j | g_j]` (`2·head_dim` rows per head), so its rows are de-interleaved at
+/// load time — each `[q_j]` and `[g_j]` block is a [`SlotSource`] row range of the same tensor —
+/// into a contiguous `[q_all | gate_all]` block ahead of the whole `k_proj` and `v_proj`, all in
+/// one stack the executor reads without an attention-desc change.
+pub fn gated_qkv_slots(
+    i: u32,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+) -> Vec<WeightSlot> {
+    let p = format!("model.layers.{i}.self_attn");
+    let q_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+    let stack = q_gate_kv_proj_name(i);
+    let stack_shape = vec![2 * q_dim + 2 * kv_dim, hidden];
+    let q_shape = vec![2 * q_dim, hidden];
+    let source = |start: usize| SlotSource {
+        shape: q_shape.clone(),
+        axis: 0,
+        start,
+        len: head_dim,
+    };
+    let place = |offset: usize| StackPlace {
+        name: stack.clone(),
+        shape: stack_shape.clone(),
+        offset,
+    };
+    let mut slots = Vec::with_capacity(2 * heads + 2);
+    // The q heads, then the output gates, each head's `[q_j]` / `[g_j]` rows at their source.
+    for j in 0..heads {
+        slots.push(WeightSlot {
+            name: format!("{p}.q_proj.weight"),
+            shape: vec![head_dim, hidden],
+            stack: Some(place(j * head_dim * hidden)),
+            source: Some(source(2 * j * head_dim)),
+        });
+    }
+    for j in 0..heads {
+        slots.push(WeightSlot {
+            name: format!("{p}.q_proj.weight"),
+            shape: vec![head_dim, hidden],
+            stack: Some(place((q_dim + j * head_dim) * hidden)),
+            source: Some(source((2 * j + 1) * head_dim)),
+        });
+    }
+    for (proj, offset) in [
+        ("k_proj", 2 * q_dim * hidden),
+        ("v_proj", (2 * q_dim + kv_dim) * hidden),
+    ] {
+        slots.push(WeightSlot {
+            name: format!("{p}.{proj}.weight"),
+            shape: vec![kv_dim, hidden],
+            stack: Some(place(offset)),
+            source: None,
+        });
+    }
+    slots
+}
+
 /// The stacked `[experts, rows, cols]` parameter of layer `layer`'s expert projection `proj`
 /// (`gate_proj`, `up_proj`, `down_proj`), as [`crate::families::olmoe_slots`] loads it.
 pub fn stacked_experts_name(layer: u32, proj: &str) -> String {
@@ -1216,5 +1283,100 @@ mod tests {
         );
         assert!(text.contains(&bin.display().to_string()), "{text}");
         assert!(text.contains("pickle formats are not supported"), "{text}");
+    }
+
+    /// P7 S-11: the Qwen3.5 `q_proj` is per-head interleaved `[q_j | g_j]`; the loader's
+    /// row-range slots de-interleave it into a contiguous `[q_all | gate_all | k | v]` stack.
+    #[test]
+    fn gated_qkv_deinterleaves_q_and_gate() {
+        use safetensors::Dtype as StDtype;
+        use safetensors::tensor::TensorView;
+
+        let (heads, kv_heads, head_dim, hidden) = (2usize, 1usize, 2usize, 3usize);
+        let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+        let dir = TempDir::new("load-gated-qkv");
+        // One BF16 value per row: `q_proj` row r holds `r + 1`, `k_proj` `100 + r`, `v_proj`
+        // `200 + r`, so the loaded stack's rows identify their source row.
+        let rows = |n: usize, base: u32| {
+            let mut data = Vec::with_capacity(n * hidden * 2);
+            for r in 0..n {
+                let v = half::bf16::from_f32((base + r as u32) as f32);
+                for _ in 0..hidden {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            data
+        };
+        let q_data = rows(2 * q_dim, 1);
+        let k_data = rows(kv_dim, 100);
+        let v_data = rows(kv_dim, 200);
+        let p = "model.layers.0.self_attn";
+        safetensors::serialize_to_file(
+            [
+                (
+                    format!("{p}.q_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![2 * q_dim, hidden], &q_data).unwrap(),
+                ),
+                (
+                    format!("{p}.k_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![kv_dim, hidden], &k_data).unwrap(),
+                ),
+                (
+                    format!("{p}.v_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![kv_dim, hidden], &v_data).unwrap(),
+                ),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let slots = gated_qkv_slots(0, heads, kv_heads, head_dim, hidden);
+        assert!(check_stacks(&slots).is_ok());
+        assert_eq!(slots.len(), 2 * heads + 2);
+        // Head j's q rows precede head j's gate rows; both read the interleaved `q_proj`.
+        let row = |s: &WeightSlot| s.stack.as_ref().unwrap().offset / hidden;
+        assert_eq!(
+            slots[..heads].iter().map(row).collect::<Vec<_>>(),
+            [0, head_dim]
+        );
+        assert_eq!(
+            slots[heads..2 * heads].iter().map(row).collect::<Vec<_>>(),
+            [q_dim, q_dim + head_dim]
+        );
+        let src = |s: &WeightSlot| {
+            let src = s.source.as_ref().unwrap();
+            (src.start, src.len)
+        };
+        assert_eq!(
+            slots[..2 * heads].iter().map(src).collect::<Vec<_>>(),
+            [
+                (0, head_dim),
+                (2 * head_dim, head_dim),
+                (head_dim, head_dim),
+                (3 * head_dim, head_dim)
+            ]
+        );
+
+        let index = SafetensorsIndex::open(dir.path()).unwrap();
+        let (_, mem) = counting();
+        let mut weights = WeightLoader::load(&index, &slots, &mem, 1 << 20).unwrap();
+        let stack = weights.take(&q_gate_kv_proj_name(0)).unwrap();
+        assert_eq!(stack.shape.as_slice(), &[2 * q_dim + 2 * kv_dim, hidden]);
+        let mut got = vec![0u8; stack.shape.iter().product::<usize>() * stack.dtype.size_bytes()];
+        stack.storage.copy_to_host(0, &mut got).unwrap();
+        let values: Vec<u32> = got
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32() as u32)
+            .collect();
+        // q_all = [q_0 rows 1,2 | q_1 rows 5,6], gate_all = [g_0 rows 3,4 | g_1 rows 7,8],
+        // then k (100,101), v (200,201); each row's `hidden` values match.
+        let expect = [
+            1, 1, 1, 2, 2, 2, 5, 5, 5, 6, 6, 6, // q_all
+            3, 3, 3, 4, 4, 4, 7, 7, 7, 8, 8, 8, // gate_all
+            100, 100, 100, 101, 101, 101, // k
+            200, 200, 200, 201, 201, 201, // v
+        ];
+        assert_eq!(values, expect);
     }
 }

@@ -539,6 +539,56 @@ fn mistral_conformance() {
     assert!(array.is_err(), "{array:?}");
 }
 
+/// P7 S-18 (part 2): the `qwen3_xml` format's own cases, the XML form the Qwen3.5 template
+/// renders. The checks every format must pass are `conformance::formats_suite`
+/// (`registry_conformance::tool_formats`); these pin the grammar's enum handling, the parser's
+/// decoding of the template's raw scalars, and that the tags are optional special tokens.
+#[test]
+fn qwen3_xml_conformance() {
+    let one = "<tool_call>\n<function=get_weather>\n<parameter=location>\n\"Oslo\"</parameter>\n<parameter=unit>\n\"celsius\"</parameter>\n</function>\n</tool_call>";
+    let time = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+    let two = format!("{one}\n{time}");
+    enveloped_conformance(
+        "qwen3_xml",
+        &Samples {
+            one,
+            two: &two,
+            time,
+            bad: "<tool_call>\n<function=get_weather>\n<parameter=location>\n\"Oslo\"</parameter>\n<parameter=unit>\n\"kelvin\"</parameter>\n</function>\n</tool_call>",
+            unknown: "<tool_call>\n<function=get_stock>\n<parameter=location>\n\"Oslo\"</parameter>\n</function>\n</tool_call>",
+            texts: &[
+                "The sea is calm.",
+                "Thinking about it.",
+                "<",
+                "  <b>bold</b>",
+            ],
+        },
+    );
+    // The parser also reads the template's raw form (unquoted scalar values, a `\n` before
+    // `</parameter>`).
+    let parser = registry().get("qwen3_xml").unwrap().parser();
+    assert_eq!(
+        names_and_args(parser.parse(
+            "<tool_call>\n<function=get_weather>\n<parameter=location>\nOslo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>"
+        )),
+        [(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )]
+    );
+    // A mapping argument is decoded from its JSON, as the template writes it.
+    assert_eq!(
+        names_and_args(parser.parse(
+            "<tool_call>\n<function=f>\n<parameter=opts>\n{\"a\": 1, \"b\": [2]}\n</parameter>\n</function>\n</tool_call>"
+        )),
+        [("f".to_string(), r#"{"opts":{"a":1,"b":[2]}}"#.to_string())]
+    );
+    // The special tokens are optional: qwen3_xml binds on the tiny tokenizer, which lacks them.
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-qwen3-xml-bind");
+    let bound = bind(&Qwen3Xml, &tokenizer).expect("bind");
+    assert_eq!(bound.tokens.id("<tool_call>"), None);
+}
+
 /// The run-ahead's grammar cases on the real Llama-3.2 tokenizer (multi-byte tokens across the
 /// envelope and the JSON).
 #[test]
