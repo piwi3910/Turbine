@@ -653,7 +653,8 @@ fn build_executor(
 ) -> Runner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
-    let weights = WeightLoader::load(
+    let weights = WeightLoader::load_format(
+        cfg.weight_format.get(),
         &index,
         &cfg.family.0.weight_slots(&cfg),
         &mem,
@@ -1780,6 +1781,193 @@ fn mxfp4_decode_vs_prefill_trace() {
             println!("  {tok:>7} ref {lp:>9.4} C {:>9.4}", logits_c[tok as usize]);
         }
         println!("  C top-5 {:?}", top(&logits_c));
+    }
+}
+
+// -------------------------------------------------- MXFP4 p05 CPU vs transformers (P7 Task 28)
+
+/// One op of the p05 transformers trace ([`scripts/golden/tiny_trace.py --prompt-file`]): its
+/// layer (`None` for `embed`/`final_norm`/`logits`), name, shape and decoded values.
+struct P05Op {
+    layer: Option<usize>,
+    name: String,
+    cols: usize,
+    values: Vec<f32>,
+}
+
+/// Two hex chars per byte, little-endian per value.
+fn decode_hex(hex: &str) -> Vec<u8> {
+    let bytes = hex.as_bytes();
+    assert!(bytes.len().is_multiple_of(2), "odd hex length");
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let digit = |b: u8| (b as char).to_digit(16).expect("hex digit") as u8;
+            (digit(pair[0]) << 4) | digit(pair[1])
+        })
+        .collect()
+}
+
+/// The MXFP4-A16 8B checkpoint and the p05 trace, from the lab environment: `None` when neither
+/// `TURBINE_TEST_MXFP4_MODEL_DIR` nor an `mxfp4`-named `TURBINE_TEST_MODEL_DIR` is set (the
+/// command line the fixture was made with, `TURBINE_TEST_MODEL_DIR=/models/llama-3.1-8b-instruct-mxfp4a16`,
+/// included). The trace path is `TURBINE_P05_TRACE` (repo-relative) or the committed fixture.
+fn p05_inputs() -> Option<(PathBuf, PathBuf)> {
+    let model_dir = if let Some(v) = std::env::var_os("TURBINE_TEST_MXFP4_MODEL_DIR") {
+        PathBuf::from(v)
+    } else {
+        let dir = PathBuf::from(std::env::var_os("TURBINE_TEST_MODEL_DIR")?);
+        let is_mxfp4 = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().contains("mxfp4"))
+            .unwrap_or(false);
+        if !is_mxfp4 {
+            return None;
+        }
+        dir
+    };
+    let rel = std::env::var("TURBINE_P05_TRACE")
+        .unwrap_or_else(|_| "tests/golden/llama-3.1-8b-instruct-mxfp4a16/p05-trace.json".into());
+    let trace = PathBuf::from(rel);
+    let trace = if trace.is_absolute() {
+        trace
+    } else {
+        repo_root().join(trace)
+    };
+    Some((model_dir, trace))
+}
+
+/// Lab diagnostic (P7 Task 28 / S-14; release only, a no-op in a debug build and without
+/// `TURBINE_TEST_MXFP4_MODEL_DIR`): the MXFP4-A16 8B checkpoint's p05 knife edge — position 25
+/// (the 21-token prompt plus the reference's first 5 greedy tokens), where Turbine's HIP decode
+/// and its cpu-reference prefill land in one "bad" state and the HIP prefill, the transformers
+/// reference and the committed tolerance in the other — checked op by op. Runs the cpu-reference
+/// (scalar) prefill of the trace's tokens and prints, per layer and op, the max |Δ| against the
+/// transformers trace and the first op whose |Δ| exceeds 1e-2 (whether a single op injects the
+/// divergence or the CPU path merely rounds differently from the reference throughout).
+#[test]
+#[ignore = "needs a release build, the MXFP4-A16 8B checkpoint and the p05 trace fixture"]
+fn mxfp4_cpu_vs_transformers_p05() {
+    use turbine_model::testing::trace::DiffStats;
+
+    if cfg!(debug_assertions) {
+        println!(
+            "mxfp4_cpu_vs_transformers_p05: debug build (the cpu-reference prefill is scalar); run with --release"
+        );
+        return;
+    }
+    let Some((model_dir, trace_path)) = p05_inputs() else {
+        println!(
+            "mxfp4_cpu_vs_transformers_p05: TURBINE_TEST_MXFP4_MODEL_DIR is not set: nothing traced"
+        );
+        return;
+    };
+    let raw =
+        std::fs::read(&trace_path).unwrap_or_else(|e| panic!("read {}: {e}", trace_path.display()));
+    let json: serde_json::Value = serde_json::from_slice(&raw).expect("trace JSON");
+    let prompt_ids: Vec<u32> = json["prompt_ids"]
+        .as_array()
+        .expect("prompt_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("prompt id") as u32)
+        .collect();
+    let ops: Vec<P05Op> = json["ops"]
+        .as_array()
+        .expect("ops")
+        .iter()
+        .map(|o| {
+            let layer = o["layer"].as_u64().map(|l| l as usize);
+            let name = o["name"].as_str().expect("name").to_string();
+            let shape = o["shape"].as_array().expect("shape");
+            let (rows, cols) = (
+                shape[0].as_u64().expect("rows") as usize,
+                shape[1].as_u64().expect("cols") as usize,
+            );
+            let bytes = decode_hex(o["data_hex"].as_str().expect("data_hex"));
+            let values: Vec<f32> = match o["dtype"].as_str().unwrap_or("f32") {
+                "bf16" => bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect(),
+                _ => bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            };
+            assert_eq!(values.len(), rows * cols, "{name}: values vs shape");
+            P05Op {
+                layer,
+                name,
+                cols,
+                values,
+            }
+        })
+        .collect();
+    println!(
+        "mxfp4_cpu_vs_transformers_p05: {} tokens, {} traced ops, {}\n  (Turbine cpu-reference prefill vs transformers; the trace holds each op's last row)",
+        prompt_ids.len(),
+        ops.len(),
+        trace_path.display()
+    );
+
+    let max_seq_len = prompt_ids.len() as u32;
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+    let mut runner = build_executor(&model_dir, cpu_reference_provider(), mem, max_seq_len);
+    runner.exec.set_trace(true);
+    let positions: Vec<u32> = (0..max_seq_len).collect();
+    runner
+        .kv
+        .forward(&mut runner.exec, &prompt_ids, &positions)
+        .expect("cpu-reference prefill");
+    let trace = runner.exec.take_trace();
+
+    let label = |layer: Option<usize>| layer.map_or_else(|| "-".to_string(), |l| l.to_string());
+    println!(
+        "{:>5}  {:<11} {:>11} {:>9} {:>10}",
+        "layer", "op", "max|Δ|", "ulps", "max |ref|"
+    );
+    let mut first_over: Option<(Option<usize>, String, f32)> = None;
+    for op in &ops {
+        let Some(got) = trace
+            .iter()
+            .find(|t| t.layer == op.layer && t.name == op.name)
+        else {
+            println!(
+                "{:>5}  {:<11} (Turbine records no such op)",
+                label(op.layer),
+                op.name
+            );
+            continue;
+        };
+        assert_eq!(
+            got.shape[1],
+            op.cols,
+            "{} {}: {} columns vs {}",
+            label(op.layer),
+            op.name,
+            got.shape[1],
+            op.cols
+        );
+        let last = &got.data[(got.shape[0] - 1) * got.shape[1]..];
+        let stats = DiffStats::of(&op.values, last);
+        println!(
+            "{:>5}  {:<11} {:>11.4e} {:>9.2} {:>10.4e}",
+            label(op.layer),
+            op.name,
+            stats.max_abs,
+            stats.max_ulps,
+            stats.max_ref
+        );
+        if stats.max_abs > 1e-2 && first_over.is_none() {
+            first_over = Some((op.layer, op.name.clone(), stats.max_abs));
+        }
+    }
+    match first_over {
+        None => println!("first op above 1e-2: none"),
+        Some((layer, name, d)) => println!(
+            "first op above 1e-2: layer {} {name} max|Δ| {d:.4e}",
+            label(layer)
+        ),
     }
 }
 
