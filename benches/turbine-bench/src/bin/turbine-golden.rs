@@ -160,6 +160,12 @@ enum Command {
         /// lossy block measured nothing.
         #[arg(long)]
         min_lossy_cached_ratio: Option<f64>,
+        /// Reasoning effort sent as the Chat request's top-level `reasoning_effort`
+        /// (`low`/`medium`/`high`). A reasoning model such as gpt-oss reasons past `max_tokens`
+        /// and writes nothing to `content` without `low`; both sides of a comparison must use
+        /// the same value.
+        #[arg(long, value_parser = turbine_bench::args::parse_reasoning_effort)]
+        reasoning_effort: Option<String>,
     },
     /// Quality gate: exit 0 when candidate accuracy ≥ baseline accuracy − max drop, else 1.
     EvalCompare {
@@ -175,6 +181,7 @@ enum Command {
 
 /// `eval`: exit 0 with the report on a completed run; 2 (no report) on any I/O, task-file or
 /// endpoint failure, naming the failing task.
+#[allow(clippy::too_many_arguments)]
 async fn run_eval(
     url: &str,
     tasks_path: &Path,
@@ -183,6 +190,7 @@ async fn run_eval(
     concurrency: u32,
     fillers: eval::Fillers,
     guards: (Option<f64>, Option<f64>),
+    reasoning_effort: Option<&str>,
 ) -> ExitCode {
     if guards
         .0
@@ -194,7 +202,18 @@ async fn run_eval(
         return ExitCode::from(2);
     }
     let report = match eval::load_tasks(tasks_path) {
-        Ok(tasks) => eval::run_eval(url, model, tasks_path, &tasks, concurrency, fillers).await,
+        Ok(tasks) => {
+            eval::run_eval(
+                url,
+                model,
+                tasks_path,
+                &tasks,
+                concurrency,
+                fillers,
+                reasoning_effort,
+            )
+            .await
+        }
         Err(e) => Err(e),
     };
     match report {
@@ -282,6 +301,13 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
         eprintln!(
             "turbine-golden eval-compare: baseline sent its fillers at filler concurrency {} but candidate at filler concurrency {}; a comparison must use the same fillers on both sides",
             baseline.filler_concurrency, candidate.filler_concurrency
+        );
+        return ExitCode::from(2);
+    }
+    if baseline.reasoning_effort != candidate.reasoning_effort {
+        eprintln!(
+            "turbine-golden eval-compare: baseline used reasoning effort {:?} but candidate {:?}; a comparison must use the same reasoning effort on both sides",
+            baseline.reasoning_effort, candidate.reasoning_effort
         );
         return ExitCode::from(2);
     }
@@ -468,6 +494,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             fillers_settle,
             min_cached_ratio,
             min_lossy_cached_ratio,
+            reasoning_effort,
         } => Ok(run_eval(
             &url,
             &tasks,
@@ -481,6 +508,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 settle: fillers_settle,
             },
             (min_cached_ratio, min_lossy_cached_ratio),
+            reasoning_effort.as_deref(),
         )
         .await),
         Command::EvalCompare {

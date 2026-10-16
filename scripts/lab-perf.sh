@@ -44,7 +44,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--reasoning-effort low|medium|high] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
 	exit 2
 }
 
@@ -106,6 +106,7 @@ CONFIG=""
 SETS=()
 PLACEMENT=""
 EVAL=0
+REASONING_EFFORT=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--placement)
@@ -116,6 +117,14 @@ while [[ $# -gt 0 ]]; do
 	--eval)
 		EVAL=1
 		shift
+		;;
+	--reasoning-effort)
+		# A reasoning model (gpt-oss Harmony) reasons past --max-tokens and a content-only
+		# client sees an empty stream without it; `low` keeps it reaching the final channel.
+		# Sent to both engines (turbine-bench and turbine-golden eval).
+		[[ $# -ge 2 && "$2" =~ ^(low|medium|high)$ ]] || usage
+		REASONING_EFFORT="$2"
+		shift 2
 		;;
 	--runs)
 		[[ $# -ge 2 && "$2" =~ ^[1-9][0-9]?$ ]] || usage
@@ -283,6 +292,7 @@ bench() {
 	local engine="$1" port="$2" requests="$3" report="$4"
 	local cmd=("$BENCH" --url "http://${ADDR}:${port}" --concurrency 16 --requests "$requests"
 		--prompt-words 512 --max-tokens 256 --ignore-eos --output json)
+	[[ -z "$REASONING_EFFORT" ]] || cmd+=(--reasoning-effort "$REASONING_EFFORT")
 	echo "+ ${cmd[*]} > ${report}"
 	[[ $DRY_RUN -eq 0 ]] || return 0
 	"${cmd[@]}" >"$report" || fail "${engine}: turbine-bench failed (exit $?) against port ${port}"
@@ -293,6 +303,7 @@ vllm_eval() {
 	local report="${OUT}/vllm-gsm8k.json"
 	local cmd=("$GOLDEN" eval --url "http://${ADDR}:18100" --tasks tests/eval/gsm8k-200.jsonl
 		--concurrency 16 --output json)
+	[[ -z "$REASONING_EFFORT" ]] || cmd+=(--reasoning-effort "$REASONING_EFFORT")
 	say "vllm: GSM8K (--eval)"
 	echo "+ ${cmd[*]} > ${report}"
 	[[ $DRY_RUN -eq 0 ]] || return 0

@@ -5,6 +5,7 @@
 #     "safetensors==0.6.2",
 #     "numpy==2.3.4",
 #     "packaging==25.0",
+#     "transformers==4.57.1",
 # ]
 #
 # [[tool.uv.index]]
@@ -41,7 +42,14 @@ Packagings (detected from `config.json` `quantization_config` and the tensors pr
   U8 `[n, k/2]` E2M1 codes, low nibble = even column, `weight_scale` U8 `[n, k/32]` E8M0;
   value `e2m1(q) × 2^(e − 127)`;
 - OpenAI native `quant_method: mxfp4` (`openai_mxfp4`): `weight_blocks` U8 `[n, k/32, 16]` (the
-  same E2M1 bytes, low nibble first) and `weight_scales` U8 `[n, k/32]` E8M0.
+  same E2M1 bytes, low nibble first) and `weight_scales` U8 `[n, k/32]` E8M0. gpt-oss stores
+  each layer's experts fused instead: `…mlp.experts.<proj>_blocks` U8 `[E, n, k/32, 16]` with
+  `<proj>_scales` U8 `[E, n, k/32]` and a BF16 `<proj>_bias` (the same rule as
+  `turbine-model/src/weights/mxfp4.rs` `fused_expert_tensor`). The copy writes the decoded
+  experts as the fused BF16 parameter `<proj>` `[E, k, n]` (the transpose of the packed
+  `[E, n, k]`) that plain transformers' `GptOssExperts` loads — the shape and order
+  transformers' own dequantize (`convert_moe_packed_tensors`, ending in `transpose(1, 2)`)
+  produces.
 
 Every other floating tensor is copied as BF16 (F16/F32 checkpoints are rounded to BF16, as the
 BF16 transformers load does). `config.json` loses `quantization_config` (and a legacy
@@ -56,7 +64,13 @@ failure exits 1 and leaves no output directory.
 Usage:
     uv run scripts/golden/dequantize_checkpoint.py --model-dir <quantized-dir> --out <bf16-dir>
         [--shard-bytes 4000000000] [--compare-with <bf16-original-dir>]
+        [--verify-transformers <n>]
     uv run scripts/golden/dequantize_checkpoint.py --check-tiny <dir>
+
+`--verify-transformers <n>` (fused-expert checkpoints): bit-compares the first n and the last
+decoded fused expert tensor of the copy against transformers' own
+`convert_moe_packed_tensors` on the checkpoint's blocks and scales, and exits 1 on the first
+mismatch — the decode is wrong, not merely lossy.
 
 `--compare-with` prints, per decoded layer, the relative RMS error of the dequantized weight
 against the same tensor of an unquantized checkpoint (a wrong packing order gives ~1 or more;
@@ -139,6 +153,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--compare-with", type=Path, help="unquantized checkpoint to measure against"
     )
     p.add_argument("--max-rel-rms", type=float, default=0.5)
+    p.add_argument(
+        "--verify-transformers",
+        type=int,
+        default=0,
+        metavar="N",
+        help="bit-compare the first N and the last decoded fused expert tensors against"
+        " transformers' convert_moe_packed_tensors (fused-expert checkpoints)",
+    )
     args = p.parse_args(argv)
     if args.check_tiny is None and (args.model_dir is None or args.out is None):
         p.error("--model-dir and --out are required (or --check-tiny <dir>)")
@@ -492,6 +514,34 @@ def model_revision(model_dir: Path) -> str | None:
     return first if re.fullmatch(r"[0-9a-f]{40}", first) else None
 
 
+def fused_expert_tensor(name: str) -> bool:
+    """Whether `name` is one of gpt-oss's fused expert tensors (`…mlp.experts.<proj>_blocks` /
+    `<proj>_scales`, stacked over the expert dim; the per-layer `weight_blocks` / `weight_scales`
+    of a linear layer are not) — the same rule as `turbine-model/src/weights/mxfp4.rs`
+    `fused_expert_tensor`."""
+    last = name.rsplit(".", 1)[-1]
+    return (
+        ".experts." in name
+        and last != "weight_blocks"
+        and last != "weight_scales"
+        and last.endswith(("_blocks", "_scales"))
+    )
+
+
+def tensor_prefix(name: str, pk: Packaging) -> str:
+    """The layer prefix `name` belongs to: the parameter prefix (the name minus its last
+    dot-component), except a fused expert tensor (`…experts.<proj>_blocks`), whose suffix sits
+    inside the last component and strips as a whole — the same prefix `quantized_prefixes`
+    recorded."""
+    if (
+        pk.name == "openai_mxfp4"
+        and fused_expert_tensor(name)
+        and name.endswith("_blocks")
+    ):
+        return name[: -len("_blocks")]
+    return name.rsplit(".", 1)[0]
+
+
 def quantized_prefixes(tensors: Tensors, pk: Packaging) -> list[str]:
     """Layer prefixes holding a quantized weight, in checkpoint order."""
     out = []
@@ -505,6 +555,8 @@ def quantized_prefixes(tensors: Tensors, pk: Packaging) -> list[str]:
         elif pk.name == "openai_mxfp4":
             if name.endswith(".weight_blocks"):
                 out.append(name[: -len(".weight_blocks")])
+            elif fused_expert_tensor(name) and name.endswith("_blocks"):
+                out.append(name[: -len("_blocks")])
         elif name.endswith(".weight"):
             prefix = name[: -len(".weight")]
             has_scale = tensors.has(prefix + ".weight_scale") or tensors.has(
@@ -597,13 +649,28 @@ def decode_layer(torch, tensors: Tensors, pk: Packaging, prefix: str):
         scheme = "mxfp4"
         used.append(prefix + ".weight")
     elif pk.name == "openai_mxfp4":
-        blocks = t(prefix + ".weight_blocks")
-        if blocks.dim() != 3 or blocks.shape[2] != 16:
-            raise DequantError(f"{prefix}.weight_blocks shape {tuple(blocks.shape)}")
-        packed = blocks.reshape(blocks.shape[0], -1)
-        value = decode_mxfp4(torch, packed, t(prefix + ".weight_scales"))
-        scheme = "mxfp4"
-        used += [prefix + ".weight_blocks", prefix + ".weight_scales"]
+        if fused_expert_tensor(prefix + "_blocks"):
+            blocks = t(prefix + "_blocks")  # [E, n, k/32, 16]
+            if blocks.dim() != 4 or blocks.shape[3] != 16:
+                raise DequantError(f"{prefix}_blocks shape {tuple(blocks.shape)}")
+            experts, rows = blocks.shape[0], blocks.shape[1]
+            value = decode_mxfp4(
+                torch,
+                blocks.reshape(experts * rows, -1),
+                t(prefix + "_scales").reshape(experts * rows, -1),
+            ).reshape(experts, rows, -1)  # F32 [E, n, k], Turbine's layout
+            scheme = "mxfp4"
+            used += [prefix + "_blocks", prefix + "_scales"]
+        else:
+            blocks = t(prefix + ".weight_blocks")
+            if blocks.dim() != 3 or blocks.shape[2] != 16:
+                raise DequantError(
+                    f"{prefix}.weight_blocks shape {tuple(blocks.shape)}"
+                )
+            packed = blocks.reshape(blocks.shape[0], -1)
+            value = decode_mxfp4(torch, packed, t(prefix + ".weight_scales"))
+            scheme = "mxfp4"
+            used += [prefix + ".weight_blocks", prefix + ".weight_scales"]
     else:
         raise DequantError(f"packaging {pk.name}")
     return value, scheme, used
@@ -718,11 +785,30 @@ def dequantize(
     with torch.inference_mode():
         prefix_set = set(prefixes)
         for name in tensors.names():
-            prefix = name.rsplit(".", 1)[0]
+            prefix = tensor_prefix(name, pk)
             if prefix in prefix_set and prefix not in layers:
                 value, scheme, used = decode_layer(torch, tensors, pk, prefix)
                 if not torch.isfinite(value).all():
                     raise DequantError(f"{prefix}: non-finite dequantized value")
+                if fused_expert_tensor(prefix + "_blocks"):
+                    # gpt-oss writes the decoded experts as the fused BF16 parameter of
+                    # transformers' GptOssExperts: [E, k, n], the transpose of the packed
+                    # [E, n, k] (transformers' own dequantize ends in transpose(1, 2)); the
+                    # `_bias` tensor already carries the plain layout's name.
+                    writer.add(prefix, value.to(torch.bfloat16).transpose(1, 2))
+                    consumed.update(used)
+                    if tensors.has(prefix + "_bias"):
+                        writer.add(
+                            prefix + "_bias",
+                            tensors.get(prefix + "_bias").to(torch.bfloat16),
+                        )
+                        consumed.add(prefix + "_bias")
+                    layers[prefix] = {
+                        "scheme": scheme,
+                        "shape": list(value.shape),
+                        "fused_experts": True,
+                    }
+                    continue
                 writer.add(prefix + ".weight", value.to(torch.bfloat16))
                 consumed.update(used)
                 entry = {"scheme": scheme, "shape": list(value.shape)}
@@ -736,7 +822,7 @@ def dequantize(
                 continue
             if name.endswith((".k_proj.output_scale", ".v_proj.output_scale")):
                 continue  # Quark's static FP8 KV scales: not weights (quant_reference.py reads them)
-            if name.rsplit(".", 1)[0] in prefix_set:
+            if tensor_prefix(name, pk) in prefix_set:
                 raise DequantError(f"{name}: unexpected tensor of a quantized layer")
             if name.endswith((".k_scale", ".v_scale")):
                 continue  # KV-cache scales: not weights (FP8 KV reads them from the checkpoint)
@@ -870,6 +956,48 @@ def check_tiny(root: Path, log=print) -> bool:
     return ok
 
 
+def verify_transformers(
+    model_dir: Path, out: Path, record: dict, n: int, log=print
+) -> bool:
+    """Bit-compares the first `n` and the last decoded fused expert tensor of the copy against
+    transformers' own `convert_moe_packed_tensors` on the checkpoint's blocks and scales."""
+    import torch
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+
+    tensors = Tensors(model_dir)
+    fused = [p for p, e in record["layers"].items() if e.get("fused_experts")]
+    if not fused:
+        raise DequantError(f"{model_dir}: no fused expert tensors to verify")
+    pick = sorted(set(fused[:n] + fused[-1:]))
+    ours = Tensors(out)
+    ok = True
+    for prefix in pick:
+        blocks = tensors.get(prefix + "_blocks")
+        scales = tensors.get(prefix + "_scales")
+        want = convert_moe_packed_tensors(blocks, scales)
+        got = ours.get(prefix)
+        if got.dtype != want.dtype or got.shape != want.shape:
+            log(
+                f"{prefix}: copy {got.dtype}{tuple(got.shape)}"
+                f" vs transformers {want.dtype}{tuple(want.shape)}"
+            )
+            ok = False
+            continue
+        if not torch.equal(got, want):
+            diff = (got.to(torch.float32) - want.to(torch.float32)).abs()
+            count = int((got != want).sum())
+            log(
+                f"{prefix}: {count} of {got.numel()} values differ,"
+                f" max |diff| {float(diff.max()):.3g}"
+            )
+            ok = False
+    log(
+        f"verify-transformers: {len(pick)} fused expert tensor(s) "
+        f"{'bit-exact' if ok else 'MISMATCH'}"
+    )
+    return ok
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.check_tiny is not None:
@@ -895,6 +1023,19 @@ def main(argv: list[str]) -> int:
             log=lambda m: print(m, file=sys.stderr),
         )
         os.replace(tmp, args.out)
+        if args.verify_transformers > 0:
+            record = json.loads(
+                (args.out / "turbine_dequant.json").read_text(encoding="utf-8")
+            )
+            if not verify_transformers(
+                args.model_dir,
+                args.out,
+                record,
+                args.verify_transformers,
+                log=lambda m: print(m, file=sys.stderr),
+            ):
+                shutil.rmtree(args.out)
+                raise DequantError("transformers cross-check mismatch")
         if args.compare_with is not None and not compare(
             args.out,
             args.compare_with,

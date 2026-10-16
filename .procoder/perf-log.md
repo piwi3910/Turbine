@@ -2283,3 +2283,30 @@ GSM8K c16 run are pending a free card — `lab-bench --model llama-mxfp4-a4 --go
 Per user decision "mxfp4_a4" (B) the row stays `experimental` until both pass.
 
 - P7 open: LlamaForCausalLM/mxfp4_a4/bf16/tp1 — fixture done (tolerance likely 1.13 / tail 4.01 / 11 prefixes); lab golden c1/c16 + GSM8K c16 blocked on both GPUs held by peer Jobs (branch `p7-t28`, 2026-10-17)
+### P7 gpt-oss gate — gpt-oss-20b (openai_mxfp4) tp1 (plan Task 27, branch `p7-t27-fixture`, 2026-10-16)
+
+- Golden (`tests/golden/gpt-oss-20b/`, tolerance from the dequantized-MXFP4 transformers self-spread; the fixture's `prompts.jsonl` is the shared set with `reasoning_effort: "low"` in every `chat_template_kwargs`, decision Harmony A):
+  `BENCH dd94f669 gpt-oss-20b commit=dd94f669 gpu=0 ... golden1=PASS golden16=PASS client=novanas` — c1 strict 16/16
+  (need 14; bounds 0.35 / 2.41, every prompt inside), c16 batched 16/16 (0.48 / 2.64).
+- GSM8K-200 c16 (`tests/eval/gsm8k-200.jsonl`, `reasoning_effort: "low"` on both engines, both written by `turbine-golden eval`): vLLM-ROCm
+  0.930 (`tests/eval/gpt-oss-20b/vllm.json`, 186/200) vs Turbine 0.925 (`turbine.json`, 185/200), drop 0.005 ≤ `gate.json`'s
+  `max_drop` 0.01 — `eval-compare` exit 0 PASS.
+- One logged run with `reasoning_effort: "high"` (not gated, decision reasoning A): Turbine 0.360 (72/200) at the GSM8K
+  `max_tokens` 512 — the model's high-effort reasoning does not reach the final channel within the budget, so the extracted
+  answers are mostly absent; a token-budget artifact, not a gate (`target/gpt-oss-gsm8k-reasoning-high.json`).
+- Throughput (3 runs each, c16, 512-word prompts, 256 tokens, `--ignore-eos`, `reasoning_effort: "low"`, client on novanas
+  against the same R9700; vLLM-ROCm `rocm/vllm` 0.23.1 serving the same checkpoint as `openai/gpt-oss-20b`): Turbine 277.2 tok/s
+  median (277.2 / 272.1 / 278.7, ITL p50 ~37.6 ms, TTFT p50 ~4.9 s) vs vLLM 133.6 median (over 37/200 successes), ratio 2.07 —
+  ≥ 0.75. Both engines carry the same workload caveat: the standard throughput workload forces fixed-length output on a
+  reasoning model, so ~5% of Turbine requests finish with no `content` (9 / 13 / 9 of 200 — they reason past 256 tokens and
+  never enter the final channel) and vLLM-ROCm returns HTTP 500 (`Unexpected token 200002 while expecting start token 200006`,
+  its Harmony parser, when `--ignore-eos` pushes past the final channel) on ~80% of requests, so its 133.6 tok/s is not a clean
+  baseline. `scripts/lab-perf.sh novanas gpt-oss-20b` cannot be used for this model as written: it builds its client with a
+  local `cargo build` (this work ran the same `turbine-bench` workload from an on-novanas release build instead), and its
+  `lab-perf:` PASS also requires zero failed Turbine requests, which the fixed-length reasoning workload cannot give. The
+  2.07x is an indicative direction (Turbine is not slower than vLLM), not a measured-equivalent ratio; both engine numbers need
+  a reasoning-aware workload (`reasoning_effort` pass-through was added to `turbine-bench` and `turbine-golden eval` in this
+  task to make the low-effort runs possible, see the handoff note) and a content-or-reasoning token rule before they are
+  comparable.
+
+- P7 closed: GptOssForCausalLM/mxfp4/bf16/tp1 golden c1/c16 dd94f669; GSM8K 0.925 vs vLLM 0.930 (drop 0.005); throughput 2.07x (with the fixed-length-workload caveat above)

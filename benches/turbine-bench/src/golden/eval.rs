@@ -161,6 +161,11 @@ pub struct EvalReport {
     /// `--fillers-settle` of this run. `eval-compare` refuses a pair that differs.
     #[serde(default)]
     pub fillers_settle: bool,
+    /// `--reasoning-effort` of this run (`low`/`medium`/`high`, absent when not sent). A
+    /// reasoning model must use the same value on both sides; `eval-compare` refuses a pair that
+    /// differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub results: Vec<TaskResult>,
 }
 
@@ -370,8 +375,14 @@ async fn served_model(client: &reqwest::Client, base: &str) -> Result<String, Ev
 
 /// Builds the request path and JSON body for a task: `/v1/completions` with `prompt` for a
 /// completion task, `/v1/chat/completions` with `messages` otherwise. `task.stop`, when set, is
-/// carried onto the request as `stop` in either case.
-fn request_body(model: &str, task: &EvalTask) -> (&'static str, serde_json::Value) {
+/// carried onto the request as `stop` in either case. `reasoning_effort` is sent as the Chat
+/// request's top-level field (a reasoning model such as gpt-oss reasons past `max_tokens` and
+/// writes nothing to `content` without it; `low` keeps it reaching the final channel).
+fn request_body(
+    model: &str,
+    task: &EvalTask,
+    reasoning_effort: Option<&str>,
+) -> (&'static str, serde_json::Value) {
     let (path, mut body) = match (&task.prompt, &task.messages) {
         (Some(prompt), _) => (
             "/v1/completions",
@@ -387,6 +398,11 @@ fn request_body(model: &str, task: &EvalTask) -> (&'static str, serde_json::Valu
     if let Some(stop) = &task.stop {
         body["stop"] = serde_json::json!(stop);
     }
+    if let Some(effort) = reasoning_effort
+        && path == "/v1/chat/completions"
+    {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
     (path, body)
 }
 
@@ -395,8 +411,9 @@ async fn complete(
     base: &str,
     model: &str,
     task: &EvalTask,
+    reasoning_effort: Option<&str>,
 ) -> Result<(String, Option<Usage>), EvalError> {
-    let (path, body) = request_body(model, task);
+    let (path, body) = request_body(model, task, reasoning_effort);
     post_completion(client, base, path, body, &task.id).await
 }
 
@@ -521,8 +538,9 @@ async fn run_task(
     base: &str,
     model: &str,
     task: &EvalTask,
+    reasoning_effort: Option<&str>,
 ) -> Result<TaskResult, EvalError> {
-    let (output, usage) = complete(client, base, model, task).await?;
+    let (output, usage) = complete(client, base, model, task, reasoning_effort).await?;
     Ok(TaskResult {
         id: task.id.clone(),
         correct: is_correct(task.match_kind, &task.answer, &output),
@@ -552,6 +570,7 @@ pub async fn run_eval(
     tasks: &[EvalTask],
     concurrency: u32,
     fillers: Fillers,
+    reasoning_effort: Option<&str>,
 ) -> Result<EvalReport, EvalError> {
     let base = base.trim_end_matches('/');
     let client = reqwest::Client::builder()
@@ -572,7 +591,7 @@ pub async fn run_eval(
     };
     let mut results: Vec<TaskResult> = Vec::with_capacity(tasks.len());
     for task in head {
-        results.push(run_task(client, base, model, task).await?);
+        results.push(run_task(client, base, model, task, reasoning_effort).await?);
     }
     let filler_concurrency = fillers.concurrency.max(1);
     let filler_retries = std::sync::atomic::AtomicU32::new(0);
@@ -592,14 +611,17 @@ pub async fn run_eval(
     // into L0, so the others plan a hit instead of each reserving a cold prompt at once.
     let rest = match rest.split_first() {
         Some((first, more)) if fillers.settle && !head.is_empty() => {
-            results.push(run_task(client, base, model, first).await?);
+            results.push(run_task(client, base, model, first, reasoning_effort).await?);
             more
         }
         _ => rest,
     };
     let mut replies = stream::iter(rest.iter().enumerate())
         .map(|(index, task)| async move {
-            Ok::<_, EvalError>((index, run_task(client, base, model, task).await?))
+            Ok::<_, EvalError>((
+                index,
+                run_task(client, base, model, task, reasoning_effort).await?,
+            ))
         })
         .buffer_unordered(concurrency);
     let mut tail = Vec::with_capacity(rest.len());
@@ -626,6 +648,7 @@ pub async fn run_eval(
         filler_concurrency,
         filler_retries: filler_retries.into_inner(),
         fillers_settle: fillers.settle && !head.is_empty(),
+        reasoning_effort: reasoning_effort.map(str::to_string),
         results,
     })
 }
@@ -717,7 +740,7 @@ mod tests {
 
     #[test]
     fn completion_task_posts_prompt_without_stop_by_default() {
-        let (path, body) = request_body("m", &task(Some("2+2="), None, None));
+        let (path, body) = request_body("m", &task(Some("2+2="), None, None), None);
         assert_eq!(path, "/v1/completions");
         assert_eq!(body["prompt"], "2+2=");
         assert!(body.get("stop").is_none());
@@ -729,6 +752,7 @@ mod tests {
         let (path, body) = request_body(
             "m",
             &task(Some("2+2="), None, Some(vec!["\n\nQ:", "Answer:"])),
+            None,
         );
         assert_eq!(path, "/v1/completions");
         assert_eq!(body["stop"], serde_json::json!(["\n\nQ:", "Answer:"]));
@@ -737,10 +761,21 @@ mod tests {
     #[test]
     fn chat_task_posts_messages_and_can_carry_stop() {
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        let (path, body) = request_body("m", &task(None, Some(messages), Some(vec!["\n"])));
+        let (path, body) = request_body("m", &task(None, Some(messages), Some(vec!["\n"])), None);
         assert_eq!(path, "/v1/chat/completions");
         assert!(body.get("prompt").is_none());
         assert_eq!(body["stop"], serde_json::json!(["\n"]));
+    }
+
+    #[test]
+    fn chat_task_carries_reasoning_effort_and_a_completion_task_does_not() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let (path, body) = request_body("m", &task(None, Some(messages), None), Some("low"));
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(body["reasoning_effort"], serde_json::json!("low"));
+        let (path, body) = request_body("m", &task(Some("2+2="), None, None), Some("low"));
+        assert_eq!(path, "/v1/completions");
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -774,6 +809,7 @@ mod tests {
             filler_concurrency: 1,
             filler_retries: 0,
             fillers_settle: false,
+            reasoning_effort: None,
             results,
         }
     }
