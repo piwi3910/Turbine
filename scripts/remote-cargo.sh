@@ -63,6 +63,14 @@ lab_url=""
 if [[ -n ${TURBINE_LAB_URL:-} ]]; then
 	lab_url="TURBINE_LAB_URL=$(printf '%q' "$TURBINE_LAB_URL")"
 fi
+# The MXFP4 p05 trace diagnostic (golden mxfp4_cpu_vs_transformers_p05) reads the MXFP4-A16 8B
+# checkpoint and the p05 trace from the caller: forwarded when set.
+mxfp4_env=""
+for var in TURBINE_TEST_MXFP4_MODEL_DIR TURBINE_P05_TRACE; do
+	if [[ -n ${!var:-} ]]; then
+		mxfp4_env+=" $var=$(printf '%q' "${!var}")"
+	fi
+done
 exec ssh -o BatchMode=yes "$host" \
 	"cd '$remote/src' && env CARGO_TARGET_DIR='$remote/target' CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=$jobs \
-   CARGO_TERM_COLOR=never $lab_url nice -n 19 taskset -c $cpus \$HOME/.cargo/bin/cargo +$toolchain$args"
+   CARGO_TERM_COLOR=never $lab_url$mxfp4_env nice -n 19 taskset -c $cpus \$HOME/.cargo/bin/cargo +$toolchain$args"

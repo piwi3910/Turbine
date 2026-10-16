@@ -193,7 +193,10 @@ llama-gptq-own) slug=llama-3.2-3b-instruct-gptq-own ;;
 llama-gptq-autoround) slug=llama-3.2-3b-instruct-autoround-gptq ;;
 llama8b-mxfp4) slug=llama-3.1-8b-instruct-mxfp4a16 ;;
 llama8b) slug=llama-3.1-8b-instruct ;;
-llama-mxfp4-a4) slug=llama-3.2-3b-mxfp4-a4 ;;
+llama-mxfp4-a4)
+	slug=llama-3.2-3b-mxfp4-a4
+	golden_slug=llama-3.2-3b-instruct-mxfp4-a4
+	;;
 llama8b-mxfp4-a4) slug=llama-3.1-8b-instruct-mxfp4-a4 ;;
 llama-yarn16)
 	slug=llama-3.2-3b-instruct

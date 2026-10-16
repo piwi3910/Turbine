@@ -212,6 +212,12 @@ spec:
             # (golden hip_trace_vs_cpu_qwen3moe, a two-GPU release-build test).
             - name: TURBINE_TEST_QWEN3MOE_MODEL_DIR
               value: /models/qwen3-30b-a3b-instruct-2507-fp8
+            # MXFP4-A16 8B weights and the committed p05 transformers trace for the Phase 7 Task 28
+            # diagnostic (golden mxfp4_cpu_vs_transformers_p05, a release-build test).
+            - name: TURBINE_TEST_MXFP4_MODEL_DIR
+              value: /models/llama-3.1-8b-instruct-mxfp4a16
+            - name: TURBINE_P05_TRACE
+              value: tests/golden/llama-3.1-8b-instruct-mxfp4a16/p05-trace.json
             - name: UV_VERSION
               value: 0.11.2
             - name: UV_INSTALL_DIR

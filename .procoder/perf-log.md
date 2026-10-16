@@ -2193,3 +2193,93 @@ gsm8k=PASS tok_s=181` — golden c1 and c16 under the multi-GPU bounds, GSM8K c1
 
 - P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/tp2 20261014T083123Z 1014103630-34ebd3fd
 - P7 closed: Qwen3MoeForCausalLM/fp8_block/bf16/ep2 20261014T091243Z 1014110554-08371519
+
+### P7 MXFP4 p05 trace — Turbine's CPU path vs transformers, the cause (plan Task 28, branch `p7-t28`, 2026-10-16)
+
+The MXFP4-A16 8B p05 golden miss (S-14, handoff `p6a-w4a4-numerics.md`): at the row predicting
+position 25 (the 21-token prompt plus the reference's first 5 greedy tokens) Turbine's HIP decode
+(`A`) and its scalar cpu-reference prefill (`C`) land in one "bad" state (top-5 `18476 −9.43`
+missing) while the HIP prefill (`B`) and every transformers variant land in the tuned one. The
+diagnostic runs Turbine's cpu-reference prefill of the same 26 tokens and compares it, op by op,
+with a transformers 4.57.1 per-op trace of the same checkpoint (`scripts/golden/tiny_trace.py
+--prompt-file --prompt-id p05 --context-tokens 5 --row last`, the checkpoint dequantized by
+`dequantize_checkpoint.py`, the committed fixture
+`tests/golden/llama-3.1-8b-instruct-mxfp4a16/p05-trace.json`):
+
+`TURBINE_TEST_MXFP4_MODEL_DIR=/home/piwi/turbine-models/llama-3.1-8b-instruct-mxfp4a16 \
+ TURBINE_P05_TRACE=tests/golden/llama-3.1-8b-instruct-mxfp4a16/p05-trace.json \
+ scripts/remote-cargo.sh test --release -p turbine-model --test golden -- --ignored --nocapture mxfp4_cpu_vs_transformers_p05`
+
+483 traced ops (embed, 15 per layer × 32, final_norm, logits); the table is `max|Δ|` of Turbine's
+last row against the reference's, per layer and op (a representative slice):
+
+```
+layer  op            max|Δ|        layer  op            max|Δ|        layer  op            max|Δ|
+    -  embed       0.0000e0           8  attn_norm   1.4648e-1           31  attn_norm   1.6016e0
+    0  attn_norm   0.0000e0           8  q           2.0312e-1           31  q           1.7539e0
+    0  q           0.0000e0           8  k           2.9688e-1           31  k           2.3684e0
+    0  k           0.0000e0           8  v           5.0781e-2           31  v           1.2754e0
+    0  v           0.0000e0           8  q_rope      2.0312e-1           31  q_rope     1.7539e0
+    0  q_rope      1.8750e-1           8  k_rope      2.9688e-1           31  attn        1.0586e0
+    0  k_rope      1.8750e-1           8  attn        7.7637e-2           31  o_proj      1.1562e0
+    0  attn        6.1035e-4           8  o_proj      8.3008e-3           31  gate        2.6562e0
+    0  o_proj      2.4414e-4           8  resid_attn  1.9531e-2           31  up          2.4648e0
+    0  resid_attn  2.4414e-4           8  mlp_norm    4.8828e-2           31  act         4.9922e0
+    0  mlp_norm    3.9062e-3           8  gate        1.4844e-1           31  down        6.0000e0
+    0  gate        1.2695e-2           8  up          9.9609e-2           31  resid_mlp   1.8789e0
+    0  up          3.9062e-3           8  act         9.3750e-2            -  final_norm  6.8828e0
+    0  act         1.4648e-3           8  down        1.2695e-2            -  logits      8.2951e0
+    0  down        4.8828e-4           8  resid_mlp   1.9043e-2                    (|ref| 2.07e1)
+    0  resid_mlp   7.3242e-4
+```
+
+`first op above 1e-2: layer 0 q_rope max|Δ| 1.8750e-1`.
+
+Cause: **the difference is the reference's own BF16 rounding, seeded at RoPE, not a kernel bug.**
+Layer 0's `embed`, `attn_norm`, `q`, `k` and `v` are **bit-exact** (`max|Δ| 0`, so the checkpoint
+dequant, the RMSNorm and Turbine's MXFP4 dequant-GEMM match transformers exactly); the first
+difference appears at `q_rope`/`k_rope` (0.1875, ≈ 5 BF16 ulps on |ref| 9.875 — Turbine's rotary
+rounds differently from transformers'), and from there the gap compounds layer by layer (layer 8
+≈ 0.15–0.30, layer 31 ≈ 1.8–6.0, logits 8.3 on 20.7). Every op stays at the BF16-rounding scale
+(~300–510 ulps, no discontinuity), which is what a rescue-the-tuned-token path would have to
+undo, and the reference's own BF16 variants already flip the same position on their own
+(handoff `p6a-w4a4-numerics.md`: no variant is tunable, the flip is not a two-source sum). No fix
+follows, so step 5 takes nothing: `LlamaForCausalLM/mxfp4/bf16/tp1` stays `experimental`.
+
+- P7 open: LlamaForCausalLM/mxfp4/bf16/tp1 — p05 knife edge is the reference's own BF16 rounding seeded at RoPE; no kernel fix (branch `p7-t28`, 2026-10-16)
+
+### P7 mxfp4_a4 gate — fixture landed, lab gate blocked (plan Task 28, branch `p7-t28`, 2026-10-17)
+
+The W4A4 3B checkpoint (`matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @
+`91925ffda6977d097354a99718a20e035f8af80a`) now has its golden fixture
+(`tests/golden/llama-3.2-3b-instruct-mxfp4-a4/{reference.jsonl,tolerance.json,README.md}`,
+`QUANT_SLUGS`), and the config its `lab-bench --model llama-mxfp4-a4` mapping needs
+(`scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml`). Reference: transformers 4.57.1, BF16
+dequant with the checkpoint's own mxfp4 activation fake-quant (196 hooks). The checkpoint's
+tokenizer ships no chat template, so the fixture copied the BF16 `llama-3.2-3b-instruct`
+`chat_template.jinja` in (recorded in the README).
+
+Self-spread (OLMoE method, the four full-sequence variants; `p7-t28/mxfp4a4_fixture.sh`,
+novanas CPU, 2026-10-17):
+
+| variant                  | prefix ok | max likely | max tail |
+| ------------------------ | --------- | ---------- | -------- |
+| bf16 sdpa full sequence  | 12/16     | 0.8533     | 2.5464   |
+| bf16 eager full sequence | 11/16     | 1.1251     | 3.8019   |
+| fp32 sdpa full sequence  | 12/16     | 0.9679     | 4.0080   |
+| fp32 eager full sequence | 11/16     | 0.9679     | 4.0080   |
+
+Tolerance (smallest two-decimal bound every variant meets, floored at the BF16 3B's 0.15/0.56):
+likely 1.13, tail 4.01, `min_prompts_passing` 11. The W4A4 activation fake-quant makes the
+reference's own top-5 this noisy, so the golden gate is loose by construction and the accuracy
+gate is the binding one.
+
+**Lab gate not run**: both R9700s were held and busy by other builders' Jobs when the fixture
+landed (`turbine-lab-serve-1016203828-1fad9cab` benchmarking on GPU 1 and port 18000,
+`turbine-lab-vllm-1016200935-2326d9cf` on GPU 0 and port 18100), so the golden c1/c16 and the
+GSM8K c16 run are pending a free card — `lab-bench --model llama-mxfp4-a4 --golden16` and
+`turbine-golden eval --tasks tests/eval/gsm8k-200.jsonl --concurrency 16`, then
+`eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16-c16.json --max-drop 0.04`.
+Per user decision "mxfp4_a4" (B) the row stays `experimental` until both pass.
+
+- P7 open: LlamaForCausalLM/mxfp4_a4/bf16/tp1 — fixture done (tolerance likely 1.13 / tail 4.01 / 11 prefixes); lab golden c1/c16 + GSM8K c16 blocked on both GPUs held by peer Jobs (branch `p7-t28`, 2026-10-17)
