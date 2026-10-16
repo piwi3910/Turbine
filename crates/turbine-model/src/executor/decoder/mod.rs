@@ -48,20 +48,21 @@
 //! instead ([`OpProfile`]): each op goes through [`LayerRun::op`] (or the skeleton's own
 //! wrapper), which synchronises the stream after it while profiling and costs one branch
 //! otherwise.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
+use turbine_core::types::{BlockId, DType, KvLayout, ModelShape, SeqId};
 use turbine_distributed::collective::{Collective, ReduceOp};
 use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
-    AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
-    ElementwiseContext, EmbeddingConfig, EmbeddingContext, FusedRope, GemmConfig, GemmContext,
-    GemmFused, GemmFusion, KernelError, KernelRegistry, NormConfig, NormContext, OpConfig,
-    OpRequirement, PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext,
-    RopeConfig, RopeContext, TqPaged,
+    ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
+    AttentionKind, Conv1dConfig, Conv1dContext, ElementwiseConfig, ElementwiseContext,
+    EmbeddingConfig, EmbeddingContext, FusedRope, GdnConfig, GdnContext, GdnMode, GemmConfig,
+    GemmContext, GemmFused, GemmFusion, KernelError, KernelRegistry, NormConfig, NormContext,
+    OpConfig, OpRequirement, PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext,
+    RopeConfig, RopeContext, SigmoidMulConfig, SigmoidMulContext, TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -74,10 +75,10 @@ use super::{
     Split, TokenFeed, feed_runs, rope,
 };
 use crate::ModelError;
-use crate::config::{ModelArchConfig, MoeConfig};
+use crate::config::{GdnDims, ModelArchConfig, MoeConfig};
 use crate::ep::{EpContext, EpDims};
 use crate::families::LayerKind;
-use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
+use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name_at};
 use crate::pp::PpContext;
 use crate::testing::trace::RoutingRow;
 use crate::tp::{TpContext, rank_config};
@@ -170,6 +171,9 @@ pub struct DecoderDims {
     /// [`LayerKind::SlidingWindow`] `{ window: w }`, which attends the last `w` positions
     /// (transformers' mask keeps `q − k < w`), `None` for full attention (P7 S-8).
     pub window_left: Vec<Option<u32>>,
+    /// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers (Qwen3.5,
+    /// P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<GdnDims>,
 }
 
 /// The `window_left` of a layer kind (`None`: every position `≤ p`).
@@ -223,6 +227,7 @@ impl DecoderDims {
             quant,
             bf16_linears,
             window_left: cfg.layer_kinds.iter().map(|k| window_left(*k)).collect(),
+            gdn: cfg.gdn,
         }
     }
 
@@ -312,6 +317,37 @@ impl DecoderDims {
             num_kv_heads: self.kv_heads as u32,
             head_dim: self.head_dim as u32,
             rotary_dim: self.rotary_dim as u32,
+            dtype: self.act,
+        }
+    }
+
+    /// The Gated DeltaNet config of a linear-attention layer in `mode` (P7 S-11); `None` when
+    /// the model has no linear layers.
+    pub fn gdn_config(&self, mode: GdnMode) -> Option<GdnConfig> {
+        self.gdn.map(|g| GdnConfig {
+            k_heads: g.k_heads,
+            v_heads: g.v_heads,
+            k_dim: g.k_dim,
+            v_dim: g.v_dim,
+            mode,
+            dtype: self.act,
+        })
+    }
+
+    /// The causal conv1d config of a linear-attention layer in `mode`; `None` without GDN.
+    pub fn conv1d_config(&self, mode: GdnMode) -> Option<Conv1dConfig> {
+        self.gdn.map(|g| Conv1dConfig {
+            channels: g.conv_dim() as u32,
+            kernel: g.conv_kernel,
+            mode,
+            dtype: self.act,
+        })
+    }
+
+    /// The sigmoid-multiply config of the gated attention output over `cols` columns.
+    pub fn sigmoid_mul(&self, cols: usize) -> SigmoidMulConfig {
+        SigmoidMulConfig {
+            cols: cols as u64,
             dtype: self.act,
         }
     }
@@ -879,15 +915,159 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
     }
 }
 
+/// The linear-attention layers of `cfg` (one GDN state and one conv state each).
+pub(crate) fn linear_layers(cfg: &ModelArchConfig) -> usize {
+    cfg.layer_kinds
+        .iter()
+        .filter(|k| **k == LayerKind::LinearAttention)
+        .count()
+}
+
+/// Device bytes of a hybrid family's Gated DeltaNet buffers (P7 S-11): the per-token
+/// projections, the conv output, the gate/decay inputs and their F32 host round trip, plus
+/// `linear_layers × max_seqs` recurrent (F32) and convolution states and the per-layer slot
+/// table (I32).
+fn gdn_workspace_bytes(cfg: &ModelArchConfig, d: &DecoderDims, limits: ExecutorLimits) -> u64 {
+    let Some(g) = d.gdn else {
+        return 0;
+    };
+    let es = d.act.size_bytes() as u64;
+    let f32 = DType::F32.size_bytes() as u64;
+    let t = u64::from(limits.max_batch_tokens);
+    let n = u64::from(limits.max_seqs);
+    let layers = linear_layers(cfg) as u64;
+    let per_token = es * (2 * g.conv_dim() + 2 * g.value_dim() + 2 * g.v_heads as usize) as u64
+        + f32 * 2 * u64::from(g.v_heads);
+    t * per_token + layers * n * (g.recurrent_bytes() + g.conv_bytes()) + 4 * layers * n
+}
+
+/// Whether a checkpoint weight is an RMSNorm weight (the `(1 + weight)` offset applies to it):
+/// its name's last-but-one dot-separated component is a norm.
+pub(crate) fn is_norm_weight(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').nth(1),
+        Some("input_layernorm" | "post_attention_layernorm" | "norm" | "q_norm" | "k_norm")
+    )
+}
+
+/// Adds 1 to every element of the `[n]` norm tensor `t` (transformers' `output · (1 + weight)`
+/// form, [`ModelArchConfig::unit_offset_norms`]) in place, in the activation dtype.
+fn unit_offset_norm(t: &Tensor) -> Result<(), ModelError> {
+    let bytes = t.storage.whole().read_bytes()?;
+    let out: Vec<u8> = bytes
+        .chunks_exact(2)
+        .flat_map(|b| {
+            half::bf16::from_f32(half::bf16::from_le_bytes([b[0], b[1]]).to_f32() + 1.0)
+                .to_le_bytes()
+        })
+        .collect();
+    t.storage.whole().write_bytes(&out)?;
+    Ok(())
+}
+
+/// Reads a `[n]` activation-dtype tensor to `Vec<f32>` (blocking).
+fn host_f32(t: &Tensor) -> Result<Vec<f32>, ModelError> {
+    let bytes = t.storage.whole().read_bytes()?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect())
+}
+
 /// The skeleton's parameters of one layer, and the hooks'.
 struct Layer {
     input_norm: Tensor,
-    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
-    w_qkv: Linear,
-    wo: Linear,
     post_norm: Tensor,
-    attention: HookWeights,
+    /// Full attention or a Gated DeltaNet linear attention.
+    mixer: Mixer,
     ffn: HookWeights,
+}
+
+/// The token mixer of a layer (P7 S-11): full attention, or a Gated DeltaNet linear attention.
+enum Mixer {
+    Attention {
+        /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V (a gated layer's stack is
+        /// `[q_all | gate_all | k | v]`, de-interleaved by the loader).
+        w_qkv: Linear,
+        wo: Linear,
+        attention: HookWeights,
+        /// `attn_output_gate`: the attention output is multiplied by `sigmoid(gate)` before the
+        /// O projection (kernel ABI v2.19 `TURBINE_OP_SIGMOID_MUL`).
+        gated: bool,
+    },
+    Gdn(Box<GdnLayer>),
+}
+
+/// A Gated DeltaNet layer's parameters (Qwen3.5).
+struct GdnLayer {
+    in_qkv: Linear,
+    in_z: Linear,
+    in_a: Linear,
+    in_b: Linear,
+    /// `[conv_dim, 1, kernel]` as stored; read as `[conv_dim, kernel]`.
+    conv_w: Tensor,
+    /// The gated RMSNorm weight over `v_dim`.
+    norm: Tensor,
+    out_proj: Linear,
+    /// F32 host copies of `A_log` and `dt_bias` (`[v_heads]`), the host `g`/`beta` producer.
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    /// The layer's base state slot: `linear_index · max_seqs`.
+    slot_base: usize,
+}
+
+/// Q/K/V in their buffer, with or without the per-head output gate.
+enum QkvSplit {
+    /// `[q | k | v]`.
+    Plain(Split<3>),
+    /// `[q | gate | k | v]` (the gated family's per-head attention gate).
+    Gated(Split<4>),
+}
+
+impl QkvSplit {
+    fn width(&self) -> usize {
+        match self {
+            QkvSplit::Plain(s) => s.width(),
+            QkvSplit::Gated(s) => s.width(),
+        }
+    }
+
+    fn fused(&self) -> bool {
+        match self {
+            QkvSplit::Plain(s) => s.fused,
+            QkvSplit::Gated(s) => s.fused,
+        }
+    }
+
+    fn whole<'a>(&self, buf: &'a Tensor, t: usize) -> TensorView<'a> {
+        match self {
+            QkvSplit::Plain(s) => s.whole(buf, t),
+            QkvSplit::Gated(s) => s.whole(buf, t),
+        }
+    }
+
+    fn part<'a>(&self, buf: &'a Tensor, i: usize, t: usize, inner: &[usize]) -> TensorView<'a> {
+        match self {
+            QkvSplit::Plain(s) => s.part(buf, i, t, inner),
+            QkvSplit::Gated(s) => s.part(buf, i, t, inner),
+        }
+    }
+}
+
+/// A Gated DeltaNet layer's activation buffers, allocated once for `max_batch_tokens` tokens.
+struct GdnBuffers {
+    /// `[t, conv_dim]`: `in_proj_qkv` output, then the conv output.
+    qkv: Tensor,
+    conv: Tensor,
+    /// `[t, value_dim]`: `in_proj_z`, then the recurrence output and its gated norm.
+    z: Tensor,
+    attn: Tensor,
+    /// `[t, v_heads]`: `in_proj_a` and `in_proj_b` outputs.
+    a: Tensor,
+    b: Tensor,
+    /// F32 `[t, v_heads]`: `beta = sigmoid(b)` and `g = −exp(A_log)·softplus(a + dt_bias)`.
+    g: Tensor,
+    beta: Tensor,
 }
 
 /// Activation buffers, allocated once: `[max_batch_tokens, cols]` per token row, `[max_seqs,
@@ -906,6 +1086,8 @@ struct Buffers {
     proj: Tensor,
     /// Final-norm output of each sequence's last row.
     last: Tensor,
+    /// A hybrid family's Gated DeltaNet buffers; `None` without linear layers.
+    gdn: Option<GdnBuffers>,
 }
 
 /// A tensor-parallel rank's extra buffers: the sharded norms' partial sums and the LM head's
@@ -944,8 +1126,9 @@ pub struct DecoderExecutor {
     mem: Arc<dyn DeviceMemory>,
     /// The op sequence ([`DecoderExecutor::requirements`] of these options).
     opts: ExecutorOptions,
-    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) in their buffer, fused or not.
-    qkv: Split<3>,
+    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`, or a gated layer's `[q, gate, k, v]`) in their
+    /// buffer, fused or not.
+    qkv: QkvSplit,
     /// Residual adds followed by a norm run as one `add_rmsnorm` (`fused_ops` and a provider
     /// selected for it).
     add_norm: bool,
@@ -986,6 +1169,26 @@ pub struct DecoderExecutor {
     /// The pool grows page classes (P6b S-5/S-7): every forward reads the batch's
     /// `block_formats` table, set by [`DecoderExecutor::set_mixed_blocks`].
     mixed_blocks: bool,
+    /// The Gated DeltaNet state of every linear layer and sequence: F32
+    /// `[linear_layers · max_seqs, v_heads, v_dim, k_dim]`; `None` without linear layers. A
+    /// private per-sequence slot map for now (Task 32 replaces it with
+    /// [`turbine_kv::state::StateSlotPool`]).
+    gdn_state: Option<Tensor>,
+    /// The Gated DeltaNet conv state: `[linear_layers · max_seqs, conv_dim, kernel − 1]` in the
+    /// activation dtype; `None` without linear layers.
+    gdn_conv_state: Option<Tensor>,
+    /// I32 `[linear_layers · max_seqs]`: sequence `s` of layer `l` uses slot `l · max_seqs + s`
+    /// (uploaded per forward).
+    gdn_slots: Option<Tensor>,
+    /// Host `SeqId → slot` map of the private state slots (CPU only for now).
+    state_slots: HashMap<SeqId, u32>,
+    /// Slot `i`'s owning sequence, `None` when free.
+    slot_owners: Vec<Option<SeqId>>,
+    /// Free slots (below `slot_owners.len()`), for reuse.
+    free_slots: Vec<u32>,
+    /// Host copy of the uploaded `gdn_slots` table, so an unchanged table is not re-uploaded
+    /// (which would synchronise the stream) every decode step.
+    gdn_slot_cache: Vec<i32>,
 }
 
 impl DecoderExecutor {
@@ -1034,13 +1237,23 @@ impl DecoderExecutor {
             OpConfig::Embedding(d.embedding()),
             OpConfig::Rmsnorm(d.norm(d.hidden)),
         ];
-        if opts.fused_projections && spec.attention.fuses_qkv() {
+        // A gated family's full-attention layers project a per-head output gate beside Q
+        // (`attn_output_gate`): the projection is twice as wide and never fused (the per-head
+        // Q/K norm reads dense parts).
+        let gated = cfg.attn_output_gate;
+        if !gated && opts.fused_projections && spec.attention.fuses_qkv() {
             specs.extend(d.linear_ops(d.q_dim + 2 * d.kv_dim, d.hidden));
         } else {
             specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            if gated {
+                specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            }
             specs.extend(d.linear_ops(d.kv_dim, d.hidden));
         }
         specs.extend(spec.attention.requirements(d));
+        if gated {
+            specs.push(OpConfig::SigmoidMul(d.sigmoid_mul(d.q_dim)));
+        }
         specs.extend([OpConfig::Rope(d.rope())]);
         let sinks = spec.attention.has_sinks();
         for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
@@ -1051,6 +1264,27 @@ impl DecoderExecutor {
             );
         }
         specs.extend(d.linear_ops(d.hidden, d.q_dim));
+        // A hybrid family's Gated DeltaNet layers (P7 S-11): the projections, the causal conv1d,
+        // the recurrence and its gated RMSNorm.
+        if let Some(g) = d.gdn {
+            specs.extend(d.linear_ops(g.conv_dim(), d.hidden));
+            specs.extend(d.linear_ops(g.value_dim(), d.hidden));
+            specs.extend(d.linear_ops(g.v_heads as usize, d.hidden));
+            specs.extend(d.linear_ops(d.hidden, g.value_dim()));
+            specs.push(OpConfig::Rmsnorm(d.norm(g.v_dim as usize)));
+            specs.push(OpConfig::SiluMul(ActivationConfig {
+                cols: g.v_dim as u64,
+                dtype: d.act,
+            }));
+            for mode in [GdnMode::Prefill, GdnMode::Decode] {
+                if let Some(c) = d.gdn_config(mode) {
+                    specs.push(OpConfig::Gdn(c));
+                }
+                if let Some(c) = d.conv1d_config(mode) {
+                    specs.push(OpConfig::Conv1d(c));
+                }
+            }
+        }
         specs.push(OpConfig::Add(d.add()));
         if opts.fused_ops {
             specs.push(OpConfig::AddRmsnorm(d.add_norm()));
@@ -1137,7 +1371,12 @@ impl DecoderExecutor {
     ) -> u64 {
         let es = d.act.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
-        let per_token = es * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64;
+        let qkv_cols = if cfg.attn_output_gate {
+            2 * d.q_dim + 2 * d.kv_dim
+        } else {
+            d.q_dim + 2 * d.kv_dim
+        };
+        let per_token = es * (3 * d.hidden + qkv_cols + d.q_dim) as u64;
         let per_seq = es * d.hidden as u64;
         let t = limits.max_batch_tokens;
         u64::from(t) * per_token
@@ -1147,6 +1386,7 @@ impl DecoderExecutor {
             + LogitsHead::bytes(d.vocab, head_rows)
             + f32 * (d.rotary_dim / 2) as u64
             + DeviceBatch::bytes(&batch_limits(cfg, limits))
+            + gdn_workspace_bytes(cfg, d, limits)
     }
 
     /// Takes the parameters out of `weights` (Q/K/V fused by the loader; the hooks take
@@ -1340,33 +1580,117 @@ impl DecoderExecutor {
             None => DecoderDims::for_shard(cfg, shard)?,
         };
         spec.ffn.check(&d)?;
-        let qkv = Split {
-            cols: [d.q_dim, d.kv_dim, d.kv_dim],
-            fused: opts.fused_projections && spec.attention.fuses_qkv(),
+        // A gated family's full-attention layers carry a per-head output gate: the Q/K/V
+        // projection is `[q_all | gate_all | k | v]` and never fused (the per-head Q/K norm
+        // reads dense parts). Every other family keeps the plain `[q | k | v]` layout.
+        let qkv = if cfg.attn_output_gate {
+            QkvSplit::Gated(Split {
+                cols: [d.q_dim, d.q_dim, d.kv_dim, d.kv_dim],
+                fused: false,
+            })
+        } else {
+            QkvSplit::Plain(Split {
+                cols: [d.q_dim, d.kv_dim, d.kv_dim],
+                fused: opts.fused_projections && spec.attention.fuses_qkv(),
+            })
         };
+        // transformers' `output · (1 + weight)` RMSNorm form: fold the offset into every norm
+        // weight before the layers read them.
+        if cfg.unit_offset_norms {
+            for (name, t) in weights.tensors.iter() {
+                if name.ends_with(".weight") && is_norm_weight(name) {
+                    unit_offset_norm(t)?;
+                }
+            }
+        }
+        let text_prefix = cfg.family.0.text_prefix();
         let mut layers = Vec::with_capacity(d.layers);
         // A pipeline stage's layer `local` is the model's layer `first + local`.
         let first = pp.as_ref().map_or(0, |s| s.layers.start);
+        let mut gdn_index = 0usize;
         for local in 0..cfg.num_layers {
             let i = first + local;
-            let p = format!("model.layers.{i}");
-            let w_qkv = d.take_linear(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
-            let wo = d.take_linear(
-                &mut weights,
-                &format!("{p}.self_attn.o_proj.weight"),
-                &[d.hidden, d.q_dim],
-            )?;
+            let p = format!("{text_prefix}.layers.{i}");
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
             let (input_norm, post_norm) =
                 (take("input_layernorm")?, take("post_attention_layernorm")?);
-            let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
+            let mixer = match cfg.layer_kinds[i as usize] {
+                LayerKind::LinearAttention => {
+                    let g = d.gdn.ok_or_else(|| {
+                        invalid(format!(
+                            "linear-attention layer {i} without Gated DeltaNet dims"
+                        ))
+                    })?;
+                    let slot_base = gdn_index * max_seqs as usize;
+                    gdn_index += 1;
+                    let a = format!("{p}.linear_attn");
+                    let in_qkv = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_qkv.weight"),
+                        &[g.conv_dim(), d.hidden],
+                    )?;
+                    let in_z = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_z.weight"),
+                        &[g.value_dim(), d.hidden],
+                    )?;
+                    let in_a = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_a.weight"),
+                        &[g.v_heads as usize, d.hidden],
+                    )?;
+                    let in_b = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_b.weight"),
+                        &[g.v_heads as usize, d.hidden],
+                    )?;
+                    let conv_w = weights.take(&format!("{a}.conv1d.weight"))?;
+                    let norm = weights.take(&format!("{a}.norm.weight"))?;
+                    let out_proj = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.out_proj.weight"),
+                        &[d.hidden, g.value_dim()],
+                    )?;
+                    let a_log = host_f32(&weights.take(&format!("{a}.A_log"))?)?;
+                    let dt_bias = host_f32(&weights.take(&format!("{a}.dt_bias"))?)?;
+                    Mixer::Gdn(Box::new(GdnLayer {
+                        in_qkv,
+                        in_z,
+                        in_a,
+                        in_b,
+                        conv_w,
+                        norm,
+                        out_proj,
+                        a_log,
+                        dt_bias,
+                        slot_base,
+                    }))
+                }
+                _ => {
+                    let w_qkv = d.take_linear(
+                        &mut weights,
+                        &qkv_proj_name_at(&p, cfg.attn_output_gate),
+                        &[qkv.width(), d.hidden],
+                    )?;
+                    let wo = d.take_linear(
+                        &mut weights,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        &[d.hidden, d.q_dim],
+                    )?;
+                    let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
+                    Mixer::Attention {
+                        w_qkv,
+                        wo,
+                        attention,
+                        gated: cfg.attn_output_gate,
+                    }
+                }
+            };
             let ffn = spec.ffn.load_layer(&d, i, &p, &mut weights, opts)?;
             layers.push(Layer {
                 input_norm,
-                w_qkv,
-                wo,
                 post_norm,
-                attention,
+                mixer,
                 ffn,
             });
         }
@@ -1374,12 +1698,12 @@ impl DecoderExecutor {
             .as_ref()
             .map_or((true, true), |s| (s.is_first(), s.is_last()));
         let embed = if embeds || (heads && d.tied_lm_head) {
-            Some(weights.take("model.embed_tokens.weight")?)
+            Some(weights.take(&format!("{text_prefix}.embed_tokens.weight"))?)
         } else {
             None
         };
         let final_norm = if heads {
-            Some(weights.take("model.norm.weight")?)
+            Some(weights.take(&format!("{text_prefix}.norm.weight"))?)
         } else {
             None
         };
@@ -1405,6 +1729,19 @@ impl DecoderExecutor {
         let ffn_buffers = spec.ffn.alloc(&d, t, &mem)?;
         let act_quant = d.alloc_act_quant(t, &mem)?;
         mem.synchronize()?;
+        let gdn_buffers = match d.gdn {
+            None => None,
+            Some(g) => Some(GdnBuffers {
+                qkv: act(g.conv_dim())?,
+                conv: act(g.conv_dim())?,
+                z: act(g.value_dim())?,
+                attn: act(g.value_dim())?,
+                a: act(g.v_heads as usize)?,
+                b: act(g.v_heads as usize)?,
+                g: Tensor::empty(&mem, &[t, g.v_heads as usize], DType::F32)?,
+                beta: Tensor::empty(&mem, &[t, g.v_heads as usize], DType::F32)?,
+            }),
+        };
         let bufs = Buffers {
             inv_freq,
             x: act(d.hidden)?,
@@ -1413,6 +1750,43 @@ impl DecoderExecutor {
             attn: act(d.q_dim)?,
             proj: act(d.hidden)?,
             last: Tensor::empty(&mem, &[n, d.hidden], d.act)?,
+            gdn: gdn_buffers,
+        };
+        // A hybrid family's per-layer Gated DeltaNet state over `linear_layers × max_seqs`
+        // slots (layer `l`, sequence slot `s` → `l · max_seqs + s`).
+        let gdn_slot_count = linear_layers(cfg) * n;
+        let (gdn_state, gdn_conv_state, gdn_slots) = match d.gdn {
+            None => (None, None, None),
+            Some(g) => {
+                let state = Tensor::empty(
+                    &mem,
+                    &[
+                        gdn_slot_count,
+                        g.v_heads as usize,
+                        g.v_dim as usize,
+                        g.k_dim as usize,
+                    ],
+                    DType::F32,
+                )?;
+                let conv = Tensor::empty(
+                    &mem,
+                    &[gdn_slot_count, g.conv_dim(), (g.conv_kernel - 1) as usize],
+                    d.act,
+                )?;
+                // Start every slot at zero (a fresh sequence reads it before any carry).
+                state
+                    .storage
+                    .whole()
+                    .write_bytes(&vec![0u8; state.storage.whole().len()])?;
+                conv.storage
+                    .whole()
+                    .write_bytes(&vec![0u8; conv.storage.whole().len()])?;
+                (
+                    Some(state),
+                    Some(conv),
+                    Some(Tensor::empty(&mem, &[gdn_slot_count], DType::I32)?),
+                )
+            }
         };
         // A stage before the last never computes logits: one row keeps the head valid.
         let head = LogitsHead::new(cfg, &registry, &mem, if heads { n } else { 1 })?;
@@ -1461,6 +1835,13 @@ impl DecoderExecutor {
             overlap: None,
             tq_device: None,
             mixed_blocks: false,
+            gdn_state,
+            gdn_conv_state,
+            gdn_slots,
+            state_slots: HashMap::new(),
+            slot_owners: Vec::new(),
+            free_slots: Vec::new(),
+            gdn_slot_cache: Vec::new(),
         })
     }
 
@@ -1892,7 +2273,8 @@ impl DecoderExecutor {
             || self.tp.is_some()
             || self.pp.is_some()
             || !self.add_norm
-            || !self.qkv.fused
+            || !self.qkv.fused()
+            || self.dims.gdn.is_some()
             || !self.spec.attention.allows_fused_decode()
         {
             return false;
@@ -1900,8 +2282,17 @@ impl DecoderExecutor {
         let Some(l) = self.layers.first() else {
             return false;
         };
-        if l.w_qkv.view().q.is_some()
-            || l.wo.view().q.is_some()
+        let Mixer::Attention {
+            w_qkv,
+            wo,
+            attention,
+            ..
+        } = &l.mixer
+        else {
+            return false;
+        };
+        if w_qkv.view().q.is_some()
+            || wo.view().q.is_some()
             || !self
                 .spec
                 .ffn
@@ -1909,6 +2300,7 @@ impl DecoderExecutor {
         {
             return false;
         }
+        let _ = attention;
         let d = &self.dims;
         let fuses = |w: &Linear, fusion: GemmFusion| {
             let w = w.view();
@@ -1923,7 +2315,7 @@ impl DecoderExecutor {
             residual: true,
             ..GemmFusion::default()
         };
-        fuses(&l.w_qkv, norm) && fuses(&l.wo, residual)
+        fuses(w_qkv, norm) && fuses(wo, residual)
     }
 
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
@@ -2171,7 +2563,10 @@ impl DecoderExecutor {
             self.ffn_part(i, &w, Some(&self.layers[i].post_norm))?;
             return Ok(());
         }
-        self.attention_part(i, &w, kv, false)?;
+        match &self.layers[i].mixer {
+            Mixer::Gdn(_) => self.gdn_part(i, &w)?,
+            Mixer::Attention { .. } => self.attention_part(i, &w, kv, false)?,
+        }
         self.all_reduce(&rows(&b.proj, t))?;
         self.record(li, "o_proj", rows(&b.proj, t))?;
         self.residual_add_norm_at(&w, Some(&self.layers[i].post_norm))?;
@@ -2196,6 +2591,16 @@ impl DecoderExecutor {
         fused: bool,
     ) -> Result<(), ModelError> {
         let l = &self.layers[i];
+        let Mixer::Attention {
+            w_qkv,
+            wo,
+            attention,
+            gated,
+        } = &l.mixer
+        else {
+            return Err(invalid(format!("layer {i} is not a full-attention layer")));
+        };
+        let (gated, attention) = (*gated, attention);
         let b = &self.bufs;
         let d = &self.dims;
         let (p, t) = (w.p, w.p.total_q);
@@ -2203,12 +2608,13 @@ impl DecoderExecutor {
         let run = self.layer_run(i, w);
         let at = |buf: &'s Tensor| -> TensorView<'s> { buf.view().rows(w.r0, t) };
         let end = w.r0 + t;
+        // The gated stack is `[q | gate | k | v]`; the plain one `[q | k | v]`.
+        let (qi, ki, vi) = if gated { (0, 2, 3) } else { (0, 1, 2) };
         let part = |i: usize, inner: &[usize]| self.qkv.part(&b.qkv, i, end, inner).rows(w.r0, t);
-        let (q, k, v) = (
-            || part(0, &[d.q_dim]),
-            || part(1, &[d.kv_dim]),
-            || part(2, &[d.kv_dim]),
-        );
+        let q = || part(qi, &[d.q_dim]);
+        let k = || part(ki, &[d.kv_dim]);
+        let v = || part(vi, &[d.kv_dim]);
+        let gate = || part(1, &[d.q_dim]);
 
         self.record(li, "attn_norm", at(&b.h))?;
         if fused {
@@ -2216,34 +2622,38 @@ impl DecoderExecutor {
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.gemm_fused(
                 at(&b.x),
-                l.w_qkv.view(),
+                w_qkv.view(),
                 whole,
                 None,
                 Some(&l.input_norm),
                 None,
             )?;
-        } else if self.qkv.fused {
-            let wq = l.w_qkv.view();
+        } else if self.qkv.fused() {
+            let wq = w_qkv.view();
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.linear(at(&b.h), wq, whole)?;
         } else {
-            let wq = |r, n| l.w_qkv.view().rows(r, n);
+            let wq = |r, n| w_qkv.view().rows(r, n);
             self.linear(at(&b.h), wq(0, d.q_dim), q())?;
-            self.linear(at(&b.h), wq(d.q_dim, d.kv_dim), k())?;
-            self.linear(at(&b.h), wq(d.q_dim + d.kv_dim, d.kv_dim), v())?;
+            if gated {
+                self.linear(at(&b.h), wq(d.q_dim, d.q_dim), gate())?;
+            }
+            let koff = if gated { 2 * d.q_dim } else { d.q_dim };
+            self.linear(at(&b.h), wq(koff, d.kv_dim), k())?;
+            self.linear(at(&b.h), wq(koff + d.kv_dim, d.kv_dim), v())?;
         }
         self.spec
             .attention
-            .after_linear(&run, &l.attention, &q(), &k(), &v())?;
+            .after_linear(&run, attention, &q(), &k(), &v())?;
         self.record(li, "q", q())?;
         self.record(li, "k", k())?;
         self.record(li, "v", v())?;
         self.spec
             .attention
-            .after_projections(&run, &l.attention, &q(), &k())?;
-        let q_heads = || part(0, &[d.heads, d.head_dim]);
-        let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
-        let v_heads = || part(2, &[d.kv_heads, d.head_dim]);
+            .after_projections(&run, attention, &q(), &k())?;
+        let q_heads = || part(qi, &[d.heads, d.head_dim]);
+        let k_heads = || part(ki, &[d.kv_heads, d.head_dim]);
+        let v_heads = || part(vi, &[d.kv_heads, d.head_dim]);
         let rope = d.rope();
         let kind = if p.is_decode() {
             AttentionKind::DecodePaged
@@ -2297,7 +2707,13 @@ impl DecoderExecutor {
                     k_new: k_heads(),
                     v_new: v_heads(),
                     out: out.clone(),
-                    kv_layer: batch::kv_layer(kv, i),
+                    kv_layer: batch::kv_layer(
+                        kv,
+                        self.cfg
+                            .kv_layer_index(i as u32)
+                            .expect("a full-attention layer has a KV slot")
+                            as usize,
+                    ),
                     block_table: w.meta.block_table_view(p),
                     q_indptr: w.meta.q_indptr_view(p),
                     kv_lens: w.meta.kv_lens_view(p),
@@ -2329,25 +2745,303 @@ impl DecoderExecutor {
                         attn_factor: d.rope_attn_factor,
                     }),
                     // Phase 7 S-8: the families with sinks (gpt-oss) pass them here.
-                    sinks: self.spec.attention.sinks(&l.attention),
+                    sinks: self.spec.attention.sinks(attention),
                 })
         })?;
+        // `attn_output_gate` (P7 S-11): `out = attn · sigmoid(gate)` before the O projection.
+        if gated {
+            let cfg = d.sigmoid_mul(d.q_dim);
+            self.op(OpConfig::SigmoidMul(cfg), || {
+                self.registry
+                    .sigmoid_mul(&cfg)
+                    .execute(&mut SigmoidMulContext {
+                        a: at(&b.attn),
+                        gate: gate(),
+                        out: at(&b.attn),
+                    })
+            })?;
+        }
         self.record(li, "attn", at(&b.attn))?;
         if fused {
             // The fused decode form: the residual add runs in the o_proj GEMV's epilogue.
-            return self.gemm_fused(
-                at(&b.attn),
-                l.wo.view(),
-                at(&b.x),
-                None,
-                None,
-                Some(at(&b.x)),
-            );
+            return self.gemm_fused(at(&b.attn), wo.view(), at(&b.x), None, None, Some(at(&b.x)));
         }
-        self.linear(at(&b.attn), l.wo.view(), at(&b.proj))?;
+        self.linear(at(&b.attn), wo.view(), at(&b.proj))?;
         self.spec
             .attention
-            .after_o_proj(&run, &l.attention, &at(&b.proj))
+            .after_o_proj(&run, attention, &at(&b.proj))
+    }
+
+    /// The Gated DeltaNet block of layer `i` on the rows of `w`, from their normalised input in
+    /// `h` to the O projection's (not yet all-reduced) output in `proj` (P7 S-11): `in_proj_qkv`
+    /// → causal depthwise conv1d (silu) → `q | k | v`, `in_proj_z` / `in_proj_a` / `in_proj_b`,
+    /// the delta-rule recurrence with the host-computed `g`/`beta`, the gated RMSNorm and
+    /// `out_proj`.
+    fn gdn_part<'s>(&'s self, i: usize, w: &Part<'_>) -> Result<(), ModelError> {
+        let l = &self.layers[i];
+        let Mixer::Gdn(l) = &l.mixer else {
+            return Err(invalid(format!("layer {i} is not a Gated DeltaNet layer")));
+        };
+        let d = &self.dims;
+        let g = d
+            .gdn
+            .ok_or_else(|| invalid("Gated DeltaNet layer without dims".into()))?;
+        let gb = self
+            .bufs
+            .gdn
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet buffers".into()))?;
+        let state = self
+            .gdn_state
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet state".into()))?;
+        let conv_state = self
+            .gdn_conv_state
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet conv state".into()))?;
+        let slots = self
+            .gdn_slots
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet slots".into()))?;
+        let (p, t) = (w.p, w.p.total_q);
+        let li = Some(i);
+        let run = self.layer_run(i, w);
+        let at = |buf: &'s Tensor| -> TensorView<'s> { buf.view().rows(w.r0, t) };
+        let mode = if p.is_decode() {
+            GdnMode::Decode
+        } else {
+            GdnMode::Prefill
+        };
+        let cu = (!p.is_decode()).then(|| w.meta.q_indptr_view(p));
+        // The layer's own slot block, `[seqs]` values `slot_base + sequence slot`.
+        let state_slots = TensorView::contiguous(
+            slots.storage.whole(),
+            l.slot_base,
+            &[p.num_seqs],
+            DType::I32,
+        );
+
+        // in_proj_qkv → causal conv1d (silu) → q | k | v.
+        let conv_in = at(&gb.qkv);
+        run.linear(at(&self.bufs.h), l.in_qkv.view(), conv_in.clone())?;
+        self.record(li, "gdn_qkv", conv_in.clone())?;
+        let conv_out = at(&gb.conv);
+        let cw = TensorView::contiguous(
+            l.conv_w.storage.whole(),
+            0,
+            &[g.conv_dim(), g.conv_kernel as usize],
+            d.act,
+        );
+        let ccfg = d.conv1d_config(mode).expect("gdn dims");
+        self.op(OpConfig::Conv1d(ccfg), || {
+            self.registry.conv1d(&ccfg).execute(&mut Conv1dContext {
+                cfg: ccfg,
+                x: conv_in,
+                weight: cw,
+                bias: None,
+                conv_state: conv_state.view(),
+                state_slots: state_slots.clone(),
+                cu_seqlens: cu.clone(),
+                out: conv_out.clone(),
+                boundary_conv_states: None,
+                boundary_tokens: 0,
+                activation: 1,
+            })
+        })?;
+        // q | k | v are the conv output's column blocks (row stride conv_dim).
+        let split = Split {
+            cols: [g.key_dim(), g.key_dim(), g.value_dim()],
+            fused: true,
+        };
+        let q = split.part(&gb.conv, 0, t, &[g.k_heads as usize, g.k_dim as usize]);
+        let k = split.part(&gb.conv, 1, t, &[g.k_heads as usize, g.k_dim as usize]);
+        let v = split.part(&gb.conv, 2, t, &[g.v_heads as usize, g.v_dim as usize]);
+        self.record(li, "gdn_q", q.clone())?;
+        self.record(li, "gdn_k", k.clone())?;
+        self.record(li, "gdn_v", v.clone())?;
+        // in_proj_z / in_proj_a / in_proj_b.
+        let z = at(&gb.z);
+        run.linear(at(&self.bufs.h), l.in_z.view(), z.clone())?;
+        let a = at(&gb.a);
+        let bb = at(&gb.b);
+        run.linear(at(&self.bufs.h), l.in_a.view(), a.clone())?;
+        run.linear(at(&self.bufs.h), l.in_b.view(), bb.clone())?;
+        // beta = sigmoid(b); g = −exp(A_log)·softplus(a + dt_bias), on the host.
+        self.gdn_g_beta(&run, l, t)?;
+        let gcfg = d.gdn_config(mode).expect("gdn dims");
+        // The kernel takes the recurrence output as `[tokens, v_heads, v_dim]` (the buffer is
+        // `[t, value_dim]`, the same memory).
+        let out = TensorView::contiguous(
+            gb.attn.storage.whole(),
+            0,
+            &[t, g.v_heads as usize, g.v_dim as usize],
+            d.act,
+        );
+        self.op(OpConfig::Gdn(gcfg), || {
+            self.registry.gdn(&gcfg).execute(&mut GdnContext {
+                cfg: gcfg,
+                q,
+                k,
+                v,
+                g: at(&gb.g),
+                beta: at(&gb.beta),
+                state: state.view(),
+                state_slots: state_slots.clone(),
+                cu_seqlens: cu.clone(),
+                out: out.clone(),
+                boundary_states: None,
+                boundary_tokens: 0,
+            })
+        })?;
+        self.record(li, "gdn_out", out.clone())?;
+        // Gated RMSNorm over v_dim per value head: weight · rms(x) · silu(z).
+        let vrows = t * g.v_heads as usize;
+        let normed = TensorView::contiguous(
+            gb.attn.storage.whole(),
+            0,
+            &[vrows, g.v_dim as usize],
+            d.act,
+        );
+        let zflat =
+            TensorView::contiguous(gb.z.storage.whole(), 0, &[vrows, g.v_dim as usize], d.act);
+        let nv = d.norm(g.v_dim as usize);
+        self.op(OpConfig::Rmsnorm(nv), || {
+            self.registry.norm(&nv).execute(&mut NormContext {
+                x: normed.clone(),
+                weight: l.norm.view(),
+                out: normed.clone(),
+                eps: d.eps,
+            })
+        })?;
+        let sm = ActivationConfig {
+            cols: g.v_dim as u64,
+            dtype: d.act,
+        };
+        self.op(OpConfig::SiluMul(sm), || {
+            self.registry
+                .activation(&sm)
+                .execute(&mut ActivationContext {
+                    gate: zflat,
+                    up: normed.clone(),
+                    out: normed.clone(),
+                })
+        })?;
+        self.record(li, "gdn_normed", normed.clone())?;
+        run.linear(at(&gb.attn), l.out_proj.view(), at(&self.bufs.proj))
+    }
+
+    /// Computes `beta = sigmoid(b)` and `g = −exp(A_log)·softplus(a + dt_bias)` on the host from
+    /// layer `l`'s `in_proj_a` / `in_proj_b` outputs (P7 S-11, decision "P7 GDN `g`/`beta`
+    /// production" A): a device→host→device round trip, acceptable until the ABI computes them
+    /// on device.
+    fn gdn_g_beta(&self, run: &LayerRun<'_>, l: &GdnLayer, t: usize) -> Result<(), ModelError> {
+        let gb = self.bufs.gdn.as_ref().expect("gdn buffers");
+        let vh = self.dims.gdn.expect("gdn dims").v_heads as usize;
+        let a = TensorView::contiguous(gb.a.storage.whole(), 0, &[t, vh], self.dims.act);
+        let b = TensorView::contiguous(gb.b.storage.whole(), 0, &[t, vh], self.dims.act);
+        run.step("gdn_g_beta", "host", || {
+            let read = |v: &TensorView<'_>| -> Result<Vec<f32>, ModelError> {
+                let bytes = v.slice.read_bytes()?;
+                Ok(bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect())
+            };
+            let av = read(&a)?;
+            let bv = read(&b)?;
+            let mut g = Vec::with_capacity(t * vh);
+            let mut beta = Vec::with_capacity(t * vh);
+            for tok in 0..t {
+                for h in 0..vh {
+                    let x = av[tok * vh + h] + l.dt_bias[h];
+                    let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+                    g.push(-l.a_log[h].exp() * sp);
+                    beta.push(1.0 / (1.0 + (-bv[tok * vh + h]).exp()));
+                }
+            }
+            let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            gb.g.storage.whole().write_bytes(&bytes(&g))?;
+            gb.beta.storage.whole().write_bytes(&bytes(&beta))?;
+            Ok(())
+        })
+    }
+
+    /// Allocates the private per-sequence Gated DeltaNet state slots of `batch` (P7 S-11) before
+    /// it is packed: a sequence that starts fresh (no cached prefix, `kv_len == q_len`) has its
+    /// recurrent and conv state zeroed. A private slot map until Task 32 replaces it with
+    /// [`turbine_kv::state::StatePool`]; the upload is skipped when the table is unchanged.
+    fn resolve_gdn_slots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
+        if self.gdn_state.is_none() {
+            return Ok(());
+        }
+        let n = self.limits.max_seqs as usize;
+        let layers = self.gdn_state.as_ref().map_or(0, |s| s.shape[0]) / n;
+        let g = self.dims.gdn.expect("gdn dims");
+        let mut host = vec![0i32; layers * n];
+        let mut fresh: Vec<u32> = Vec::new();
+        for (s, seq) in batch.seqs.iter().enumerate() {
+            let slot = match self.state_slots.get(&seq.seq) {
+                Some(slot) => *slot,
+                None => {
+                    let slot = match self.free_slots.pop() {
+                        Some(slot) => slot,
+                        None => {
+                            let slot = self.slot_owners.len() as u32;
+                            if slot as usize >= n {
+                                return Err(invalid(format!(
+                                    "Gated DeltaNet state slots exhausted: {n} sequences"
+                                )));
+                            }
+                            self.slot_owners.push(None);
+                            slot
+                        }
+                    };
+                    self.slot_owners[slot as usize] = Some(seq.seq);
+                    self.state_slots.insert(seq.seq, slot);
+                    slot
+                }
+            };
+            for l in 0..layers {
+                host[l * n + s] = (l * n + slot as usize) as i32;
+            }
+            if seq.kv_len == seq.q_len {
+                fresh.push(slot);
+            }
+        }
+        if !fresh.is_empty() {
+            let rec = (g.v_heads * g.v_dim * g.k_dim) as usize * 4;
+            let conv = g.conv_dim() * (g.conv_kernel as usize - 1) * self.dims.act.size_bytes();
+            let zeros_rec = vec![0u8; rec];
+            let zeros_conv = vec![0u8; conv];
+            let state = self.gdn_state.as_ref().expect("state");
+            let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+            for slot in &fresh {
+                for l in 0..layers {
+                    let idx = l * n + *slot as usize;
+                    state
+                        .storage
+                        .whole()
+                        .sub(idx * rec, rec)
+                        .write_bytes(&zeros_rec)?;
+                    conv_state
+                        .storage
+                        .whole()
+                        .sub(idx * conv, conv)
+                        .write_bytes(&zeros_conv)?;
+                }
+            }
+        }
+        if host != self.gdn_slot_cache {
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.gdn_slots
+                .as_ref()
+                .expect("slots")
+                .storage
+                .whole()
+                .write_bytes(&bytes)?;
+            self.gdn_slot_cache = host;
+        }
+        Ok(())
     }
 
     /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the
@@ -2618,9 +3312,14 @@ impl ModelExecutor for DecoderExecutor {
         self.collect()
     }
 
-    /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch.
+    /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch. Never
+    /// for a hybrid family: the Gated DeltaNet `g`/`beta` host round trip is not safe with two
+    /// launches in flight.
     fn overlaps(&self) -> bool {
-        self.group().is_none() && self.head.overlaps() && self.meta.is_async()
+        self.group().is_none()
+            && self.head.overlaps()
+            && self.meta.is_async()
+            && self.dims.gdn.is_none()
     }
 
     fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
@@ -2638,6 +3337,8 @@ impl ModelExecutor for DecoderExecutor {
         // Feeds read the previous launch's choices: resolve them before this launch replans.
         let runs = feed_runs(feeds, batch.tokens.len(), |slot| self.head.feed_word(slot))?;
         let order = self.head.plan(batch.seqs).to_vec();
+        // A hybrid family's per-sequence Gated DeltaNet state slots, before the batch is packed.
+        self.resolve_gdn_slots(batch)?;
         let graph_top_n = self
             .graphs
             .as_ref()
@@ -2654,6 +3355,8 @@ impl ModelExecutor for DecoderExecutor {
                     .ffn
                     .graph_capturable(&self.dims, &self.registry, batch.tokens.len())
             })
+            // A hybrid family's Gated DeltaNet layers read `g`/`beta` back on the host: no graph.
+            .filter(|_| self.dims.gdn.is_none())
             .and_then(|_| self.head.graph_top_n());
         self.routing.begin(batch.positions);
         let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);

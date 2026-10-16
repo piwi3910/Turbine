@@ -161,6 +161,17 @@ pub fn q_gate_kv_proj_name_at(prefix: &str) -> String {
     format!("{prefix}.self_attn.q_gate_kv_proj.weight")
 }
 
+/// The fused Q/K/V parameter name of a layer prefix: the gated `[q_all | gate_all | k | v]`
+/// stack ([`q_gate_kv_proj_name_at`]) for an `attn_output_gate` family, else the plain
+/// `[q | k | v]` [`qkv_proj_name`] of `model.layers.{i}`.
+pub fn qkv_proj_name_at(prefix: &str, gated: bool) -> String {
+    if gated {
+        q_gate_kv_proj_name_at(prefix)
+    } else {
+        format!("{prefix}.self_attn.qkv_proj.weight")
+    }
+}
+
 /// The Qwen3.5 layer prefix: the text model lives under `model.language_model` in the
 /// multimodal `Qwen3_5ForConditionalGeneration` checkpoint (the vision tower is
 /// `model.visual`).

@@ -353,7 +353,10 @@ fn ragged_check(
 }
 
 /// A prefill in chunks of [`CHUNK`] tokens ends with the whole prefill's row, and the decode
-/// step after it matches too, bit for bit.
+/// step after it matches too, bit for bit. A decode reads a family's per-sequence state (the
+/// Gated DeltaNet recurrence of a hybrid family) as well as its KV, so each decode is preceded
+/// by the prefill it belongs to: the whole-prefill decode first, then the chunked prefill
+/// (which resets a fresh sequence's state to the same place) and the chunked decode.
 fn chunked_check(
     spec: &TinySpec,
     exec: &mut dyn ModelExecutor,
@@ -365,6 +368,11 @@ fn chunked_check(
     let whole = forward(exec, &pool, &[(&tokens, 0, &whole_table)])?
         .row(0)
         .to_vec();
+    let next = argmax(&whole);
+    let len = tokens.len() as u32;
+    let a = forward(exec, &pool, &[(&[next], len, &whole_table)])?;
+    // The chunked prefill continues a fresh sequence, so it carries the same state as the whole
+    // prefill did and leaves the state where it was before `a`'s decode.
     let mut last = Vec::new();
     for (i, chunk) in tokens.chunks(CHUNK).enumerate() {
         let start = (i * CHUNK) as u32;
@@ -378,9 +386,6 @@ fn chunked_check(
             max_abs_diff(&whole, &last)
         )
     })?;
-    let next = argmax(&whole);
-    let len = tokens.len() as u32;
-    let a = forward(exec, &pool, &[(&[next], len, &whole_table)])?;
     let b = forward(exec, &pool, &[(&[next], len, &chunk_table)])?;
     ensure(bitwise_equal(a.row(0), b.row(0)), || {
         format!(

@@ -78,6 +78,7 @@ mod registry_conformance {
                 "mistral",
                 "mixtral",
                 "gpt_oss",
+                "qwen3_5",
             ],
         );
         passes(families_suite(reg));
