@@ -126,6 +126,9 @@ pub struct DecoderDims {
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// The rotary dimension the rope op rotates ([`ModelArchConfig::rotary_dim`]): `head_dim`,
+    /// or a fraction of it for a partial-rotary family (Qwen3.5).
+    pub rotary_dim: usize,
     /// `heads · head_dim`.
     pub q_dim: usize,
     /// `kv_heads · head_dim`.
@@ -202,6 +205,7 @@ impl DecoderDims {
             heads: cfg.num_attention_heads as usize,
             kv_heads: cfg.num_kv_heads as usize,
             head_dim,
+            rotary_dim: cfg.rotary_dim as usize,
             q_dim: cfg.num_attention_heads as usize * head_dim,
             kv_dim: cfg.num_kv_heads as usize * head_dim,
             inter: cfg.intermediate as usize,
@@ -307,7 +311,7 @@ impl DecoderDims {
             num_q_heads: self.heads as u32,
             num_kv_heads: self.kv_heads as u32,
             head_dim: self.head_dim as u32,
-            rotary_dim: self.head_dim as u32,
+            rotary_dim: self.rotary_dim as u32,
             dtype: self.act,
         }
     }
@@ -1141,7 +1145,7 @@ impl DecoderExecutor {
             + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
             + LogitsHead::bytes(d.vocab, head_rows)
-            + f32 * (d.head_dim / 2) as u64
+            + f32 * (d.rotary_dim / 2) as u64
             + DeviceBatch::bytes(&batch_limits(cfg, limits))
     }
 
@@ -1390,9 +1394,13 @@ impl DecoderExecutor {
         let t = max_batch_tokens as usize;
         let n = max_seqs as usize;
         let act = |cols: usize| Tensor::empty(&mem, &[t, cols], d.act);
-        let mut inv_freq = Tensor::empty(&mem, &[d.head_dim / 2], DType::F32)?;
+        let mut inv_freq = Tensor::empty(&mem, &[d.rotary_dim / 2], DType::F32)?;
         let freqs = rope::inv_freq(cfg.rope_theta, cfg.head_dim, cfg.rope_scaling.as_ref());
-        let freq_bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let freq_bytes: Vec<u8> = freqs
+            .iter()
+            .take(d.rotary_dim / 2)
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         inv_freq.storage.copy_from_host(0, &freq_bytes)?;
         let ffn_buffers = spec.ffn.alloc(&d, t, &mem)?;
         let act_quant = d.alloc_act_quant(t, &mem)?;
