@@ -393,6 +393,87 @@ pub fn write_tiny_family_quantized(
     }
 }
 
+/// Writes the tiny `Qwen3_5ForConditionalGeneration` checkpoint into `dir` (Phase 7 S-11): 8
+/// layers with `full_attention_interval` 4 (layers 3 and 7 full attention, the rest Gated
+/// DeltaNet), hidden 64, 4 query / 2 KV heads of dimension 64 (`rotary_dim` 16 via
+/// `partial_rotary_factor` 0.25), the full layers' `q_proj` per-head interleaved `[q_j | g_j]`
+/// (`attn_output_gate`) and per-head Q/K norm, the linear layers' Gated DeltaNet projections
+/// (2 key / 4 value heads of dimension 8, conv window 4), untied `lm_head`, the tiny tokenizer
+/// and [`PLAIN_CHAT_TEMPLATE`]. The tensors are named as `Qwen/Qwen3.5-9B` stores them, under
+/// `model.language_model`. Same files and determinism as [`write_tiny_llama_with`].
+pub fn write_tiny_qwen3_5(dir: &Path, seed: u64) -> TinySpec {
+    write_tiny_qwen3_5_with(dir, seed, &TinyOptions::default())
+}
+
+/// [`write_tiny_qwen3_5`] with extra files and tensors ([`TinyOptions::extra`], e.g. the
+/// unused `model.visual.*` and `mtp.*` tensors the family's `skipped_prefixes` count).
+pub fn write_tiny_qwen3_5_with(dir: &Path, seed: u64, extra: &TinyOptions) -> TinySpec {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        head_dim: 64,
+        extra: extra.extra.clone(),
+        omit: extra.omit.clone(),
+        ship_lm_head: extra.ship_lm_head,
+    };
+    write_tiny_slots(
+        dir,
+        seed,
+        &qwen3_5_config_json(),
+        &opts,
+        Some(crate::families::qwen3_5::qwen3_5_checkpoint_slots),
+    )
+}
+
+/// `config.json` of [`write_tiny_qwen3_5`]: the keys of `Qwen/Qwen3.5-9B` at tiny size, under
+/// the multimodal wrapper's `text_config`.
+fn qwen3_5_config_json() -> serde_json::Value {
+    let text = json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5_text",
+        "attention_bias": false,
+        "attn_output_gate": true,
+        "bos_token_id": BOS.1,
+        "eos_token_id": TINY_EOS,
+        "full_attention_interval": 4,
+        "head_dim": 64,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+            "linear_attention", "linear_attention", "linear_attention", "full_attention",
+            "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        ],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_value_head_dim": 8,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": TINY_MAX_POSITIONS,
+        "num_attention_heads": 4,
+        "num_hidden_layers": 8,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+        },
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "use_cache": true,
+        "vocab_size": TINY_VOCAB,
+    });
+    json!({
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "text_config": text,
+        "tie_word_embeddings": false,
+    })
+}
+
 /// Writes the tiny `GptOssForCausalLM` checkpoint into `dir` (Phase 7 S-8): 4 layers alternating
 /// a sliding window of `sliding_window` positions (layers 0 and 2) and full attention, hidden
 /// 64, 4 query / 2 KV heads of dimension 64 with biased projections and one sink logit per
@@ -591,6 +672,20 @@ fn write_tiny(
     config_json: &serde_json::Value,
     opts: &TinyOptions,
 ) -> TinySpec {
+    write_tiny_slots(dir, seed, config_json, opts, None)
+}
+
+/// [`write_tiny`] with an explicit checkpoint tensor layout builder (the family's
+/// [`crate::loader::WeightSlot`]s when its load layout differs, e.g. Qwen3.5's de-interleaved
+/// `q_proj`): `checkpoint_slots` builds the tensors to write, `None` the family's own
+/// [`crate::families::ModelFamily::weight_slots`].
+fn write_tiny_slots(
+    dir: &Path,
+    seed: u64,
+    config_json: &serde_json::Value,
+    opts: &TinyOptions,
+    checkpoint_slots: Option<fn(&ModelArchConfig) -> Vec<crate::loader::WeightSlot>>,
+) -> TinySpec {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     write_json(&dir.join("config.json"), config_json);
     write_json(
@@ -611,7 +706,11 @@ fn write_tiny(
 
     let config =
         load_model_config(dir).unwrap_or_else(|e| panic!("tiny config does not parse: {e}"));
-    write_weights(&dir.join("model.safetensors"), &config, seed, opts);
+    let slots = match checkpoint_slots {
+        Some(build) => build(&config),
+        None => config.family.0.weight_slots(&config),
+    };
+    write_weights(&dir.join("model.safetensors"), &config, seed, opts, &slots);
     TinySpec {
         dir: dir.to_path_buf(),
         config,
@@ -877,21 +976,27 @@ fn random_named_bf16(rng: &mut ChaCha8Rng, name: &str, shape: &[usize]) -> Optio
     Some(bytes)
 }
 
-fn write_weights(path: &Path, config: &ModelArchConfig, seed: u64, opts: &TinyOptions) {
+fn write_weights(
+    path: &Path,
+    config: &ModelArchConfig,
+    seed: u64,
+    opts: &TinyOptions,
+    slots: &[crate::loader::WeightSlot],
+) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let format = config.weight_format.get();
     let mut tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
-    for slot in config.family.0.weight_slots(config) {
+    for slot in slots {
         // A family whose checkpoint stores some tensors packed (gpt-oss's MXFP4 experts) names
         // them U8 in its weight format.
-        let (dtype, data) = if format.slot_dtype(&slot) == turbine_core::types::DType::U8 {
+        let (dtype, data) = if format.slot_dtype(slot) == turbine_core::types::DType::U8 {
             (Dtype::U8, random_u8(&mut rng, &slot.name, &slot.shape))
         } else {
             let data = random_named_bf16(&mut rng, &slot.name, &slot.shape)
                 .unwrap_or_else(|| random_bf16(&mut rng, &slot.name, &slot.shape));
             (Dtype::BF16, data)
         };
-        tensors.push((slot.name, dtype, slot.shape, data));
+        tensors.push((slot.name.clone(), dtype, slot.shape.clone(), data));
     }
     if config.tie_word_embeddings && opts.ship_lm_head {
         let shape = vec![config.vocab_size as usize, config.hidden as usize];

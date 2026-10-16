@@ -47,7 +47,7 @@ use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_quantized,
     write_tiny_family_with_head_dim, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
     write_tiny_olmoe_quantized, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
-    write_tiny_qwen3moe_quantized,
+    write_tiny_qwen3_5, write_tiny_qwen3_5_with, write_tiny_qwen3moe_quantized,
 };
 use turbine_model::testing::trace::{
     DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
@@ -4830,6 +4830,7 @@ fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
         "olmoe" => families::olmoe::decoder_spec(),
         "qwen3" => families::qwen3::decoder_spec(),
         "gpt_oss" => families::gpt_oss::decoder_spec(),
+        "qwen3_5" => families::qwen3_5::decoder_spec(),
         other => panic!("no tiny decoder spec for family {other}"),
     }
 }
@@ -7531,4 +7532,77 @@ fn gpt_oss_matches_reference() {
 #[test]
 fn gpt_oss_window_matches_reference() {
     gpt_oss_against_transformers(4, "tiny-gpt-oss-window-trace.json");
+}
+
+/// P7 S-11: the Qwen3.5 family's `skipped_prefixes` (`model.visual.`, `mtp.`) count an unused
+/// sub-module's tensors and load none of them, leaving the rest of the text checkpoint intact.
+/// The loader logs one `event="weights_skipped"` per prefix (exercised by the loader suite);
+/// breaks if a skipped tensor is loaded or an untouched one is dropped.
+#[test]
+fn weights_skipped_logged_for_vision_and_mtp() {
+    let tmp = TempDir::new("tiny-qwen35-skipped");
+    let opts = TinyOptions {
+        extra: vec![
+            "model.visual.blocks.0.attn.qkv.weight".to_string(),
+            "model.visual.blocks.0.attn.proj.weight".to_string(),
+            "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+        ],
+        ..TinyOptions::default()
+    };
+    let spec = write_tiny_qwen3_5_with(&tmp.path().join("qwen35"), SEED, &opts);
+    let cfg = &spec.config;
+    let index = SafetensorsIndex::open(&spec.dir).unwrap();
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let weights = WeightLoader::load_format_skipping(
+        &turbine_model::weights::Bf16,
+        &index,
+        &cfg.family.0.weight_slots(cfg),
+        cfg.family.0.skipped_prefixes(),
+        &mem,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load");
+    // One [64] BF16 tensor is 128 bytes.
+    assert_eq!(
+        weights.skipped,
+        vec![
+            turbine_model::loader::SkippedPrefix {
+                prefix: "model.visual.".to_string(),
+                tensors: 2,
+                bytes: 256,
+            },
+            turbine_model::loader::SkippedPrefix {
+                prefix: "mtp.".to_string(),
+                tensors: 1,
+                bytes: 128,
+            },
+        ]
+    );
+    assert!(weights.unexpected.is_empty(), "{:?}", weights.unexpected);
+    for name in [
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.visual.blocks.0.attn.proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+    ] {
+        assert!(!weights.tensors.contains_key(name), "loaded {name}");
+    }
+    // The text path is untouched: the embedding, a Gated DeltaNet layer's projections and the
+    // final norm are all present.
+    let tp = cfg.family.0.text_prefix();
+    for name in [
+        format!("{tp}.embed_tokens.weight"),
+        format!("{tp}.layers.0.linear_attn.in_proj_qkv.weight"),
+        format!("{tp}.norm.weight"),
+    ] {
+        assert!(weights.tensors.contains_key(&name), "missing {name}");
+    }
+}
+
+/// The tiny Qwen3.5 checkpoint and its executor build on the CPU provider.
+#[test]
+fn qwen3_5_tiny_builds() {
+    let tmp = TempDir::new("tiny-qwen35-build");
+    let spec = write_tiny_qwen3_5(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let _ = cpu_decoder(&spec, &mem);
 }

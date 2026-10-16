@@ -1382,7 +1382,8 @@ mod tests {
             "unsupported architectures = ExampleUnregisteredForCausalLM; supported: registered \
              families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
              qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
-             (MixtralForCausalLM), gpt_oss (GptOssForCausalLM)"
+             (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), qwen3_5 \
+             (Qwen3_5ForConditionalGeneration)"
         );
         fs::remove_dir_all(dir).unwrap();
 

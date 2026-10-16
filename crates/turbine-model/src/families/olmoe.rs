@@ -187,6 +187,7 @@ pub(crate) fn moe_slots(
         (m.num_experts as usize, m.expert_intermediate as usize)
     });
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: false,
         name,
         shape,
         stack: None,
@@ -229,6 +230,7 @@ pub(crate) fn moe_slots(
                 offset: e * shape.iter().product::<usize>(),
             };
             WeightSlot {
+                float32_stored: false,
                 name: format!("{p}.{}.{e}.{proj}.weight", names.experts),
                 shape,
                 stack: Some(place),

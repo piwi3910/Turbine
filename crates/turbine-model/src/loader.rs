@@ -40,6 +40,10 @@ pub struct WeightSlot {
     /// ([`crate::tp::weight_slots`]); only its bytes are read. `None`: the whole tensor, of
     /// `shape`.
     pub source: Option<SlotSource>,
+    /// `true`: the checkpoint may store this tensor in F32 rather than the format's dtype
+    /// (Qwen3.5's `linear_attn.norm.weight`, `A_log`, `dt_bias`); it is converted to the
+    /// format's dtype on load. Every other slot must be stored exactly as the format says.
+    pub float32_stored: bool,
 }
 
 /// The part of a checkpoint tensor of `shape` a sharded [`WeightSlot`] loads: elements
@@ -120,6 +124,7 @@ pub(crate) fn row_concat(stack: String, parts: &[(String, usize)], cols: usize) 
         .iter()
         .map(|(name, rows)| {
             let slot = WeightSlot {
+                float32_stored: false,
                 name: name.clone(),
                 shape: vec![*rows, cols],
                 stack: Some(StackPlace {
@@ -159,6 +164,17 @@ pub fn q_gate_kv_proj_name(layer: u32) -> String {
 /// `model.language_model.layers.{i}`).
 pub fn q_gate_kv_proj_name_at(prefix: &str) -> String {
     format!("{prefix}.self_attn.q_gate_kv_proj.weight")
+}
+
+/// The fused Q/K/V parameter name of a layer prefix: the gated `[q_all | gate_all | k | v]`
+/// stack ([`q_gate_kv_proj_name_at`]) for an `attn_output_gate` family, else the plain
+/// `[q | k | v]` [`qkv_proj_name`] of `model.layers.{i}`.
+pub fn qkv_proj_name_at(prefix: &str, gated: bool) -> String {
+    if gated {
+        q_gate_kv_proj_name_at(prefix)
+    } else {
+        format!("{prefix}.self_attn.qkv_proj.weight")
+    }
 }
 
 /// The Qwen3.5 layer prefix: the text model lives under `model.language_model` in the
@@ -219,6 +235,7 @@ pub fn gated_qkv_slots_at(
     // The q heads, then the output gates, each head's `[q_j]` / `[g_j]` rows at their source.
     for j in 0..heads {
         slots.push(WeightSlot {
+            float32_stored: false,
             name: format!("{p}.q_proj.weight"),
             shape: vec![head_dim, hidden],
             stack: Some(place(j * head_dim * hidden)),
@@ -227,6 +244,7 @@ pub fn gated_qkv_slots_at(
     }
     for j in 0..heads {
         slots.push(WeightSlot {
+            float32_stored: false,
             name: format!("{p}.q_proj.weight"),
             shape: vec![head_dim, hidden],
             stack: Some(place((q_dim + j * head_dim) * hidden)),
@@ -238,6 +256,7 @@ pub fn gated_qkv_slots_at(
         ("v_proj", (2 * q_dim + kv_dim) * hidden),
     ] {
         slots.push(WeightSlot {
+            float32_stored: false,
             name: format!("{p}.{proj}.weight"),
             shape: vec![kv_dim, hidden],
             stack: Some(place(offset)),
@@ -357,7 +376,12 @@ impl WeightLoader {
                 None if empty && format.optional(slot) => continue,
                 None => return Err(ModelError::MissingTensor(slot.name.clone())),
             };
-            format.check_tensor(entry)?;
+            // A `float32_stored` slot (Qwen3.5's `linear_attn.norm.weight`, `A_log`,
+            // `dt_bias`) may be F32 instead of the format's dtype; it is converted on load.
+            let stored_f32 = slot.float32_stored && entry.dtype == safetensors::Dtype::F32;
+            if !stored_f32 {
+                format.check_tensor(entry)?;
+            }
             if format.repacks(slot) {
                 for name in format.companions(slot) {
                     if index.get(&name).is_none() {
@@ -379,7 +403,12 @@ impl WeightLoader {
             // right shape in a wider dtype would spill into the next slot of a stack (review
             // r13 C3).
             let dtype = format.slot_dtype(slot);
-            let want = expected.iter().product::<usize>() as u64 * dtype.size_bytes() as u64;
+            let stored = if stored_f32 {
+                turbine_tensor::DType::F32
+            } else {
+                dtype
+            };
+            let want = expected.iter().product::<usize>() as u64 * stored.size_bytes() as u64;
             if entry.byte_len() != want {
                 return Err(ModelError::Safetensors {
                     file: entry.file.clone(),
@@ -619,6 +648,25 @@ impl WeightLoader {
                 continue;
             }
             let tensor = tensors.get_mut(key).expect("inserted above");
+            // A `float32_stored` slot kept in F32 by the checkpoint is converted to the
+            // format's dtype here.
+            if slot.float32_stored && entry.dtype == safetensors::Dtype::F32 {
+                let file = files.get(&entry.file).expect("opened above");
+                let mut raw = vec![0u8; entry.byte_len() as usize];
+                file.read_exact_at(&mut raw, entry.range.start)
+                    .map_err(|e| io_err(&entry.file, e))?;
+                let conv: Vec<u8> = raw
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .to_le_bytes()
+                    })
+                    .collect();
+                tensor.storage.copy_from_host(base, &conv)?;
+                mem.synchronize()?;
+                weight_bytes += conv.len() as u64;
+                continue;
+            }
             if let Some(src) = &slot.source {
                 weight_bytes += upload_shard(
                     file,

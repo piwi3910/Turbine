@@ -195,6 +195,7 @@ impl Mxfp4Layout {
             let mut shape = lead.clone();
             shape.extend([rows, cols]);
             WeightSlot {
+                float32_stored: false,
                 name: format!("{module}.{suffix}"),
                 shape: vec![n, cols],
                 stack: Some(StackPlace {

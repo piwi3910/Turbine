@@ -27,6 +27,7 @@ pub mod mistral;
 pub mod mixtral;
 pub mod olmoe;
 pub mod qwen3;
+pub mod qwen3_5;
 pub mod qwen3_moe;
 
 pub use gpt_oss::GptOss;
@@ -35,6 +36,7 @@ pub use mistral::Mistral;
 pub use mixtral::{Mixtral, mixtral_slots};
 pub use olmoe::{Olmoe, olmoe_slots};
 pub use qwen3::Qwen3;
+pub use qwen3_5::Qwen3_5;
 pub use qwen3_moe::Qwen3Moe;
 
 /// One decoder family.
@@ -192,7 +194,7 @@ impl std::fmt::Debug for FamilyRef {
 static FAMILIES: Registry<dyn ModelFamily> = Registry::new(
     "model_family",
     &[
-        &Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral, &GptOss,
+        &Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral, &GptOss, &Qwen3_5,
     ],
 );
 
@@ -368,6 +370,7 @@ mod tests {
             ("mistral", "MistralForCausalLM"),
             ("mixtral", "MixtralForCausalLM"),
             ("gpt_oss", "GptOssForCausalLM"),
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
         ] {
             assert_eq!(
                 resolve(&json!({"architectures": [hf]})).unwrap().0.name(),
@@ -384,7 +387,8 @@ mod tests {
             err.contains(
                 "registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 \
                  (Qwen3ForCausalLM), qwen3_moe (Qwen3MoeForCausalLM), mistral \
-                 (MistralForCausalLM), mixtral (MixtralForCausalLM), gpt_oss (GptOssForCausalLM)"
+                 (MistralForCausalLM), mixtral (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), \
+                 qwen3_5 (Qwen3_5ForConditionalGeneration)"
             ),
             "{err}"
         );
@@ -445,11 +449,25 @@ mod tests {
             .iter()
             .filter(|k| **k == LayerKind::LinearAttention)
             .count();
-        assert_eq!(
-            linear, 0,
-            "{family}: derive the linear-attention state bytes here when such a family registers"
-        );
-        (kinds, StateLayout::default())
+        let state = if linear == 0 {
+            StateLayout::default()
+        } else {
+            // The Gated DeltaNet state of a hybrid family: the linear layers' dimensions come
+            // from the raw config, the state bytes from them.
+            let k_heads = text["linear_num_key_heads"].as_u64().unwrap();
+            let v_heads = text["linear_num_value_heads"].as_u64().unwrap();
+            let k_dim = text["linear_key_head_dim"].as_u64().unwrap();
+            let v_dim = text["linear_value_head_dim"].as_u64().unwrap();
+            let conv_kernel = text["linear_conv_kernel_dim"].as_u64().unwrap();
+            let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
+            StateLayout {
+                linear_layers: linear as u32,
+                recurrent_bytes_per_layer: v_heads * v_dim * k_dim * 4,
+                conv_bytes_per_layer: conv_dim * (conv_kernel - 1) * 2,
+                dtype: Some(turbine_core::types::StateDtype::F32),
+            }
+        };
+        (kinds, state)
     }
 
     #[test]

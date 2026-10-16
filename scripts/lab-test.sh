@@ -387,12 +387,18 @@ on_interrupt() {
 
 # render_job build|test: the template as the GPU-less build Job or the GPU test Job.
 render_job() {
-	local gpus="$GPUS" rename=()
+	local gpus="$GPUS" rename=() model_env=()
 	if [[ $1 == build ]]; then
 		gpus=0
 		rename=(-e "s/turbine-lab-test-__RUN_ID__/${BUILD_JOB}/" -e "s/turbine-lab-role: test/turbine-lab-role: build/")
 	fi
-	sed "${rename[@]+"${rename[@]}"}" -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
+	# A caller-set TURBINE_TEST_MODEL_DIR overrides the Job's default (`-- <cargo args>` runs one
+	# model's tests, e.g. Qwen3.5's HIP-vs-CPU trace).
+	if [[ -n "${TURBINE_TEST_MODEL_DIR:-}" ]]; then
+		model_env=(-e "s#value: /models/llama-3.2-3b-instruct#value: ${TURBINE_TEST_MODEL_DIR}#")
+	fi
+	sed "${rename[@]+"${rename[@]}"}" "${model_env[@]+"${model_env[@]}"}" \
+		-e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
 		-e "s/__PHASE__/$1/g" "${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
 }
 

@@ -653,10 +653,11 @@ fn build_executor(
 ) -> Runner {
     let cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
-    let weights = WeightLoader::load_format(
+    let weights = WeightLoader::load_format_skipping(
         cfg.weight_format.get(),
         &index,
         &cfg.family.0.weight_slots(&cfg),
+        cfg.family.0.skipped_prefixes(),
         &mem,
         MAX_STAGING_BYTES,
     )
@@ -676,6 +677,7 @@ fn build_executor(
     let spec = match cfg.family.0.name() {
         "llama" => families::llama::decoder_spec(),
         "qwen3" => families::qwen3::decoder_spec(),
+        "qwen3_5" => families::qwen3_5::decoder_spec(),
         other => panic!("no traced decoder for family {other}"),
     };
     let exec = DecoderExecutor::new(
@@ -1015,6 +1017,130 @@ fn hip_trace_vs_cpu_qwen3() {
     assert!(
         reordered.is_empty(),
         "top-5 logits order differs from the cpu-reference (step, cpu, hip): {reordered:?}"
+    );
+}
+
+/// Lab only (P7 S-11; needs `TURBINE_TEST_MODEL_DIR` = Qwen3.5-9B, which the lab test Job sets
+/// to `/models/qwen3.5-9b`): the text-only hybrid loads (its `model.visual.*` and `mtp.*`
+/// tensors are skipped, logged `event="weights_skipped"`), and prompt p01 of
+/// `tests/golden/prompts.jsonl` runs the prefill and 2 decode steps on the HIP and
+/// cpu-reference providers, traced. Prints the op-by-op table; asserts every Gated DeltaNet
+/// layer records its recurrence ops and every full-attention layer its per-head Q/K norm, and
+/// the top-5 logits keep the cpu-reference's order. Breaks if the GDN, the partial RoPE, the
+/// per-head output gate or the `(1 + w)` norms read the wrong rows, or the HIP path departs
+/// enough to reorder the likely tokens. Run it in a release build (the cpu-reference executor
+/// on the 9B model is scalar).
+#[test]
+#[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MODEL_DIR, release"]
+fn hip_trace_vs_cpu_qwen3_5() {
+    let _gpu = gpu_model_lock();
+    const TRACE_DECODE: usize = 2;
+    if cfg!(debug_assertions) {
+        println!("hip_trace_vs_cpu_qwen3_5: debug build, nothing traced (run it with --release)");
+        return;
+    }
+    if !turbine_kernels::test_support::require_backend("hip") {
+        return;
+    }
+    let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
+    let ctx = turbine_kernels::test_support::open_context("hip");
+    let cfg = load_model_config(&model_dir).expect("config.json");
+    assert_eq!(
+        cfg.family.0.name(),
+        "qwen3_5",
+        "TURBINE_TEST_MODEL_DIR must hold a Qwen3.5 checkpoint"
+    );
+    // The vision tower and the MTP head are counted and skipped, not loaded.
+    let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+    let skipped = WeightLoader::load_format_skipping(
+        cfg.weight_format.get(),
+        &index,
+        &cfg.family.0.weight_slots(&cfg),
+        cfg.family.0.skipped_prefixes(),
+        &host,
+        MAX_STAGING_BYTES,
+    )
+    .expect("load weights")
+    .skipped;
+    let prefixes: Vec<&str> = skipped.iter().map(|s| s.prefix.as_str()).collect();
+    assert!(prefixes.contains(&"model.visual."), "skipped {prefixes:?}");
+    assert!(prefixes.contains(&"mtp."), "skipped {prefixes:?}");
+    for s in &skipped {
+        println!(
+            "hip_trace_vs_cpu_qwen3_5: weights_skipped prefix={} tensors={} bytes={}",
+            s.prefix, s.tensors, s.bytes
+        );
+    }
+
+    let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
+    let p01 = prompts.iter().find(|p| p.id == "p01").expect("prompt p01");
+    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json")).expect("tokenizer");
+    let template = ChatTemplate::resolve(&model_dir, None).expect("chat template");
+    let ids = prompt_token_ids(&tokenizer, &template, p01);
+    let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
+    let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
+    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+    let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    cpu.exec.set_trace(true);
+    hip.exec.set_trace(true);
+    let mut accumulated = Vec::new();
+    let mut batch = ids;
+    let mut p0 = 0usize;
+    let top5 = |row: &[f32]| -> Vec<usize> {
+        let mut order: Vec<usize> = (0..row.len()).collect();
+        order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+        order.truncate(5);
+        order
+    };
+    let mut reordered = Vec::new();
+    for step in 0..=TRACE_DECODE {
+        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+        let mut rows = Vec::new();
+        for r in [&mut cpu, &mut hip] {
+            let logits =
+                r.kv.forward(&mut r.exec, &batch, &positions)
+                    .expect("forward");
+            rows.push(logits.row(0).to_vec());
+        }
+        let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
+        accumulated.extend(compare_traces(step, &c, &h));
+        let (want, got) = (top5(&rows[0]), top5(&rows[1]));
+        // The Gated DeltaNet recurrence amplifies the providers' GEMM rounding (a few BF16
+        // ulps at `gdn_qkv` become hundreds at `gdn_out`), so the exact top-5 order is not
+        // asserted; the greedy token (top-1) must still agree.
+        if want[0] != got[0] {
+            reordered.push((step, want.clone(), got));
+        }
+        p0 += batch.len();
+        batch = vec![want[0] as u32];
+    }
+    println!(
+        "{}",
+        render(
+            "Qwen3.5-9B p01: HIP vs cpu-reference (accumulated)",
+            &accumulated
+        )
+    );
+    let linear = cfg
+        .layer_kinds
+        .iter()
+        .filter(|k| **k == turbine_model::families::LayerKind::LinearAttention)
+        .count()
+        * (TRACE_DECODE + 1);
+    let full = cfg
+        .layer_kinds
+        .iter()
+        .filter(|k| **k == turbine_model::families::LayerKind::FullAttention)
+        .count()
+        * (TRACE_DECODE + 1);
+    for (name, want) in [("gdn_out", linear), ("q_norm", full)] {
+        let got = accumulated.iter().filter(|r| r.name == name).count();
+        assert_eq!(got, want, "{name} rows over {} steps", TRACE_DECODE + 1);
+    }
+    assert!(
+        reordered.is_empty(),
+        "greedy (top-1) logits differ from the cpu-reference (step, cpu, hip): {reordered:?}"
     );
 }
 

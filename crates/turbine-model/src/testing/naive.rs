@@ -31,6 +31,8 @@ use turbine_kernels::cpu::quant::{e2m1_value, e8m0_value};
 use turbine_kernels::torch_topk;
 
 use crate::config::{ModelArchConfig, RopeScaling};
+use crate::executor::decoder::is_norm_weight;
+use crate::families::LayerKind;
 
 fn bf(v: f32) -> f32 {
     bf16::from_f32(v).to_f32()
@@ -82,10 +84,17 @@ impl Naive {
         for (name, dtype, shape, data) in &raw {
             match dtype {
                 ::safetensors::Dtype::BF16 => {
-                    let values: Vec<f32> = data
+                    let mut values: Vec<f32> = data
                         .chunks_exact(2)
                         .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
                         .collect();
+                    // transformers' `output · (1 + weight)` RMSNorm form, folded at load as
+                    // the executor folds it (the sum is rounded back to the activation dtype).
+                    if cfg.unit_offset_norms && is_norm_weight(name) {
+                        for v in &mut values {
+                            *v = bf(*v + 1.0);
+                        }
+                    }
                     w.insert(name.clone(), values);
                 }
                 ::safetensors::Dtype::U8 => {
@@ -203,10 +212,12 @@ impl Naive {
         self.rmsnorm(x, w)
     }
 
-    /// HF `rotate_half` with cos and sin times YaRN's attention factor before BF16 rounding.
+    /// HF `rotate_half` with cos and sin times YaRN's attention factor before BF16 rounding,
+    /// over the first `rotary_dim` elements of each head (partial RoPE when it is below
+    /// `head_dim`, Qwen3.5).
     fn rope(&self, x: &mut [f32], heads: usize) {
         let d = self.cfg.head_dim as usize;
-        let half = d / 2;
+        let half = self.cfg.rotary_dim.max(2) as usize / 2;
         let m = self.cfg.rope_attention_factor();
         for (pos, token) in x.chunks_exact_mut(heads * d).enumerate() {
             for head in token.chunks_exact_mut(d) {
@@ -429,53 +440,208 @@ impl Naive {
         out
     }
 
+    /// The full-attention block of layer `layer` over the normalised rows `h`: Q/K/V, the
+    /// per-head Q/K norm, partial RoPE, causal (windowed) attention, the per-head output gate
+    /// (`attn_output_gate`) and the O projection. A gated layer's `q_proj` is per-head
+    /// interleaved `[q_j | g_j]`; the checkpoint's rows are de-interleaved here.
+    fn full_attention(&self, h: &[f32], p: &str, t: usize, layer: u32) -> Vec<f32> {
+        let c = &self.cfg;
+        let hidden = c.hidden as usize;
+        let d = c.head_dim as usize;
+        let (heads, kv_heads) = (c.num_attention_heads as usize, c.num_kv_heads as usize);
+        let q_dim = heads * d;
+        let w = |s: &str| self.get(&format!("{p}.{s}.weight"));
+        let b = |s: &str| self.opt(&format!("{p}.{s}.bias"));
+        let (mut q, gate) = if c.attn_output_gate {
+            let qg = self.bias(
+                Naive::linear_bf(h, w("self_attn.q_proj"), hidden),
+                b("self_attn.q_proj"),
+            );
+            let mut q = Vec::with_capacity(t * q_dim);
+            let mut gate = Vec::with_capacity(t * q_dim);
+            for tok in qg.chunks_exact(2 * q_dim) {
+                for hh in 0..heads {
+                    q.extend_from_slice(&tok[2 * hh * d..][..d]);
+                    gate.extend_from_slice(&tok[(2 * hh + 1) * d..][..d]);
+                }
+            }
+            (q, Some(gate))
+        } else {
+            (
+                self.bias(
+                    Naive::linear_bf(h, w("self_attn.q_proj"), hidden),
+                    b("self_attn.q_proj"),
+                ),
+                None,
+            )
+        };
+        let mut k = self.bias(
+            Naive::linear_bf(h, w("self_attn.k_proj"), hidden),
+            b("self_attn.k_proj"),
+        );
+        let v = self.bias(
+            Naive::linear_bf(h, w("self_attn.v_proj"), hidden),
+            b("self_attn.v_proj"),
+        );
+        if self.qk_norm {
+            q = self.qk_norm(&q, w("self_attn.q_norm"), heads);
+            k = self.qk_norm(&k, w("self_attn.k_norm"), kv_heads);
+        }
+        self.rope(&mut q, heads);
+        self.rope(&mut k, kv_heads);
+        let window = match c.layer_kinds[layer as usize] {
+            LayerKind::SlidingWindow { window } => Some(window),
+            _ => None,
+        };
+        let sinks = self.opt(&format!("{p}.self_attn.sinks"));
+        let mut attn = self.attention(&q, &k, &v, t, window, sinks);
+        if let Some(gate) = gate {
+            for (a, g) in attn.iter_mut().zip(&gate) {
+                *a = bf(bf(1.0 / (1.0 + (-*g).exp())) * *a);
+            }
+        }
+        self.bias(
+            Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim),
+            b("self_attn.o_proj"),
+        )
+    }
+
+    /// The Gated DeltaNet block of layer prefix `p` over the normalised rows `h` (Qwen3.5):
+    /// `in_proj_qkv` → causal depthwise conv1d (kernel 4, silu) → `q | k | v`, `in_proj_z` /
+    /// `in_proj_a` / `in_proj_b`, the delta-rule recurrence (l2-normalised q/k, `beta`,
+    /// per-token decay `exp(g)`, f32 state) and the gated RMSNorm.
+    pub fn gdn(&self, h: &[f32], p: &str) -> Vec<f32> {
+        let c = &self.cfg;
+        let g = c.gdn.expect("a Gated DeltaNet config");
+        let (_, normed) = self.gdn_recurrence(h, p);
+        let a = format!("{p}.linear_attn");
+        Naive::linear_bf(
+            &normed,
+            self.get(&format!("{a}.out_proj.weight")),
+            g.value_dim(),
+        )
+    }
+
+    /// The GDN recurrence and gated norm of layer prefix `p`: `(out, normed)`.
+    fn gdn_recurrence(&self, h: &[f32], p: &str) -> (Vec<f32>, Vec<f32>) {
+        let c = &self.cfg;
+        let hidden = c.hidden as usize;
+        let g = c.gdn.expect("a Gated DeltaNet config");
+        let (kh, vh, kd, vd) = (
+            g.k_heads as usize,
+            g.v_heads as usize,
+            g.k_dim as usize,
+            g.v_dim as usize,
+        );
+        let (conv_dim, value_dim) = (g.conv_dim(), g.value_dim());
+        let t = h.len() / hidden;
+        let a = format!("{p}.linear_attn");
+        let w = |s: &str| self.get(&format!("{a}.{s}.weight"));
+        // in_proj_qkv → causal depthwise conv1d (kernel 4, silu).
+        let qkv = Naive::linear_bf(h, w("in_proj_qkv"), hidden);
+        let cw = w("conv1d");
+        let mut conv = vec![0f32; t * conv_dim];
+        for tok in 0..t {
+            for ch in 0..conv_dim {
+                let mut acc = 0f32;
+                for j in 0..4usize {
+                    let src = tok as isize - 3 + j as isize;
+                    if src >= 0 {
+                        acc += cw[ch * 4 + j] * qkv[src as usize * conv_dim + ch];
+                    }
+                }
+                conv[tok * conv_dim + ch] = bf(acc / (1.0 + (-acc).exp()));
+            }
+        }
+        let z = Naive::linear_bf(h, w("in_proj_z"), hidden);
+        let av = Naive::linear_bf(h, w("in_proj_a"), hidden);
+        let bv = Naive::linear_bf(h, w("in_proj_b"), hidden);
+        let a_log = self.get(&format!("{a}.A_log"));
+        let dt_bias = self.get(&format!("{a}.dt_bias"));
+        let mut beta = vec![0f32; t * vh];
+        let mut decay = vec![0f32; t * vh];
+        for tok in 0..t {
+            for hh in 0..vh {
+                beta[tok * vh + hh] = 1.0 / (1.0 + (-bv[tok * vh + hh]).exp());
+                let x = av[tok * vh + hh] + dt_bias[hh];
+                let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+                decay[tok * vh + hh] = (-a_log[hh].exp() * sp).exp();
+            }
+        }
+        let l2 =
+            |row: &[f32]| -> f32 { 1.0 / (row.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt() };
+        let qscale = 1.0 / (kd as f32).sqrt();
+        let key_dim = kh * kd;
+        let mut state = vec![0f32; vh * kd * vd];
+        let mut out = vec![0f32; t * value_dim];
+        for hh in 0..vh {
+            let kvh = hh / (vh / kh);
+            for tok in 0..t {
+                let s = &mut state[hh * kd * vd..(hh + 1) * kd * vd];
+                let dec = decay[tok * vh + hh];
+                for x in s.iter_mut() {
+                    *x *= dec;
+                }
+                let qrow = &conv[tok * conv_dim + kvh * kd..][..kd];
+                let krow = &conv[tok * conv_dim + key_dim + kvh * kd..][..kd];
+                let qs = l2(qrow) * qscale;
+                let ks = l2(krow);
+                let qn: Vec<f32> = qrow.iter().map(|v| v * qs).collect();
+                let kn: Vec<f32> = krow.iter().map(|v| v * ks).collect();
+                let bt = beta[tok * vh + hh];
+                let vrow = &conv[tok * conv_dim + 2 * key_dim + hh * vd..][..vd];
+                for col in 0..vd {
+                    let kv: f32 = (0..kd).map(|i| s[i * vd + col] * kn[i]).sum();
+                    let delta = (vrow[col] - kv) * bt;
+                    for i in 0..kd {
+                        s[i * vd + col] += kn[i] * delta;
+                    }
+                    out[tok * value_dim + hh * vd + col] =
+                        bf((0..kd).map(|i| s[i * vd + col] * qn[i]).sum());
+                }
+            }
+        }
+        // Gated RMSNorm over v_dim per value head: weight · rms(x) · silu(z).
+        let norm_w = self.get(&format!("{a}.norm.weight"));
+        let eps = c.rms_norm_eps;
+        let mut normed = vec![0f32; t * value_dim];
+        for tok in 0..t {
+            for hh in 0..vh {
+                let row = &out[(tok * vh + hh) * vd..][..vd];
+                let ss: f32 = row.iter().map(|v| v * v).sum();
+                let r = 1.0 / (ss / vd as f32 + eps).sqrt();
+                for i in 0..vd {
+                    let zz = z[(tok * vh + hh) * vd + i];
+                    let silu = zz / (1.0 + (-zz).exp());
+                    normed[(tok * vh + hh) * vd + i] =
+                        bf(bf(silu) * bf(bf(row[i] * r) * norm_w[i]));
+                }
+            }
+        }
+        (out, normed)
+    }
+
     /// Logits of every position of `tokens` (positions `0..tokens.len()`): row `i` depends
     /// only on `tokens[..=i]` (causal attention).
     pub fn forward(&self, tokens: &[u32]) -> Vec<Vec<f32>> {
         let c = &self.cfg;
         let hidden = c.hidden as usize;
-        let (heads, kv_heads) = (c.num_attention_heads as usize, c.num_kv_heads as usize);
-        let q_dim = heads * c.head_dim as usize;
         let t = tokens.len();
-        let embed = self.get("model.embed_tokens.weight");
+        let tp = c.family.0.text_prefix();
+        let embed = self.get(&format!("{tp}.embed_tokens.weight"));
         let mut x: Vec<f32> = tokens
             .iter()
             .flat_map(|&id| embed[id as usize * hidden..][..hidden].iter().copied())
             .collect();
         for layer in 0..c.num_layers {
-            let p = format!("model.layers.{layer}");
+            let p = format!("{tp}.layers.{layer}");
             let w = |s: &str| self.get(&format!("{p}.{s}.weight"));
-            let b = |s: &str| self.opt(&format!("{p}.{s}.bias"));
-            let sinks = self.opt(&format!("{p}.self_attn.sinks"));
             let h = self.rmsnorm(&x, w("input_layernorm"));
-            let mut q = self.bias(
-                Naive::linear_bf(&h, w("self_attn.q_proj"), hidden),
-                b("self_attn.q_proj"),
-            );
-            let mut k = self.bias(
-                Naive::linear_bf(&h, w("self_attn.k_proj"), hidden),
-                b("self_attn.k_proj"),
-            );
-            let v = self.bias(
-                Naive::linear_bf(&h, w("self_attn.v_proj"), hidden),
-                b("self_attn.v_proj"),
-            );
-            if self.qk_norm {
-                q = self.qk_norm(&q, w("self_attn.q_norm"), heads);
-                k = self.qk_norm(&k, w("self_attn.k_norm"), kv_heads);
-            }
-            self.rope(&mut q, heads);
-            self.rope(&mut k, kv_heads);
-            let window = match c.layer_kinds[layer as usize] {
-                crate::families::LayerKind::SlidingWindow { window } => Some(window),
-                _ => None,
+            let mixer = match c.layer_kinds[layer as usize] {
+                LayerKind::LinearAttention => self.gdn(&h, &p),
+                _ => self.full_attention(&h, &p, t, layer),
             };
-            let attn = self.attention(&q, &k, &v, t, window, sinks);
-            let o = self.bias(
-                Naive::linear_bf(&attn, w("self_attn.o_proj"), q_dim),
-                b("self_attn.o_proj"),
-            );
-            x = x.iter().zip(&o).map(|(a, b)| bf(a + b)).collect();
+            x = x.iter().zip(&mixer).map(|(a, b)| bf(a + b)).collect();
             let h = self.rmsnorm(&x, w("post_attention_layernorm"));
             let down = if self.opt(&format!("{p}.mlp.experts.gate_up_proj")).is_some() {
                 self.moe_gpt_oss(&h, &p)
@@ -486,7 +652,7 @@ impl Naive {
             };
             x = x.iter().zip(&down).map(|(a, b)| bf(a + b)).collect();
         }
-        let normed = self.rmsnorm(&x, self.get("model.norm.weight"));
+        let normed = self.rmsnorm(&x, self.get(&format!("{tp}.norm.weight")));
         let head = if self.tied {
             embed
         } else {

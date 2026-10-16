@@ -214,6 +214,7 @@ pub fn gpt_oss_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
         (m.num_experts as usize, m.expert_intermediate as usize)
     });
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: false,
         name,
         shape,
         stack: None,

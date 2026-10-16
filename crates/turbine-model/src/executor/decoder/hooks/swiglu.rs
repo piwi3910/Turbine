@@ -14,7 +14,7 @@ use turbine_tensor::{DeviceMemory, Tensor};
 use crate::ModelError;
 use crate::executor::decoder::{DecoderDims, FfnHook, HookBuffers, HookWeights, LayerRun, rows};
 use crate::executor::{ExecutorOptions, Split};
-use crate::loader::{LoadedWeights, gate_up_proj_name};
+use crate::loader::LoadedWeights;
 
 /// Linear-layer indices of [`HookWeights`] (BF16 or quantized, [`DecoderDims::take_linear`]):
 /// `[2·inter, hidden]` gate rows then up rows, and `[hidden, inter]` down.
@@ -88,7 +88,7 @@ impl FfnHook for SwiGlu {
     fn load_layer(
         &self,
         d: &DecoderDims,
-        layer: u32,
+        _layer: u32,
         prefix: &str,
         weights: &mut LoadedWeights,
         _opts: ExecutorOptions,
@@ -96,7 +96,11 @@ impl FfnHook for SwiGlu {
         Ok(HookWeights(
             Vec::new(),
             vec![
-                d.take_linear(weights, &gate_up_proj_name(layer), &[2 * d.inter, d.hidden])?,
+                d.take_linear(
+                    weights,
+                    &format!("{prefix}.mlp.gate_up_proj.weight"),
+                    &[2 * d.inter, d.hidden],
+                )?,
                 d.take_linear(
                     weights,
                     &format!("{prefix}.mlp.down_proj.weight"),
