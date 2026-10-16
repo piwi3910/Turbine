@@ -4690,3 +4690,44 @@ Three iSCSI session drops (2026-10-13/14) took the ext4 on novanas's TrueNAS LUN
 - **C. Mitigate and move on:** add a 2.5G multipath failover path; does not cover target-side stalls.
 
 **Decision (user, 2026-10-14):** A, run after the storage changes; the first run was cut short by the sync flip and its telemetry sampler was faulty — rerun against the flipped zvol when wanted. Also (user, 2026-10-14): `sync=disabled` on the zvol — everything on the LUN is regenerable; measured 20× on the small-file-fsync pattern (12 m 25 s → 38 s for 2 000 synced files) and 1.6× on big writes (334 → 532 MB/s).
+
+## P7 Qwen3.5/Qwen3.6 hybrid kernel-ABI gaps (Task 31, 2026-10-16)
+
+Task 31's Qwen3.5 full-attention layers compute `attn_output * sigmoid(gate)` before `o_proj`, and
+`q_proj` is per-head interleaved `[q_j | g_j]` (transformers `chunk(2, -1)`). The kernel ABI
+(ops 0–23, `TURBINE_ABI_MINOR` 18) exposes only `ADD` and `SILU_MUL` (`silu(a)*b`) — no multiply or
+sigmoid — and `turbine_attention_paged_desc` (v2.17) has no output-gate field and only
+`q_stride_token` (no head stride). The plan lists an `ATTENTION_OUTPUT_GATE` hook but schedules no
+kernel/ABI addition, so Task 31 cannot be built as written.
+
+- A. New elementwise op `TURBINE_OP_SIGMOID_MUL` (ABI v2.19): `out = a * sigmoid(gate)`, CPU
+  reference + HIP; the loader de-interleaves `q_proj` at load time (per-head row-range slots into a
+  reordered `[q_all | gate_all | k | v]` stack), so no attention-desc change is needed.
+- B. An `output_gate` pointer field on `turbine_attention_paged_desc`, applied inside the attention
+  kernels — couples the external Composable Kernel `fmha_fwd_pagedkv`/`fmha_fwd_splitkv` path, which
+  has no gate input (likely infeasible there).
+- C. Defer the Qwen3.5/Qwen3.6 hybrids (their rows stay `unsupported`; S-11 hybrid half open).
+
+**Decision (user, 2026-10-16): A.** ABI v2.19 adds `TURBINE_OP_SIGMOID_MUL` (sigmoid of the gate
+multiplied into the activation, BF16 in/out), the loader de-interleaves `q_proj`, and the output
+gate is applied after attention on every backend; reusable for later gated families. Plan Task 31
+is amended to schedule the ABI step first.
+
+## P7 Qwen3.5 tool format `qwen3_xml` (Task 31, 2026-10-16)
+
+The Qwen3.5 chat template emits XML tool calls
+(`<tool_call>\n<function=NAME>\n<parameter=k>v</parameter>…</function>\n</tool_call>`), which the
+`hermes` format cannot parse (S-18).
+
+- A. Implement the new registered `qwen3_xml` format (llguidance grammar + conformance suite + the
+  family round-trip test) and make it the Qwen3.5 default.
+- B. Register the family and refuse tool calls with a reason code for now.
+
+**Decision (user, 2026-10-16): A.** `qwen3_xml` is implemented as part of the hybrid work (S-18).
+
+## P7 shared lab slot cache cleared (2026-10-16)
+
+The shared slot `/home/piwi/turbine-ci/cache/slots/test-0/target` held dozens of stale
+`libturbine_kernels-*.rlib` variants (a builder's aborted `lab-test`), failing the `hip_ops` link
+with undefined symbols that exist in source. **Decision (user, 2026-10-16): clear it** (everything
+on the LUN is regenerable). Cleared with `sudo rm -rf`; the next lab Job rebuilds from scratch.
