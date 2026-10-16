@@ -32,8 +32,47 @@ merges.
   `apply_chat_template` and `turbine-golden` replays the same kwargs through the chat route, so
   reference and candidate tokenize identically. The `date_string` kwarg of the shared file is
   kept (unused by the gpt-oss template).
-- Tolerances and engine captures are not part of the fixture half; the gate half re-derives the
-  bounds from the engine spread (Qwen3-MoE method) before `lab-bench --golden16`.
+## Tolerance
+
+`tolerance.json` was seeded at the quantized floor — Llama-3.2-3B's strict and batched bounds
+(decision "Golden tolerance floor for quantized checkpoints", B) — which was never measured
+against a Turbine run of this checkpoint, and then re-derived from the engine spread below
+(the Qwen3-MoE method, `tests/golden/qwen3-30b-a3b-instruct-2507-fp8/README.md`), not a
+transformers self-spread: gpt-oss-20b is a quantized sparse-MoE checkpoint whose reference is
+the dequantized MXFP4 → BF16 copy, so how far Turbine's own serving of the checkpoint moves
+under a change of summation order is the metric that matters, and it is one card (no
+`<family>-spread` lab-cluster scenario), so the captures come from the one-card
+`scripts/lab/golden-engine-spread.sh`. `min_identical_prefix` 32, `min_prompts_passing` 14,
+`top_k` 5, `likely_logprob_floor` −2 and `margin_nats` 0.5 are unchanged.
+
+## Engine summation-order spread (2026-10-16)
+
+`scripts/lab/golden-engine-spread.sh p7t27-gptoss gpt-oss-20b` (novanas GPU 0, commit
+`a4d79dd9`) captured this slug free-running (top-20) 20 times: `c1-cold`, `c1-warm` (prefix
+reuse), `c1-heuristic` (`execution.gemm_autotune=false`), `c1-unfused`
+(`execution.fused_ops=false`) and `par-00`…`par-15` (16 prompt-rotated captures at once:
+batched GEMMs and CK split-KV decode attention instead of the b1 kernel). `python3
+scripts/golden/engine_spread.py <captures>/spread --slug gpt-oss-20b` (data: `engine_spread.json`)
+judges each capture against `reference.jsonl` with the compare rule (observed) and measures the
+engine's own noise: per position and reference top-5 candidate, the range of its logprob over
+every capture still on the reference's tokens there. Max engine noise: likely 0.3413 (p12
+position 29), tail 2.7258 (p12 position 1).
+
+| bound          | old (floor) | observed | triangle | proposed |
+| -------------- | ----------- | -------- | -------- | -------- |
+| likely         | 0.15        | 0.35     | 0.50     | 0.35 **new** |
+| tail           | 0.56        | 2.41     | 3.29     | 2.41 **new** |
+| likely batched | 0.25        | 0.48     | 0.60     | 0.48 **new** |
+| tail batched   | 0.75        | 2.64     | 3.48     | 2.64 **new** |
+
+Every capture keeps 16/16 prompts (the token prefix rule) and no capture misses a reference
+top-5 id from its top-20, so nothing hinges on the margin excuse; `c1-warm` is at the reference
+level identical to `c1-cold` (both likely 0.3406 / tail 2.4044), i.e. prefix reuse changes
+nothing the gate judges. The proposed column is `max(today, observed)` capped at the triangle
+(today's bound plus the slug's largest order noise, the most the measured noise justifies);
+nothing hit the cap, so the bounds are the observed spread. The token rule is unchanged.
+Re-run the script and re-derive the bounds if the reference, the prompts or the gate placement
+change.
 
 ## Fixture provenance
 
