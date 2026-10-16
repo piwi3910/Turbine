@@ -152,7 +152,20 @@ pub(crate) fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<Weigh
 /// The fused `[2·q_dim + 2·kv_dim, hidden]` Q/K/V-and-output-gate projection of a Qwen3.5
 /// full-attention layer `layer`, laid out `[q_all | gate_all | k | v]` (P7 S-11).
 pub fn q_gate_kv_proj_name(layer: u32) -> String {
-    format!("model.layers.{layer}.self_attn.q_gate_kv_proj.weight")
+    q_gate_kv_proj_name_at(&format!("model.layers.{layer}"))
+}
+
+/// [`q_gate_kv_proj_name`] of a layer prefix (`model.layers.{i}`, or Qwen3.5's
+/// `model.language_model.layers.{i}`).
+pub fn q_gate_kv_proj_name_at(prefix: &str) -> String {
+    format!("{prefix}.self_attn.q_gate_kv_proj.weight")
+}
+
+/// The Qwen3.5 layer prefix: the text model lives under `model.language_model` in the
+/// multimodal `Qwen3_5ForConditionalGeneration` checkpoint (the vision tower is
+/// `model.visual`).
+pub fn language_model_layer(i: u32) -> String {
+    format!("model.language_model.layers.{i}")
 }
 
 /// [`q_gate_kv_proj_name`]`(i)`'s slots (P7 S-11): the checkpoint's `q_proj` is per-head
@@ -167,10 +180,28 @@ pub fn gated_qkv_slots(
     head_dim: usize,
     hidden: usize,
 ) -> Vec<WeightSlot> {
-    let p = format!("model.layers.{i}.self_attn");
+    gated_qkv_slots_at(
+        &format!("model.layers.{i}"),
+        heads,
+        kv_heads,
+        head_dim,
+        hidden,
+    )
+}
+
+/// [`gated_qkv_slots`] of a layer prefix (`model.layers.{i}`, or Qwen3.5's
+/// `model.language_model.layers.{i}`).
+pub fn gated_qkv_slots_at(
+    layer_prefix: &str,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+) -> Vec<WeightSlot> {
+    let p = format!("{layer_prefix}.self_attn");
     let q_dim = heads * head_dim;
     let kv_dim = kv_heads * head_dim;
-    let stack = q_gate_kv_proj_name(i);
+    let stack = q_gate_kv_proj_name_at(layer_prefix);
     let stack_shape = vec![2 * q_dim + 2 * kv_dim, hidden];
     let q_shape = vec![2 * q_dim, hidden];
     let source = |start: usize| SlotSource {
@@ -1378,5 +1409,36 @@ mod tests {
             200, 200, 200, 201, 201, 201, // v
         ];
         assert_eq!(values, expect);
+    }
+
+    /// P7 S-11: Qwen3.5's text model lives under `model.language_model`; the prefix-aware
+    /// [`gated_qkv_slots_at`] names each layer's fused stack and its parts under it, and
+    /// [`language_model_layer`] is that prefix.
+    #[test]
+    fn gated_qkv_slots_at_use_the_layer_prefix() {
+        let lp = language_model_layer(7);
+        assert_eq!(lp, "model.language_model.layers.7");
+        let slots = gated_qkv_slots_at(&lp, 2, 1, 2, 3);
+        assert_eq!(slots.len(), 2 * 2 + 2);
+        for slot in &slots {
+            assert!(
+                slot.name.starts_with(&format!("{lp}.self_attn.")),
+                "slot {} is outside {lp}",
+                slot.name
+            );
+        }
+        assert!(slots.iter().all(|s| s.stack.as_ref().is_some_and(|p| {
+            p.name == q_gate_kv_proj_name_at(&lp)
+                && p.name == "model.language_model.layers.7.self_attn.q_gate_kv_proj.weight"
+        })));
+        // The default-name helpers agree with the `_at` form of the default prefix.
+        assert_eq!(
+            q_gate_kv_proj_name(3),
+            q_gate_kv_proj_name_at("model.layers.3")
+        );
+        assert_eq!(
+            gated_qkv_slots(3, 2, 1, 2, 3),
+            gated_qkv_slots_at("model.layers.3", 2, 1, 2, 3)
+        );
     }
 }

@@ -116,6 +116,13 @@ pub trait ModelFamily: Module {
     fn skipped_prefixes(&self) -> &'static [&'static str] {
         &[]
     }
+    /// The checkpoint prefix of the text model's parameters (`model`, or Qwen3.5's
+    /// `model.language_model` under the multimodal wrapper): the executor builds the embedding,
+    /// per-layer and final-norm names from it. Slots stacks the family names itself
+    /// ([`ModelFamily::weight_slots`]) are unaffected. The default: `model`.
+    fn text_prefix(&self) -> &'static str {
+        "model"
+    }
 }
 
 /// How one decoder layer mixes tokens (P7 S-1): full causal attention, attention over the last
@@ -148,6 +155,20 @@ pub struct FamilyConfig {
     /// `sliding_window` of `config.json`, read by a family whose layers alternate it with full
     /// attention (gpt-oss); `None` for every other family.
     pub sliding_window: Option<u32>,
+    /// The Gated DeltaNet dimensions of the family's linear-attention layers
+    /// ([`LayerKind::LinearAttention`], P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<crate::config::GdnDims>,
+    /// Every full-attention layer has a per-head output gate (Qwen3.5, P7 S-11).
+    pub attn_output_gate: bool,
+    /// A fraction of `head_dim` the RoPE rotates (`partial_rotary_factor`, Qwen3.5's 0.25);
+    /// `None` rotates the whole head.
+    pub partial_rotary_factor: Option<f32>,
+    /// The family's RMSNorm weights follow transformers' `output · (1 + weight)` form (Qwen3.5).
+    pub unit_offset_norms: bool,
+    /// A hybrid family's full-attention interval (Qwen3.5's `full_attention_interval`): every
+    /// `n`-th layer is [`LayerKind::FullAttention`] (1-indexed: layers `n − 1`, `2n − 1`, …),
+    /// the rest [`LayerKind::LinearAttention`]. `None` for every attention-only family.
+    pub full_attention_interval: Option<u32>,
 }
 
 /// A registered family as a value of `ModelArchConfig`: equal by name, printed as its name.

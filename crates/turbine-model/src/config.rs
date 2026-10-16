@@ -93,6 +93,24 @@ pub struct ModelArchConfig {
     /// The window of the sliding-attention layers ([`LayerKind::SlidingWindow`]), for a family
     /// that alternates them with full attention (gpt-oss, P7 S-8); `None` otherwise.
     pub sliding_window: Option<u32>,
+    /// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers
+    /// ([`LayerKind::LinearAttention`], P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<GdnDims>,
+    /// Every full-attention layer computes a per-head output gate that multiplies the attention
+    /// output before the O projection (Qwen3.5's `attn_output_gate`, P7 S-11).
+    pub attn_output_gate: bool,
+    /// The rotary dimension: `head_dim`, or a fraction of it for a partial-rotary family
+    /// (`partial_rotary_factor`, Qwen3.5's `head_dim / 4`). The rope op rotates only the first
+    /// `rotary_dim` elements of each head.
+    pub rotary_dim: u32,
+    /// The family's RMSNorm weights follow transformers' `output · (1 + weight)` form (Qwen3.5's
+    /// `Qwen3_5RMSNorm`): the loader adds 1 to them, so the plain `rmsnorm` op applies it
+    /// (`families::ModelFamily::unit_offset_norms`).
+    pub unit_offset_norms: bool,
+    /// A hybrid family's full-attention interval (Qwen3.5): every `n`-th layer is
+    /// [`crate::families::LayerKind::FullAttention`], the rest linear; `None` otherwise. The
+    /// family's [`crate::families::ModelFamily::layer_kinds`] reads it.
+    pub full_attention_interval: Option<u32>,
     /// How the weights are stored and which dtypes weights and activations use.
     pub weight_format: WeightFormatRef,
     /// How the paged KV pool stores K and V (`kv.dtype`, Phase 6a S-13): BF16 as parsed; the
@@ -116,6 +134,48 @@ pub struct MoeConfig {
     pub expert_intermediate: u32,
     /// Renormalise the selected top-k softmax weights to sum to 1 (`false` for OLMoE).
     pub norm_topk_prob: bool,
+}
+
+/// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers (P7 S-11):
+/// `k_heads` key heads of `k_dim` and `v_heads` value heads of `v_dim` (each value head reads
+/// key head `h / (v_heads / k_heads)`), and a causal depthwise convolution of the concatenated
+/// `q | k | v` channels with window `conv_kernel` (`TURBINE_ABI` supports 4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GdnDims {
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    pub conv_kernel: u32,
+}
+
+impl GdnDims {
+    /// Elements of the key projection (`k_heads · k_dim`), and of the `q` and `k` blocks of the
+    /// convolution.
+    pub fn key_dim(&self) -> usize {
+        self.k_heads as usize * self.k_dim as usize
+    }
+
+    /// Elements of the value projection (`v_heads · v_dim`), and of the `v` block.
+    pub fn value_dim(&self) -> usize {
+        self.v_heads as usize * self.v_dim as usize
+    }
+
+    /// The convolution's channels: `2 · key_dim + value_dim` (`q | k | v`).
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    /// F32 bytes of one sequence's recurrent state (`v_heads · v_dim · k_dim`).
+    pub fn recurrent_bytes(&self) -> u64 {
+        (self.v_heads as u64) * (self.v_dim as u64) * (self.k_dim as u64) * 4
+    }
+
+    /// Bytes of one sequence's convolution state (`conv_dim · (conv_kernel − 1)`, activation
+    /// dtype: 2 bytes BF16).
+    pub fn conv_bytes(&self) -> u64 {
+        (self.conv_dim() as u64) * (self.conv_kernel.saturating_sub(1) as u64) * 2
+    }
 }
 
 /// `generation_config.json`: EOS ids, BOS and the model's suggested sampling defaults.
@@ -657,6 +717,26 @@ pub fn load_model_config_with(
     };
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
+    // Part Rotary: `rotary_dim` is `head_dim` unless the family names a `partial_rotary_factor`.
+    let rotary_dim = match family_cfg.partial_rotary_factor {
+        None => head_dim,
+        Some(f) => {
+            if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+                return Err(invalid(format!(
+                    "partial_rotary_factor {f} must be in (0, 1]"
+                )));
+            }
+            let d = (f64::from(head_dim) * f64::from(f)).round() as u32;
+            if d == 0 || !d.is_multiple_of(2) || d > head_dim {
+                return Err(invalid(format!(
+                    "partial_rotary_factor {f} of head_dim {head_dim} gives an invalid \
+                     rotary_dim {d} (positive, even, at most head_dim)"
+                )));
+            }
+            d
+        }
+    };
+
     let mut cfg = ModelArchConfig {
         family: FamilyRef(family),
         hf_architecture,
@@ -677,6 +757,11 @@ pub fn load_model_config_with(
         qk_norm: family_cfg.qk_norm,
         qk_norm_per_head: family_cfg.qk_norm_per_head,
         sliding_window: family_cfg.sliding_window,
+        gdn: family_cfg.gdn,
+        attn_output_gate: family_cfg.attn_output_gate,
+        rotary_dim,
+        unit_offset_norms: family_cfg.unit_offset_norms,
+        full_attention_interval: family_cfg.full_attention_interval,
         weight_format,
         kv_cache: crate::kv_scales::KvCache::bf16(),
         layer_kinds: Vec::new(),
