@@ -4731,3 +4731,33 @@ The shared slot `/home/piwi/turbine-ci/cache/slots/test-0/target` held dozens of
 `libturbine_kernels-*.rlib` variants (a builder's aborted `lab-test`), failing the `hip_ops` link
 with undefined symbols that exist in source. **Decision (user, 2026-10-16): clear it** (everything
 on the LUN is regenerable). Cleared with `sudo rm -rf`; the next lab Job rebuilds from scratch.
+
+## P7 GDN `g`/`beta` production for the hybrids (Task 31/34, 2026-10-17)
+
+`turbine_gdn_desc` (ABI v2.18, Task 30) takes `g` and `beta` as precomputed F32, but ops 0–24 have
+no sigmoid/exp/softplus op, so `beta = sigmoid(in_proj_b)` and
+`g = -exp(A_log) · softplus(in_proj_a + dt_bias)` cannot be produced on-device. The plan never
+assigned their producer.
+
+- A. Compute them on the host from the small per-layer `in_proj_a`/`in_proj_b` outputs
+  (`[tokens, v_heads]`) in Rust, per GDN layer per step (a device→host→device round trip on HIP;
+  ~27 GDN layers on the 9B → ~1 ms/step at B ≤ 64 against ~28 ms of weight reads) — no ABI change.
+- B. Fold the raw `a_proj`/`b_proj`/`A_log`/`dt_bias` into `turbine_gdn_desc` and compute `g`/`beta`
+  inside the GDN kernel — changes the just-landed ABI v2.18 GDN desc/impls/tests.
+- C. Add a small ABI op (a `GDN_PREP`, or `exp`/`softplus`) the executor composes — another ABI bump.
+
+**Decision (lead, 2026-10-17; safe reversible default taken while the goal ran): A** — the smallest
+correct slice, no ABI change; revisit B/C with a measured 16k-prefill profile if the round trip
+shows (the "P7 Gated DeltaNet provider" decision already defers GDN prefill tuning to a measured
+follow-up). Amendable; B/C are the optimization path.
+
+## P7 mxfp4_a4 stays experimental (Task 28, 2026-10-17)
+
+The `mxfp4_a4` checkpoint (`matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq`) is the **base**
+Llama-3.2-3B, not Instruct: `eos_token_id` 128001 (`<|end_of_text|>`; Instruct is 128009), no chat
+template, and a Llama chat prompt is echoed rather than answered. So the plan's GSM8K-chat gate
+against the BF16 Instruct baseline does not measure quantized accuracy, and the golden gate fails
+10/16 (need 11; the golden `missing_top_k` clause is not folded into the self-spread tolerance).
+**Decision (lead, 2026-10-17; plan's else branch):** record `- P7 open:` with the numbers and leave
+`LlamaForCausalLM/mxfp4_a4/bf16/tp1` `experimental`. An Instruct W4A4 3B checkpoint or a
+completion-form re-gate would be new work; not started without the user's word.
