@@ -1700,7 +1700,7 @@ fn lab_bench_model_map() {
         ),
         (
             "llama-mxfp4-a4",
-            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-mxfp4-a4 scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml",
+            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-instruct-mxfp4-a4 scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml",
         ),
         (
             "llama-yarn16",
