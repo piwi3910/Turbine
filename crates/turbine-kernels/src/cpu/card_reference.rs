@@ -32,7 +32,7 @@ use crate::ops::{
     AttentionKind, Conv1dKernel, ElementwiseKernel, EmbeddingKernel, GdnKernel, GemmKernel,
     KernelProvider, KvCopyKernel, KvTranscodeKernel, LogitsReduceKernel, MoeKernel, NormKernel,
     OpKind, PagedAttentionContext, ProviderId, QGemmKernel, QuantizeActKernel, RopeKernel,
-    ShardedNormKernel,
+    ShardedNormKernel, SigmoidMulKernel,
 };
 
 /// The b1 decode kernel's implementation name in a card's decode-attention order.
@@ -172,6 +172,9 @@ impl KernelProvider for CardReference {
     }
     fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
         CPU.conv1d()
+    }
+    fn sigmoid_mul(&self) -> Option<&dyn SigmoidMulKernel> {
+        CPU.sigmoid_mul()
     }
 }
 

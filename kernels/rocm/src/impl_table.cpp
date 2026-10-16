@@ -55,6 +55,7 @@
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
 //   row_sumsq, rmsnorm_sharded (v2.6)
+//   sigmoid_mul (v2.19)          0 turbine_hip [turbine_hip]
 //   qgemm (v2.9)                 0 hipblaslt_fp8 [hipblaslt] (FP8_TENSOR /
 //                                  FP8_CHANNEL weights, FP8_TENSOR /
 //                                  FP8_TOKEN activations)
@@ -227,6 +228,10 @@ const ImplEntry kRope[] = {
 const ImplEntry kSiluMul[] = {
     whole<turbine_silu_mul_desc, turbine_silu_mul_supported, turbine_silu_mul>(
         "turbine_hip", kTurbine),
+};
+const ImplEntry kSigmoidMul[] = {
+    whole<turbine_sigmoid_mul_desc, turbine_sigmoid_mul_supported,
+          turbine_sigmoid_mul>("turbine_hip", kTurbine),
 };
 const ImplEntry kEmbedding[] = {
     whole<turbine_embedding_desc, turbine_embedding_supported,
@@ -417,14 +422,15 @@ const OpImpls kOps[] = {
     of(kGdnDecode),
     of(kConv1dPrefill),
     of(kConv1dUpdate),
+    of(kSigmoidMul),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_CONV1D_UPDATE + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_SIGMOID_MUL + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_CONV1D_UPDATE) {
+  if (op < 0 || op > TURBINE_OP_SIGMOID_MUL) {
     *count = 0;
     return nullptr;
   }
