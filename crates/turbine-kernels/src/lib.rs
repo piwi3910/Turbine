@@ -36,7 +36,8 @@ pub use ops::{
     PagedAttentionContext, ProviderId, QGemmConfig, QGemmContext, QGemmKernel, QuantizeActConfig,
     QuantizeActContext, QuantizeActKernel, RmsnormShardedConfig, RmsnormShardedContext, RopeConfig,
     RopeContext, RopeKernel, RouteMode, RowSumsqConfig, RowSumsqContext, RowTier,
-    ShardedNormKernel, TqEncodeFn, TqHeadTables, TqPaged, TqParams, kv_format_code,
+    ShardedNormKernel, SigmoidMulConfig, SigmoidMulContext, SigmoidMulKernel, TqEncodeFn,
+    TqHeadTables, TqPaged, TqParams, kv_format_code,
 };
 pub use registry::{KernelMetrics, KernelRegistry, OpConfig, OpRequirement, Selection};
 pub use shim::{

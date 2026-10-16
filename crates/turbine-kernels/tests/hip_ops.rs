@@ -37,8 +37,9 @@ use turbine_kernels::{
     MoeExpertsConfig, MoeExpertsContext, MoeRouteConfig, MoeRouteContext, NormConfig, NormContext,
     OpConfig, OpKind, PagedAttentionContext, RmsnormShardedConfig, RmsnormShardedContext,
     RopeConfig, RopeContext, RouteMode, RowSumsqConfig, RowSumsqContext, ShimContext, ShimLibrary,
-    TURBINE_OPTION_GEMM_AUTOTUNE, TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged,
-    TqParams, cpu_reference_provider, shim_provider,
+    SigmoidMulConfig, SigmoidMulContext, TURBINE_OPTION_GEMM_AUTOTUNE,
+    TURBINE_OPTION_GEMM_TUNED_SHAPES, TqHeadTables, TqPaged, TqParams, cpu_reference_provider,
+    shim_provider,
 };
 use turbine_tensor::host::HostMemory;
 use turbine_tensor::{DeviceBuffer, DeviceMemory, HostStaging, Tensor, TensorView};
@@ -1397,6 +1398,42 @@ fn silu_mul_case(p: &Pair, rng: &mut Rng, t: usize) {
     assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
 }
 
+/// `a · sigmoid(gate)` over `t` rows of Llama's hidden size (the Qwen3.5 output-gate shape,
+/// ABI v2.19).
+fn sigmoid_mul_case(p: &Pair, rng: &mut Rng, t: usize) {
+    let cfg = SigmoidMulConfig {
+        cols: HIDDEN as u64,
+        dtype: DType::BF16,
+    };
+    let hip = p.hip.sigmoid_mul().expect("hip sigmoid_mul");
+    assert!(hip.supports(&cfg), "hip must support sigmoid_mul {cfg}");
+    let impl_name = hip.implementation(&cfg);
+    let n = t * HIDDEN;
+    let shape = [t, HIDDEN];
+    let (a_hip, a_cpu) = twin(p, &shape, DType::BF16, &rng.normal(n, 1.0));
+    let (g_hip, g_cpu) = twin(p, &shape, DType::BF16, &rng.normal(n, 1.0));
+    let (o_hip, o_cpu) = twin(p, &shape, DType::BF16, &vec![0.0; n]);
+    let runs = [
+        (hip, &a_hip, &g_hip, &o_hip),
+        (
+            p.cpu.sigmoid_mul().expect("cpu sigmoid_mul"),
+            &a_cpu,
+            &g_cpu,
+            &o_cpu,
+        ),
+    ];
+    for (kernel, a, g, o) in runs {
+        let mut ctx = SigmoidMulContext {
+            a: a.view(),
+            gate: g.view(),
+            out: o.view(),
+        };
+        kernel.execute(&mut ctx).expect("sigmoid_mul");
+    }
+    let what = format!("sigmoid_mul rows={t} {cfg}");
+    assert_close(&what, &impl_name, &read(&o_hip), &read(&o_cpu), DType::BF16);
+}
+
 /// Embedding of `t` tokens from the full Llama vocabulary.
 fn embedding_case(p: &Pair, rng: &mut Rng, t: usize) {
     // Embedding over the full vocabulary, ids spread across it (last row included).
@@ -1484,6 +1521,23 @@ fn norm_rope_silu_embedding_add_match_cpu() {
     silu_mul_case(&p, &mut rng, t);
     embedding_case(&p, &mut rng, t);
     add_case(&p, &mut rng, t);
+}
+
+/// `a · sigmoid(gate)` (ABI v2.19): the HIP kernel matches the cpu-reference provider on seeded
+/// inputs at Llama's hidden size. Run: `scripts/lab-test.sh novanas -- -p turbine-kernels --test
+/// hip_ops sigmoid_mul`.
+#[test]
+#[ignore = "needs an R9700 and libturbine_hip.so (scripts/lab-test.sh novanas)"]
+fn sigmoid_mul_matches_cpu() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = lock_gpu();
+    let p = setup();
+    let mut rng = Rng(11);
+    for t in [1usize, 3, 17] {
+        sigmoid_mul_case(&p, &mut rng, t);
+    }
 }
 
 /// The first `cols` columns of the `[rows, stride]` tensor `t`, as a row-strided `[rows, cols]`
@@ -6854,6 +6908,8 @@ fn implementations_enumerated() {
             one("aiter_causal_conv1d_split_qkv", "aiter"),
         ),
         (OpKind::Conv1dUpdate, one("llama_cpp_ssm_conv", "llama_cpp")),
+        // ABI v2.19 (Phase 7 Task 31): the gated-attention sigmoid-multiply.
+        (OpKind::SigmoidMul, one("turbine_hip", "turbine_hip")),
     ];
     assert_eq!(table.len(), OpKind::ALL.len());
     for (op, want) in &table {
@@ -7067,6 +7123,13 @@ fn every_implementation_matches_cpu() {
                 dtype: bf16,
             }),
             Box::new(|p, _name, rng| silu_mul_case(p, rng, 17)),
+        ),
+        case(
+            OpConfig::SigmoidMul(SigmoidMulConfig {
+                cols: HIDDEN as u64,
+                dtype: bf16,
+            }),
+            Box::new(|p, _name, rng| sigmoid_mul_case(p, rng, 17)),
         ),
         case(
             OpConfig::Embedding(EmbeddingConfig {
