@@ -271,6 +271,7 @@ impl Fp8Layout {
         let matrix = self.scale_shape(rows, k);
         let per_row = matrix.get(1).copied().unwrap_or(1);
         out.push(WeightSlot {
+            float32_stored: false,
             name: format!("{module}.{}", self.scale_suffix),
             shape: self.scale_shape(n, k),
             stack: Some(StackPlace {
@@ -282,6 +283,7 @@ impl Fp8Layout {
         });
         if self.act == ActivationQuant::Fp8PerTensorStatic {
             out.push(WeightSlot {
+                float32_stored: false,
                 name: format!("{module}.input_scale"),
                 shape: vec![n],
                 stack: Some(StackPlace {
@@ -498,6 +500,7 @@ fn check_slot(name: &str) -> WeightSlot {
         shape: vec![0],
         stack: None,
         source: None,
+        float32_stored: false,
     }
 }
 
@@ -827,6 +830,7 @@ mod tests {
             shape,
             stack: None,
             source: None,
+            float32_stored: false,
         }
     }
 

@@ -255,6 +255,7 @@ impl Int4Layout {
             let mut shape = lead.clone();
             shape.extend([rows, cols]);
             WeightSlot {
+                float32_stored: false,
                 name: format!("{module}.{suffix}"),
                 shape: vec![n, cols],
                 stack: Some(StackPlace {
@@ -551,6 +552,7 @@ fn check_slot(module: &str, suffix: &str, (n, k): (usize, usize)) -> WeightSlot 
         shape: vec![0, n, k],
         stack: None,
         source: None,
+        float32_stored: false,
     }
 }
 
@@ -940,6 +942,7 @@ mod tests {
             shape,
             stack: None,
             source: None,
+            float32_stored: false,
         }
     }
 

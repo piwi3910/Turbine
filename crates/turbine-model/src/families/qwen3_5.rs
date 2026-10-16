@@ -313,7 +313,14 @@ pub fn qwen3_5_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     let gdn = cfg
         .gdn
         .expect("a Qwen3.5 configuration carries Gated DeltaNet dims");
+    // The Gated DeltaNet gated-norm weight, `A_log` and `dt_bias` are F32 in the released
+    // checkpoint (transformers casts them to the model dtype); accept either and convert.
+    // Every RMSNorm weight, `A_log` and `dt_bias` is F32 in the released checkpoint
+    // (transformers casts them to the model dtype); accept either and convert on load.
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: crate::executor::decoder::is_norm_weight(&name)
+            || name.ends_with("A_log")
+            || name.ends_with("dt_bias"),
         name,
         shape,
         stack: None,
@@ -414,7 +421,14 @@ pub fn qwen3_5_checkpoint_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     let gdn = cfg
         .gdn
         .expect("a Qwen3.5 configuration carries Gated DeltaNet dims");
+    // The Gated DeltaNet gated-norm weight, `A_log` and `dt_bias` are F32 in the released
+    // checkpoint (transformers casts them to the model dtype); accept either and convert.
+    // Every RMSNorm weight, `A_log` and `dt_bias` is F32 in the released checkpoint
+    // (transformers casts them to the model dtype); accept either and convert on load.
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: crate::executor::decoder::is_norm_weight(&name)
+            || name.ends_with("A_log")
+            || name.ends_with("dt_bias"),
         name,
         shape,
         stack: None,

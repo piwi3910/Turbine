@@ -116,6 +116,7 @@ pub(crate) fn dense_slots(
     let inter = cfg.intermediate as usize;
     let vocab = cfg.vocab_size as usize;
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: false,
         name,
         shape,
         stack: None,
