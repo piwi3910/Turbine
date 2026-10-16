@@ -579,6 +579,20 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     family_row("MistralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Fp8),
+    // gpt-oss-20b (the `openai_mxfp4` packaging, which detects as the `mxfp4` weight column —
+    // `support_startup::format_columns`; it has no matrix row of its own) closed its S-13 gate
+    // on gfx1201 (perf-log "P7 gpt-oss gate", 2026-10-16: golden c1/c16 16/16, GSM8K-200 c16
+    // 0.925 vs vLLM-ROCm's 0.930 — drop 0.005, `max_drop` 0.01 — and 277.2 tok/s vs vLLM's
+    // 133.6, ratio 2.07); other amd archs stay pending.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("GptOssForCausalLM"),
+        Some(WeightFormatColumn::Mxfp4),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     family_row("GptOssForCausalLM", WeightFormatColumn::Mxfp4),
     // A BF16 `GptOssForCausalLM` checkpoint does not exist: the experts are always stored
     // fused MXFP4 (`mlp.experts.<proj>_blocks`), so the Bf16 weights column is refused with
@@ -1482,9 +1496,9 @@ mod tests {
         // Nothing but the AMD BF16 baseline, the proven gfx1201 Llama FP8 KV row (Task 24), the
         // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
         // awq_int4 and gptq_int4, Task 18), the Phase 7 families that closed their S-13 gates
-        // (Qwen3 and Mistral BF16 tp1; Qwen3-MoE fp8_block tp2 and ep2, Task 18) and the proven
-        // OLMoE rows (fp8_e4m3 KV; tq4 L0 stays `experimental`) are supported before the tracks
-        // add rows.
+        // (Qwen3 and Mistral BF16 tp1; Qwen3-MoE fp8_block tp2 and ep2; gpt-oss-20b mxfp4 tp1,
+        // Task 27) and the proven OLMoE rows (fp8_e4m3 KV; tq4 L0 stays `experimental`) are
+        // supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
@@ -1494,7 +1508,7 @@ mod tests {
                 assert!(
                     matches!(
                         r.key.weight_format,
-                        Some(W::Fp8 | W::Fp8Block | W::AwqInt4 | W::GptqInt4)
+                        Some(W::Fp8 | W::Fp8Block | W::AwqInt4 | W::GptqInt4 | W::Mxfp4)
                     ),
                     "{:?}",
                     r.view()
@@ -1503,7 +1517,9 @@ mod tests {
                 assert!(
                     matches!(
                         r.key.architecture,
-                        Some("LlamaForCausalLM") | Some("Qwen3MoeForCausalLM")
+                        Some("LlamaForCausalLM")
+                            | Some("Qwen3MoeForCausalLM")
+                            | Some("GptOssForCausalLM")
                     ),
                     "{:?}",
                     r.view()
@@ -1711,7 +1727,6 @@ mod tests {
             ("Qwen3MoeForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Fp8),
-            ("GptOssForCausalLM", W::Mxfp4),
             ("Qwen3_5ForConditionalGeneration", W::Bf16),
             ("Qwen3_5MoeForConditionalGeneration", W::Fp8Block),
         ] {
@@ -1770,6 +1785,40 @@ mod tests {
             "amd",
             "gfx1201",
             "MistralForCausalLM",
+            W::AwqInt4,
+            K::Bf16,
+            S::None,
+        );
+        let status = resolve(&k);
+        assert!(
+            status.reason().unwrap().contains("phase-6a-quantization"),
+            "{k}: {status:?}"
+        );
+        // gpt-oss-20b (openai_mxfp4) closed its gate on gfx1201 (perf-log "P7 gpt-oss gate"):
+        // supported there, pending on the other amd archs; another weight format stays refused
+        // by its format row.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "GptOssForCausalLM",
+            W::Mxfp4,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        let k = key(
+            "amd",
+            "gfx942",
+            "GptOssForCausalLM",
+            W::Mxfp4,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+        let k = key(
+            "amd",
+            "gfx1201",
+            "GptOssForCausalLM",
             W::AwqInt4,
             K::Bf16,
             S::None,

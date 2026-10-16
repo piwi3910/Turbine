@@ -2,9 +2,10 @@
 //! `quant_method: mxfp4`, `modules_to_not_convert` naming modules left in BF16 (globs such as
 //! `model.layers.*.self_attn`). Tensors: `X.weight_blocks` U8 `[n, k/32, 16]` (32 E2M1 codes
 //! per block, low nibble first) and `X.weight_scales` U8 `[n, k/32]` ([`super::mxfp4`]). Its
-//! family (`GptOssForCausalLM`, whose experts are stored this way) arrives with Phase 7; in
-//! this phase only the dense tiny fixtures exercise the loader, and the support-matrix row
-//! stays `unsupported`.
+//! family (`GptOssForCausalLM`, whose experts are stored this way) arrives with Phase 7; its
+//! `GptOssForCausalLM/mxfp4` support-matrix row closed its gate on gfx1201 (perf-log "P7 gpt-oss
+//! gate", 2026-10-16) and is `supported` there — the packaging itself collapses into the `mxfp4`
+//! weight column, so it has no matrix row of its own.
 
 use serde_json::{Value, json};
 
