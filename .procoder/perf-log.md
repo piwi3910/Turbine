@@ -2248,7 +2248,7 @@ follows, so step 5 takes nothing: `LlamaForCausalLM/mxfp4/bf16/tp1` stays `exper
 
 - P7 open: LlamaForCausalLM/mxfp4/bf16/tp1 — p05 knife edge is the reference's own BF16 rounding seeded at RoPE; no kernel fix (branch `p7-t28`, 2026-10-16)
 
-### P7 mxfp4_a4 gate — fixture landed, lab gate blocked (plan Task 28, branch `p7-t28`, 2026-10-17)
+### P7 mxfp4_a4 gate — lab gate run, both legs FAIL (plan Task 28, branch `p7-t28a`, 2026-10-17)
 
 The W4A4 3B checkpoint (`matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` @
 `91925ffda6977d097354a99718a20e035f8af80a`) now has its golden fixture
@@ -2274,15 +2274,37 @@ likely 1.13, tail 4.01, `min_prompts_passing` 11. The W4A4 activation fake-quant
 reference's own top-5 this noisy, so the golden gate is loose by construction and the accuracy
 gate is the binding one.
 
-**Lab gate not run**: both R9700s were held and busy by other builders' Jobs when the fixture
-landed (`turbine-lab-serve-1016203828-1fad9cab` benchmarking on GPU 1 and port 18000,
-`turbine-lab-vllm-1016200935-2326d9cf` on GPU 0 and port 18100), so the golden c1/c16 and the
-GSM8K c16 run are pending a free card — `lab-bench --model llama-mxfp4-a4 --golden16` and
-`turbine-golden eval --tasks tests/eval/gsm8k-200.jsonl --concurrency 16`, then
-`eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16-c16.json --max-drop 0.04`.
-Per user decision "mxfp4_a4" (B) the row stays `experimental` until both pass.
+**Lab gate run 2026-10-17** (branch `p7-t28a`, `lab-bench --model llama-mxfp4-a4 --golden16`, run id
+`p7t28a-mxfp4a4`, config `scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml`):
 
-- P7 open: LlamaForCausalLM/mxfp4_a4/bf16/tp1 — fixture done (tolerance likely 1.13 / tail 4.01 / 11 prefixes); lab golden c1/c16 + GSM8K c16 blocked on both GPUs held by peer Jobs (branch `p7-t28`, 2026-10-17)
+- Golden c1 **FAIL 10/16** (need 11), strict bounds likely 1.13 / tail 4.01: p02, p05, p10, p11, p12
+  fail on `missing_top_k` (a reference top-5 id absent from Turbine's top list at a compared
+  position), p04 exceeds the likely bound (1.4720 > 1.13). Golden c16 **FAIL 10/16** (batched
+  bounds): p02 (margin 0.556 ≥ 0.5), p04 (likely 1.8591 > 1.13), p05, p06, p11, p13 fail.
+  Throughput 1141.7 tok/s at c16 (200 requests, 0 failed), ITL p50 10.1 ms, TTFT p50 262 ms — the
+  W4A4 path is fast.
+
+- The self-spread tolerance came from `self_spread.py`, which reports the prefix/bounds and the
+  `missing` count per variant but does not fold the `missing_top_k` clause (a hard clause of
+  `turbine-golden compare`'s judge, `all(logprob_within_bound)`) into the derived bounds, so the
+  golden gate is stricter than the derivation.
+
+- GSM8K-200 c16: Turbine **0.015** (3/200). The checkpoint turned out to be the **base**
+  Llama-3.2-3B, not Instruct: `config.json` `eos_token_id` 128001 (`<|end_of_text|>`; the Instruct
+  3B is 128009 `<|eot_id|>`), the tokenizer ships no `chat_template`, and a manual Llama chat prompt
+  (`<|start_header_id|>user…<|eot_id|><|start_header_id|>assistant<|end_header_id|>`) is echoed,
+  not answered (raw `Q: …\nA:` completions do work). A base model does not follow the GSM8K chat
+  prompt, so the comparison against the BF16 **Instruct** baseline (0.795) does not test the
+  checkpoint's accuracy. `eval-compare` also refuses the pair on a filler-metadata mismatch (the
+  committed `turbine-bf16-c16.json` predates the eval filler fields; the candidate records
+  `filler_words` 2000), rc 2.
+
+- Both golden and GSM8K fail, so per decision "mxfp4_a4" (B) the row stays `experimental`.
+  Questions for the user (recorded, not decided): (1) the checkpoint is base — choose an Instruct
+  W4A4 3B, gate golden-only, or keep open; (2) the self-spread tolerance vs the `missing_top_k`
+  clause; (3) the stale BF16 c16 baseline's filler metadata.
+
+- P7 open: LlamaForCausalLM/mxfp4_a4/bf16/tp1 — lab gate 2026-10-17 (branch `p7-t28a`): golden c1/c16 FAIL 10/16 (need 11; `missing_top_k` on 6 prompts, p04 likely 1.4720 > 1.13); GSM8K c16 0.015 (3/200) but the checkpoint is base Llama-3.2-3B (no chat template, eos 128001), so the GSM8K gate against the BF16 Instruct baseline is invalid; row stays experimental
 ### P7 gpt-oss gate — gpt-oss-20b (openai_mxfp4) tp1 (plan Task 27, branch `p7-t27-fixture`, 2026-10-16)
 
 - Golden (`tests/golden/gpt-oss-20b/`, tolerance from the dequantized-MXFP4 transformers self-spread; the fixture's `prompts.jsonl` is the shared set with `reasoning_effort: "low"` in every `chat_template_kwargs`, decision Harmony A):
