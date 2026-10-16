@@ -1551,12 +1551,14 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
         }
     };
     // Other expert ranks' and stages' tensors are skipped quietly (counted), not warned one
-    // by one.
-    WeightLoader::load_part(
+    // by one; a family's deliberately unused sub-modules (e.g. a vision tower) are counted per
+    // prefix too (one `weights_skipped` event each).
+    WeightLoader::load_part_skipping(
         arch.weight_format.get(),
         &prepared.index,
         &slots,
         &arch.family.0.weight_slots(arch),
+        arch.family.0.skipped_prefixes(),
         &prepared.provider.opened.mem,
         MAX_STAGING_BYTES,
     )

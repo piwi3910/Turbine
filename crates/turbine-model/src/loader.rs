@@ -155,6 +155,16 @@ pub fn stacked_experts_name(layer: u32, proj: &str) -> String {
     format!("model.layers.{layer}.mlp.experts.{proj}.weight")
 }
 
+/// One checkpoint tensor prefix a family deliberately skips
+/// ([`crate::families::ModelFamily::skipped_prefixes`], e.g. an unused vision tower or MTP head):
+/// the tensors and bytes the loader counted under it (logged `event="weights_skipped"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedPrefix {
+    pub prefix: String,
+    pub tensors: usize,
+    pub bytes: u64,
+}
+
 /// The loaded parameters by checkpoint name (a stacked parameter by its [`StackPlace`] name),
 /// plus what the checkpoint held beyond them.
 #[derive(Debug)]
@@ -166,6 +176,8 @@ pub struct LoadedWeights {
     pub unexpected: Vec<String>,
     /// Checkpoint tensors deliberately skipped: `lm_head.weight` of a tied model.
     pub ignored: Vec<String>,
+    /// Checkpoint tensors skipped by prefix ([`SkippedPrefix`]), sorted by prefix.
+    pub skipped: Vec<SkippedPrefix>,
     /// Checkpoint tensors another pipeline stage or expert-parallel rank loads
     /// ([`WeightLoader::load_part`]): counted, logged at debug level only.
     pub elsewhere: usize,
@@ -211,7 +223,22 @@ impl WeightLoader {
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
-        WeightLoader::load_part(format, index, slots, &[], mem, staging_bytes)
+        WeightLoader::load_part_skipping(format, index, slots, &[], &[], mem, staging_bytes)
+    }
+
+    /// [`WeightLoader::load_format`] with a family's deliberately skipped checkpoint tensor
+    /// prefixes ([`crate::families::ModelFamily::skipped_prefixes`]): an index tensor naming no
+    /// slot but starting with one of `skip` is counted per prefix (logged one
+    /// `event="weights_skipped"` each) instead of warning `unexpected_tensor`.
+    pub fn load_format_skipping(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        skip: &[&str],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_part_skipping(format, index, slots, &[], skip, mem, staging_bytes)
     }
 
     /// The validation half of [`WeightLoader::load_part`] over already-derived slots (the
@@ -283,23 +310,38 @@ impl WeightLoader {
         Ok(planned)
     }
 
+    /// [`WeightLoader::load_part_skipping`] without a family's skipped prefixes.
+    pub fn load_part(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        whole: &[WeightSlot],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_part_skipping(format, index, slots, whole, &[], mem, staging_bytes)
+    }
+
     /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
     /// ranks: `whole` is the unsplit model's slot list (the family's
     /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
     /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
     /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
-    /// warn. An empty `whole` is [`WeightLoader::load_format`].
+    /// warn, unless they start with one of `skip` ([`SkippedPrefix`], one
+    /// `event="weights_skipped"` per prefix). An empty `whole` and `skip` is
+    /// [`WeightLoader::load_format`].
     ///
     /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
     /// quantized layer's scales, zero points and activation scales). A slot the format
     /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
     /// uploaded (its checkpoint tensor's shape is the format's to check), or only validated
     /// when it has no elements (a check-only slot); every other slot is copied as stored.
-    pub fn load_part(
+    pub fn load_part_skipping(
         format: &dyn WeightFormat,
         index: &SafetensorsIndex,
         slots: &[WeightSlot],
         whole: &[WeightSlot],
+        skip: &[&str],
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
@@ -318,6 +360,7 @@ impl WeightLoader {
             .filter(|n| !wanted.contains(n))
             .collect();
         let (mut unexpected, mut ignored, mut elsewhere) = (Vec::new(), Vec::new(), 0usize);
+        let mut skipped_count: HashMap<&str, (usize, u64)> = HashMap::new();
         for entry in index.entries() {
             if wanted.contains(entry.name.as_str()) {
                 continue;
@@ -332,6 +375,10 @@ impl WeightLoader {
                     "tied model: checkpoint lm_head.weight is ignored"
                 );
                 ignored.push(entry.name.clone());
+            } else if let Some(prefix) = skip.iter().find(|p| entry.name.starts_with(**p)) {
+                let slot = skipped_count.entry(*prefix).or_insert((0, 0));
+                slot.0 += 1;
+                slot.1 += entry.byte_len();
             } else {
                 tracing::warn!(
                     event = "unexpected_tensor",
@@ -341,6 +388,24 @@ impl WeightLoader {
                 );
                 unexpected.push(entry.name.clone());
             }
+        }
+        let mut skipped: Vec<SkippedPrefix> = skipped_count
+            .into_iter()
+            .map(|(prefix, (tensors, bytes))| SkippedPrefix {
+                prefix: prefix.to_string(),
+                tensors,
+                bytes,
+            })
+            .collect();
+        skipped.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+        for s in &skipped {
+            tracing::warn!(
+                event = "weights_skipped",
+                prefix = %s.prefix,
+                tensors = s.tensors,
+                bytes = s.bytes,
+                "checkpoint tensors of an unused sub-module are skipped"
+            );
         }
         if elsewhere > 0 {
             tracing::debug!(
@@ -492,6 +557,7 @@ impl WeightLoader {
             weight_bytes,
             unexpected,
             ignored,
+            skipped,
             elsewhere,
         })
     }
@@ -888,6 +954,73 @@ mod tests {
         assert_matches_file(&untied, &weights);
         assert_eq!(weights.tensors[LM_HEAD].shape.as_slice(), &[263, 64]);
         assert!(weights.ignored.is_empty());
+    }
+
+    /// P7 Task 31 (S-11): a family's `skipped_prefixes` count the checkpoint tensors of an
+    /// unused sub-module (`model.visual.*`, `mtp.*`) per prefix, load none of them, and leave
+    /// every other unnamed tensor `unexpected`. Breaks if a skipped tensor is loaded, counted
+    /// as unexpected, or attributed to the wrong prefix.
+    #[test]
+    fn skipped_prefixes_counted() {
+        let dir = TempDir::new("load-skipped");
+        let opts = TinyOptions {
+            extra: vec![
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+                "model.visual.blocks.0.attn.proj.weight".to_string(),
+                "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+                "model.extra.weight".to_string(),
+            ],
+            ..TinyOptions::default()
+        };
+        write_tiny_llama_with(dir.path(), 3, &opts);
+        let cfg = load_model_config(dir.path()).unwrap();
+        let index = SafetensorsIndex::open(dir.path()).unwrap();
+        let (_, mem) = counting();
+        let weights = WeightLoader::load_format_skipping(
+            &Bf16,
+            &index,
+            &llama_slots(&cfg),
+            &["model.visual.", "mtp."],
+            &mem,
+            1 << 20,
+        )
+        .unwrap();
+        // One [64] BF16 tensor is 128 bytes.
+        assert_eq!(
+            weights.skipped,
+            vec![
+                SkippedPrefix {
+                    prefix: "model.visual.".to_string(),
+                    tensors: 2,
+                    bytes: 256,
+                },
+                SkippedPrefix {
+                    prefix: "mtp.".to_string(),
+                    tensors: 1,
+                    bytes: 128,
+                },
+            ]
+        );
+        assert_eq!(weights.unexpected, vec!["model.extra.weight".to_string()]);
+        assert!(weights.ignored.is_empty());
+        for name in [
+            "model.visual.blocks.0.attn.qkv.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+        ] {
+            assert!(!weights.tensors.contains_key(name), "loaded {name}");
+        }
+        // Without the skip list the same checkpoint warns them unexpected and skips nothing.
+        let weights = load(&dir, 1 << 20).unwrap();
+        assert!(weights.skipped.is_empty());
+        assert_eq!(
+            weights.unexpected,
+            vec![
+                "model.extra.weight".to_string(),
+                "model.visual.blocks.0.attn.proj.weight".to_string(),
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+                "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+            ]
+        );
     }
 
     #[test]
