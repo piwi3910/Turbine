@@ -149,10 +149,87 @@ pub(crate) fn qkv_slots(i: u32, q: usize, kv: usize, hidden: usize) -> Vec<Weigh
     )
 }
 
+/// The fused `[2·q_dim + 2·kv_dim, hidden]` Q/K/V-and-output-gate projection of a Qwen3.5
+/// full-attention layer `layer`, laid out `[q_all | gate_all | k | v]` (P7 S-11).
+pub fn q_gate_kv_proj_name(layer: u32) -> String {
+    format!("model.layers.{layer}.self_attn.q_gate_kv_proj.weight")
+}
+
+/// [`q_gate_kv_proj_name`]`(i)`'s slots (P7 S-11): the checkpoint's `q_proj` is per-head
+/// interleaved `[q_j | g_j]` (`2·head_dim` rows per head), so its rows are de-interleaved at
+/// load time — each `[q_j]` and `[g_j]` block is a [`SlotSource`] row range of the same tensor —
+/// into a contiguous `[q_all | gate_all]` block ahead of the whole `k_proj` and `v_proj`, all in
+/// one stack the executor reads without an attention-desc change.
+pub fn gated_qkv_slots(
+    i: u32,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+) -> Vec<WeightSlot> {
+    let p = format!("model.layers.{i}.self_attn");
+    let q_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+    let stack = q_gate_kv_proj_name(i);
+    let stack_shape = vec![2 * q_dim + 2 * kv_dim, hidden];
+    let q_shape = vec![2 * q_dim, hidden];
+    let source = |start: usize| SlotSource {
+        shape: q_shape.clone(),
+        axis: 0,
+        start,
+        len: head_dim,
+    };
+    let place = |offset: usize| StackPlace {
+        name: stack.clone(),
+        shape: stack_shape.clone(),
+        offset,
+    };
+    let mut slots = Vec::with_capacity(2 * heads + 2);
+    // The q heads, then the output gates, each head's `[q_j]` / `[g_j]` rows at their source.
+    for j in 0..heads {
+        slots.push(WeightSlot {
+            name: format!("{p}.q_proj.weight"),
+            shape: vec![head_dim, hidden],
+            stack: Some(place(j * head_dim * hidden)),
+            source: Some(source(2 * j * head_dim)),
+        });
+    }
+    for j in 0..heads {
+        slots.push(WeightSlot {
+            name: format!("{p}.q_proj.weight"),
+            shape: vec![head_dim, hidden],
+            stack: Some(place((q_dim + j * head_dim) * hidden)),
+            source: Some(source((2 * j + 1) * head_dim)),
+        });
+    }
+    for (proj, offset) in [
+        ("k_proj", 2 * q_dim * hidden),
+        ("v_proj", (2 * q_dim + kv_dim) * hidden),
+    ] {
+        slots.push(WeightSlot {
+            name: format!("{p}.{proj}.weight"),
+            shape: vec![kv_dim, hidden],
+            stack: Some(place(offset)),
+            source: None,
+        });
+    }
+    slots
+}
+
 /// The stacked `[experts, rows, cols]` parameter of layer `layer`'s expert projection `proj`
 /// (`gate_proj`, `up_proj`, `down_proj`), as [`crate::families::olmoe_slots`] loads it.
 pub fn stacked_experts_name(layer: u32, proj: &str) -> String {
     format!("model.layers.{layer}.mlp.experts.{proj}.weight")
+}
+
+/// One checkpoint tensor prefix a family deliberately skips
+/// ([`crate::families::ModelFamily::skipped_prefixes`], e.g. an unused vision tower or MTP head):
+/// the tensors and bytes the loader counted under it (logged `event="weights_skipped"`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedPrefix {
+    pub prefix: String,
+    pub tensors: usize,
+    pub bytes: u64,
 }
 
 /// The loaded parameters by checkpoint name (a stacked parameter by its [`StackPlace`] name),
@@ -166,6 +243,8 @@ pub struct LoadedWeights {
     pub unexpected: Vec<String>,
     /// Checkpoint tensors deliberately skipped: `lm_head.weight` of a tied model.
     pub ignored: Vec<String>,
+    /// Checkpoint tensors skipped by prefix ([`SkippedPrefix`]), sorted by prefix.
+    pub skipped: Vec<SkippedPrefix>,
     /// Checkpoint tensors another pipeline stage or expert-parallel rank loads
     /// ([`WeightLoader::load_part`]): counted, logged at debug level only.
     pub elsewhere: usize,
@@ -211,7 +290,22 @@ impl WeightLoader {
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
-        WeightLoader::load_part(format, index, slots, &[], mem, staging_bytes)
+        WeightLoader::load_part_skipping(format, index, slots, &[], &[], mem, staging_bytes)
+    }
+
+    /// [`WeightLoader::load_format`] with a family's deliberately skipped checkpoint tensor
+    /// prefixes ([`crate::families::ModelFamily::skipped_prefixes`]): an index tensor naming no
+    /// slot but starting with one of `skip` is counted per prefix (logged one
+    /// `event="weights_skipped"` each) instead of warning `unexpected_tensor`.
+    pub fn load_format_skipping(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        skip: &[&str],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_part_skipping(format, index, slots, &[], skip, mem, staging_bytes)
     }
 
     /// The validation half of [`WeightLoader::load_part`] over already-derived slots (the
@@ -283,23 +377,38 @@ impl WeightLoader {
         Ok(planned)
     }
 
+    /// [`WeightLoader::load_part_skipping`] without a family's skipped prefixes.
+    pub fn load_part(
+        format: &dyn WeightFormat,
+        index: &SafetensorsIndex,
+        slots: &[WeightSlot],
+        whole: &[WeightSlot],
+        mem: &Arc<dyn DeviceMemory>,
+        staging_bytes: usize,
+    ) -> Result<LoadedWeights, ModelError> {
+        WeightLoader::load_part_skipping(format, index, slots, whole, &[], mem, staging_bytes)
+    }
+
     /// [`WeightLoader::load_format`] of one part of a model split by pipeline stages or expert
     /// ranks: `whole` is the unsplit model's slot list (the family's
     /// `weight_slots`); a checkpoint tensor it names but `slots` does not belongs to another
     /// stage or rank and is skipped quietly (counted in [`LoadedWeights::elsewhere`], one
     /// `debug` line) instead of warning `unexpected_tensor`. Tensors neither list names still
-    /// warn. An empty `whole` is [`WeightLoader::load_format`].
+    /// warn, unless they start with one of `skip` ([`SkippedPrefix`], one
+    /// `event="weights_skipped"` per prefix). An empty `whole` and `skip` is
+    /// [`WeightLoader::load_format`].
     ///
     /// Both lists are the family's slots: each is expanded by [`WeightFormat::slots`] (a
     /// quantized layer's scales, zero points and activation scales). A slot the format
     /// [`WeightFormat::repacks`] is read whole, rewritten by [`WeightFormat::repack`] and
     /// uploaded (its checkpoint tensor's shape is the format's to check), or only validated
     /// when it has no elements (a check-only slot); every other slot is copied as stored.
-    pub fn load_part(
+    pub fn load_part_skipping(
         format: &dyn WeightFormat,
         index: &SafetensorsIndex,
         slots: &[WeightSlot],
         whole: &[WeightSlot],
+        skip: &[&str],
         mem: &Arc<dyn DeviceMemory>,
         staging_bytes: usize,
     ) -> Result<LoadedWeights, ModelError> {
@@ -318,6 +427,7 @@ impl WeightLoader {
             .filter(|n| !wanted.contains(n))
             .collect();
         let (mut unexpected, mut ignored, mut elsewhere) = (Vec::new(), Vec::new(), 0usize);
+        let mut skipped_count: HashMap<&str, (usize, u64)> = HashMap::new();
         for entry in index.entries() {
             if wanted.contains(entry.name.as_str()) {
                 continue;
@@ -332,6 +442,10 @@ impl WeightLoader {
                     "tied model: checkpoint lm_head.weight is ignored"
                 );
                 ignored.push(entry.name.clone());
+            } else if let Some(prefix) = skip.iter().find(|p| entry.name.starts_with(**p)) {
+                let slot = skipped_count.entry(*prefix).or_insert((0, 0));
+                slot.0 += 1;
+                slot.1 += entry.byte_len();
             } else {
                 tracing::warn!(
                     event = "unexpected_tensor",
@@ -341,6 +455,24 @@ impl WeightLoader {
                 );
                 unexpected.push(entry.name.clone());
             }
+        }
+        let mut skipped: Vec<SkippedPrefix> = skipped_count
+            .into_iter()
+            .map(|(prefix, (tensors, bytes))| SkippedPrefix {
+                prefix: prefix.to_string(),
+                tensors,
+                bytes,
+            })
+            .collect();
+        skipped.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+        for s in &skipped {
+            tracing::warn!(
+                event = "weights_skipped",
+                prefix = %s.prefix,
+                tensors = s.tensors,
+                bytes = s.bytes,
+                "checkpoint tensors of an unused sub-module are skipped"
+            );
         }
         if elsewhere > 0 {
             tracing::debug!(
@@ -492,6 +624,7 @@ impl WeightLoader {
             weight_bytes,
             unexpected,
             ignored,
+            skipped,
             elsewhere,
         })
     }
@@ -890,6 +1023,73 @@ mod tests {
         assert!(weights.ignored.is_empty());
     }
 
+    /// P7 Task 31 (S-11): a family's `skipped_prefixes` count the checkpoint tensors of an
+    /// unused sub-module (`model.visual.*`, `mtp.*`) per prefix, load none of them, and leave
+    /// every other unnamed tensor `unexpected`. Breaks if a skipped tensor is loaded, counted
+    /// as unexpected, or attributed to the wrong prefix.
+    #[test]
+    fn skipped_prefixes_counted() {
+        let dir = TempDir::new("load-skipped");
+        let opts = TinyOptions {
+            extra: vec![
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+                "model.visual.blocks.0.attn.proj.weight".to_string(),
+                "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+                "model.extra.weight".to_string(),
+            ],
+            ..TinyOptions::default()
+        };
+        write_tiny_llama_with(dir.path(), 3, &opts);
+        let cfg = load_model_config(dir.path()).unwrap();
+        let index = SafetensorsIndex::open(dir.path()).unwrap();
+        let (_, mem) = counting();
+        let weights = WeightLoader::load_format_skipping(
+            &Bf16,
+            &index,
+            &llama_slots(&cfg),
+            &["model.visual.", "mtp."],
+            &mem,
+            1 << 20,
+        )
+        .unwrap();
+        // One [64] BF16 tensor is 128 bytes.
+        assert_eq!(
+            weights.skipped,
+            vec![
+                SkippedPrefix {
+                    prefix: "model.visual.".to_string(),
+                    tensors: 2,
+                    bytes: 256,
+                },
+                SkippedPrefix {
+                    prefix: "mtp.".to_string(),
+                    tensors: 1,
+                    bytes: 128,
+                },
+            ]
+        );
+        assert_eq!(weights.unexpected, vec!["model.extra.weight".to_string()]);
+        assert!(weights.ignored.is_empty());
+        for name in [
+            "model.visual.blocks.0.attn.qkv.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+        ] {
+            assert!(!weights.tensors.contains_key(name), "loaded {name}");
+        }
+        // Without the skip list the same checkpoint warns them unexpected and skips nothing.
+        let weights = load(&dir, 1 << 20).unwrap();
+        assert!(weights.skipped.is_empty());
+        assert_eq!(
+            weights.unexpected,
+            vec![
+                "model.extra.weight".to_string(),
+                "model.visual.blocks.0.attn.proj.weight".to_string(),
+                "model.visual.blocks.0.attn.qkv.weight".to_string(),
+                "mtp.layers.0.mlp.gate_proj.weight".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn olmoe_slot_mapping() {
         // OLMoE-1B-7B: 3 top-level tensors + per layer 9 attention/norm/router tensors and
@@ -1083,5 +1283,100 @@ mod tests {
         );
         assert!(text.contains(&bin.display().to_string()), "{text}");
         assert!(text.contains("pickle formats are not supported"), "{text}");
+    }
+
+    /// P7 S-11: the Qwen3.5 `q_proj` is per-head interleaved `[q_j | g_j]`; the loader's
+    /// row-range slots de-interleave it into a contiguous `[q_all | gate_all | k | v]` stack.
+    #[test]
+    fn gated_qkv_deinterleaves_q_and_gate() {
+        use safetensors::Dtype as StDtype;
+        use safetensors::tensor::TensorView;
+
+        let (heads, kv_heads, head_dim, hidden) = (2usize, 1usize, 2usize, 3usize);
+        let (q_dim, kv_dim) = (heads * head_dim, kv_heads * head_dim);
+        let dir = TempDir::new("load-gated-qkv");
+        // One BF16 value per row: `q_proj` row r holds `r + 1`, `k_proj` `100 + r`, `v_proj`
+        // `200 + r`, so the loaded stack's rows identify their source row.
+        let rows = |n: usize, base: u32| {
+            let mut data = Vec::with_capacity(n * hidden * 2);
+            for r in 0..n {
+                let v = half::bf16::from_f32((base + r as u32) as f32);
+                for _ in 0..hidden {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            data
+        };
+        let q_data = rows(2 * q_dim, 1);
+        let k_data = rows(kv_dim, 100);
+        let v_data = rows(kv_dim, 200);
+        let p = "model.layers.0.self_attn";
+        safetensors::serialize_to_file(
+            [
+                (
+                    format!("{p}.q_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![2 * q_dim, hidden], &q_data).unwrap(),
+                ),
+                (
+                    format!("{p}.k_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![kv_dim, hidden], &k_data).unwrap(),
+                ),
+                (
+                    format!("{p}.v_proj.weight"),
+                    TensorView::new(StDtype::BF16, vec![kv_dim, hidden], &v_data).unwrap(),
+                ),
+            ],
+            None,
+            &dir.path().join("model.safetensors"),
+        )
+        .unwrap();
+
+        let slots = gated_qkv_slots(0, heads, kv_heads, head_dim, hidden);
+        assert!(check_stacks(&slots).is_ok());
+        assert_eq!(slots.len(), 2 * heads + 2);
+        // Head j's q rows precede head j's gate rows; both read the interleaved `q_proj`.
+        let row = |s: &WeightSlot| s.stack.as_ref().unwrap().offset / hidden;
+        assert_eq!(
+            slots[..heads].iter().map(row).collect::<Vec<_>>(),
+            [0, head_dim]
+        );
+        assert_eq!(
+            slots[heads..2 * heads].iter().map(row).collect::<Vec<_>>(),
+            [q_dim, q_dim + head_dim]
+        );
+        let src = |s: &WeightSlot| {
+            let src = s.source.as_ref().unwrap();
+            (src.start, src.len)
+        };
+        assert_eq!(
+            slots[..2 * heads].iter().map(src).collect::<Vec<_>>(),
+            [
+                (0, head_dim),
+                (2 * head_dim, head_dim),
+                (head_dim, head_dim),
+                (3 * head_dim, head_dim)
+            ]
+        );
+
+        let index = SafetensorsIndex::open(dir.path()).unwrap();
+        let (_, mem) = counting();
+        let mut weights = WeightLoader::load(&index, &slots, &mem, 1 << 20).unwrap();
+        let stack = weights.take(&q_gate_kv_proj_name(0)).unwrap();
+        assert_eq!(stack.shape.as_slice(), &[2 * q_dim + 2 * kv_dim, hidden]);
+        let mut got = vec![0u8; stack.shape.iter().product::<usize>() * stack.dtype.size_bytes()];
+        stack.storage.copy_to_host(0, &mut got).unwrap();
+        let values: Vec<u32> = got
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32() as u32)
+            .collect();
+        // q_all = [q_0 rows 1,2 | q_1 rows 5,6], gate_all = [g_0 rows 3,4 | g_1 rows 7,8],
+        // then k (100,101), v (200,201); each row's `hidden` values match.
+        let expect = [
+            1, 1, 1, 2, 2, 2, 5, 5, 5, 6, 6, 6, // q_all
+            3, 3, 3, 4, 4, 4, 7, 7, 7, 8, 8, 8, // gate_all
+            100, 100, 100, 101, 101, 101, // k
+            200, 200, 200, 201, 201, 201, // v
+        ];
+        assert_eq!(values, expect);
     }
 }

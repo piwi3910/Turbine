@@ -109,6 +109,13 @@ pub trait ModelFamily: Module {
         let _ = cfg;
         StateLayout::default()
     }
+    /// Checkpoint tensor prefixes this family's executor does not load but that the checkpoint
+    /// legitimately ships (e.g. a vision tower or an MTP head the text path ignores): the loader
+    /// counts the tensors and bytes under each prefix and logs one `event="weights_skipped"`
+    /// each, instead of warning `unexpected_tensor` per tensor. The default: none.
+    fn skipped_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// How one decoder layer mixes tokens (P7 S-1): full causal attention, attention over the last

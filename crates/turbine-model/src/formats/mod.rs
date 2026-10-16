@@ -23,11 +23,13 @@ pub mod harmony;
 pub mod hermes;
 pub mod llama3_json;
 pub mod mistral;
+pub mod qwen3_xml;
 
 pub use harmony::{Harmony, HarmonyParser};
 pub use hermes::{Hermes, HermesParser};
 pub use llama3_json::{Llama3Json, Llama3JsonParser};
 pub use mistral::{Mistral, MistralParser};
+pub use qwen3_xml::{Qwen3Xml, Qwen3XmlParser};
 
 /// One way of writing tool calls.
 pub trait ToolFormat: Module {
@@ -155,8 +157,10 @@ pub fn bind(
     })
 }
 
-static TOOL_FORMATS: Registry<dyn ToolFormat> =
-    Registry::new("tool_format", &[&Llama3Json, &Hermes, &Mistral, &Harmony]);
+static TOOL_FORMATS: Registry<dyn ToolFormat> = Registry::new(
+    "tool_format",
+    &[&Llama3Json, &Hermes, &Mistral, &Harmony, &Qwen3Xml],
+);
 
 /// Every tool-call format, in registration order.
 pub fn registry() -> &'static Registry<dyn ToolFormat> {
