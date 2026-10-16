@@ -1614,7 +1614,7 @@ impl DecoderExecutor {
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
             let (input_norm, post_norm) =
                 (take("input_layernorm")?, take("post_attention_layernorm")?);
-            let mixer = match cfg.layer_kinds[i as usize] {
+            let mixer = match cfg.layer_kinds[local as usize] {
                 LayerKind::LinearAttention => {
                     let g = d.gdn.ok_or_else(|| {
                         invalid(format!(

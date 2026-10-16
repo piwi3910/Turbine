@@ -723,6 +723,7 @@ fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'
         // them. The served gpt-oss tokenizer defines all seven, and (P7 decision "Harmony marker
         // visibility") the detokenizer emits them, so the parser sees them all.
         "gpt_oss" => (Some(harmony::HARMONY), &[]),
+        "qwen3_5" => (Some(qwen3_xml::QWEN3_XML), &[]),
         other => panic!("family {other} has no expected default tool format"),
     }
 }

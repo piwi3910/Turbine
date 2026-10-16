@@ -402,11 +402,19 @@ pub fn write_tiny_family_quantized(
 /// and [`PLAIN_CHAT_TEMPLATE`]. The tensors are named as `Qwen/Qwen3.5-9B` stores them, under
 /// `model.language_model`. Same files and determinism as [`write_tiny_llama_with`].
 pub fn write_tiny_qwen3_5(dir: &Path, seed: u64) -> TinySpec {
+    write_tiny_qwen3_5_with(dir, seed, &TinyOptions::default())
+}
+
+/// [`write_tiny_qwen3_5`] with extra files and tensors ([`TinyOptions::extra`], e.g. the
+/// unused `model.visual.*` and `mtp.*` tensors the family's `skipped_prefixes` count).
+pub fn write_tiny_qwen3_5_with(dir: &Path, seed: u64, extra: &TinyOptions) -> TinySpec {
     let opts = TinyOptions {
         tied: false,
         template_with_tools: false,
         head_dim: 64,
-        ..TinyOptions::default()
+        extra: extra.extra.clone(),
+        omit: extra.omit.clone(),
+        ship_lm_head: extra.ship_lm_head,
     };
     write_tiny_slots(
         dir,

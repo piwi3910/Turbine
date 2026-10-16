@@ -726,9 +726,32 @@ impl<P: Int4Packaging> WeightFormat for Int4Format<P> {
     }
 
     fn write_tiny(&self, dir: &Path, twin: Option<&Path>) -> Result<bool, ModelError> {
+        // A checkpoint with a projectable-but-unpackable linear (a Qwen3.5 Gated DeltaNet
+        // projection `[v_heads, hidden]` with `v_heads` not a multiple of 8) cannot be packed
+        // into this INT4 layout: skip it, as the other formats do for a checkpoint they do not
+        // apply to.
+        if !int4_packable(&self.layout, dir)? {
+            return Ok(false);
+        }
         write_tiny_int4(&self.layout, &P::to_json(&self.layout), dir, twin)?;
         Ok(true)
     }
+}
+
+/// Whether every BF16 tensor `layout` would quantize has a shape the INT4 packing supports
+/// (`n` a multiple of 8, `k` a whole number of groups).
+fn int4_packable(layout: &Int4Layout, dir: &Path) -> Result<bool, ModelError> {
+    let group = layout.group as usize;
+    for (name, dtype, shape, _) in read_owned(&dir.join("model.safetensors"))? {
+        if dtype != Dtype::BF16 || shape.len() != 2 || !layout.quantizes(&name, &shape) {
+            continue;
+        }
+        let (n, k) = (shape[0], shape[1]);
+        if n % 8 != 0 || group == 0 || k % group != 0 || k < group {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ------------------------------------------------------------------------ tiny fixtures
