@@ -40,7 +40,11 @@ Rules:
 - `--bf16-logits` (diagnostics only) instead log-softmaxes the model's own BF16
   logits upcast to FP32; the engine string then has no `-fp32-logits` suffix.
 - Output goes to `<out>.tmp`, renamed over `<out>` only when every prompt
-  succeeded. Any failure (including usage errors) exits 1 and leaves no file.
+  succeeded. Progress is checkpointed after every prompt: a killed or failed run
+  exits 1 and keeps `<out>.tmp` with the prompts it finished, and a rerun resumes
+  from it (or from a complete `<out>` when no `.tmp` is present), regenerating
+  only the ids that are missing. The records are identical to an uninterrupted
+  run. Usage errors exit 1 before any prompt runs.
 
 Usage:
     uv run scripts/golden/hf_reference.py --model-dir <dir> \
@@ -133,6 +137,25 @@ def load_prompts(path: Path) -> list[dict]:
                 )
             prompts.append(rec)
     return prompts
+
+
+def load_existing(path: Path) -> dict[str, dict]:
+    """Records already captured in a JSONL file, keyed by `id` (tolerates a torn last line)."""
+    done: dict[str, dict] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return done
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and isinstance(rec.get("id"), str):
+            done[rec["id"]] = rec
+    return done
 
 
 def model_name(model_dir: Path) -> str:
@@ -264,44 +287,60 @@ def run(args: argparse.Namespace) -> None:
 
     tmp = args.out.with_name(args.out.name + ".tmp")
     tmp.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            for rec in prompts:
-                ids = prompt_ids(tokenizer, rec)
-                tokens, tops = generate(
-                    torch,
-                    model,
-                    ids,
-                    rec["max_tokens"],
-                    args.top_logprobs,
-                    args.device,
-                    not args.bf16_logits,
-                )
-                captured = (
-                    datetime.datetime.now(datetime.UTC)
-                    .isoformat(timespec="seconds")
-                    .replace("+00:00", "Z")
-                )
-                line = {"id": rec["id"], "engine": engine, "model": name}
-                if revision is not None:
-                    line["revision"] = revision
-                line |= {
-                    "captured": captured,
-                    "prompt_token_ids": ids,
-                    "tokens": tokens,
-                    "top_logprobs": tops,
-                }
+    # Resume: a killed run leaves <out>.tmp holding the prompts it finished; seed from it
+    # (or from a complete <out> when no .tmp exists) and regenerate only the missing ids.
+    resume_path = tmp if tmp.exists() else (args.out if args.out.exists() else None)
+    done = load_existing(resume_path) if resume_path is not None else {}
+    if done:
+        print(
+            f"resuming from {resume_path.name}: {len(done)} prompt(s) already captured",
+            file=sys.stderr,
+        )
+    with tmp.open("w", encoding="utf-8") as f:
+        for rec in prompts:
+            prior = done.get(rec["id"])
+            if (
+                prior is not None
+                and prior.get("engine") == engine
+                and prior.get("model") == name
+            ):
+                print(f"{rec['id']}: cached", file=sys.stderr)
                 f.write(
-                    json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    json.dumps(prior, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
-                print(
-                    f"{rec['id']}: {len(ids)} prompt tokens, {len(tokens)} generated",
-                    file=sys.stderr,
-                )
-        os.replace(tmp, args.out)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+                f.flush()
+                continue
+            ids = prompt_ids(tokenizer, rec)
+            tokens, tops = generate(
+                torch,
+                model,
+                ids,
+                rec["max_tokens"],
+                args.top_logprobs,
+                args.device,
+                not args.bf16_logits,
+            )
+            captured = (
+                datetime.datetime.now(datetime.UTC)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+            line = {"id": rec["id"], "engine": engine, "model": name}
+            if revision is not None:
+                line["revision"] = revision
+            line |= {
+                "captured": captured,
+                "prompt_token_ids": ids,
+                "tokens": tokens,
+                "top_logprobs": tops,
+            }
+            f.write(json.dumps(line, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.flush()
+            print(
+                f"{rec['id']}: {len(ids)} prompt tokens, {len(tokens)} generated",
+                file=sys.stderr,
+            )
+    os.replace(tmp, args.out)
 
 
 def main(argv: list[str]) -> int:
