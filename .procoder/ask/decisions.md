@@ -4945,3 +4945,20 @@ Two bugs fixed in Task 35: `dequantize_checkpoint.py`'s fused-expert test matche
 layer (breaking the Qwen3.6 dequant), and `ModelConfig::check_supported_weights` refused the real
 checkpoints' F32 `linear_attn.norm.weight`/`A_log` (`float32_stored` slots the loader converts), so
 serving the real hybrid checkpoints died at startup.
+
+## P7 Task 33 tier-travel details — lead calls (2026-10-17)
+
+The snapshot bytes now travel through L1/L2 (`state_snapshot_follows_block` PASS). Three calls:
+
+1. **Store-handle placement:** confirmed — the handle lives on the backends that touch the L0
+   snapshot buffer (`CopyStreamBackend`, `SimTransferBackend`); `IoPoolBackend` carries the tail
+   through its `HostTranscode::load`/`store` record (its only op, `Move`, is L1↔L2 and never sees
+   L0), so it needs no separate handle.
+2. **`snapshot_tier_travel` gate:** kept (default off; enabled when the engine sets the snapshot
+   store). It stops a backend that cannot move the tail from filing a ref to bytes it never wrote;
+   in production it is always on now that the device path carries the tail.
+3. **Tier-hit restore:** the planner must treat a tier location whose record carries
+   `snapshot_bytes > 0` as a restorable snapshot at the promoted block, so `MatchedBlock.snapshot`
+   is `Some` for a pure lower-tier hit and the state restores instead of recomputing. Implement this
+   together with the checkpoint-enabled device-path validation (the real Qwen3.5 checkpoint now loads
+   on `p7-stack` after Task 35's `check_supported_weights` fix).
