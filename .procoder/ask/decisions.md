@@ -5022,3 +5022,23 @@ T33c landed the tier-hit restore and the L1/L2 slot widening (gate ok, 1120 test
 
 Multi-shard hybrid snapshot tiers stay unsupported/untested (single-card gates), noted in
 `tier/sharded.rs`.
+
+## P7 Task 33 L1→L2 spill for hybrid records — lead call (2026-10-17)
+
+Task 33's AC now passes at L0 **and** L1 (`kv_gpu hybrid_prefix_reuse_matches_cold`; `restored` 1→2,
+`turbine_kv_promotions_total{from="l1",to="l0"}` 0→6), but the L2 leg is SKIPPED: the L1→L2 spill
+never fires for a hybrid record. A Qwen3.5-9B hybrid record carries a ~49 MiB snapshot tail (24 linear
+layers × ~2.1 MiB), so L1's KV-only `blocks_total` (256) far exceeds its real hybrid record capacity
+(~19) — the tier reports itself nearly empty (~7 %) and never reaches the spill threshold.
+
+**Decision (lead, 2026-10-17): accept the L2 leg as a documented open item for now.** The L1 leg
+proves the tier transport one tier down (same code path), and the S-12 core (L0/L1 prefix reuse with
+restored state) is met. The L1/L2 hybrid capacity accounting — charge the effective record size, as
+the L0 budget term does — is a bounded follow-up that would let the L2 leg run; the test asserts the
+L2 leg only when a spill appears and prints `hybrid L2 leg SKIPPED` otherwise, and plan Task 33
+records the open L2 item.
+
+Recorded test-judging deviation: tier turns are judged with the batched bounds, not bit-for-bit — a
+restore resumes the prefill at the snapshot boundary (a short chunk) whose kernel tiling rounds
+differently from the cold full-length prefill, so strict equality fails on GPU for that reason alone
+(the values stay within bounds).
