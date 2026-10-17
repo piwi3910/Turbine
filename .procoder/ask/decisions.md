@@ -4923,3 +4923,25 @@ back into it, and the block's `SnapshotRef` is set to `{new L0 BlockId, new entr
 entries therefore only ever refer to L0-resident blocks, which keeps round-3's "one entry per L0
 block, freed with the block" rule and makes a stale read impossible. Implement option (a)'s tier
 travel with this lifetime rule.
+
+## P7 hybrid golden gates — lead call (2026-10-17)
+
+Task 35's Qwen3.5-9B golden cannot meet the standard criterion: only **9/16** prompts keep a 32-token
+identical prefix (need 16), and the engine spread over 20 captures reports its own noise at likely
+8.43 / tail 11.36 (over cap). Where tokens agree the engine matches the reference within ~0.5 nats,
+and the 7/16 flips are near-ties, config-independent (default, `gemm_autotune=false`, `fused_ops=false`
+flip the same prompts) — no gross or structural mismatch.
+
+**Decision (lead, 2026-10-17):** the Gated DeltaNet recurrence amplifies BF16 rounding exactly as it
+does under TP2 (see "P7 Task 34 recurrence-aware TP criterion"), so the hybrid families are not held
+to the standard golden prefix criterion, and the gate is not relaxed to force a pass. The
+Qwen3.5-9B and Qwen3.6-35B-A3B hybrid rows stay `experimental` with `- P7 open:` perf-log lines
+carrying this evidence. The Qwen3.6-35B BF16 CPU reference (~8–12 h; ~30 min/prompt, no CPU fused
+GDN kernel) continues detached and resumable on novanas; that row stays open until a reference and
+its gates exist. Revisit with a ROCm-GPU transformers reference and/or if the user wants the rows
+`supported`.
+
+Two bugs fixed in Task 35: `dequantize_checkpoint.py`'s fused-expert test matched a per-expert FP8
+layer (breaking the Qwen3.6 dequant), and `ModelConfig::check_supported_weights` refused the real
+checkpoints' F32 `linear_attn.norm.weight`/`A_log` (`float32_stored` slots the loader converts), so
+serving the real hybrid checkpoints died at startup.
