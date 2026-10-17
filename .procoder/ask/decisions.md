@@ -4891,3 +4891,21 @@ sit on a residual stream the preceding GDN layers have already drifted — on th
 checkpoint `resid_attn` breaches the bound from layer 15 on, `max |Δ| 4.875` vs `max |ref| 3` — so
 those rows are printed as a diagnostic; layer 3, the first full-attention layer, stays within it).
 Revisit only if a deterministic all-reduce order lands.
+
+## P7 Task 33 snapshot transfer — lead call (2026-10-17)
+
+How a block's snapshot bytes travel with it through the tiers. The transfer path
+(`turbine-kv/src/transfer.rs`: `TransferRequest`/`TransferCodec`) carries only KV slots plus
+`from_bytes`/`to_bytes`, L0↔L1 runs on the GPU copy streams and L1↔L2 on the IO pool, and
+`SimTransferBackend` has no access to the L0 snapshot buffer.
+
+- (a) add a snapshot entry + tail length to the transfer request and a snapshot-store handle to every
+  backend (the device copy path included); a tier slot is `[kv bytes in the tier format][snapshot
+  bytes exact]`, `SLAB_VERSION` + 1,
+- (b) move the snapshot buffer into `turbine-kv` so the hierarchy marshals it,
+- (c) a separate derived-key tier record for the snapshot.
+
+**Decision (lead, 2026-10-17): (a)** — it is what the plan's combined-record wording requires and it
+keeps Task 32's KV-owned buffer with the one-time `set_state_snapshots` handoff (the executor holds
+only a view). The device copy path is validated by the `kv_gpu hybrid_prefix_reuse_matches_cold` lab
+leg, not on the host.
