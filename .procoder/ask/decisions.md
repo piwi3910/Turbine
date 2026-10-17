@@ -4872,3 +4872,19 @@ The Qwen3.6 MoE family (`Qwen3_5Moe`) landed on the host/CPU path; TP2 and EP2 r
 2. **Shared expert under EP2:** the shared expert is replicated, not sharded, so only EP rank 0 adds
    it — `hooks/moe.rs` (`MOE_SHARED`) passes a zero/absent shared contribution on ranks > 0 while the
    routed experts still run on every rank. This replaces the current shared-under-EP refusal.
+
+## P7 Task 34 recurrence-aware TP criterion — lead call (2026-10-17)
+
+Under TP2 the Gated DeltaNet recurrence amplifies the BF16 all-reduce rounding: the ranks agree
+bitwise, but one device's greedy tokens diverge within ≤ 15 of 16 decode steps for every seed the
+committed `qwen3_5_tp2_seed_sweep` diagnostic swept (seeds 1–40), and after 16 steps the top-5
+|Δ logprob| vs one device is ~9.5 — while the per-op diffs themselves stay at the BF16 all-reduce
+scale (`o_proj` rel 4e-3, `resid_mlp` 6e-3).
+
+**Decision (lead, 2026-10-17):** the TP acceptance criterion for the recurrent hybrid families is
+(a) bitwise rank agreement, (b) structural correctness (per-op shapes/op counts,
+`conformance::families`, `registry_tp_conformance`), and (c) the one-device comparison kept as a
+printed diagnostic (`qwen3_5_tp2_trace_diag`). The two-GPU `hip_trace_vs_cpu_qwen3_5` tp2 leg
+asserts the same relaxed criterion and is not held to the 2e-2 per-op bound on the GDN ops; its
+full-layer attention ops stay on the trace bound. Revisit only if a deterministic all-reduce order
+lands.
