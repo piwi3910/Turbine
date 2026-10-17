@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::compare::{CompareReport, compare_prompt};
 use super::fixture::{GoldenError, PromptKind, PromptRecord, ReferenceRecord, Tolerance};
@@ -67,14 +67,16 @@ impl Endpoint {
             })
     }
 
-    /// Run one prompt greedily for its `max_tokens` positions.
+    /// Run one prompt greedily for its `max_tokens` positions. `extra_kwargs` is the CLI's
+    /// `--chat-template-kwargs` object, merged over the prompt's own kwargs on a chat request.
     pub async fn generate(
         &self,
         model: &str,
         prompt: &PromptRecord,
         top_logprobs: u32,
+        extra_kwargs: Option<&Map<String, Value>>,
     ) -> Result<Generation, GoldenError> {
-        let (path, body) = request_body(model, prompt, top_logprobs);
+        let (path, body) = request_body(model, prompt, top_logprobs, extra_kwargs);
         let url = format!("{}{path}", self.base);
         let resp = self
             .client
@@ -127,10 +129,13 @@ async fn json_body(resp: reqwest::Response, url: &str) -> Result<Value, GoldenEr
 /// Route and body for one greedy replay: `temperature: 0`, `top_logprobs` logprobs, token ids
 /// as `token_id:<id>`, `ignore_eos` (the reference always runs `max_tokens` positions),
 /// non-streaming. `return_token_ids` asks vLLM-style engines for the prompt token ids.
+/// `extra_kwargs` (`--chat-template-kwargs`) is merged over a chat prompt's own
+/// `chat_template_kwargs`, the flag winning a shared key (Phase 7 hybrid thinking off).
 pub fn request_body(
     model: &str,
     prompt: &PromptRecord,
     top_logprobs: u32,
+    extra_kwargs: Option<&Map<String, Value>>,
 ) -> (&'static str, Value) {
     let mut body = json!({
         "model": model,
@@ -151,10 +156,32 @@ pub fn request_body(
             body["messages"] = json!(prompt.messages);
             body["logprobs"] = json!(true);
             body["top_logprobs"] = json!(top_logprobs);
-            if let Some(kwargs) = &prompt.chat_template_kwargs {
-                body["chat_template_kwargs"] = Value::Object(kwargs.clone());
+            if let Some(kwargs) =
+                merge_chat_template_kwargs(prompt.chat_template_kwargs.as_ref(), extra_kwargs)
+            {
+                body["chat_template_kwargs"] = Value::Object(kwargs);
             }
             ("/v1/chat/completions", body)
+        }
+    }
+}
+
+/// The prompt's own `chat_template_kwargs` with the CLI's `--chat-template-kwargs` object merged
+/// over it (the flag wins a shared key); `None` when neither is present.
+pub fn merge_chat_template_kwargs(
+    prompt: Option<&Map<String, Value>>,
+    extra: Option<&Map<String, Value>>,
+) -> Option<Map<String, Value>> {
+    match (prompt, extra) {
+        (None, None) => None,
+        (Some(prompt), None) => Some(prompt.clone()),
+        (None, Some(extra)) => Some(extra.clone()),
+        (Some(prompt), Some(extra)) => {
+            let mut merged = prompt.clone();
+            for (key, value) in extra {
+                merged.insert(key.clone(), value.clone());
+            }
+            Some(merged)
         }
     }
 }
@@ -279,6 +306,7 @@ pub fn parse_chat(v: &Value, k: usize) -> Result<Generation, String> {
 /// reference order whatever order the replies arrive in, and the first endpoint error ends the
 /// run. Above concurrency 1 the prompts are judged by the tolerance's batched logprob bounds
 /// ([`Tolerance::logprob_bounds`]); the token rule is the same at every concurrency.
+/// `extra_kwargs` (`--chat-template-kwargs`) is sent on every chat request.
 pub async fn compare(
     endpoint: &Endpoint,
     model: &str,
@@ -286,6 +314,7 @@ pub async fn compare(
     prompts: &[PromptRecord],
     tol: &Tolerance,
     concurrency: usize,
+    extra_kwargs: Option<&Map<String, Value>>,
 ) -> Result<CompareReport, GoldenError> {
     let by_id: HashMap<&str, &PromptRecord> = prompts.iter().map(|p| (p.id.as_str(), p)).collect();
     // Resolve every prompt before sending anything, so a missing id is a usage error up front.
@@ -309,7 +338,7 @@ pub async fn compare(
     let mut replies = stream::iter(jobs.into_iter().enumerate())
         .map(|(index, (reference, prompt))| async move {
             let got = endpoint
-                .generate(model, prompt, COMPARE_TOP_LOGPROBS)
+                .generate(model, prompt, COMPARE_TOP_LOGPROBS, extra_kwargs)
                 .await?;
             Ok::<_, GoldenError>((
                 index,
@@ -330,15 +359,19 @@ pub async fn compare(
 }
 
 /// Run every prompt and build reference records (engine from `system_fingerprint`).
+/// `extra_kwargs` (`--chat-template-kwargs`) is sent on every chat request.
 pub async fn capture(
     endpoint: &Endpoint,
     model: &str,
     prompts: &[PromptRecord],
     top_logprobs: u32,
+    extra_kwargs: Option<&Map<String, Value>>,
 ) -> Result<Vec<ReferenceRecord>, GoldenError> {
     let mut out = Vec::with_capacity(prompts.len());
     for prompt in prompts {
-        let got = endpoint.generate(model, prompt, top_logprobs).await?;
+        let got = endpoint
+            .generate(model, prompt, top_logprobs, extra_kwargs)
+            .await?;
         out.push(ReferenceRecord {
             id: prompt.id.clone(),
             engine: got

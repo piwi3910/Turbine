@@ -54,6 +54,7 @@ label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 run_tests=0
 run_golden16=0
 batched=0
+chat_kwargs=""
 run_c1=0
 run_quality=0
 quick=0
@@ -67,7 +68,7 @@ mt_only=0
 cfg_override=""
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--chat-template-kwargs <json>] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4 qwen3-4b mistral-7b gpt-oss-20b qwen3.5-9b" >&2
 	exit 2
 }
@@ -109,6 +110,14 @@ while [[ $# -gt 0 ]]; do
 	--quality)
 		run_quality=1
 		shift
+		;;
+	--chat-template-kwargs)
+		# A JSON object sent as each chat request's `chat_template_kwargs` by the --quality GSM8K
+		# eval (the Phase 7 hybrids run thinking off: '{"enable_thinking":false}'). The golden
+		# compare takes it from the slug's own tests/golden/<slug>/prompts.jsonl instead.
+		[[ $# -ge 2 ]] || usage
+		chat_kwargs="$2"
+		shift 2
 		;;
 	--quick)
 		quick=1
@@ -485,7 +494,9 @@ else
 fi
 if [[ $dry -eq 1 ]]; then
 	if [[ $run_quality -eq 1 ]]; then
-		echo "+ ssh -o BatchMode=yes $host 'cd $remote/src && taskset -c $bench_cpus $remote/target/release/turbine-golden eval --url http://127.0.0.1:18000 --tasks tests/eval/gsm8k-200.jsonl --output json'"
+		dry_kw=""
+		[[ -z "$chat_kwargs" ]] || dry_kw=" --chat-template-kwargs $chat_kwargs"
+		echo "+ ssh -o BatchMode=yes $host 'cd $remote/src && taskset -c $bench_cpus $remote/target/release/turbine-golden eval --url http://127.0.0.1:18000 --tasks tests/eval/gsm8k-200.jsonl --output json${dry_kw}'"
 	fi
 	echo "+ ssh -o BatchMode=yes $host \"cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; $stop_server\""
 	echo "lab-bench: dry run: nothing contacted"
@@ -493,9 +504,11 @@ if [[ $dry -eq 1 ]]; then
 fi
 rm -f "$out/quality.json"
 if [[ $run_quality -eq 1 ]]; then
+	quality_kw=""
+	[[ -z "$chat_kwargs" ]] || quality_kw=" --chat-template-kwargs '$chat_kwargs'"
 	ssh -o BatchMode=yes "$host" "cd '$remote/src' && taskset -c $bench_cpus \
     '$remote/target/release/turbine-golden' eval --url http://127.0.0.1:18000 \
-      --tasks tests/eval/gsm8k-200.jsonl --output json" >"$out/quality.json" 2>"$out/quality.err" ||
+      --tasks tests/eval/gsm8k-200.jsonl --output json${quality_kw}" >"$out/quality.json" 2>"$out/quality.err" ||
 		echo "lab-bench: quality run failed (see $out/quality.err)" >&2
 fi
 ssh -o BatchMode=yes "$host" "cp /tmp/lab-bench-server.log /tmp/lab-bench-server.last.log; $stop_server"

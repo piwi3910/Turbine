@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::{Map, Value};
 use turbine_bench::golden::fixture::{
     read_jsonl, read_prompts, read_tolerance, write_jsonl_atomic,
 };
@@ -64,6 +65,11 @@ enum Command {
         /// the batched bounds when the keys are absent).
         #[arg(long, conflicts_with = "batched_bounds")]
         multi_gpu_bounds: bool,
+        /// JSON object sent verbatim as each chat request's `chat_template_kwargs`, merged over
+        /// the prompt's own kwargs (the flag wins a shared key), e.g.
+        /// `'{"enable_thinking":false}'` for a Qwen3.5/3.6 hybrid.
+        #[arg(long)]
+        chat_template_kwargs: Option<String>,
     },
     /// Record reference.jsonl from any OpenAI-compatible endpoint.
     Capture {
@@ -78,6 +84,10 @@ enum Command {
         model: Option<String>,
         #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(2..=20))]
         top_logprobs: u32,
+        /// JSON object sent verbatim as each chat request's `chat_template_kwargs`, merged over
+        /// the prompt's own kwargs (the flag wins a shared key).
+        #[arg(long)]
+        chat_template_kwargs: Option<String>,
     },
     /// One reference prompt judged position by position: every reference top-k candidate's
     /// |Δ logprob|, tier and strict bound. With --url the endpoint is teacher-forced on the
@@ -166,6 +176,11 @@ enum Command {
         /// the same value.
         #[arg(long, value_parser = turbine_bench::args::parse_reasoning_effort)]
         reasoning_effort: Option<String>,
+        /// JSON object sent verbatim as each chat request's `chat_template_kwargs`, e.g.
+        /// `'{"enable_thinking":false}'` for a Qwen3.5/3.6 hybrid. Both sides of a comparison
+        /// must use the same value.
+        #[arg(long)]
+        chat_template_kwargs: Option<String>,
     },
     /// Quality gate: exit 0 when candidate accuracy ≥ baseline accuracy − max drop, else 1.
     EvalCompare {
@@ -191,6 +206,7 @@ async fn run_eval(
     fillers: eval::Fillers,
     guards: (Option<f64>, Option<f64>),
     reasoning_effort: Option<&str>,
+    chat_template_kwargs: Option<&str>,
 ) -> ExitCode {
     if guards
         .0
@@ -201,6 +217,14 @@ async fn run_eval(
         eprintln!("turbine-golden eval: reuse ratios must be between 0 and 1");
         return ExitCode::from(2);
     }
+    let chat_template_kwargs =
+        match parse_chat_template_kwargs(chat_template_kwargs.map(str::to_string)) {
+            Ok(kwargs) => kwargs,
+            Err(e) => {
+                eprintln!("turbine-golden eval: {e}");
+                return ExitCode::from(2);
+            }
+        };
     let report = match eval::load_tasks(tasks_path) {
         Ok(tasks) => {
             eval::run_eval(
@@ -211,6 +235,7 @@ async fn run_eval(
                 concurrency,
                 fillers,
                 reasoning_effort,
+                chat_template_kwargs.as_ref(),
             )
             .await
         }
@@ -311,6 +336,13 @@ fn run_eval_compare(baseline: &Path, candidate: &Path, max_drop: f64) -> ExitCod
         );
         return ExitCode::from(2);
     }
+    if baseline.chat_template_kwargs != candidate.chat_template_kwargs {
+        eprintln!(
+            "turbine-golden eval-compare: baseline used chat_template_kwargs {:?} but candidate {:?}; a comparison must use the same chat_template_kwargs on both sides",
+            baseline.chat_template_kwargs, candidate.chat_template_kwargs
+        );
+        return ExitCode::from(2);
+    }
     let o = eval::compare(&baseline, &candidate, max_drop);
     println!(
         "baseline accuracy {:.4}, candidate accuracy {:.4}, max drop {:.4} (concurrency {}): {}",
@@ -329,6 +361,22 @@ fn reference_dir(reference: &Path) -> &Path {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
+}
+
+/// `--chat-template-kwargs '<json>'` → the object, or a usage error when it is not a JSON object.
+fn parse_chat_template_kwargs(
+    text: Option<String>,
+) -> Result<Option<Map<String, Value>>, GoldenError> {
+    match text {
+        None => Ok(None),
+        Some(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(map)) => Ok(Some(map)),
+            Ok(_) => Err(GoldenError::Usage(
+                "--chat-template-kwargs must be a JSON object".into(),
+            )),
+            Err(e) => Err(GoldenError::Usage(format!("--chat-template-kwargs: {e}"))),
+        },
+    }
 }
 
 /// `prompts.jsonl` beside the reference, else in its parent directory (the committed layout
@@ -362,8 +410,10 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             concurrency,
             batched_bounds,
             multi_gpu_bounds,
+            chat_template_kwargs,
         } => {
             let endpoint = Endpoint::new(&url)?;
+            let chat_template_kwargs = parse_chat_template_kwargs(chat_template_kwargs)?;
             let references: Vec<ReferenceRecord> = read_jsonl(&reference)?;
             let prompts = match prompts {
                 Some(p) => p,
@@ -388,6 +438,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
                 &prompts,
                 &tol,
                 concurrency as usize,
+                chat_template_kwargs.as_ref(),
             )
             .await?;
             if batched_bounds {
@@ -416,11 +467,20 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             out,
             model,
             top_logprobs,
+            chat_template_kwargs,
         } => {
             let endpoint = Endpoint::new(&url)?;
+            let chat_template_kwargs = parse_chat_template_kwargs(chat_template_kwargs)?;
             let prompts = read_prompts(&prompts)?;
             let model = endpoint.model(model.as_deref()).await?;
-            let records = capture(&endpoint, &model, &prompts, top_logprobs).await?;
+            let records = capture(
+                &endpoint,
+                &model,
+                &prompts,
+                top_logprobs,
+                chat_template_kwargs.as_ref(),
+            )
+            .await?;
             write_jsonl_atomic(&out, &records)?;
             eprintln!(
                 "turbine-golden: captured {} prompts into {}",
@@ -495,6 +555,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             min_cached_ratio,
             min_lossy_cached_ratio,
             reasoning_effort,
+            chat_template_kwargs,
         } => Ok(run_eval(
             &url,
             &tasks,
@@ -509,6 +570,7 @@ async fn run(cli: Cli) -> Result<ExitCode, GoldenError> {
             },
             (min_cached_ratio, min_lossy_cached_ratio),
             reasoning_effort.as_deref(),
+            chat_template_kwargs.as_deref(),
         )
         .await),
         Command::EvalCompare {

@@ -853,6 +853,148 @@ async fn multi_gpu_bounds_select_calibrated_keys() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `--chat-template-kwargs '<json>'` (Phase 7 hybrid thinking off): the flag's object is sent
+/// verbatim as the request's `chat_template_kwargs` on every chat replay, merged over the
+/// prompt's own kwargs with the flag winning a shared key, and never on a completion request;
+/// a value that is not a JSON object is a usage error. Breaks if the flag is dropped, not
+/// parsed, applied to completions, or replaces the prompt's kwargs.
+#[tokio::test(flavor = "multi_thread")]
+async fn golden_passes_chat_template_kwargs() {
+    use std::sync::Mutex;
+
+    // A chat mock that records every request body and answers from the Base script.
+    let recorded: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let bodies = Arc::clone(&recorded);
+    let app = Router::new().route("/v1/models", get(models)).route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let bodies = Arc::clone(&bodies);
+            async move {
+                bodies.lock().unwrap().push(body.clone());
+                let s = body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|m| m["content"].as_str())
+                    .and_then(|c| script(Variant::Base).get(c).cloned())
+                    .expect("known prompt");
+                let content: Vec<Value> = s
+                    .tokens
+                    .iter()
+                    .zip(&s.top)
+                    .map(|(tok, row)| {
+                        json!({
+                            "token": id_str(*tok),
+                            "logprob": row.iter().find(|(id, _)| id == tok).map_or(-9.0, |e| e.1),
+                            "top_logprobs": row
+                                .iter()
+                                .map(|(id, lp)| json!({"token": id_str(*id), "logprob": lp}))
+                                .collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                Json(json!({
+                    "id": "chatcmpl-mock", "object": "chat.completion", "model": "mock-model",
+                    "system_fingerprint": "mock-engine-1", "prompt_token_ids": PROMPT_TOKEN_IDS,
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "irrelevant"},
+                        "logprobs": {"content": content}, "finish_reason": "length"}],
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = temp_dir("chat-template-kwargs");
+    std::fs::write(
+        dir.join("prompts.jsonl"),
+        concat!(
+            r#"{"id":"p01","kind":"chat","messages":[{"role":"user","content":"alpha"}],"max_tokens":10,"chat_template_kwargs":{"date_string":"26 Jul 2024"}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("mock/tolerance.json"),
+        r#"{"min_identical_prefix":8,"min_prompts_passing":1,"top_k":5,"max_abs_logprob_diff_likely":0.15,"max_abs_logprob_diff_tail":0.55,"likely_logprob_floor":-2.0,"margin_nats":0.5}"#,
+    )
+    .unwrap();
+    // Capture through the asserting `chat` mock: the prompt's own kwargs are forwarded there too.
+    let reference = dir.join("mock/reference.jsonl");
+    let capture_addr = mock_server(Variant::Base).await;
+    let run = golden(strings(&[
+        "capture",
+        "--url",
+        &format!("http://{capture_addr}"),
+        "--prompts",
+        dir.join("prompts.jsonl").to_str().unwrap(),
+        "--out",
+        reference.to_str().unwrap(),
+        "--model",
+        "mock-model",
+    ]))
+    .await;
+    assert_eq!(run.code, Some(0), "capture failed: {}", run.stderr);
+
+    // The flag's object appears verbatim, merged over the prompt's own kwargs.
+    let run = golden(strings(&[
+        "compare",
+        "--url",
+        &format!("http://{addr}"),
+        "--reference",
+        reference.to_str().unwrap(),
+        "--chat-template-kwargs",
+        r#"{"enable_thinking":false}"#,
+    ]))
+    .await;
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    let bodies = recorded.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "{bodies:?}");
+    assert_eq!(
+        bodies[0]["chat_template_kwargs"],
+        json!({"date_string": "26 Jul 2024", "enable_thinking": false}),
+        "{}",
+        bodies[0]
+    );
+
+    // A shared key: the flag wins over the prompt's value.
+    let run = golden(strings(&[
+        "compare",
+        "--url",
+        &format!("http://{addr}"),
+        "--reference",
+        reference.to_str().unwrap(),
+        "--chat-template-kwargs",
+        r#"{"date_string":"2 Feb 2001"}"#,
+    ]))
+    .await;
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    let bodies = recorded.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(
+        bodies[1]["chat_template_kwargs"]["date_string"],
+        json!("2 Feb 2001"),
+        "{}",
+        bodies[1]
+    );
+
+    // A value that is not a JSON object is a usage error (exit 2), before any request.
+    let run = golden(strings(&[
+        "compare",
+        "--url",
+        &format!("http://{addr}"),
+        "--reference",
+        reference.to_str().unwrap(),
+        "--chat-template-kwargs",
+        r#""enable_thinking""#,
+    ]))
+    .await;
+    assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(recorded.lock().unwrap().len(), 2, "no request was sent");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Phase 8 (S-3, S-4): `turbine-golden eval` and `eval-compare` against an in-process mock.
 mod phase8_eval {
     use std::path::{Path, PathBuf};

@@ -158,6 +158,24 @@ family_slug() {
 	esac
 }
 
+# family_prompts <slug>: the prompts file of a family's fixture — the slug's own prompts.jsonl
+# when it has one (a hybrid's thinking-off `chat_template_kwargs` live there, so the captures and
+# compares render the same prompt as the reference), else the shared tests/golden/prompts.jsonl.
+family_prompts() {
+	local own="tests/golden/$1/prompts.jsonl"
+	if [[ -f $own ]]; then echo "$own"; else echo tests/golden/prompts.jsonl; fi
+}
+
+# family_chat_kwargs <short>: the `--chat-template-kwargs` value of a family, empty when the
+# family needs none. The Qwen3.5/3.6 hybrids run thinking off (their golden references are
+# thinking-off), so their golden compare and GSM8K eval carry it.
+family_chat_kwargs() {
+	case "$1" in
+	qwen36) echo '{"enable_thinking":false}' ;;
+	*) echo "" ;;
+	esac
+}
+
 # ---------------------------------------------------------------------------------------------
 # Inside the Job: `scripts/lab-cluster.sh --in-job <scenario>`, run from the slot's source tree
 # with the release binaries in $CARGO_TARGET_DIR/release and the weights at /models.
@@ -864,15 +882,19 @@ scenario_ep2() {
 	fi
 }
 
-# olmoe_capture_set <dir> <prefix> <rotated-dir>: the greedy captures of one placement: c1 as
-# <prefix>c1 and 16 prompt-rotated captures at once as <prefix>c16-NN (batched, like the par-*
-# captures of scripts/lab/golden-engine-spread.sh).
+# olmoe_capture_set <dir> <prefix> <rotated-dir> <prompts> [chat-kwargs...]: the greedy captures
+# of one placement: c1 as <prefix>c1 and 16 prompt-rotated captures at once as <prefix>c16-NN
+# (batched, like the par-* captures of scripts/lab/golden-engine-spread.sh). `prompts` is the
+# fixture prompts file (a hybrid's own, thinking off) and any further args are forwarded to
+# `turbine-golden capture`.
 olmoe_capture_set() {
-	local dir="$1" prefix="$2" rot="$3" i pids=()
+	local dir="$1" prefix="$2" rot="$3" prompts="$4"
+	shift 4
+	local i pids=()
 	echo "lab-step: turbine-golden capture ${prefix}c1"
-	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl --out "${dir}/${prefix}c1.jsonl" || job_fail "turbine-golden capture ${prefix}c1 failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" --out "${dir}/${prefix}c1.jsonl" "$@" || job_fail "turbine-golden capture ${prefix}c1 failed"
 	for i in $(seq 0 15); do
-		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" --out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" &
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" --out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" "$@" &
 		pids+=($!)
 	done
 	# Not a bare wait: the server is a child of this shell too.
@@ -925,7 +947,7 @@ scenario_olmoe_spread() {
 		esac
 		start_server "${WORK}/spread-${placement}.log" "$ep2" "$@"
 		wait_ready "$URL" "${WORK}/spread-${placement}.log"
-		olmoe_capture_set "$dir" "mg-${placement}-" "$rot"
+		olmoe_capture_set "$dir" "mg-${placement}-" "$rot" tests/golden/prompts.jsonl
 		stop_servers
 	done
 	echo "lab-info: spread captures $(find "$dir" -name '*.jsonl' | wc -l) in ${dir}"
@@ -1041,6 +1063,8 @@ scenario_family() {
 	local eval_json="${results}/turbine-${placement}.json"
 	local baseline="tests/eval/${slug}/vllm-${placement}.json"
 	local golden1=PASS golden16=PASS gsm8k=nobaseline tok_s=none verdict=PASS
+	local kw_json; kw_json="$(family_chat_kwargs "$short")"
+	local kw=(); [[ -n $kw_json ]] && kw=(--chat-template-kwargs "$kw_json")
 	if [[ $FAMILY_DRY -eq 1 ]]; then
 		echo "+ ${BIN}/turbine-server --config ${config} (background; until ${URL}/ready answers 200)"
 	else
@@ -1049,7 +1073,8 @@ scenario_family() {
 	fi
 	for c in 1 16; do
 		if ! fam_run - "${BIN}/turbine-golden" compare --url "$URL" \
-			--reference "tests/golden/${slug}/reference.jsonl" --concurrency "$c" --multi-gpu-bounds; then
+			--reference "tests/golden/${slug}/reference.jsonl" --concurrency "$c" --multi-gpu-bounds \
+			"${kw[@]}"; then
 			if [[ $c == 1 ]]; then golden1=FAIL; else golden16=FAIL; fi
 			verdict=FAIL
 		fi
@@ -1059,7 +1084,7 @@ scenario_family() {
 	# (cleanup's rm -rf of the run directory).
 	fam_run - chmod a+rwx "$results" || true
 	fam_run "$eval_json" "${BIN}/turbine-golden" eval --url "$URL" --tasks tests/eval/gsm8k-200.jsonl \
-		--concurrency 16 --output json || job_fail "turbine-golden eval failed"
+		--concurrency 16 --output json "${kw[@]}" || job_fail "turbine-golden eval failed"
 	local drop="<gate.json max_drop>"
 	if [[ $FAMILY_DRY -eq 0 ]]; then
 		drop="$(jq -r '.max_drop // 0.01' "tests/eval/${slug}/gate.json" 2>/dev/null || echo 0.01)"
@@ -1105,14 +1130,17 @@ scenario_family_spread() {
 	local tp2="scripts/lab/phase7-novanas-${short}-tp2.yaml" ep2="scripts/lab/phase7-novanas-${short}-ep2.yaml"
 	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
 	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i
+	local prompts; prompts="$(family_prompts "$slug")"
+	local kw_json; kw_json="$(family_chat_kwargs "$short")"
+	local kw=(); [[ -n $kw_json ]] && kw=(--chat-template-kwargs "$kw_json")
 	mkdir -p "$dir" "$rot" || job_fail "cannot create ${dir}"
 	chmod -R a+rwx "${results}" || true
-	n=$(grep -c . tests/golden/prompts.jsonl)
+	n=$(grep -c . "$prompts")
 	for i in $(seq 0 15); do
 		k=$((i % n))
 		{
-			tail -n +$((k + 1)) tests/golden/prompts.jsonl
-			head -n $k tests/golden/prompts.jsonl
+			tail -n +$((k + 1)) "$prompts"
+			head -n $k "$prompts"
 		} | grep . >"${rot}/${i}.jsonl"
 	done
 	start_server "${WORK}/spread-tp2.log" "$tp2"
@@ -1120,14 +1148,14 @@ scenario_family_spread() {
 	# The reference capture set of the baseline placement (as scenario_olmoe_spread's one-GPU set):
 	# c1-cold, c1-warm, then the 16 rotated captures at once as par-NN.
 	echo "lab-step: turbine-golden capture c1-cold"
-	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
-		--out "${dir}/c1-cold.jsonl" || job_fail "turbine-golden capture c1-cold failed"
-	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
-		--out "${dir}/c1-warm.jsonl" || job_fail "turbine-golden capture c1-warm failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" \
+		--out "${dir}/c1-cold.jsonl" "${kw[@]}" || job_fail "turbine-golden capture c1-cold failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" \
+		--out "${dir}/c1-warm.jsonl" "${kw[@]}" || job_fail "turbine-golden capture c1-warm failed"
 	local pids=()
 	for i in $(seq 0 15); do
 		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" \
-			--out "${dir}/$(printf 'par-%02d' "$i").jsonl" &
+			--out "${dir}/$(printf 'par-%02d' "$i").jsonl" "${kw[@]}" &
 		pids+=($!)
 	done
 	for i in "${pids[@]}"; do
@@ -1136,7 +1164,7 @@ scenario_family_spread() {
 	stop_servers
 	start_server "${WORK}/spread-ep2.log" "$ep2"
 	wait_ready "$URL" "${WORK}/spread-ep2.log"
-	olmoe_capture_set "$dir" "mg-ep2-" "$rot"
+	olmoe_capture_set "$dir" "mg-ep2-" "$rot" "$prompts" "${kw[@]}"
 	stop_servers
 	echo "lab-info: spread captures $(find "$dir" -name '*.jsonl' | wc -l) in ${dir}"
 }
