@@ -47,6 +47,7 @@ use crate::policy::{
 };
 use crate::pool::BlockPool;
 use crate::session::{PrefetchTracker, SessionAction, SessionTable};
+use crate::state::{SnapshotPool, SnapshotRef};
 use crate::tier::{KvLocation, KvTier, L0_FORMAT, TierError, TierId, demotion_target};
 use turbine_reliability::throttle::KvReclaimer;
 
@@ -107,6 +108,10 @@ pub struct HierarchyConfig {
     /// reuses whole blocks only and restores the nearest snapshot at or before its cutoff. The
     /// server sets it from the executor's [`turbine_core::types::StateLayout`] at startup.
     pub hybrid: bool,
+    /// `kv.hybrid_snapshot_interval_blocks` (`≥ 1`, P7 S-12): a hybrid family's state is
+    /// snapshotted at every this-many-th full block (the engine reads it via
+    /// [`KvHierarchy::snapshot_interval`]).
+    pub hybrid_snapshot_interval_blocks: u32,
 }
 
 /// The compression ladder's settings (P6b S-6): `kv.ladder.*` and the pressure controller's
@@ -184,6 +189,7 @@ impl HierarchyConfig {
             slab_drains_per_tick: kv.cpu.slab_drains_per_tick,
             // P7 S-12: the model's state layout is not known here; the server sets it.
             hybrid: false,
+            hybrid_snapshot_interval_blocks: kv.hybrid_snapshot_interval_blocks,
             lossy_penalty: crate::codec::registry()
                 .iter()
                 .map(|c| {
@@ -628,6 +634,9 @@ pub struct KvHierarchy {
     requests: HashMap<RequestId, RequestKv>,
     /// L0 block → the key the directory holds for it.
     l0_keys: HashMap<BlockId, KvKey>,
+    /// P7 S-12 (Task 32): the block-boundary snapshot entries (one per L0 block). `None` until
+    /// the server marks the model hybrid (`set_hybrid_state`). Freed with the block.
+    snapshot_pool: Option<SnapshotPool>,
     l0_state: PressureState,
     prefill_tps: f64,
     reclaim: Arc<KvReclaimHandle>,
@@ -766,6 +775,7 @@ impl KvHierarchy {
             pending: HashMap::new(),
             requests: HashMap::new(),
             l0_keys: HashMap::new(),
+            snapshot_pool: None,
             l0_state: PressureState::Green,
             prefill_tps: Self::DEFAULT_PREFILL_TPS,
             reclaim: Arc::new(KvReclaimHandle::new()),
@@ -2115,6 +2125,8 @@ impl KvHierarchy {
                 self.dir.stale_location(key, TierId::L0);
                 return;
             }
+            // P7 S-12: the evicted block's snapshot entry goes with it.
+            self.release_snapshot(b);
             self.l0_keys.remove(&b);
             if let Some(e) = self.dir.get_mut(key) {
                 e.ref_count = 0;
@@ -2314,6 +2326,9 @@ impl KvHierarchy {
     /// After the scheduler allocated blocks: forget the L0 copies allocation reclaimed.
     pub fn after_plan(&mut self, pool: &mut BlockPool) {
         for b in pool.take_reclaimed() {
+            // P7 S-12: the reclaimed block's snapshot entry goes with it (before `l0_keys` loses
+            // the block, so the directory entry can be cleared).
+            self.release_snapshot(b);
             let Some(key) = self.l0_keys.remove(&b) else {
                 continue;
             };
@@ -3541,10 +3556,47 @@ impl KvHierarchy {
         }
     }
 
-    /// P7 S-12 (Task 32): marks the model as a hybrid family (per-sequence state). A hybrid
-    /// lookup restores the nearest snapshot at or before its cutoff and never takes a tail copy.
-    pub fn set_hybrid(&mut self, hybrid: bool) {
-        self.cfg.hybrid = hybrid;
+    /// P7 S-12 (Task 32): marks the model as a hybrid family and sizes the block-boundary
+    /// snapshot pool (one entry per L0 block, the conservative bound of the round-3 lead call)
+    /// from the model's `layout`. The snapshot bytes themselves are the L0 state buffer the
+    /// executor owns; the pool is pure index bookkeeping.
+    pub fn set_hybrid_state(&mut self, layout: turbine_core::types::StateLayout, blocks: u32) {
+        self.cfg.hybrid = true;
+        self.snapshot_pool = Some(SnapshotPool::new(layout, blocks));
+    }
+
+    /// `kv.hybrid_snapshot_interval_blocks` (P7 S-12), always `≥ 1`.
+    pub fn snapshot_interval(&self) -> u32 {
+        self.cfg.hybrid_snapshot_interval_blocks.max(1)
+    }
+
+    /// Reserves (or returns) `block`'s snapshot entry (P7 S-12); `None` for an attention-only
+    /// model or when every entry is in use. The entry's bytes are written by the executor with
+    /// the block's boundary state; the ref is recorded on the directory with
+    /// [`KvHierarchy::snapshot_record`] once the block's key is known.
+    pub fn snapshot_alloc(&mut self, block: BlockId) -> Option<SnapshotRef> {
+        self.snapshot_pool.as_mut()?.alloc(block).ok()
+    }
+
+    /// Records `block`'s snapshot on its directory entry (P7 S-12), so a later prefix hit sees
+    /// `MatchedBlock.snapshot = Some(ref)`. A block with no committed key (a shrunken or failed
+    /// step) is a no-op.
+    pub fn snapshot_record(&mut self, block: BlockId, snapshot: SnapshotRef) {
+        if let Some(key) = self.l0_keys.get(&block).copied() {
+            self.dir.set_snapshot(&key, Some(snapshot));
+        }
+    }
+
+    /// Releases `block`'s snapshot entry and clears it from the directory (P7 S-12), so a
+    /// reused `BlockId` never returns stale bytes. Called wherever an L0 block is freed, and by
+    /// the engine when a step that reserved an entry fails before committing its block.
+    pub fn release_snapshot(&mut self, block: BlockId) {
+        if let Some(pool) = self.snapshot_pool.as_mut()
+            && pool.release(block)
+            && let Some(key) = self.l0_keys.get(&block).copied()
+        {
+            self.dir.set_snapshot(&key, None);
+        }
     }
 
     pub fn window_maintain(&mut self, pool: &mut BlockPool) {

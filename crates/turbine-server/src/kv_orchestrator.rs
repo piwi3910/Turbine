@@ -669,10 +669,33 @@ impl KvOrchestrator {
         self.h.set_ladder_dwell(dwell);
     }
 
-    /// P7 S-12 (Task 32): marks the model as a hybrid family (per-sequence state); the hierarchy
-    /// then restores a hit's nearest block snapshot instead of taking a tail copy.
-    pub fn set_hybrid(&mut self, hybrid: bool) {
-        self.h.set_hybrid(hybrid);
+    /// P7 S-12 (Task 32): marks the model hybrid and sizes the block-boundary snapshot pool (one
+    /// entry per L0 block) from the model's `layout`.
+    pub fn set_hybrid_state(&mut self, layout: turbine_core::types::StateLayout, blocks: u32) {
+        self.h.set_hybrid_state(layout, blocks);
+    }
+
+    /// `kv.hybrid_snapshot_interval_blocks` (P7 S-12), always `≥ 1`.
+    pub fn snapshot_interval(&self) -> u32 {
+        self.h.snapshot_interval()
+    }
+
+    /// Reserves `block`'s snapshot entry (P7 S-12); `None` for an attention-only model or when
+    /// the pool is exhausted.
+    pub fn snapshot_alloc(&mut self, block: BlockId) -> Option<turbine_kv::state::SnapshotRef> {
+        self.h.snapshot_alloc(block)
+    }
+
+    /// Records `block`'s snapshot on its directory entry once the block's key is committed (P7
+    /// S-12), so a later prefix hit restores it.
+    pub fn snapshot_record(&mut self, block: BlockId, snapshot: turbine_kv::state::SnapshotRef) {
+        self.h.snapshot_record(block, snapshot);
+    }
+
+    /// Releases `block`'s snapshot entry (P7 S-12): the L0 block is freed, or a step that
+    /// reserved the entry failed before committing the block.
+    pub fn snapshot_release(&mut self, block: BlockId) {
+        self.h.release_snapshot(block);
     }
 
     /// The lock-free reclaim requests the Phase 3 controller issues (`KvReclaimer`).

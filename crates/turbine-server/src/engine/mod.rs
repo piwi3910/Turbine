@@ -123,13 +123,27 @@ pub struct EngineDocs {
 }
 
 /// State the engine publishes for the HTTP side; `None` until the engine runs.
-#[derive(Default)]
 pub struct EngineShared {
     docs: Mutex<Option<EngineDocs>>,
     /// Tokens this engine still has to process for the requests it holds: per request its
     /// prompt plus `n × max_tokens`, less what it generated. Raised when a submission is
     /// accepted and recomputed after every step; the data-parallel router's load (P5 S-7).
     outstanding_tokens: AtomicU64,
+    /// P7 S-12 (Task 32): free entries of the scheduler's state-slot pool, or `u32::MAX` for an
+    /// attention-only family. A health signal (a slot must return on every finish, cancel and
+    /// preemption); the engine republishes it every turn.
+    state_slots_free: AtomicU64,
+}
+
+impl Default for EngineShared {
+    fn default() -> EngineShared {
+        EngineShared {
+            docs: Mutex::new(None),
+            outstanding_tokens: AtomicU64::new(0),
+            // `u64::MAX`: an attention-only family (no state-slot pool) until a run says otherwise.
+            state_slots_free: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl EngineShared {
@@ -143,6 +157,22 @@ impl EngineShared {
 
     pub(crate) fn set_outstanding(&self, tokens: u64) {
         self.outstanding_tokens.store(tokens, Ordering::Release);
+    }
+
+    /// P7 S-12 (Task 32): free entries of the scheduler's state-slot pool, or `None` for an
+    /// attention-only family. Read by the S-12 engine test to assert no slot leaks (a hybrid's
+    /// slot pool must return every slot on finish, cancel and preemption).
+    #[cfg(test)]
+    pub fn state_slots_free(&self) -> Option<u32> {
+        match self.state_slots_free.load(Ordering::Acquire) {
+            u64::MAX => None,
+            n => Some(n as u32),
+        }
+    }
+
+    pub(crate) fn set_state_slots_free(&self, free: Option<u32>) {
+        self.state_slots_free
+            .store(free.map_or(u64::MAX, u64::from), Ordering::Release);
     }
 
     pub fn publish(&self, docs: EngineDocs) {
