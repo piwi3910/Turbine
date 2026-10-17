@@ -2751,6 +2751,50 @@ mod tests {
         assert!(plain.state_slots().is_none());
     }
 
+    /// P7 S-12 (Task 32): a request preempted by recompute returns its state slot — the
+    /// recompute rebuilds the state from scratch, so the preempted sequence holds none until it
+    /// is admitted again. Breaks if a preemption leaks a slot.
+    #[test]
+    fn preemption_returns_the_state_slot() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_running_requests: 2,
+                ..params()
+            },
+            Arc::new(clock.clone()),
+        )
+        .with_state_layout(state_layout());
+        let mut p = pool(3);
+        s.submit(request(1, 1, 8, 40), p.total_blocks()).unwrap();
+        s.submit(request(2, 2, 8, 40), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        complete_all(&mut s, &mut p, &plan, &[]);
+        assert_eq!(
+            s.state_slots().unwrap().free(),
+            0,
+            "both sequences hold a slot"
+        );
+
+        // A 3-block pool forces request 2 to be preempted as both decode across a boundary.
+        let mut preempted = None;
+        for _ in 0..12 {
+            let plan = s.plan(&mut p, &IterationLimits::default());
+            if !plan.preempted.is_empty() {
+                preempted = Some(plan);
+                break;
+            }
+            complete_all(&mut s, &mut p, &plan, &[]);
+        }
+        let plan = preempted.expect("the pool forced a preemption");
+        assert_eq!(
+            s.state_slots().unwrap().free(),
+            1,
+            "the preempted sequence returned its slot"
+        );
+        complete_all(&mut s, &mut p, &plan, &[]);
+    }
+
     /// P7 S-12 (Task 32, decision 2026-10-08 1 B): a prefix hit whose plan carries a snapshot
     /// plans one `Snapshot -> Slot` state copy into the sequence's own slot; a hit without a
     /// snapshot (or an attention-only family) plans none. Breaks if the copy targets another

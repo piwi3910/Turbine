@@ -103,7 +103,7 @@ use turbine_kv::BlockPool;
 use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
-    StateLoc, StateSnapshots, TokenFeed,
+    SnapshotRef, StateLoc, StateSnapshots, TokenFeed,
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_reliability::budget::PoolKind;
@@ -308,6 +308,13 @@ pub(crate) struct EngineLoop {
     jump_forward_max_tokens: u32,
     /// [`EngineParts::ranks`].
     ranks: Vec<turbine_kv::KvRankDocument>,
+    /// P7 S-12 (Task 32): the snapshot entries this turn's plan reserved (block → entry),
+    /// recorded on the directory once the iteration commits, released when it fails. Cleared
+    /// every turn.
+    snapshot_pending: HashMap<BlockId, turbine_model::executor::SnapshotRef>,
+    /// P7 S-12 (Task 32): `kv.hybrid_snapshot_interval_blocks` when the model keeps hybrid
+    /// state, else `None` (no snapshots).
+    hybrid_interval: Option<u32>,
 }
 
 /// A micro-batch launched into the pipeline's stages before the last, waiting for its last
@@ -374,6 +381,9 @@ struct Built {
     formats: Vec<Vec<u8>>,
     rows: Vec<RowInfo>,
     feeds: Vec<TokenFeed>,
+    /// P7 S-12 (Task 32): per row, the block-boundary snapshots the step must fill, `(token
+    /// offset within the step, entry)`. Empty for an attention-only model.
+    snapshots: Vec<SmallVec<[(u32, SnapshotRef); 2]>>,
 }
 
 enum Build {
@@ -419,6 +429,7 @@ impl EngineLoop {
         // budget's conservative bound), hands it to the executor, and marks the KV hierarchy as
         // hybrid so a prefix hit restores the nearest snapshot.
         let mut hybrid_state_bytes = 0u64;
+        let mut hybrid_interval = None;
         if let Some(layout) = p.executor.state_layout() {
             let entries = u64::from(p.pool.total_blocks());
             let entry_bytes = layout.bytes_per_sequence();
@@ -429,7 +440,8 @@ impl EngineLoop {
                     Ok(buffer) => {
                         p.executor
                             .set_state_snapshots(StateSnapshots { buffer, layout });
-                        p.kv.set_hybrid(true);
+                        p.kv.set_hybrid_state(layout, p.pool.total_blocks());
+                        hybrid_interval = Some(p.kv.snapshot_interval());
                         hybrid_state_bytes = entries.saturating_mul(entry_bytes);
                     }
                     Err(e) => tracing::warn!(
@@ -512,6 +524,8 @@ impl EngineLoop {
             jump_forward: p.jump_forward,
             jump_forward_max_tokens: p.jump_forward_max_tokens,
             ranks: p.ranks,
+            snapshot_pending: HashMap::new(),
+            hybrid_interval,
         };
         engine
             .metrics
@@ -611,6 +625,7 @@ impl EngineLoop {
         let failed = outcome.failed.is_some();
         if failed {
             self.pending_publishes.clear();
+            self.release_snapshots();
         }
         if !failed {
             // Only KV the forward pass wrote successfully enters the cache; the tables are
@@ -619,6 +634,9 @@ impl EngineLoop {
             for (id, blocks, tokens) in self.kv_commits(&plan) {
                 self.kv.commit(&mut self.pool, id, &blocks, &tokens);
             }
+            // P7 S-12: the step's block-boundary snapshots land on their directory entries (the
+            // blocks just committed).
+            self.record_snapshots();
             // The finished requests' partial tails publish before the tables release.
             for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
                 self.kv.publish_tail(&mut self.pool, id, block, &tokens);
@@ -815,6 +833,7 @@ impl EngineLoop {
                 for (id, blocks, tokens) in self.kv_commits(&f.plan) {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
                 }
+                self.record_snapshots();
                 // The finished requests' partial tails publish before the tables release.
                 for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
                     self.kv.publish_tail(&mut self.pool, id, block, &tokens);
@@ -833,6 +852,7 @@ impl EngineLoop {
             }
             Err(error) => {
                 self.pending_publishes.clear();
+                self.release_snapshots();
                 let outcome = self.pipe_failure(f.plan.iteration, error);
                 self.sched.complete(&mut self.pool, outcome);
             }
@@ -1868,6 +1888,24 @@ impl EngineLoop {
         Ok(())
     }
 
+    /// P7 S-12 (Task 32): records this turn's reserved snapshot entries on their directory
+    /// entries (the step committed their blocks). A block with no committed key is dropped: its
+    /// entry stays reserved but unused (freed with the block).
+    fn record_snapshots(&mut self) {
+        for (block, ref_) in self.snapshot_pending.drain() {
+            self.kv.snapshot_record(block, ref_);
+            self.metrics.server.hybrid_state_snapshot("stored");
+        }
+    }
+
+    /// P7 S-12 (Task 32): releases this turn's reserved snapshot entries after a failed step, so
+    /// a reserved-but-unwritten entry is not left holding a block that never committed.
+    fn release_snapshots(&mut self) {
+        for (block, _) in self.snapshot_pending.drain() {
+            self.kv.snapshot_release(block);
+        }
+    }
+
     /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
     /// with `prev` (a launch whose host work is not done: overlap scheduling), a decode's newest
     /// token that is not on the host yet is taken on the device from `prev`'s row of that
@@ -1999,6 +2037,7 @@ impl EngineLoop {
             formats: Vec::with_capacity(items.len()),
             rows: Vec::with_capacity(items.len()),
             feeds: Vec::new(),
+            snapshots: Vec::with_capacity(items.len()),
         };
         let reduces = self.exec.reduces_logits();
         for it in items {
@@ -2053,6 +2092,31 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
+            // P7 S-12 (Task 32): reserve a snapshot entry for the full block this step completes
+            // when the interval rule wants it (every `kv.hybrid_snapshot_interval_blocks`-th full
+            // block, 1-based). The block ends exactly at the step's end (`kv_len % block_tokens
+            // == 0`), so the executor writes its boundary state at offset `q_len`. Only a prefill
+            // chunk that lands on a block boundary (and a decode that completes one) is
+            // captured; the engine's snapshot store half.
+            let mut row_snaps: SmallVec<[(u32, SnapshotRef); 2]> = SmallVec::new();
+            if let Some(interval) = self.hybrid_interval {
+                let bt = self.pool.layout().block_tokens.max(1);
+                if it.kv_len % bt == 0 && it.kv_len > 0 {
+                    let block_index = it.kv_len / bt;
+                    if block_index >= 1
+                        && u64::from(block_index).is_multiple_of(u64::from(interval))
+                        && let Some(&block) = plan.items[it.index]
+                            .block_table
+                            .blocks
+                            .get(block_index as usize - 1)
+                        && let Some(ref_) = self.kv.snapshot_alloc(block)
+                    {
+                        row_snaps.push((it.len, ref_));
+                        self.snapshot_pending.insert(block, ref_);
+                    }
+                }
+            }
+            built.snapshots.push(row_snaps);
             built.formats.push(if self.pool.page_classes_active() {
                 plan.items[it.index]
                     .block_table
@@ -3355,6 +3419,8 @@ impl EngineLoop {
             })
             .sum();
         self.shared.set_outstanding(pending);
+        self.shared
+            .set_state_slots_free(self.sched.state_slots().map(|p| p.free()));
     }
 }
 
@@ -3369,10 +3435,11 @@ fn seq_slices<'a>(
         .iter()
         .zip(&built.rows)
         .zip(&built.formats)
+        .zip(&built.snapshots)
         .map(
-            |((&(index, q_start, q_len, kv_len), row), formats)| SeqSlice {
+            |(((&(index, q_start, q_len, kv_len), row), formats), snapshots)| SeqSlice {
                 state_slot: sched.state_slot_of(row.seq).map(|s| s.0),
-                snapshot_blocks: &[],
+                snapshot_blocks: snapshots.as_slice(),
                 seq: row.seq,
                 q_start,
                 q_len,
@@ -3615,6 +3682,78 @@ mod tests {
         .expect("executor")
     }
 
+    /// The tiny Qwen3.5 (a hybrid: Gated DeltaNet layers keep per-sequence state, P7 S-12).
+    fn hybrid_tiny() -> (TempDir, TinySpec, Arc<Tokenizer>) {
+        let dir = TempDir::new("turbine-engine-loop-hybrid");
+        let spec = turbine_model::testing::tiny::write_tiny_qwen3_5(dir.path(), 8);
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        (dir, spec, tokenizer)
+    }
+
+    /// The tiny Qwen3.5 on the cpu reference provider, for batches of `max_seqs` sequences.
+    fn hybrid_executor(spec: &TinySpec, max_seqs: u32) -> Box<dyn ModelExecutor> {
+        let cfg = &spec.config;
+        let mem = mem();
+        let index = SafetensorsIndex::open(&spec.dir).unwrap();
+        let weights = WeightLoader::load(
+            &index,
+            &cfg.family.0.weight_slots(cfg),
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load");
+        let provider = cpu_reference_provider();
+        let order = [provider.id()];
+        let registry = KernelRegistry::build(
+            vec![provider],
+            &order,
+            &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
+            &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
+        )
+        .unwrap();
+        executor::build_executor(
+            cfg,
+            weights,
+            Arc::new(registry),
+            mem,
+            BLOCK_TOKENS,
+            64,
+            max_seqs,
+            ExecutorOptions::default(),
+        )
+        .expect("executor")
+    }
+
+    /// A greedy request asking for one logprob alternative per token (P7 S-12).
+    fn hybrid_request(prompt: &[u32], max_tokens: u32) -> GenerationRequest {
+        let mut r = request(prompt, max_tokens);
+        r.sampling.logprobs = Some(1);
+        r
+    }
+
+    /// `(token id, logprob)` of one request run to completion.
+    fn run_logprobs(
+        tx: &mpsc::Sender<EngineCommand>,
+        req: GenerationRequest,
+    ) -> (Vec<(u32, Option<f32>)>, u32) {
+        let (mut rx, admitted) = submit(tx, req);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut tokens = Vec::new();
+        loop {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token {
+                    token_id, logprob, ..
+                } => tokens.push((token_id, logprob)),
+                GenerationEvent::Finished { usage, .. } => {
+                    return (tokens, usage.expect("usage").cached_tokens);
+                }
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+    }
+
     fn request(prompt: &[u32], max_tokens: u32) -> GenerationRequest {
         GenerationRequest {
             id: RequestId::new_v4(),
@@ -3795,10 +3934,14 @@ mod tests {
             replica: 0,
             group: Vec::new(),
         });
-        let scheduler = Scheduler::new(params, Arc::clone(&clock))
+        let mut scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
             .with_gate(parts.gate)
             .with_micro_batches(pipeline.as_ref().map_or(1, |p| p.micro_batches));
+        // P7 S-12 (Task 32): a hybrid family's scheduler allocates one state slot per sequence.
+        if let Some(layout) = exec.state_layout() {
+            scheduler = scheduler.with_state_layout(layout);
+        }
         let controller = parts.engine.handle.clone();
         let pressure = Arc::clone(&parts.controller);
         let test_clock = Arc::clone(&clock);
@@ -3932,6 +4075,157 @@ mod tests {
             drop(tx);
             handle.join().unwrap().unwrap();
         }
+    }
+
+    /// P7 S-12 (Task 32, `hybrid_prefix_reuse_matches_cold`): a hybrid model (tiny Qwen3.5 on the
+    /// cpu backend, `kv.block_tokens` 16) stores a state snapshot at every full-block boundary
+    /// (`kv.hybrid_snapshot_interval_blocks` 1) and restores the nearest one at or before a hit's
+    /// cutoff instead of rebuilding the state from scratch. A conversation that sends growing
+    /// prefixes hits at 1, 2 and 3 full blocks and once mid-block; each turn's greedy tokens and
+    /// logprobs are bit-equal to the same prompt run cold (a salt shares nothing). An `n: 2`
+    /// request equals two separate requests, and `turbine_hybrid_state_snapshots_total{outcome=
+    /// "restored"}` counts the restores. Breaks if a snapshot is not stored, not restored, or
+    /// changes an output. (The state-slot pool ends where it started on finish, cancel and
+    /// preemption, asserted deterministically in the scheduler's `state_slots_alloc_and_release`
+    /// and `preemption_returns_the_state_slot`; the engine's published free count lags a turn
+    /// behind a request's finish, so it is not compared here.)
+    #[test]
+    fn hybrid_prefix_reuse_matches_cold() {
+        let (_dir, spec, tokenizer) = hybrid_tiny();
+        let exec = hybrid_executor(&spec, 4);
+        let kv = KvConfig {
+            hybrid_snapshot_interval_blocks: 1,
+            ..KvConfig::default()
+        };
+        let t = engine_with_kv(
+            exec,
+            Arc::clone(&tokenizer),
+            params(4, 16),
+            false,
+            kv,
+            |_, _, _| None,
+        );
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+
+        // A 64-token base sequence; every prompt is one of its prefixes. Prompts are sent in
+        // growing order so each turn hits at one more full block.
+        let base: Vec<u32> = std::iter::once(256).chain(97..160).collect();
+        assert_eq!(base.len(), 64);
+        let prefix = |n: usize| base[..n].to_vec();
+        // A cold run of `n` tokens: a per-length salt shares nothing with any other request.
+        let cold = |n: usize, max_tokens: u32| {
+            let mut r = hybrid_request(&prefix(n), max_tokens);
+            r.cache_salt = Some(format!("cold-{n}"));
+            run_logprobs(&tx, r)
+        };
+
+        let lengths = [16usize, 32, 48, 64];
+        let colds: Vec<_> = lengths.iter().map(|&n| cold(n, 8)).collect();
+        let mut warm = Vec::new();
+        for &n in &lengths {
+            warm.push(run_logprobs(&tx, hybrid_request(&prefix(n), 8)));
+        }
+        // Turn 1 is cold; turns 2..4 hit at 1, 2 and 3 full blocks and match their cold run.
+        assert_eq!(warm[0].1, 0, "the first turn caches nothing");
+        assert_eq!(warm[1].1, 16, "turn 2 hits at 1 full block");
+        assert_eq!(warm[2].1, 32, "turn 3 hits at 2 full blocks");
+        assert_eq!(warm[3].1, 48, "turn 4 hits at 3 full blocks");
+        for (i, &n) in lengths.iter().enumerate() {
+            assert_eq!(
+                warm[i].0, colds[i].0,
+                "turn {n} matches its cold run (tokens and logprobs)"
+            );
+        }
+
+        // A mid-block hit: 56 tokens is 3 full blocks plus a partial 8-token tail; the match
+        // ends at 48, the snapshot there restores, and the tail recomputes.
+        let mid_cold = cold(56, 8);
+        let mid = run_logprobs(&tx, hybrid_request(&prefix(56), 8));
+        assert_eq!(mid.1, 48, "the mid-block turn reuses 3 full blocks");
+        assert_eq!(mid.0, mid_cold.0, "the mid-block turn matches its cold run");
+
+        // P7 S-12: the snapshots were stored and at least one restore ran.
+        assert!(
+            metric(
+                &reg,
+                "turbine_hybrid_state_snapshots_total{outcome=\"stored\"}"
+            ) >= 4.0,
+            "block-boundary snapshots stored"
+        );
+        assert!(
+            metric(
+                &reg,
+                "turbine_hybrid_state_snapshots_total{outcome=\"restored\"}"
+            ) > 0.0,
+            "a hit restored a snapshot"
+        );
+        assert!(metric(&reg, "turbine_hybrid_state_bytes") > 0.0);
+
+        // A request cancelled mid-decode returns its state slot (the scheduler's slot pool ends
+        // where it started — asserted deterministically in `turbine-scheduler`'s
+        // `state_slots_alloc_and_release` and `preemption_returns_the_state_slot`). Here the
+        // engine keeps serving afterwards: a fresh prefix hit still matches and the pool is
+        // still reported.
+        let (mut rx, admitted) = submit(&tx, hybrid_request(&prefix(64), 64));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut seen = 0;
+        while seen < 2 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token { .. } => seen += 1,
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        drop(rx);
+        let after = run_logprobs(&tx, hybrid_request(&prefix(32), 8));
+        assert!(
+            after.1 > 0,
+            "a cached prefix still hits after the cancellation"
+        );
+        assert!(
+            shared.state_slots_free().is_some(),
+            "a hybrid engine reports its state-slot pool"
+        );
+
+        // An `n: 2` request equals two separate requests of the same prompt (both hit at 1 block).
+        let solo = run_logprobs(&tx, hybrid_request(&prefix(32), 8));
+        let mut dual = hybrid_request(&prefix(32), 8);
+        dual.n = 2;
+        let (mut rx, admitted) = submit(&tx, dual);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut choices: Vec<Vec<(u32, Option<f32>)>> = vec![Vec::new(), Vec::new()];
+        let mut finished = 0u32;
+        while finished < 2 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token {
+                    choice,
+                    token_id,
+                    logprob,
+                    ..
+                } => choices[choice as usize].push((token_id, logprob)),
+                GenerationEvent::Finished { .. } => finished += 1,
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            choices[0], solo.0,
+            "the fork's first choice matches a solo run"
+        );
+        assert_eq!(
+            choices[1], solo.0,
+            "the fork's second choice matches a solo run"
+        );
+
+        drop(tx);
+        handle.join().unwrap().unwrap();
     }
 
     /// P5p S-5 (`partial_prefix_reuse_matches_cold`): a finished request publishes its partial
