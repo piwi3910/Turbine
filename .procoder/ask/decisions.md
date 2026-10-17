@@ -4962,3 +4962,24 @@ The snapshot bytes now travel through L1/L2 (`state_snapshot_follows_block` PASS
    is `Some` for a pure lower-tier hit and the state restores instead of recomputing. Implement this
    together with the checkpoint-enabled device-path validation (the real Qwen3.5 checkpoint now loads
    on `p7-stack` after Task 35's `check_supported_weights` fix).
+
+## P7 Task 33/37 findings — lead calls (2026-10-17)
+
+- **Tier slot sizing (T33c):** the landed tier travel writes `[kv][snapshot]` but the L1/L2 tiers
+  still cap a slot at the L0-format block, so demoting a snapshot-bearing block FAILS (`block is
+  55705600 bytes, L1 slots hold 1 to 4194304 bytes`) and the block is dropped, not demoted. Fix in
+  progress: `KvTier::set_snapshot_bytes` (default no-op) widened by `L1PinnedTier`/`L2NvmeTier` and
+  forwarded by `ShardedL1Tier`. **Decision: close this gap** — the `[kv][snapshot]` record must fit an
+  L1/L2 slot, covered by `hybrid_record_fits_a_sized_slot` and the `kv_gpu` lab leg.
+- **Multi-shard hybrid (T33c):** `ShardedL1Tier::parts` drops the tail for world > 1. **Decision:**
+  the tail goes to the last shard; multi-shard hybrid snapshot tiers stay **unsupported/untested** —
+  the hybrid families are experimental and their gates are single-card, so no shard-level hybrid test
+  is required (documented, no refusal code).
+- **L0 `tq4` deadlock (T37):** with `kv.dtype: tq4` and the default `kv.recent_window_blocks: 1`, each
+  live sequence needs a fresh BF16 window page, but `BlockPool::allocate_in` grows a class only from a
+  fully-free base slab and `next_reclaimable` reclaims only base pages, so a full base pool starves
+  the window class and decodes defer forever (`kv_exhausted`). The golden legs now PASS (16/16 vs
+  Task 13's FAIL 0/16), but the throughput and shared-prefix legs time out. **Decision:** the L0
+  `tq4` row stays `experimental` with the failing gate recorded; the pool class-growth deadlock is a
+  real serving-path bug (the window it interacts with is Task 17's) recorded for a follow-up fix — it
+  is not Task 37's scope, and it is not papered over by relaxing the gate.
