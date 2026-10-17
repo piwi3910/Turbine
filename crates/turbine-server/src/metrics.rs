@@ -4,6 +4,7 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use turbine_core::request::Endpoint;
 use turbine_model::executor::GraphCounters;
@@ -82,6 +83,12 @@ pub struct ReasonLabels {
     pub reason: &'static str,
 }
 
+/// `turbine_hybrid_state_snapshots_total{outcome}` values (P7 S-12, Task 32).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HybridOutcomeLabels {
+    pub outcome: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct StageLabels {
     pub stage: &'static str,
@@ -130,6 +137,17 @@ pub struct ServerMetrics {
     /// (`jump_forward_step`, `jump_forward_eligible`, `unstarted_admitted`, `request_ended`;
     /// P5p S-3, S-10).
     pub overlap_serial_turns: Family<ReasonLabels, Counter>,
+    /// `turbine_hybrid_state_bytes` (P7 S-12, Task 32): hybrid state bytes held in L0 — the live
+    /// slots in use plus the snapshot entries held for blocks.
+    // The hybrid engine path that updates these lands with the loop wiring (Task 32 item 5);
+    // until then they are defined and registered but never written.
+    #[allow(dead_code)]
+    pub hybrid_state_bytes: Gauge,
+    /// `turbine_hybrid_state_snapshots_total{outcome}`: block-boundary snapshots `stored`,
+    /// `restored` from a prefix hit, or `recomputed` because a hit's state had to be rebuilt by
+    /// prefill (no snapshot at or before the match).
+    #[allow(dead_code)]
+    pub hybrid_state_snapshots: Family<HybridOutcomeLabels, Counter>,
 }
 
 impl ServerMetrics {
@@ -203,7 +221,32 @@ impl ServerMetrics {
                 "Overlap-scheduling turns that completed the iteration in flight serially, by reason",
                 Family::default(),
             ),
+            hybrid_state_bytes: reg.register(
+                "turbine_hybrid_state_bytes",
+                "Hybrid per-sequence state bytes held in L0 (live slots plus snapshots)",
+                Gauge::default(),
+            ),
+            hybrid_state_snapshots: reg.register(
+                "turbine_hybrid_state_snapshots",
+                "Hybrid block-boundary snapshots by outcome",
+                Family::default(),
+            ),
         }
+    }
+
+    /// Sets `turbine_hybrid_state_bytes`: the live state slots in use plus the snapshot bytes
+    /// held for L0 blocks (P7 S-12).
+    #[allow(dead_code)]
+    pub fn set_hybrid_state_bytes(&self, bytes: u64) {
+        self.hybrid_state_bytes.set(bytes as i64);
+    }
+
+    /// Counts one hybrid snapshot outcome (`stored`, `restored`, `recomputed`; P7 S-12).
+    #[allow(dead_code)]
+    pub fn hybrid_state_snapshot(&self, outcome: &'static str) {
+        self.hybrid_state_snapshots
+            .get_or_create(&HybridOutcomeLabels { outcome })
+            .inc();
     }
 
     /// Counts one overlap-scheduling turn completed serially for `reason`.

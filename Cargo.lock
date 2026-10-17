@@ -2595,6 +2595,7 @@ dependencies = [
  "prometheus-client",
  "serde",
  "serde_json",
+ "serde_norway",
  "smallvec",
  "socket2",
  "tokio",
