@@ -84,6 +84,132 @@ impl Module for Qwen3_5 {
     }
 }
 
+/// The shared Qwen3.5/3.6 hybrid keys of `config.json`: the Gated DeltaNet dimensions, the
+/// attention output gate, the layer kinds and the partial RoPE. `hf` names the family in error
+/// messages. The Qwen3.6 MoE variant ([`super::qwen3_5_moe`]) reuses this and adds its `moe`.
+pub(crate) fn qwen3_5_family_config(
+    hf: &str,
+    text: &serde_json::Value,
+) -> Result<FamilyConfig, ModelError> {
+    let keys = Qwen3_5Keys::deserialize(text).map_err(|e| invalid(format!("invalid JSON: {e}")))?;
+    if keys.attn_output_gate == Some(false) {
+        return Err(unsupported("attn_output_gate", "false", "true"));
+    }
+    // The full-attention interval is what `layer_kinds` reads; `layer_types`, when present,
+    // must agree with it.
+    let interval = keys.full_attention_interval.unwrap_or(1);
+    if interval == 0 {
+        return Err(invalid(
+            "full_attention_interval must be non-zero".to_string(),
+        ));
+    }
+    let kinds: Vec<LayerKind> = (0..keys.num_hidden_layers)
+        .map(|i| {
+            if (i as u64 + 1).is_multiple_of(u64::from(interval)) {
+                LayerKind::FullAttention
+            } else {
+                LayerKind::LinearAttention
+            }
+        })
+        .collect();
+    if let Some(types) = &keys.layer_types {
+        if types.len() != keys.num_hidden_layers as usize {
+            return Err(invalid(format!(
+                "layer_types has {} entries for num_hidden_layers {}",
+                types.len(),
+                keys.num_hidden_layers
+            )));
+        }
+        for (i, (t, kind)) in types.iter().zip(&kinds).enumerate() {
+            let want = match kind {
+                LayerKind::FullAttention => "full_attention",
+                LayerKind::LinearAttention => "linear_attention",
+                _ => unreachable!(),
+            };
+            if t != want {
+                return Err(unsupported(
+                    "layer_types",
+                    format!("layer {i} {t}"),
+                    &format!("{want} (full_attention_interval {interval})"),
+                ));
+            }
+        }
+    }
+    let required = |name: &str, value: Option<u32>| {
+        value.ok_or_else(|| invalid(format!("{hf} requires {name}")))
+    };
+    let conv_kernel = required("linear_conv_kernel_dim", keys.linear_conv_kernel_dim)?;
+    if conv_kernel != CONV_KERNEL {
+        return Err(unsupported(
+            "linear_conv_kernel_dim",
+            conv_kernel.to_string(),
+            &CONV_KERNEL.to_string(),
+        ));
+    }
+    let gdn = GdnDims {
+        k_heads: required("linear_num_key_heads", keys.linear_num_key_heads)?,
+        v_heads: required("linear_num_value_heads", keys.linear_num_value_heads)?,
+        k_dim: required("linear_key_head_dim", keys.linear_key_head_dim)?,
+        v_dim: required("linear_value_head_dim", keys.linear_value_head_dim)?,
+        conv_kernel,
+    };
+    if gdn.k_heads == 0 || gdn.v_heads == 0 || gdn.k_dim == 0 || gdn.v_dim == 0 {
+        return Err(invalid(
+            "Gated DeltaNet dimensions must be non-zero".to_string(),
+        ));
+    }
+    if !gdn.v_heads.is_multiple_of(gdn.k_heads) {
+        return Err(invalid(format!(
+            "linear_num_value_heads {} must be a multiple of linear_num_key_heads {}",
+            gdn.v_heads, gdn.k_heads
+        )));
+    }
+    Ok(FamilyConfig {
+        moe: None,
+        qk_norm: false,
+        qk_norm_per_head: true,
+        sliding_window: None,
+        gdn: Some(gdn),
+        attn_output_gate: true,
+        partial_rotary_factor: partial_rotary_factor(&keys)?,
+        unit_offset_norms: true,
+        full_attention_interval: Some(interval),
+    })
+}
+
+/// Every `n`-th layer full attention, the rest linear (`full_attention_interval`), shared by the
+/// Qwen3.5 dense and Qwen3.6 MoE hybrids.
+pub(crate) fn hybrid_layer_kinds(cfg: &ModelArchConfig) -> Vec<LayerKind> {
+    let n = cfg.full_attention_interval.unwrap_or(1).max(1);
+    (0..cfg.num_layers)
+        .map(|i| {
+            if (i as u64 + 1).is_multiple_of(u64::from(n)) {
+                LayerKind::FullAttention
+            } else {
+                LayerKind::LinearAttention
+            }
+        })
+        .collect()
+}
+
+/// The per-sequence Gated DeltaNet state: one F32 recurrent state and one activation-dtype conv
+/// state per linear layer, shared by the Qwen3.5 dense and Qwen3.6 MoE hybrids.
+pub(crate) fn gdn_state_layout(cfg: &ModelArchConfig) -> StateLayout {
+    let Some(gdn) = cfg.gdn else {
+        return StateLayout::default();
+    };
+    StateLayout {
+        linear_layers: cfg
+            .layer_kinds
+            .iter()
+            .filter(|k| **k == LayerKind::LinearAttention)
+            .count() as u32,
+        recurrent_bytes_per_layer: gdn.recurrent_bytes(),
+        conv_bytes_per_layer: gdn.conv_bytes(),
+        dtype: Some(StateDtype::F32),
+    }
+}
+
 /// The `partial_rotary_factor` of `keys`: the top-level key, else
 /// `rope_parameters.partial_rotary_factor`.
 fn partial_rotary_factor(keys: &Qwen3_5Keys) -> Result<Option<f32>, ModelError> {
@@ -109,123 +235,18 @@ impl ModelFamily for Qwen3_5 {
     }
 
     fn parse_config(&self, text: &serde_json::Value) -> Result<FamilyConfig, ModelError> {
-        let keys =
-            Qwen3_5Keys::deserialize(text).map_err(|e| invalid(format!("invalid JSON: {e}")))?;
-        if keys.attn_output_gate == Some(false) {
-            return Err(unsupported("attn_output_gate", "false", "true"));
-        }
-        // The full-attention interval is what `layer_kinds` reads; `layer_types`, when present,
-        // must agree with it.
-        let interval = keys.full_attention_interval.unwrap_or(1);
-        if interval == 0 {
-            return Err(invalid(
-                "full_attention_interval must be non-zero".to_string(),
-            ));
-        }
-        let kinds: Vec<LayerKind> = (0..keys.num_hidden_layers)
-            .map(|i| {
-                if (i as u64 + 1).is_multiple_of(u64::from(interval)) {
-                    LayerKind::FullAttention
-                } else {
-                    LayerKind::LinearAttention
-                }
-            })
-            .collect();
-        if let Some(types) = &keys.layer_types {
-            if types.len() != keys.num_hidden_layers as usize {
-                return Err(invalid(format!(
-                    "layer_types has {} entries for num_hidden_layers {}",
-                    types.len(),
-                    keys.num_hidden_layers
-                )));
-            }
-            for (i, (t, kind)) in types.iter().zip(&kinds).enumerate() {
-                let want = match kind {
-                    LayerKind::FullAttention => "full_attention",
-                    LayerKind::LinearAttention => "linear_attention",
-                    _ => unreachable!(),
-                };
-                if t != want {
-                    return Err(unsupported(
-                        "layer_types",
-                        format!("layer {i} {t}"),
-                        &format!("{want} (full_attention_interval {interval})"),
-                    ));
-                }
-            }
-        }
-        let required = |name: &str, value: Option<u32>| {
-            value.ok_or_else(|| invalid(format!("{HF_NAME} requires {name}")))
-        };
-        let conv_kernel = required("linear_conv_kernel_dim", keys.linear_conv_kernel_dim)?;
-        if conv_kernel != CONV_KERNEL {
-            return Err(unsupported(
-                "linear_conv_kernel_dim",
-                conv_kernel.to_string(),
-                &CONV_KERNEL.to_string(),
-            ));
-        }
-        let gdn = GdnDims {
-            k_heads: required("linear_num_key_heads", keys.linear_num_key_heads)?,
-            v_heads: required("linear_num_value_heads", keys.linear_num_value_heads)?,
-            k_dim: required("linear_key_head_dim", keys.linear_key_head_dim)?,
-            v_dim: required("linear_value_head_dim", keys.linear_value_head_dim)?,
-            conv_kernel,
-        };
-        if gdn.k_heads == 0 || gdn.v_heads == 0 || gdn.k_dim == 0 || gdn.v_dim == 0 {
-            return Err(invalid(
-                "Gated DeltaNet dimensions must be non-zero".to_string(),
-            ));
-        }
-        if !gdn.v_heads.is_multiple_of(gdn.k_heads) {
-            return Err(invalid(format!(
-                "linear_num_value_heads {} must be a multiple of linear_num_key_heads {}",
-                gdn.v_heads, gdn.k_heads
-            )));
-        }
-        Ok(FamilyConfig {
-            moe: None,
-            qk_norm: false,
-            qk_norm_per_head: true,
-            sliding_window: None,
-            gdn: Some(gdn),
-            attn_output_gate: true,
-            partial_rotary_factor: partial_rotary_factor(&keys)?,
-            unit_offset_norms: true,
-            full_attention_interval: Some(interval),
-        })
+        qwen3_5_family_config(HF_NAME, text)
     }
 
     /// Every `n`-th layer full attention, the rest linear (`full_attention_interval`).
     fn layer_kinds(&self, cfg: &ModelArchConfig) -> Vec<LayerKind> {
-        let n = cfg.full_attention_interval.unwrap_or(1).max(1);
-        (0..cfg.num_layers)
-            .map(|i| {
-                if (i as u64 + 1).is_multiple_of(u64::from(n)) {
-                    LayerKind::FullAttention
-                } else {
-                    LayerKind::LinearAttention
-                }
-            })
-            .collect()
+        hybrid_layer_kinds(cfg)
     }
 
     /// The per-sequence Gated DeltaNet state: one F32 recurrent state and one activation-dtype
     /// conv state per linear layer.
     fn state_layout(&self, cfg: &ModelArchConfig) -> StateLayout {
-        let Some(gdn) = cfg.gdn else {
-            return StateLayout::default();
-        };
-        StateLayout {
-            linear_layers: cfg
-                .layer_kinds
-                .iter()
-                .filter(|k| **k == LayerKind::LinearAttention)
-                .count() as u32,
-            recurrent_bytes_per_layer: gdn.recurrent_bytes(),
-            conv_bytes_per_layer: gdn.conv_bytes(),
-            dtype: Some(StateDtype::F32),
-        }
+        gdn_state_layout(cfg)
     }
 
     /// The checkpoint tensor prefixes the text path ignores: the vision tower and the MTP head.

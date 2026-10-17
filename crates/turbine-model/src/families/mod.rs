@@ -28,6 +28,7 @@ pub mod mixtral;
 pub mod olmoe;
 pub mod qwen3;
 pub mod qwen3_5;
+pub mod qwen3_5_moe;
 pub mod qwen3_moe;
 
 pub use gpt_oss::GptOss;
@@ -37,6 +38,7 @@ pub use mixtral::{Mixtral, mixtral_slots};
 pub use olmoe::{Olmoe, olmoe_slots};
 pub use qwen3::Qwen3;
 pub use qwen3_5::Qwen3_5;
+pub use qwen3_5_moe::Qwen3_5Moe;
 pub use qwen3_moe::Qwen3Moe;
 
 /// One decoder family.
@@ -194,7 +196,15 @@ impl std::fmt::Debug for FamilyRef {
 static FAMILIES: Registry<dyn ModelFamily> = Registry::new(
     "model_family",
     &[
-        &Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral, &GptOss, &Qwen3_5,
+        &Llama,
+        &Olmoe,
+        &Qwen3,
+        &Qwen3Moe,
+        &Mistral,
+        &Mixtral,
+        &GptOss,
+        &Qwen3_5,
+        &Qwen3_5Moe,
     ],
 );
 
@@ -241,6 +251,7 @@ pub(crate) fn experts(
         experts_per_token,
         expert_intermediate,
         norm_topk_prob,
+        shared_inter: None,
     })
 }
 
@@ -371,6 +382,7 @@ mod tests {
             ("mixtral", "MixtralForCausalLM"),
             ("gpt_oss", "GptOssForCausalLM"),
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ] {
             assert_eq!(
                 resolve(&json!({"architectures": [hf]})).unwrap().0.name(),
@@ -388,7 +400,8 @@ mod tests {
                 "registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 \
                  (Qwen3ForCausalLM), qwen3_moe (Qwen3MoeForCausalLM), mistral \
                  (MistralForCausalLM), mixtral (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), \
-                 qwen3_5 (Qwen3_5ForConditionalGeneration)"
+                 qwen3_5 (Qwen3_5ForConditionalGeneration), qwen3_5_moe \
+                 (Qwen3_5MoeForConditionalGeneration)"
             ),
             "{err}"
         );

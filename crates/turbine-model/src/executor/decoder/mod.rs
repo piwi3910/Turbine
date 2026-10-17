@@ -91,8 +91,8 @@ mod trace;
 pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
 pub use hooks::{
-    ATTENTION_SINKS_WINDOW, MOE, MOE_GPT_OSS, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD,
-    SWIGLU,
+    ATTENTION_SINKS_WINDOW, MOE, MOE_GPT_OSS, MOE_SHARED, PLAIN_ATTENTION, QK_NORM_FULL,
+    QK_NORM_PER_HEAD, SWIGLU,
 };
 pub use tq_tables::TqDeviceTables;
 pub use trace::TraceTensor;

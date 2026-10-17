@@ -724,6 +724,7 @@ fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'
         // visibility") the detokenizer emits them, so the parser sees them all.
         "gpt_oss" => (Some(harmony::HARMONY), &[]),
         "qwen3_5" => (Some(qwen3_xml::QWEN3_XML), &[]),
+        "qwen3_5_moe" => (Some(qwen3_xml::QWEN3_XML), &[]),
         other => panic!("family {other} has no expected default tool format"),
     }
 }

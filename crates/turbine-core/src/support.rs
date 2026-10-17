@@ -609,6 +609,10 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     family_row("Qwen3_5ForConditionalGeneration", WeightFormatColumn::Bf16),
     family_row(
         "Qwen3_5MoeForConditionalGeneration",
+        WeightFormatColumn::Bf16,
+    ),
+    family_row(
+        "Qwen3_5MoeForConditionalGeneration",
         WeightFormatColumn::Fp8Block,
     ),
     // Phase 6a weight formats: each row turns `supported` for its proven combination only.

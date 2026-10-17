@@ -368,6 +368,27 @@ impl Naive {
                     *a = bf(*a + bf(y * bf(weight)));
                 }
             }
+            // The shared expert (Qwen3.5/3.6 MoE): its SwiGLU over the same row, scaled by
+            // `sigmoid(x · shared_expert_gate)`, added after the routed experts (the kernel adds
+            // it once per call, after the experts' scatter).
+            if moe.shared_inter.is_some() {
+                let sp = format!("{p}.mlp.shared_expert");
+                let y = self.swiglu(
+                    row,
+                    self.get(&format!("{sp}.gate_proj.weight")),
+                    self.get(&format!("{sp}.up_proj.weight")),
+                    self.get(&format!("{sp}.down_proj.weight")),
+                );
+                let gate_w = self.get(&format!("{p}.mlp.shared_expert_gate.weight"));
+                let mut dot = 0f32;
+                for (a, b) in row.iter().zip(gate_w) {
+                    dot += a * b;
+                }
+                let scale = bf(1.0 / (1.0 + (-bf(dot)).exp()));
+                for (a, y) in acc.iter_mut().zip(y) {
+                    *a = bf(*a + bf(y * scale));
+                }
+            }
             out.extend(acc);
         }
         out

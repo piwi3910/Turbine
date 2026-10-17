@@ -19,7 +19,7 @@ mod qk_norm;
 mod swiglu;
 
 pub use attention_sinks_window::{ATTENTION_SINKS_WINDOW, AttentionSinksWindow};
-pub use moe::{GPT_OSS_SWIGLU_LIMIT, MOE, MOE_GPT_OSS, Moe, experts_served};
+pub use moe::{GPT_OSS_SWIGLU_LIMIT, MOE, MOE_GPT_OSS, MOE_SHARED, Moe, experts_served};
 pub use plain_attention::{PLAIN_ATTENTION, PlainAttention};
 pub use qk_norm::{QK_NORM_FULL, QK_NORM_PER_HEAD, QkNormFull, QkNormPerHead};
 pub use swiglu::{SWIGLU, SwiGlu};
