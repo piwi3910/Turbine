@@ -4761,3 +4761,36 @@ against the BF16 Instruct baseline does not measure quantized accuracy, and the 
 **Decision (lead, 2026-10-17; plan's else branch):** record `- P7 open:` with the numbers and leave
 `LlamaForCausalLM/mxfp4_a4/bf16/tp1` `experimental`. An Instruct W4A4 3B checkpoint or a
 completion-form re-gate would be new work; not started without the user's word.
+
+## P7 Task 31 landing — lead calls (2026-10-17)
+
+The Qwen3.5 hybrid family landed (branch `p7-t31c`, merged into `p7-stack`; gate ok, lab
+`hip_trace_vs_cpu_qwen3_5` PASS with `weights_skipped` for `model.visual`/`mtp`). Four calls were
+taken as safe, reversible defaults while the goal ran:
+
+- **Host `g`/`beta` (decision A)** costs a blocking device→host→device round trip per GDN layer per
+  step on HIP and forces overlap scheduling off for hybrids. A future ABI op (or folding
+  `a`/`b`/`A_log`/`dt_bias` into the GDN descriptor) is the optimization path — decide before
+  Qwen3.6 TP/EP (Task 34).
+- **Mixed-dtype checkpoint:** the released Qwen3.5 checkpoint stores RMSNorm weights, `A_log` and
+  `dt_bias` in F32; they are converted to BF16 at load (matching transformers' cast to the model
+  dtype) via a new `WeightSlot::float32_stored`. Keeping them F32 through the kernels is the
+  alternative.
+- **Conformance `chunked` check reordered** so each decode follows its own prefill (a stateful GDN
+  family cannot decode twice at the same position on one sequence); stateless families are
+  unaffected. Shared-test shape change.
+- **`float32_stored`** is marked on every norm/`A_log`/`dt_bias` slot (broad, safe); the private
+  per-sequence state map (replaced by `StateSlots`, Task 32) never releases a slot.
+
+## P7 Task 31 tiny-trace bound (2026-10-17)
+
+`tiny_model qwen3_5_matches_reference`'s per-op bound is `max_abs > 2e-2 && max_abs > max_ref * 0.9`
+(the op's own magnitude) — looser than the house style — because the tiny random hybrid's GDN
+recurrence amplifies CPU-vs-torch accumulation (`gdn_out` layer 4 relF 6.1 %) and the gated RMSNorm
+then normalizes near-zero rows (`gdn_normed` relF 51 % on one row). A greedy-token check is also
+unusable here (the fixture's top-3 logits are near-tied, gaps 0.18/0.29, while the logits differ by
+up to 0.54). **Decision (lead, 2026-10-17): keep it** — a gross/structural error (a wrong
+de-interleave, a missing gate or conv, the doubled norm) still yields a ~O(value) mismatch, which
+this bound catches; a less chaotic tiny checkpoint (a `write_tiny_qwen3_5` change) is the
+alternative if a tighter signal is wanted. The real-checkpoint lab trace
+(`hip_trace_vs_cpu_qwen3_5`) asserts the greedy token and passed.
