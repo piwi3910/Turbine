@@ -2374,3 +2374,66 @@ capture legs.
 - P7 open: Qwen3_5ForConditionalGeneration/bf16/bf16/tp1 — golden c1 9/16 identical prefixes (need 16), engine_spread likely 8.59 / tail 11.30 OVER CAP (the GDN recurrence amplifies BF16 rounding on the real checkpoint); row stays `experimental`
 - P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/tp2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
 - P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/ep2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
+
+### P7 L0 tq4 re-gate — `kv.dtype=tq4` on the Phase 7 tree (plan Task 37, S-16, branch `p7-t37`, 2026-10-17)
+
+Re-run of the Phase 6b Task 13 gates, unchanged, on tree `8be49852` (`p7-stack` tip). The
+Phase 7 tree changed the picture: the L0 `tq4` **numerics now pass** (the BF16 recent window,
+Task 17, restores newest-block exactness — Task 13 was FAIL 0/16 Llama, 8/16 OLMoE), but the
+**serving path deadlocks once L0 fills** — the BF16 window class cannot grow from a full base
+pool — so the shared-prefix eval (the gate that could not run) and the load legs fail. Both
+rows stay `experimental`.
+
+`scripts/lab-bench.sh --model <m> --golden16 --batched-bounds --multi-turn -- --set kv.dtype=tq4`,
+GPU 0, client on `novanas`:
+
+```
+BENCH 8be49852 llama commit=8be49852 gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas golden1_strict=PASS: weight_format=bf16 kv=tq4 conc=16 host_share=0.0397 ok=184 failed=16 tok/s=63.2 itl_p50=15.4 ttft_p50=226 decode_fwd_ms=14.8 mt_cached=0.9075 mt_ttft_first_p50=105 mt_ttft_first_p99=6573 mt_ttft_later_p50=76 mt_tok_s=294.8 mt_recompute_tokens=63177 mt_orange_s=10.0 mt_orange_ladder_s=10.0 mt_ladder_rewrites=44923 mt_orange_samples=20 mt_l1_blocks=319 mt_l1_rung_share=0.3542
+BENCH 8be49852 olmoe commit=8be49852 gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas golden1_strict=PASS: weight_format=bf16 kv=tq4 conc=16 host_share=0.0294 ok=112 failed=88 tok/s=27.7 itl_p50=22.7 ttft_p50=144 decode_fwd_ms=20.6 mt=FAILED('cached_tokens_ratio') mt_recompute_tokens=57771 mt_ladder_rewrites=2407 mt_orange_samples=0 mt_l1_blocks=15 mt_l1_rung_share=0.0667
+```
+
+- Golden c1 and c16 **PASS** on both models (batched bounds and strict): Llama 16/16 (need 14),
+  `max_abs_logprob_diff_likely` ≤ 0.096 / tail ≤ 0.241; OLMoE 15/16 (need 14), likely ≤ 0.098 /
+  tail ≤ 0.368. Task 13 was FAIL 0/16 (Llama) and FAIL 8/16 (OLMoE). The `tq4` format itself is
+  numerically sound on the Phase 7 tree.
+- **The load legs fail.** Llama's throughput bench timed out 16 of 200 requests (`request_timeout`,
+  e2e p95 93.9 s, `tok/s=63.2` vs Task 13's 806.8); OLMoE's timed out 88 of 200 and left the
+  server in SURVIVAL, so its `--multi-turn` leg failed with 503 `overloaded`
+  (`mt=FAILED('cached_tokens_ratio')`; every session's first turn refused). Llama's multi-turn
+  leg did run (`mt_cached=0.9075`, matching Task 13's 0.9075).
+- Server state at the wedge: `decode_deferred reason="kv_exhausted"` ("no preemption below
+  SURVIVAL") repeats forever; `GET /turbine/v1/kv` shows L0 `blocks_used == blocks_total`
+  (`773/773` in the 4 GiB eval) with hundreds of cached-unreferenced base pages, a `bf16` window
+  class that stops growing, and `turbine_kv_ladder_actions_total{tier="l0",to="tq4",reason="recent_window"}=6338475`
+  (the rewrite churn while wedged).
+- Mechanism (code): `BlockPool::next_reclaimable` reclaims only base pages, and
+  `allocate_in(<class>)` grows a class only from a fully-free ("convertible") base slab; with
+  `kv.recent_window_blocks=1` (default) every live sequence needs a fresh BF16 window page, so a
+  base pool with no fully-free slab starves the class and decodes defer forever. Task 13 predates
+  the window (Task 17), which is why it never hit this. **A pool/serving-path bug, not a format
+  decision — a design question for the lead, not decided here.**
+
+Shared-prefix GSM8K-200 (`p6b-eval-prefix.md` recipe: c16, `kv.gpu.max_bytes=4GiB`,
+`kv.cpu.max_bytes=4GiB`, `kv.cpu.format=l0`, `--min-cached-ratio 0.5` baseline /
+`--min-lossy-cached-ratio 0.5` candidate, fresh `lab-serve` Job per run). At the recipe's
+32 fillers the Llama `tq4` candidate serves **34/200 then wedges** (the stall above; the report
+is empty, `target/p7-t37/eval/turbine-candidate-sp-p7-r1.json`), so the gate cannot complete;
+the two 32-filler BF16 baselines on this tree are 0.770 / 0.760
+(`turbine-baseline-sp-p7-r{1,2}.json`). The recipe's step-4 filler count (8; the L0 then has
+room, so the format is measurable) gives the pair below — 3 + 3 fresh servers per model, all
+servers counted only their eval (`turbine_kv_prompt_tokens_total` 653,414 Llama / 685,781 OLMoE),
+`lossy_cached_tokens` 585,856 Llama / 637,314 OLMoE (real L0 TurboQuant reuse, unlike Task 13's 0):
+
+| Model | Arm  | r1    | r2    | r3    | Median | Drop   | McNemar exact p | Gate |
+| ----- | ---- | ----- | ----- | ----- | ------ | ------ | --------------- | ---- |
+| Llama | BF16 | 0.770 | 0.760 | 0.770 | 0.770  |        |                 |      |
+| Llama | tq4  | 0.770 | 0.770 | 0.780 | 0.770  | 0.000  | 0.82–1.0        | PASS |
+| OLMoE | BF16 | 0.680 | 0.680 | 0.680 | 0.680  |        |                 |      |
+| OLMoE | tq4  | 0.635 | 0.635 | 0.635 | 0.635  | 0.045  | 0.078 (lost 15, gained 6) | FAIL |
+
+Committed: `turbine-bf16-sp-p7-f8-r{1,2,3}.json` / `turbine-l0-tq4-sp-p7-f8-r{1,2,3}.json` and
+`turbine-l0-tq4-sp-p7-f8-r{1,2,3}-paired.json` per slug, plus the Llama 32-filler baselines
+`turbine-bf16-sp-p7-r{1,2}.json`.
+
+- P7 open: LlamaForCausalLM/bf16/tq4/tp1 — golden c1/c16 PASS (16/16, batched and strict) and the 8-filler shared-prefix pair PASS (drop 0.000 / −0.010 / −0.010; `mt_cached=0.9075`), but the unchanged Task 13 recipe (32 fillers) wedges the L0 pool (34/200) and the throughput leg times out 16/200 — the L0 `tq4` window-class growth bug; row stays `experimental`
+- P7 open: OlmoeForCausalLM/bf16/tq4/tp1 — golden c1/c16 PASS (15/16, batched and strict), but the shared-prefix pair FAILS (drop 0.045 > 0.01) and the throughput leg times out 88/200, leaving the server in SURVIVAL (`mt=FAILED('cached_tokens_ratio')`); row stays `experimental`

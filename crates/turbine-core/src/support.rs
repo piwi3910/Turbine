@@ -516,7 +516,12 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     // server uploads): `experimental`. The Task 13 proof (S-8 gate, 2026-10-02) failed golden
     // under the batched bounds for all four (Llama tq4 0/16, tq2 1/16; OLMoE tq4 8/16, tq2 1/16);
     // shared-prefix GSM8K medians against BF16 KV: Llama tq4 0.785 (0.780) PASS, tq2 0.195 FAIL;
-    // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0"). `tq4`
+    // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0"). The S-16
+    // re-gate on the Phase 7 tree (Task 37, 2026-10-17, perf log "P7 L0 tq4 re-gate") found the
+    // numerics fixed by the BF16 recent window (golden c1/c16 PASS on both models) but the serving
+    // path deadlocks once L0 fills (the BF16 window class cannot grow from a full base pool:
+    // `decode_deferred reason="kv_exhausted"`, request timeouts, the unchanged Task 13 shared-prefix
+    // recipe wedges at 34/200) and OLMoE's 8-filler pair still drops 0.045 > 0.01, so `tq4`
     // stays `experimental`; `tq2` is refused below (`kv_tq2_l0_refused`).
     row(
         Some("amd"),
@@ -1613,7 +1618,9 @@ mod tests {
         );
         // TurboQuant L0 pages (P6b S-5): `tq4` is `experimental` on the CPU reference provider
         // and on gfx1201 Llama / OLMoE (BF16 weights; Task 12 attention, Task 8 tables) until the
-        // S-8 gate; refused naming the track on any other arch, weight format or vendor, blaming
+        // S-8 gate, still open after the S-16 re-gate (Task 37: golden passes on the Phase 7 tree
+        // but the L0 pool deadlocks under load and OLMoE's pair drops 0.045); refused naming the
+        // track on any other arch, weight format or vendor, blaming
         // kv.dtype. `tq2` is refused everywhere with `kv_tq2_l0_refused` (user decision
         // 2026-10-02, 2 B). The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
         for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
