@@ -1150,7 +1150,11 @@ fn moe_decode_tier_timings() {
         .provider
         .implementations(spec.op())
         .into_iter()
-        .filter(|i| i.name.starts_with("turbine_hip_moe_"))
+        .filter(|i| {
+            // `turbine_hip_moe_quant*` serve quantized experts only (tests/hip_moe_quant.rs);
+            // `turbine_moe_experts_supported` is path-agnostic, so they bind a BF16 spec too.
+            i.name.starts_with("turbine_hip_moe_") && !i.name.starts_with("turbine_hip_moe_quant")
+        })
         .filter_map(|i| {
             let p = h.provider.bind(&spec, &ImplChoice::Single(i.index))?;
             Some((i.name, p))

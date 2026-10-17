@@ -1,0 +1,17 @@
+PASS p01 identical_prefix=0/32 first_divergence=0 margin=0.007 max_abs_logprob_diff_likely=0.0000 max_abs_logprob_diff_tail=0.0000
+PASS p02 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0326 max_abs_logprob_diff_tail=0.0635
+PASS p03 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0122 max_abs_logprob_diff_tail=0.1574
+PASS p04 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0381 max_abs_logprob_diff_tail=0.2899
+PASS p05 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0348 max_abs_logprob_diff_tail=0.1191
+PASS p06 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0364 max_abs_logprob_diff_tail=0.0946
+PASS p07 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0328 max_abs_logprob_diff_tail=0.0319
+PASS p08 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0453 max_abs_logprob_diff_tail=0.1161
+PASS p09 identical_prefix=14/32 first_divergence=14 margin=0.004 max_abs_logprob_diff_likely=0.0640 max_abs_logprob_diff_tail=0.0850
+PASS p10 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.2284 max_abs_logprob_diff_tail=0.2324
+PASS p11 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.1966 max_abs_logprob_diff_tail=0.2736
+PASS p12 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0612 max_abs_logprob_diff_tail=0.1598
+PASS p13 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0676 max_abs_logprob_diff_tail=0.1638
+PASS p14 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.3298 max_abs_logprob_diff_tail=0.2815
+PASS p15 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.0491 max_abs_logprob_diff_tail=0.1319
+PASS p16 identical_prefix=32/32 first_divergence=none margin=- max_abs_logprob_diff_likely=0.1762 max_abs_logprob_diff_tail=0.5438
+PASS: 16/16 prompts passing (need 14); strict bounds (concurrency 1): |Δ logprob| over top-5 ≤ 0.35 (reference logprob > -2) and ≤ 0.56 (tail) on every prompt: yes
