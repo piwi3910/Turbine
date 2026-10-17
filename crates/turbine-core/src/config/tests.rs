@@ -952,6 +952,33 @@ fn kv_config_validation() {
     assert_eq!(KV_IO_ALIGN, 4096);
 }
 
+/// `kv.hybrid_snapshot_interval_blocks` (P7 S-12, Task 32) defaults to 8, takes any value ≥ 1,
+/// and `0` exits 2 naming the key. Breaks if the default moves or the key is not validated.
+#[test]
+fn hybrid_snapshot_interval() {
+    let base = "model:\n  path: /m\n";
+    assert_eq!(
+        parse(base, &[])
+            .expect("defaults")
+            .kv
+            .hybrid_snapshot_interval_blocks,
+        8
+    );
+    for n in [1u32, 2, 16] {
+        let cfg = parse(
+            &format!("{base}kv:\n  hybrid_snapshot_interval_blocks: {n}\n"),
+            &[],
+        )
+        .expect("in range");
+        assert_eq!(cfg.kv.hybrid_snapshot_interval_blocks, n);
+    }
+    assert_rejected(
+        &format!("{base}kv:\n  hybrid_snapshot_interval_blocks: 0\n"),
+        &[],
+        "kv.hybrid_snapshot_interval_blocks",
+    );
+}
+
 #[test]
 fn parallel_rejections() {
     use std::time::Duration;

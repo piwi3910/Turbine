@@ -71,6 +71,12 @@ pub struct KvConfig {
     pub lossy_penalty: Option<BTreeMap<ModuleName, f64>>,
     /// The pressure-driven compression ladder (P6b S-6, S-7).
     pub ladder: KvLadderConfig,
+    /// A hybrid family's state is snapshotted at every `hybrid_snapshot_interval_blocks`-th
+    /// full block (P7 S-12, Task 32), plus the last full block of every finished sequence; a
+    /// prefix hit restores the nearest snapshot at or before the match. `≥ 1`; `0` is refused
+    /// naming the key. Default 8 (1024 tokens at 128-token blocks, user decision 2026-10-08).
+    /// Ignored by attention-only families (their `StateLayout` is empty).
+    pub hybrid_snapshot_interval_blocks: u32,
 }
 
 impl Default for KvConfig {
@@ -94,6 +100,7 @@ impl Default for KvConfig {
             lossy_reuse: LossyReuse::Allow,
             lossy_penalty: None,
             ladder: KvLadderConfig::default(),
+            hybrid_snapshot_interval_blocks: 8,
         }
     }
 }
@@ -484,6 +491,12 @@ impl KvConfig {
                     "must be between 0 and 64, got {}",
                     self.recent_window_blocks
                 ),
+            ));
+        }
+        if self.hybrid_snapshot_interval_blocks == 0 {
+            return Err(invalid(
+                "kv.hybrid_snapshot_interval_blocks",
+                "must be at least 1, got 0",
             ));
         }
         for (name, &value) in self.lossy_penalty.iter().flatten() {

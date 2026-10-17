@@ -3538,6 +3538,8 @@ mod tests {
                     recompute_tokens: 0,
                     partial_tokens: 0,
                     reason: PlanReason::AllL0,
+                    state_snapshot: None,
+                    state_recompute_from: None,
                 },
                 tail_copy: None,
             }
