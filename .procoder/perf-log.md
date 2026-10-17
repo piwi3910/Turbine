@@ -2372,5 +2372,5 @@ capture legs.
   does.
 
 - P7 open: Qwen3_5ForConditionalGeneration/bf16/bf16/tp1 — golden c1 9/16 identical prefixes (need 16), engine_spread likely 8.59 / tail 11.30 OVER CAP (the GDN recurrence amplifies BF16 rounding on the real checkpoint); row stays `experimental`
-- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/tp2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
-- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/ep2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
+- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/tp2 — golden not gated: the committed CPU reference (`tests/golden/qwen3.6-35b-a3b-fp8/reference.jsonl`, 16 prompts, `transformers-5.9.0-bf16-cpu-fp32-logits`) exists, but the GDN recurrence amplifies BF16 rounding as on Qwen3.5-9B; row stays `experimental`
+- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/ep2 — same as tp2 (the recurrence numerics and the unrun tp2/ep2 golden gates, not the reference, keep the row open)
