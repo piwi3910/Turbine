@@ -1284,7 +1284,9 @@ impl KvHierarchy {
         let mut tail_copy: Option<TailCopy> = None;
         if let Some(src) = tail_src {
             let class = pool.format_of(src);
-            match pool.allocate_in(class, 1) {
+            // Strict: the tail is an optimization with a whole-block fallback, and this runs
+            // outside the iteration's plan where the reclaim order is not refreshed.
+            match pool.allocate_in_strict(class, 1) {
                 Ok(mut ids) => {
                     let dst = ids.pop().expect("allocate_in(1) returns one block");
                     // The private block rides at the end of the request's table: the shared
@@ -3272,9 +3274,11 @@ impl KvHierarchy {
         }
         // An L0 rewrite fills a page of the smaller class, allocated now so a class that
         // cannot grow is the back-off's trigger (`no_room`, S-7); the base page is freed at
-        // completion. A lower tier's rewrite stores back into its own slot.
+        // completion. A lower tier's rewrite stores back into its own slot. The allocation is
+        // strict (no reclaim of cached base pages): the ladder runs outside the iteration's plan,
+        // where the reclaim order is not refreshed, and its S-7 back-off is deliberate.
         let dst = if tier == TierId::L0 {
-            match pool.allocate_in(to, 1) {
+            match pool.allocate_in_strict(to, 1) {
                 Ok(mut b) => b.pop(),
                 Err(e) => {
                     tracing::debug!(

@@ -744,9 +744,9 @@ mod tests {
             assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
             assert!(err.message.contains("ABI v2.11"), "{err:?}");
             // The model's arch is not known before discovery: the partial row is the best any
-            // arch could give; gfx1201 Llama is experimental, gfx942 refused.
+            // arch could give; gfx1201 Llama is supported (Task 37b), gfx942 refused.
             let first = before_discovery(&hip).unwrap();
-            assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
+            assert_eq!(first.status, SupportStatus::Supported, "{}", first.key);
         }
     }
 
