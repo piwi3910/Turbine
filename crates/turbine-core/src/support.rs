@@ -518,10 +518,14 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
     // shared-prefix GSM8K medians against BF16 KV: Llama tq4 0.785 (0.780) PASS, tq2 0.195 FAIL;
     // OLMoE tq4 0.615 (0.635) FAIL, tq2 0.170 FAIL (perf log 6b, "TurboQuant in L0"). The S-16
     // re-gate on the Phase 7 tree (Task 37, 2026-10-17, perf log "P7 L0 tq4 re-gate") found the
-    // numerics fixed by the BF16 recent window (golden c1/c16 PASS on both models) but the serving
-    // path deadlocks once L0 fills (the BF16 window class cannot grow from a full base pool:
-    // `decode_deferred reason="kv_exhausted"`, request timeouts, the unchanged Task 13 shared-prefix
-    // recipe wedges at 34/200) and OLMoE's 8-filler pair still drops 0.045 > 0.01, so `tq4`
+    // numerics fixed by the BF16 recent window (golden c1/c16 PASS on both models); the serving
+    // path deadlocked once L0 filled (the BF16 window class could not grow from a full base pool:
+    // `decode_deferred reason="kv_exhausted"`, request timeouts, the 32-filler shared-prefix recipe
+    // wedged at 34/200). Task 37b fixed the pool class growth (a class now also grows from
+    // reclaimed cached-unreferenced base pages; perf log "P7 L0 tq4 re-gate", 37b): Llama's load
+    // legs pass (`ok=200`, golden c1/c16) and its 32-filler shared-prefix pair passes against the
+    // same-tree baseline (0.765 vs 0.770/0.760), so the **Llama** row is `supported`; OLMoE's
+    // 8-filler pair still drops 0.045 > 0.01 (a separate numerics matter), so the **OLMoE** row
     // stays `experimental`; `tq2` is refused below (`kv_tq2_l0_refused`).
     row(
         Some("amd"),
@@ -530,7 +534,7 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         BF16,
         Some(KvFormatColumn::Tq4),
         NO_SPEC,
-        SupportStatus::Experimental,
+        SupportStatus::Supported,
     ),
     row(
         Some("amd"),
@@ -1506,8 +1510,8 @@ mod tests {
         // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
         // awq_int4 and gptq_int4, Task 18), the Phase 7 families that closed their S-13 gates
         // (Qwen3 and Mistral BF16 tp1; Qwen3-MoE fp8_block tp2 and ep2; gpt-oss-20b mxfp4 tp1,
-        // Task 27) and the proven OLMoE rows (fp8_e4m3 KV; tq4 L0 stays `experimental`) are
-        // supported before the tracks add rows.
+        // Task 27), the proven OLMoE rows (fp8_e4m3 KV) and the gfx1201 Llama L0 `tq4` row
+        // (Task 37b; OLMoE's `tq4` stays `experimental`) are supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
@@ -1545,6 +1549,16 @@ mod tests {
                     "{:?}",
                     r.view()
                 );
+            } else if r.key.kv_format == Some(K::Tq4) {
+                // The L0 tq4 row (P7 Task 37b): gfx1201 Llama with BF16 weights only.
+                assert_eq!(r.key.arch, Some("gfx1201"), "{:?}", r.view());
+                assert_eq!(
+                    r.key.architecture,
+                    Some("LlamaForCausalLM"),
+                    "{:?}",
+                    r.view()
+                );
+                assert_eq!(r.key.weight_format, Some(W::Bf16), "{:?}", r.view());
             } else {
                 assert_eq!(r.key.kv_format, Some(K::Bf16), "{:?}", r.view());
             }
@@ -1616,13 +1630,8 @@ mod tests {
             status.reason().unwrap().contains("phase-6a-quantization"),
             "{status:?}"
         );
-        // TurboQuant L0 pages (P6b S-5): `tq4` is `experimental` on the CPU reference provider
-        // and on gfx1201 Llama / OLMoE (BF16 weights; Task 12 attention, Task 8 tables) until the
-        // S-8 gate, still open after the S-16 re-gate (Task 37: golden passes on the Phase 7 tree
-        // but the L0 pool deadlocks under load and OLMoE's pair drops 0.045); refused naming the
-        // track on any other arch, weight format or vendor, blaming
-        // kv.dtype. `tq2` is refused everywhere with `kv_tq2_l0_refused` (user decision
-        // 2026-10-02, 2 B). The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
+        // TurboQuant L0 pages (P6b S-5): `tq2` is refused everywhere with `kv_tq2_l0_refused`
+        // (user decision 2026-10-02, 2 B). `tq4` is gated below.
         for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
             for (vendor, arch) in [("cpu", "cpu"), ("amd", "gfx1201"), ("amd", "gfx942")] {
                 for weights in [W::Bf16, W::Fp8] {
@@ -1637,14 +1646,25 @@ mod tests {
                 }
             }
         }
+        // `tq4` is `experimental` on the CPU reference provider and on gfx1201 OLMoE (BF16
+        // weights; Task 12 attention, Task 8 tables) — OLMoE's shared-prefix pair still drops
+        // 0.045. On gfx1201 Llama it is `supported` since its S-16 re-gate closed (Task 37b:
+        // golden c1/c16, `ok=200` and the 32-filler shared-prefix pair pass after the pool
+        // class-growth fix). Refused naming the track on any other arch, weight format or vendor,
+        // blaming kv.dtype. The lower-tier formats resolve through TIER_FORMAT_REFUSALS.
         let kv = K::Tq4;
         for architecture in ["LlamaForCausalLM", "OlmoeForCausalLM"] {
+            let gfx1201_want = if architecture == "LlamaForCausalLM" {
+                "supported"
+            } else {
+                "experimental"
+            };
             let k = key("cpu", "cpu", architecture, W::Bf16, kv, S::None);
             assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
             let k = key("cpu", "cpu", architecture, W::Fp8, kv, S::None);
             assert_eq!(resolve(&k).as_str(), "unsupported", "{k}");
             let k = key("amd", "gfx1201", architecture, W::Bf16, kv, S::None);
-            assert_eq!(resolve(&k).as_str(), "experimental", "{k}");
+            assert_eq!(resolve(&k).as_str(), gfx1201_want, "{k}");
             assert!(check(k).is_ok());
             for (arch, weights) in [("gfx942", W::Bf16), ("gfx1201", W::Fp8)] {
                 let k = key("amd", arch, architecture, weights, kv, S::None);

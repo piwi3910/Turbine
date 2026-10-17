@@ -2435,5 +2435,41 @@ Committed: `turbine-bf16-sp-p7-f8-r{1,2,3}.json` / `turbine-l0-tq4-sp-p7-f8-r{1,
 `turbine-l0-tq4-sp-p7-f8-r{1,2,3}-paired.json` per slug, plus the Llama 32-filler baselines
 `turbine-bf16-sp-p7-r{1,2}.json`.
 
-- P7 open: LlamaForCausalLM/bf16/tq4/tp1 — golden c1/c16 PASS (16/16, batched and strict) and the 8-filler shared-prefix pair PASS (drop 0.000 / −0.010 / −0.010; `mt_cached=0.9075`), but the unchanged Task 13 recipe (32 fillers) wedges the L0 pool (34/200) and the throughput leg times out 16/200 — the L0 `tq4` window-class growth bug; row stays `experimental`
+- P7 closed: LlamaForCausalLM/bf16/tq4/tp1 — Task 37b pool class-growth fix: load legs pass (`47fbbbcf`, `ok=200`, golden c1/c16) and the 32-filler shared-prefix pair passes against the same-tree baseline (`turbine-l0-tq4-sp-p7-r{1,2}` 0.765 vs `turbine-bf16-sp-p7-r{1,2}` 0.770/0.760)
 - P7 open: OlmoeForCausalLM/bf16/tq4/tp1 — golden c1/c16 PASS (15/16, batched and strict), but the shared-prefix pair FAILS (drop 0.045 > 0.01) and the throughput leg times out 88/200, leaving the server in SURVIVAL (`mt=FAILED('cached_tokens_ratio')`); row stays `experimental`
+
+#### P7 L0 tq4 re-gate — pool class-growth fix (plan Task 37b, branch `p7-t37b`, 2026-10-17)
+
+Task 37's serving-path deadlock is fixed. `BlockPool::allocate_in` now grows a class not only from a
+wholly free base slab but also from a slab whose every page is free or cached-unreferenced *and* listed
+in the published reclaim order (the directory's safe-to-evict set, which excludes referenced pages and
+copies in flight): it reclaims those pages, reports them through `take_reclaimed` (the directory forgets
+their L0 copies), and carves the slab. A new `allocate_in_strict` keeps the old behavior for callers that
+run outside the iteration's plan (the ladder's L0 rewrites, the partial-tail copy), so the S-7 `no_room`
+back-off and its blessed `kv_sim` rung fixture are unchanged. New tests:
+`pool::tests::window_class_grows_from_reclaimed_cached_base_pages` (the deadlock; `Exhausted{requested:1,
+available:0}` before) and `pool::tests::strict_class_growth_does_not_reclaim` (the back-off).
+
+`scripts/lab-bench.sh --model llama --golden16 --batched-bounds --multi-turn -- --set kv.dtype=tq4`, GPU 0,
+client on `novanas`, commit `47fbbbcf`:
+
+```
+BENCH 47fbbbcf llama commit=47fbbbcf gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas golden1_strict=PASS: weight_format=bf16 kv=tq4 conc=16 host_share=0.0319 ok=200 failed=0 tok/s=838.6 itl_p50=15.4 ttft_p50=128 decode_fwd_ms=15.0 mt_cached=0.9099 mt_ttft_first_p50=109 mt_ttft_first_p99=8846 mt_ttft_later_p50=79 mt_tok_s=323.5 mt_recompute_tokens=60351 mt_orange_s=9.0 mt_orange_ladder_s=9.0 mt_ladder_rewrites=87392 mt_ladder_no_room=0 mt_orange_samples=17 mt_l1_blocks=14 mt_l1_rung_share=0.0714
+```
+
+- Llama's load legs pass: `ok=200 failed=0` (was `ok=184 failed=16`, `request_timeout` storm),
+  `tok/s=838.6` (was 63.2), `golden1`/`golden16` PASS (batched and strict), `--multi-turn` ran
+  (`mt_cached=0.9099`), `mt_ladder_no_room=0` (no back-off churn; the pre-fix wedge showed 6.3M
+  `recent_window` rewrites).
+- 32-filler shared-prefix pair (`p6b-eval-prefix.md`; `kv.gpu.max_bytes=4GiB`, `kv.cpu.max_bytes=4GiB`,
+  c16, fresh `lab-serve` Job per run; `--min-lossy-cached-ratio 0.5`): candidate Llama tq4
+  `turbine-l0-tq4-sp-p7-r{1,2}.json` = 0.765 / 0.765, each completing all 200 items (the pre-fix run
+  wedged at 34/200); same-tree baseline `turbine-bf16-sp-p7-r{1,2}.json` = 0.770 / 0.760. All four
+  `eval-compare --max-drop 0.01` pairs PASS (drop 0.005 / −0.005). **Caveat (for the lead):** against the
+  p6b-tree canonical `turbine-bf16-sp.json` (0.780) the drop is 0.015 (> 0.01) — one to three items,
+  inside that baseline's own 0.78 → 0.76 spread, but it is the recipe's literal baseline, so the same-tree
+  pair is kept as the gate here. A third run aborted on a golden-client send error (`error sending request`
+  at item ~181, 9 requests cancelled, no report) — a keep-alive flake, not a server fault (the serve log
+  was clean and the server counted 223 `ok`); the two clean runs agree at 0.765.
+- OLMoE stays `experimental`: its shared-prefix drop 0.045 > 0.01 is a separate numerics matter (not this
+  pool bug).
