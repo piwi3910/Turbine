@@ -4856,3 +4856,19 @@ the S-12 test remain. Decisions:
    `MatchedBlock.snapshot` is populated on later hits.
 4. **Entry lifetime:** the `SnapshotPool` lives with the KV hierarchy; freeing or evicting a block
    releases its entry (the directory's free path), so a reused `BlockId` cannot return stale bytes.
+
+## P7 Task 34 TP/EP sharding — lead calls (2026-10-17)
+
+The Qwen3.6 MoE family (`Qwen3_5Moe`) landed on the host/CPU path; TP2 and EP2 remain.
+
+1. **GDN sharding under TP:** extend the weight-shard mechanism to **multi-part** sources — a
+   `SlotSource` may carry a list of `(axis, start, len)` parts, so
+   `linear_attn.in_proj_qkv`'s two disjoint row regions (the `[0, key_dim)` key-head rows and the
+   `[key_dim, key_dim + value_dim)` value-head rows) can each take a rank's slice. Thread the rank
+   GDN dims and state through the executor: under TP2 `v_heads` 32 → 16 per rank and kv heads 2 → 1;
+   `tp::rank_config`/`DecoderDims::for_shard` shrink `cfg.gdn` and the executor's GDN buffers and
+   `state_layout().v_heads` accordingly; `out_proj`'s partial output is all-reduced as usual (no
+   double-count).
+2. **Shared expert under EP2:** the shared expert is replicated, not sharded, so only EP rank 0 adds
+   it — `hooks/moe.rs` (`MOE_SHARED`) passes a zero/absent shared contribution on ranks > 0 while the
+   routed experts still run on every rank. This replaces the current shared-under-EP refusal.
