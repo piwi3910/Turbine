@@ -1045,10 +1045,9 @@ fn hip_trace_vs_cpu_qwen3_5() {
     let model_dir = turbine_kernels::test_support::require_env_dir("TURBINE_TEST_MODEL_DIR");
     let ctx = turbine_kernels::test_support::open_context("hip");
     let cfg = load_model_config(&model_dir).expect("config.json");
-    assert_eq!(
-        cfg.family.0.name(),
-        "qwen3_5",
-        "TURBINE_TEST_MODEL_DIR must hold a Qwen3.5 checkpoint"
+    assert!(
+        ["qwen3_5", "qwen3_5_moe"].contains(&cfg.family.0.name()),
+        "TURBINE_TEST_MODEL_DIR must hold a Qwen3.5 or Qwen3.6 MoE checkpoint"
     );
     // The vision tower and the MTP head are counted and skipped, not loaded.
     let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");

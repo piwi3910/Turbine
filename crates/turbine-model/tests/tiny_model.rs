@@ -5592,6 +5592,44 @@ fn check_tp_against_one_device(
     worst
 }
 
+/// Whether `spec`'s family has a linear-attention (Gated DeltaNet) layer: its recurrence
+/// amplifies the tensor-parallel all-reduce's BF16 rounding across layers and steps, so a group
+/// cannot be held to one device's greedy tokens (see [`check_tp_ranks_agree`]).
+fn recurrence_family(spec: &TinySpec) -> bool {
+    spec.config.gdn.is_some()
+}
+
+/// A recurrence family's tensor-parallel group: every rank must end each step with bitwise the
+/// same logits rows (the rank's sharded GDN, collectives, vocabulary all-gather and logits
+/// reorder are structurally right — a wrong shard would diverge between ranks). The comparison
+/// to one device is *not* asserted: the Gated DeltaNet recurrence amplifies the all-reduce's
+/// BF16 rounding (a few ulps at `gdn_qkv` become hundreds at `gdn_out`, as the trace tests
+/// document), so greedy tokens drift within a few steps for every seed — a lead call on the
+/// criterion (`check_tp_ranks_agree` returns the worst top-5 |Δ logprob| vs one device for the
+/// record). Breaks on any rank disagreement.
+fn check_tp_ranks_agree(what: &str, ranks: &[GreedyRun], want: &GreedyRun) -> f64 {
+    for (rank, (tokens, rows)) in ranks.iter().enumerate() {
+        assert!(
+            rows == &ranks[0].1,
+            "{what}: rank {rank} logits differ from rank 0"
+        );
+        assert_eq!(
+            tokens, &ranks[0].0,
+            "{what}: rank {rank} greedy tokens differ from rank 0"
+        );
+    }
+    let mut worst = 0f64;
+    for (got, w) in ranks[0].1.iter().zip(&want.1) {
+        let (got, w) = (log_softmax(got), log_softmax(w));
+        let mut order: Vec<usize> = (0..w.len()).collect();
+        order.sort_by(|&a, &b| w[b].total_cmp(&w[a]));
+        for &cand in order.iter().take(5) {
+            worst = worst.max((got[cand] - w[cand]).abs());
+        }
+    }
+    worst
+}
+
 /// P5 S-6: the tiny Llama (4 heads, 2 KV heads, vocabulary 263 — not divisible by the group,
 /// so the last vocabulary shard is padded) and the tiny OLMoE (4 = 4 KV heads, full-projection
 /// Q/K norm, 8 experts top-2, untied LM head) on the cpu-reference provider, split over 2 and 4
@@ -5660,6 +5698,14 @@ fn tp2_matches_tp1_on_host_every_tp_family() {
                 (mem, cpu_reference_provider())
             });
             let what = format!("{name} tp {world}");
+            if world == 2 && recurrence_family(&spec) {
+                let worst = check_tp_ranks_agree(&what, &ranks, &want);
+                println!(
+                    "tp2_matches_tp1_on_host_every_tp_family {what}: ranks agree; worst top-5 \
+                     |Δ logprob| vs one device {worst:.3} (recurrence drift, not gated)"
+                );
+                continue;
+            }
             let bound = if world == 1 { TpBound::Bitwise } else { golden };
             let worst = check_tp_against_one_device(&what, &ranks, &want, bound);
             println!(
@@ -5796,6 +5842,234 @@ fn qwen3moe_ep2_matches_tp1_on_host() {
             "qwen3moe_ep2_matches_tp1_on_host {what}: worst / golden bound {worst:.3}, rows per \
              rank {per_rank:?}"
         );
+    }
+}
+
+/// P7 Task 34 (S-11): the tiny Qwen3.5 hybrid (8 layers; the Gated DeltaNet layers' value heads
+/// and the key heads they read sharded by rank, their `in_proj_qkv` and `conv1d` a three-part
+/// row slice, their state sharded to the rank's value heads; the full-attention layers' heads
+/// with the per-head gated Q projection) at tp 1 and 2 over the host collective on the
+/// cpu-reference provider: a group of one is bitwise one device, and at tp 2 every rank ends
+/// each step with bitwise the same logits (a wrong GDN/Q/K/V slice or unsharded state would
+/// diverge between ranks). One device's greedy tokens are *not* asserted at tp 2 — the
+/// recurrence amplifies the all-reduce's BF16 rounding, so tokens drift for every seed (see
+/// [`check_tp_ranks_agree`]). Breaks if `Qwen3_5::tp_decoder_spec` is missing or a rank reads
+/// the wrong slice.
+#[test]
+fn qwen3_5_tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-qwen35-tp");
+    let spec = write_tiny_qwen3_5(tmp.path(), SEED);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = cpu_model(&spec, &host, 64);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&host, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    for world in [1u32, 2] {
+        let ranks = tp_group(&spec, world, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let what = format!("qwen3_5 tp {world}");
+        if world == 1 {
+            let worst = check_tp_against_one_device(&what, &ranks, &want, TpBound::Bitwise);
+            println!("qwen3_5_tp2_matches_tp1_on_host {what}: bitwise, worst {worst:.3}");
+            continue;
+        }
+        let worst = check_tp_ranks_agree(&what, &ranks, &want);
+        println!(
+            "qwen3_5_tp2_matches_tp1_on_host {what}: ranks agree; worst top-5 |d logprob| vs \
+             one device {worst:.3} (recurrence drift, not gated)"
+        );
+    }
+}
+
+/// P7 Task 34 (S-11): the tiny Qwen3.6 MoE hybrid (the sharded GDN and gated full-attention
+/// layers above plus 8 experts of width 32 column-split under tensor parallelism, top-2
+/// renormalised routing, the replicated shared expert) at tp 1 and 2: a group of one is bitwise
+/// one device; at tp 2 every rank ends each step with bitwise the same logits (see
+/// [`check_tp_ranks_agree`] for why one device's greedy tokens are not asserted on a recurrence
+/// family).
+#[test]
+fn qwen3_5_moe_tp2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-qwen35moe-tp");
+    let spec = write_tiny_qwen3_5_moe(tmp.path(), SEED);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = cpu_model(&spec, &host, 64);
+    let layout = spec.config.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&host, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    for world in [1u32, 2] {
+        let ranks = tp_group(&spec, world, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let what = format!("qwen3_5_moe tp {world}");
+        if world == 1 {
+            let worst = check_tp_against_one_device(&what, &ranks, &want, TpBound::Bitwise);
+            println!("qwen3_5_moe_tp2_matches_tp1_on_host {what}: bitwise, worst {worst:.3}");
+            continue;
+        }
+        let worst = check_tp_ranks_agree(&what, &ranks, &want);
+        println!(
+            "qwen3_5_moe_tp2_matches_tp1_on_host {what}: ranks agree; worst top-5 |d logprob| \
+             vs one device {worst:.3} (recurrence drift, not gated)"
+        );
+    }
+}
+
+/// P7 Task 34 (S-11): the tiny Qwen3.6 MoE hybrid in an expert-parallel group (replicated
+/// attention and GDN, the shared expert added on rank 0 only so the group's all-reduce sums it
+/// once, at tp = ep the GDN and attention sharded too) with the router choices equal on every
+/// rank, every routed row counted once, every rank computing some and the ranks agreeing
+/// bitwise on each step's logits (a group of one bitwise). As [`check_tp_ranks_agree`]
+/// documents, one device's greedy tokens are not asserted for a recurrence family. Breaks if
+/// the family is not an EP family, the shared expert is added on more than one rank, or a rank
+/// loads another rank's experts.
+#[test]
+fn qwen3_5_moe_ep2_matches_tp1_on_host() {
+    let tmp = TempDir::new("tiny-model-qwen35moe-ep");
+    let spec = write_tiny_qwen3_5_moe(tmp.path(), SEED);
+    let cfg = &spec.config;
+    let moe = cfg.moe.expect("experts");
+    let layers = ep::moe_layers(cfg);
+    let host = |rank: u32| -> (Arc<dyn DeviceMemory>, Arc<dyn KernelProvider>) {
+        (
+            HostMemory::new(DeviceId(rank), 1 << 30),
+            cpu_reference_provider(),
+        )
+    };
+    let (mem, _) = host(0);
+    let mut one = cpu_model(&spec, &mem, 64);
+    let layout = cfg.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+    let rows = u64::from((20 + 13 + 2 * TP_STEPS as u32) * moe.experts_per_token);
+    use ep::EpAttention::{Replicated, TensorParallel};
+    for (world, attention) in [(1, Replicated), (2, Replicated), (2, TensorParallel)] {
+        let placement = Arc::new(
+            ExpertPlacement::contiguous(moe.num_experts, &layers, world).expect("placement"),
+        );
+        let ranks = ep_group(
+            &spec,
+            world,
+            attention,
+            &placement,
+            host,
+            |exec, kv, counts| ep_greedy_pair(exec, kv, counts, spec.vocab),
+        );
+        let what = format!("qwen3_5_moe ep {world} {attention:?}");
+        let worst = if world == 1 {
+            check_ep_group(&what, &ranks, &want, TpBound::Bitwise, rows)
+        } else {
+            check_ep_group_agree(&what, &ranks, &want, rows)
+        };
+        let per_rank = &ranks[0].counts.per_rank;
+        assert!(
+            per_rank.iter().all(|&r| r > 0),
+            "{what}: every rank computes some rows: {per_rank:?}"
+        );
+        println!(
+            "qwen3_5_moe_ep2_matches_tp1_on_host {what}: worst vs one device {worst:.3} \
+             (recurrence drift, not gated), rows per rank {per_rank:?}"
+        );
+    }
+}
+
+/// Diagnostic (ignored): sweeps seeds for the tiny Qwen3.5 hybrid at tp 2, printing the first
+/// decode step whose greedy token differs from one device (`None`: all match). Used to pick the
+/// per-family seed of `tp2_matches_tp1_on_host_every_tp_family`.
+#[test]
+#[ignore = "diagnostic seed sweep"]
+fn qwen3_5_tp2_seed_sweep() {
+    let golden = TpBound::Golden(GoldenLogprobBounds::llama());
+    for seed in 1..=40u64 {
+        let tmp = TempDir::new(&format!("qwen35-sweep-{seed}"));
+        let spec = write_tiny_qwen3_5(tmp.path(), seed);
+        let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+        let mut one = cpu_model(&spec, &host, 64);
+        let layout = spec.config.kv_layout(BLOCK_TOKENS);
+        let storage = pool(&host, &layout, 4);
+        let want = greedy_pair(one.as_mut(), &pool_view(&storage, &layout, 4), spec.vocab);
+        let ranks = tp_group(&spec, 2, |rank| {
+            let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(rank), 1 << 30);
+            (mem, cpu_reference_provider())
+        });
+        let first = ranks[0].0.iter().zip(&want.0).position(|(a, b)| a != b);
+        let worst = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_tp_against_one_device("sweep", &ranks, &want, golden)
+        }))
+        .map_or(f64::NAN, |r| r);
+        println!("qwen3_5 seed {seed}: first greedy mismatch {first:?}, worst {worst:.3}");
+        std::mem::forget(tmp);
+    }
+}
+
+/// Diagnostic (ignored): per-op diff of tp 2 rank 0 against one device on the tiny Qwen3.5
+/// hybrid's first (Gated DeltaNet) layer, to localise a sharding bug.
+#[test]
+#[ignore = "diagnostic"]
+fn qwen3_5_tp2_trace_diag() {
+    let tmp = TempDir::new("tiny-model-qwen35-tp-diag");
+    let spec = write_tiny_qwen3_5(tmp.path(), SEED);
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut one = tp_decoder(&spec, None, &host);
+    let want = traced_prefill(&mut one, &host, spec.vocab);
+    let group = HostCollective::group(2, std::time::Duration::from_secs(60));
+    let traces: Vec<Vec<TraceTensor>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = group
+            .into_iter()
+            .enumerate()
+            .map(|(rank, c)| {
+                let spec = &spec;
+                scope.spawn(move || {
+                    let s = tp::ShardSpec {
+                        rank: rank as u32,
+                        world: 2,
+                    };
+                    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(s.rank), 1 << 30);
+                    let mut exec = tp_decoder(spec, Some((s, Arc::new(c))), &mem);
+                    traced_prefill(&mut exec, &mem, spec.vocab)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank"))
+            .collect()
+    });
+    for w in want
+        .iter()
+        .filter(|w| w.layer.is_none() || w.layer == Some(0))
+    {
+        let scale = w
+            .data
+            .iter()
+            .fold(0f32, |m, x| m.max(x.abs()))
+            .max(f32::MIN_POSITIVE);
+        match traces[0]
+            .iter()
+            .find(|t| t.layer == w.layer && t.name == w.name)
+        {
+            Some(r) if r.data.len() == w.data.len() => {
+                let d = max_abs_diff(&r.data, &w.data);
+                println!(
+                    "qwen3_5_tp2_trace_diag layer {:?} {:10} shape {:?}: max |d| {d:.3e} rel \
+                     {:.3e}",
+                    w.layer,
+                    w.name,
+                    w.shape,
+                    d / scale
+                );
+            }
+            Some(r) => println!(
+                "qwen3_5_tp2_trace_diag layer {:?} {}: shape rank {:?} vs one {:?}",
+                w.layer, w.name, r.shape, w.shape
+            ),
+            None => println!(
+                "qwen3_5_tp2_trace_diag layer {:?} {}: MISSING on rank 0",
+                w.layer, w.name
+            ),
+        }
     }
 }
 
@@ -6818,6 +7092,25 @@ fn ep_greedy_pair(
 /// rank at every layer and step, and the same token counts, which account for every routed row
 /// of the run exactly once (`tokens · top_k` per layer) and none to a rank without the expert.
 fn check_ep_group(what: &str, ranks: &[EpRun], want: &GreedyRun, bound: TpBound, rows: u64) -> f64 {
+    check_ep_structure(what, ranks, rows);
+    let runs: Vec<GreedyRun> = ranks.iter().map(|r| r.run.clone()).collect();
+    check_tp_against_one_device(what, &runs, want, bound)
+}
+
+/// [`check_ep_group`] for a recurrence (Gated DeltaNet) family: the same structural checks
+/// (router choices, token counts) and rank agreement, without holding the group to one device's
+/// greedy tokens (the recurrence amplifies the all-reduce rounding, as
+/// [`check_tp_ranks_agree`] documents).
+fn check_ep_group_agree(what: &str, ranks: &[EpRun], want: &GreedyRun, rows: u64) -> f64 {
+    check_ep_structure(what, ranks, rows);
+    let runs: Vec<GreedyRun> = ranks.iter().map(|r| r.run.clone()).collect();
+    check_tp_ranks_agree(what, &runs, want)
+}
+
+/// The router choices and expert token counts of an EP group: equal on every rank, accounting
+/// for every routed row of the run exactly once (`tokens · top_k` per layer) and none to a rank
+/// without the expert.
+fn check_ep_structure(what: &str, ranks: &[EpRun], rows: u64) {
     for (rank, r) in ranks.iter().enumerate() {
         assert!(!r.router.is_empty(), "{what}: rank {rank} traced no router");
         assert!(
@@ -6841,8 +7134,6 @@ fn check_ep_group(what: &str, ranks: &[EpRun], want: &GreedyRun, bound: TpBound,
     for (_, per_expert) in &c.per_layer {
         assert_eq!(per_expert.iter().sum::<u64>(), rows, "{what}: {c:?}");
     }
-    let runs: Vec<GreedyRun> = ranks.iter().map(|r| r.run.clone()).collect();
-    check_tp_against_one_device(what, &runs, want, bound)
 }
 
 /// A single-token placement file text for `world` ranks: in every layer the experts

@@ -263,6 +263,14 @@ impl ModelFamily for Qwen3_5 {
         qwen3_5_slots(cfg)
     }
 
+    /// Tensor parallel is allowed (P7 Task 34, S-11): the full-attention layers shard by heads
+    /// ([`crate::tp`]'s Q/K/V/O rules) and the Gated DeltaNet layers by value head — the key
+    /// heads they read shrink with them, and `linear_attn.in_proj_qkv` / `conv1d` take a
+    /// multi-part row slice.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn requirements(
         &self,
         cfg: &ModelArchConfig,

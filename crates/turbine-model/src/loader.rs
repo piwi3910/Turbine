@@ -46,33 +46,68 @@ pub struct WeightSlot {
     pub float32_stored: bool,
 }
 
-/// The part of a checkpoint tensor of `shape` a sharded [`WeightSlot`] loads: elements
-/// `[start, start + len)` along `axis` (0: whole rows, one contiguous byte range; 1: a column
-/// block of a 2-D tensor, one positioned read per row), every other dimension whole. The slot's
-/// own `shape` is the checkpoint's with `len` along `axis`, except that along axis 0 it may be
-/// longer: the rows past `len` are zeros (the last vocabulary shard's padding).
+/// The parts of a checkpoint tensor of `shape` a sharded [`WeightSlot`] loads, concatenated in
+/// destination order. Each part is elements `[start, start + len)` along `axis` (0: whole rows,
+/// one contiguous byte range; 1: a column block of a 2-D tensor, one positioned read per row),
+/// every other dimension whole. A single part is the ordinary one-rank slice
+/// ([`SlotSource::one`]); the multi-part form lets a rank's slice be the concatenation of
+/// disjoint regions of the same tensor (Qwen3.5/3.6's `in_proj_qkv` `[q | k | v]` and its
+/// `conv1d`, whose key-head and value-head rows take different slices, P7 Task 34). The slot's
+/// own `shape` is the checkpoint's with the axis's length replaced by the sum of the parts',
+/// except that along axis 0 it may be longer: the rows past the loaded ones are zeros (the last
+/// vocabulary shard's padding).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotSource {
     pub shape: Vec<usize>,
+    pub parts: Vec<SlotPart>,
+}
+
+/// One region of a [`SlotSource`]: elements `[start, start + len)` along `axis`, every other
+/// dimension whole. All parts of a source share one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotPart {
     pub axis: usize,
     pub start: usize,
     pub len: usize,
 }
 
 impl SlotSource {
-    /// Whether `slot_shape` can hold this part (see [`SlotSource`]).
+    /// A one-part source: elements `[start, start + len)` along `axis`.
+    pub fn one(shape: Vec<usize>, axis: usize, start: usize, len: usize) -> SlotSource {
+        SlotSource {
+            shape,
+            parts: vec![SlotPart { axis, start, len }],
+        }
+    }
+
+    /// The source's axis (every part's); `None` for no parts.
+    pub(crate) fn axis(&self) -> Option<usize> {
+        self.parts.first().map(|p| p.axis)
+    }
+
+    /// Whether `slot_shape` can hold these parts (see [`SlotSource`]).
     fn fits(&self, slot_shape: &[usize]) -> bool {
         let dims = self.shape.len();
-        (self.axis == 0 && dims >= 1 || self.axis == 1 && dims == 2)
+        let Some(axis) = self.axis() else {
+            return false;
+        };
+        (axis == 0 && dims >= 1 || axis == 1 && dims == 2)
+            && self.parts.iter().all(|p| p.axis == axis)
             && slot_shape.len() == dims
-            && self.start + self.len <= self.shape[self.axis]
+            && self
+                .parts
+                .iter()
+                .all(|p| p.start + p.len <= self.shape[axis])
             && (0..dims).all(|d| {
-                if d != self.axis {
+                if d != axis {
                     slot_shape[d] == self.shape[d]
-                } else if d == 0 {
-                    slot_shape[d] >= self.len
                 } else {
-                    slot_shape[d] == self.len
+                    let loaded: usize = self.parts.iter().map(|p| p.len).sum();
+                    if d == 0 {
+                        slot_shape[d] >= loaded
+                    } else {
+                        slot_shape[d] == loaded
+                    }
                 }
             })
     }
@@ -81,10 +116,19 @@ impl SlotSource {
     /// destination order.
     fn runs(&self, es: usize) -> Vec<(u64, usize)> {
         let inner: usize = self.shape[1..].iter().product();
-        match self.axis {
-            0 => vec![((self.start * inner * es) as u64, self.len * inner * es)],
+        match self.axis() {
+            Some(0) => self
+                .parts
+                .iter()
+                .map(|p| ((p.start * inner * es) as u64, p.len * inner * es))
+                .collect(),
+            // A column block: per row, the parts' column runs in order.
             _ => (0..self.shape[0])
-                .map(|r| (((r * inner + self.start) * es) as u64, self.len * es))
+                .flat_map(|r| {
+                    self.parts
+                        .iter()
+                        .map(move |p| (((r * inner + p.start) * es) as u64, p.len * es))
+                })
                 .collect(),
         }
     }
@@ -220,12 +264,7 @@ pub fn gated_qkv_slots_at(
     let stack = q_gate_kv_proj_name_at(layer_prefix);
     let stack_shape = vec![2 * q_dim + 2 * kv_dim, hidden];
     let q_shape = vec![2 * q_dim, hidden];
-    let source = |start: usize| SlotSource {
-        shape: q_shape.clone(),
-        axis: 0,
-        start,
-        len: head_dim,
-    };
+    let source = |start: usize| SlotSource::one(q_shape.clone(), 0, start, head_dim);
     let place = |offset: usize| StackPlace {
         name: stack.clone(),
         shape: stack_shape.clone(),
@@ -622,7 +661,7 @@ impl WeightLoader {
                         let mut part = take_part(&all, src, dtype.size_bytes());
                         // The last vocabulary shard's padding rows are zeros.
                         let want = slot.shape.iter().product::<usize>() * dtype.size_bytes();
-                        if src.axis == 0 && part.len() < want {
+                        if src.axis() == Some(0) && part.len() < want {
                             part.resize(want, 0);
                         }
                         part
@@ -736,17 +775,26 @@ fn read_companions<'i>(
         .collect()
 }
 
-/// The part `src` of a whole row-major tensor `all` of `src.shape` (elements of `es` bytes):
-/// rows `start..start + len` along axis 0, or that column block of every row along axis 1.
+/// The parts `src` of a whole row-major tensor `all` of `src.shape` (elements of `es` bytes),
+/// concatenated in destination order: along axis 0 rows `start..start + len` of each part, along
+/// axis 1 that column block of every row of each part.
 fn take_part(all: &[u8], src: &SlotSource, es: usize) -> Vec<u8> {
     let row: usize = src.shape[1..].iter().product::<usize>() * es;
-    match src.axis {
-        0 => all[src.start * row..(src.start + src.len) * row].to_vec(),
-        _ => all
-            .chunks_exact(row)
-            .flat_map(|r| &r[src.start * es..(src.start + src.len) * es])
-            .copied()
+    match src.axis() {
+        Some(0) => src
+            .parts
+            .iter()
+            .flat_map(|p| all[p.start * row..(p.start + p.len) * row].to_vec())
             .collect(),
+        _ => {
+            let mut out = Vec::new();
+            for r in all.chunks_exact(row) {
+                for p in &src.parts {
+                    out.extend_from_slice(&r[p.start * es..(p.start + p.len) * es]);
+                }
+            }
+            out
+        }
     }
 }
 
@@ -1425,7 +1473,10 @@ mod tests {
         );
         let src = |s: &WeightSlot| {
             let src = s.source.as_ref().unwrap();
-            (src.start, src.len)
+            let [part] = src.parts.as_slice() else {
+                panic!("gated qkv sources have one part");
+            };
+            (part.start, part.len)
         };
         assert_eq!(
             slots[..2 * heads].iter().map(src).collect::<Vec<_>>(),

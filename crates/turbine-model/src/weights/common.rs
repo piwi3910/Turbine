@@ -13,6 +13,17 @@ pub fn module_of(name: &str) -> Option<&str> {
     name.strip_suffix(".weight")
 }
 
+/// Whether `name` is one of a Qwen3.5/3.6 shared expert's SwiGLU weights
+/// (`mlp.shared_expert.{gate,up,down}_proj.weight`): always loaded in BF16 by the MoE path
+/// (P7 Task 34), never run as its own qgemm, so a block-scaled FP8 checkpoint decodes it at
+/// load.
+pub fn is_shared_expert(name: &str) -> bool {
+    name.contains(".mlp.shared_expert.")
+        && ["gate_proj", "up_proj", "down_proj"]
+            .iter()
+            .any(|p| name.ends_with(&format!(".{p}.weight")))
+}
+
 /// The non-null `quantization_config` of `top`.
 pub fn quantization_config(top: &serde_json::Value) -> Option<&serde_json::Value> {
     top.get("quantization_config").filter(|q| !q.is_null())
@@ -177,33 +188,42 @@ pub struct Follows {
 /// leaves `slot` whole) when the shard does not fall on the slot's row or column units: the
 /// caller refuses the split (`quant_shard_misaligned`).
 pub fn shard_like(slot: &mut WeightSlot, src: &SlotSource, full: Vec<usize>, f: Follows) -> bool {
-    let div = match (src.axis, f.cols) {
-        (0, _) => f.rows,
+    let axis = src.axis();
+    let div = match (axis, f.cols) {
+        (Some(0), _) => f.rows,
         (_, Some(c)) => c,
         // Row-parallel and not following k: every rank holds the whole slot.
         (_, None) => return true,
     };
-    if !src.start.is_multiple_of(div) || !src.len.is_multiple_of(div) {
-        return false;
+    let mut parts = Vec::with_capacity(src.parts.len());
+    for p in &src.parts {
+        if !p.start.is_multiple_of(div) || !p.len.is_multiple_of(div) {
+            return false;
+        }
+        parts.push(crate::loader::SlotPart {
+            axis: p.axis,
+            start: p.start / div,
+            len: p.len / div,
+        });
     }
-    slot.source = Some(SlotSource {
-        shape: full,
-        axis: src.axis,
-        start: src.start / div,
-        len: src.len / div,
-    });
+    slot.source = Some(SlotSource { shape: full, parts });
     true
 }
 
 /// The refusal of a tensor-parallel split that cuts a quantized layer's groups or blocks.
 pub fn shard_misaligned(layer: &str, src: &SlotSource, unit: &str) -> ModelError {
+    let axis = src.axis().unwrap_or(0);
+    let ranges: Vec<String> = src
+        .parts
+        .iter()
+        .map(|p| format!("{}..{}", p.start, p.start + p.len))
+        .collect();
     unsupported(
         "tensor-parallel shard",
         format!(
-            "{layer} {} {}..{}",
-            if src.axis == 0 { "rows" } else { "columns" },
-            src.start,
-            src.start + src.len
+            "{layer} {} {}",
+            if axis == 0 { "rows" } else { "columns" },
+            ranges.join("+")
         ),
         &format!("quant_shard_misaligned: shards on {unit} boundaries"),
     )
