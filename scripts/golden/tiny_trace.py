@@ -23,8 +23,8 @@ logits are F32 from the BF16 final-norm output and the LM head weight (the form 
 
 Two modes:
 
-- `--prompt-ids 1,2,3`: a tiny synthetic checkpoint. Supported architectures: `GptOssForCausalLM`
-  and `Qwen3_5ForConditionalGeneration`. The gpt-oss checkpoint's MXFP4 experts are dequantized
+- `--prompt-ids 1,2,3`: a tiny synthetic checkpoint. Supported architectures: `GptOssForCausalLM`,
+  `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration`. The gpt-oss checkpoint's MXFP4 experts are dequantized
   here (E2M1 codes times 2^(e - 127), exact in BF16) into transformers' BF16 layout
   (`gate_up_proj` `[experts, hidden, 2 * inter]`, the transpose of the stored
   `[experts, 2 * inter, hidden]`), and the model is built from the config with its
@@ -36,7 +36,9 @@ Two modes:
   resid_mlp`, plus `embed/final_norm/logits`. It needs transformers >= 5
   (`Qwen3_5ForConditionalGeneration`, the torch GDN fallback): run it as
   `uv run --with transformers==5.9.0 scripts/golden/tiny_trace.py …` (the `--with` overrides the
-  pinned 4.57.1 below).
+  pinned 4.57.1 below). The `qwen3_5_moe` branch records the same hybrid ops with the MoE FFN's
+  `router_logits` and `moe_out` in place of `gate/up/act/down`, and fuses the tiny checkpoint's
+  per-expert SwiGLU tensors into transformers' `mlp.experts.{gate_up_proj,down_proj}`.
 - `--prompt-file tests/golden/prompts.jsonl --prompt-id p05`: a real checkpoint. Supported
   architecture: `LlamaForCausalLM`. The prompt is tokenized as `hf_reference.py` does (a
   `completion` prompt with `add_special_tokens=True`; a `chat` prompt through the chat template
@@ -63,6 +65,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -713,6 +716,293 @@ def trace_qwen3_5(model_dir: Path, ids, out_path: Path) -> int:
     return 0
 
 
+# The op order of a Qwen3.6 MoE hybrid layer: the dense hybrid's full-attention block (per-head
+# Q/K norm, partial RoPE, the `sigmoid` output gate) with the MoE FFN's `router_logits` and
+# `moe_out` (the routed experts plus the gated shared expert) in place of the SwiGLU MLP.
+QWEN3_5_MOE_FULL_ORDER = [
+    "attn_norm", "q", "k", "v", "q_norm", "k_norm", "q_rope", "k_rope", "attn", "o_proj",
+    "resid_attn", "mlp_norm", "router_logits", "moe_out", "resid_mlp",
+]  # fmt: skip
+
+# The op order of a Gated DeltaNet layer of a Qwen3.6 MoE hybrid: the dense hybrid's GDN ops, then
+# the MoE FFN's `router_logits` and `moe_out`.
+QWEN3_5_MOE_GDN_ORDER = [
+    "gdn_qkv", "gdn_q", "gdn_k", "gdn_v", "gdn_out", "gdn_normed", "o_proj", "resid_attn",
+    "mlp_norm", "router_logits", "moe_out", "resid_mlp",
+]  # fmt: skip
+
+_EXPERT_TENSOR = re.compile(
+    r"^(?P<prefix>.*\.mlp)\.experts\.(?P<e>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def load_state_dict_qwen3_5_moe(model_dir: Path) -> dict[str, torch.Tensor]:
+    """The tiny checkpoint's state dict with the per-expert SwiGLU tensors fused into
+    transformers' `mlp.experts.gate_up_proj` / `mlp.experts.down_proj`: `gate_up_proj` stacks,
+    per expert, the gate rows then the up rows (the halves `Qwen3_5MoeExperts.forward` chunks),
+    and `down_proj` stacks each expert's `[hidden, inter]`."""
+    raw: dict[str, torch.Tensor] = {}
+    for f in sorted(model_dir.glob("*.safetensors")):
+        with safe_open(str(f), framework="pt") as st:
+            for name in st.keys():
+                raw[name] = st.get_tensor(name)
+    state: dict[str, torch.Tensor] = {}
+    experts: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+    for name, t in raw.items():
+        m = _EXPERT_TENSOR.match(name)
+        if m:
+            experts.setdefault(m["prefix"], {}).setdefault(m["proj"], {})[int(m["e"])] = t
+            continue
+        state[name] = t
+    for prefix, projs in experts.items():
+        n = len(projs["gate_proj"])
+        state[f"{prefix}.experts.gate_up_proj"] = torch.stack(
+            [
+                torch.cat([projs["gate_proj"][e], projs["up_proj"][e]], dim=0)
+                for e in range(n)
+            ],
+            dim=0,
+        )
+        state[f"{prefix}.experts.down_proj"] = torch.stack(
+            [projs["down_proj"][e] for e in range(n)], dim=0
+        )
+    return state
+
+
+def trace_qwen3_5_moe(model_dir: Path, ids, out_path: Path) -> int:
+    """The per-op trace of `Qwen3_5MoeForConditionalGeneration` on the tiny checkpoint
+    [`write_tiny_qwen3_5_moe`] writes (seed 7): the dense hybrid's full-attention and Gated
+    DeltaNet ops, plus the MoE FFN's `router_logits` (the F32 router GEMM, as Turbine traces it)
+    and `moe_out` (the routed experts plus the gate-scaled shared expert, in the activation
+    dtype).
+
+    Needs transformers >= 5 (`Qwen3_5MoeForConditionalGeneration`, the torch GDN fallback); run
+    it as `uv run --with transformers==5.9.0 scripts/golden/tiny_trace.py …`.
+    """
+    import transformers
+
+    if not hasattr(transformers, "Qwen3_5MoeForConditionalGeneration"):
+        print(
+            "tiny_trace: the qwen3_5_moe branch needs transformers >= 5 "
+            f"(got {transformers.__version__}); run it as `uv run --with transformers==5.9.0 "
+            "scripts/golden/tiny_trace.py …`",
+            file=sys.stderr,
+        )
+        return 2
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeVisionConfig,
+    )
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForConditionalGeneration,
+        apply_rotary_pos_emb,
+    )
+
+    cfg_json = json.loads((model_dir / "config.json").read_text())
+    if (cfg_json.get("architectures") or [None])[0] != "Qwen3_5MoeForConditionalGeneration":
+        print(
+            f"tiny_trace: unsupported architectures {cfg_json.get('architectures')}",
+            file=sys.stderr,
+        )
+        return 2
+
+    config = Qwen3_5MoeConfig.from_pretrained(model_dir)
+    # Text-only forward (`pixel_values` is never passed): a one-block vision tower replaces the
+    # default and the load below is not strict about `model.visual.*`.
+    config.vision_config = Qwen3_5MoeVisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=16,
+        num_heads=2,
+        patch_size=2,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        num_position_embeddings=16,
+        out_hidden_size=16,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    model = Qwen3_5MoeForConditionalGeneration(config).to(torch.bfloat16).eval()
+    missing, unexpected = model.load_state_dict(
+        load_state_dict_qwen3_5_moe(model_dir), strict=False
+    )
+    missing = [k for k in missing if not k.startswith("model.visual.")]
+    if missing or unexpected:
+        print(f"tiny_trace: missing {missing}, unexpected {unexpected}", file=sys.stderr)
+        return 2
+
+    ops: list[dict] = []
+    raw: dict[int, dict[str, torch.Tensor]] = {}
+
+    def rec(layer, name, t: torch.Tensor) -> None:
+        t = t.detach().to(torch.float32).reshape(-1, t.shape[-1])
+        ops.append(
+            {
+                "layer": layer,
+                "name": name,
+                "shape": list(t.shape),
+                "data": t.flatten().tolist(),
+            }
+        )
+
+    handles = []
+
+    def out_hook(layer, name):
+        def hook(_m, _i, out):
+            rec(layer, name, out[0] if isinstance(out, tuple) else out)
+
+        return hook
+
+    def in_hook(layer, name):
+        def hook(_m, inp):
+            rec(layer, name, inp[0])
+
+        return hook
+
+    def raw_in(layer, name):
+        def hook(_m, inp):
+            raw.setdefault(layer, {})[name] = inp[0].detach()
+
+        return hook
+
+    def raw_out(layer, name):
+        def hook(_m, _i, out):
+            raw.setdefault(layer, {})[name] = (
+                out[0] if isinstance(out, tuple) else out
+            ).detach()
+
+        return hook
+
+    def router_pre(layer):
+        def hook(mod, inp):
+            x = inp[0].reshape(-1, mod.weight.shape[1])
+            rec(layer, "router_logits", x.float() @ mod.weight.float().T)
+
+        return hook
+
+    text = model.model.language_model
+    handles.append(text.embed_tokens.register_forward_hook(out_hook(None, "embed")))
+
+    rope: dict[str, torch.Tensor] = {}
+    handles.append(
+        text.rotary_emb.register_forward_hook(
+            lambda _m, _i, out: rope.update(cos=out[0].detach(), sin=out[1].detach())
+        )
+    )
+
+    for i, layer in enumerate(text.layers):
+        handles += [
+            layer.register_forward_hook(out_hook(i, "resid_mlp")),
+            layer.post_attention_layernorm.register_forward_pre_hook(
+                in_hook(i, "resid_attn")
+            ),
+            layer.post_attention_layernorm.register_forward_hook(out_hook(i, "mlp_norm")),
+            layer.mlp.register_forward_hook(out_hook(i, "moe_out")),
+            layer.mlp.gate.register_forward_pre_hook(router_pre(i)),
+        ]
+        if layer.layer_type == "full_attention":
+            a = layer.self_attn
+            handles += [
+                layer.input_layernorm.register_forward_hook(out_hook(i, "attn_norm")),
+                a.q_proj.register_forward_hook(raw_out(i, "q_proj")),
+                a.k_proj.register_forward_hook(raw_out(i, "k_proj")),
+                a.v_proj.register_forward_hook(out_hook(i, "v")),
+                a.q_norm.register_forward_hook(raw_out(i, "q_norm")),
+                a.k_norm.register_forward_hook(raw_out(i, "k_norm")),
+                a.o_proj.register_forward_pre_hook(in_hook(i, "attn")),
+                a.o_proj.register_forward_hook(out_hook(i, "o_proj")),
+            ]
+        else:
+            a = layer.linear_attn
+            handles += [
+                a.in_proj_qkv.register_forward_hook(out_hook(i, "gdn_qkv")),
+                a.conv1d.register_forward_hook(raw_out(i, "conv1d")),
+                a.norm.register_forward_pre_hook(raw_in(i, "gdn_out")),
+                a.norm.register_forward_hook(raw_out(i, "gdn_normed")),
+                a.out_proj.register_forward_hook(out_hook(i, "o_proj")),
+            ]
+    final: dict[str, torch.Tensor] = {}
+    handles.append(
+        text.norm.register_forward_hook(
+            lambda _m, _i, out: final.update(norm=out[0, -1:, :])
+        )
+    )
+
+    with torch.no_grad():
+        model(input_ids=torch.tensor([ids]), use_cache=False)
+    for h in handles:
+        h.remove()
+
+    # The raw captures -> Turbine's op names and layouts.
+    t = len(ids)
+    tc = config.text_config
+    for i, layer in enumerate(text.layers):
+        r = raw.get(i, {})
+        if layer.layer_type == "full_attention":
+            heads, kv_heads, head_dim = (
+                tc.num_attention_heads,
+                tc.num_key_value_heads,
+                tc.head_dim,
+            )
+            # `q_proj` is per-head interleaved `[q_j | gate_j]`; Turbine de-interleaves at load.
+            q, _gate = torch.chunk(
+                r["q_proj"].view(1, t, heads, 2 * head_dim), 2, dim=-1
+            )
+            rec(i, "q", q.reshape(1, t, heads * head_dim))
+            rec(i, "k", r["k_proj"].view(1, t, kv_heads * head_dim))
+            rec(i, "q_norm", r["q_norm"].reshape(1, t, heads * head_dim))
+            rec(i, "k_norm", r["k_norm"].reshape(1, t, kv_heads * head_dim))
+            qr = r["q_norm"].transpose(1, 2)
+            kr = r["k_norm"].transpose(1, 2)
+            q_rope, k_rope = apply_rotary_pos_emb(qr, kr, rope["cos"], rope["sin"])
+            rec(i, "q_rope", q_rope.transpose(1, 2).reshape(1, t, heads * head_dim))
+            rec(i, "k_rope", k_rope.transpose(1, 2).reshape(1, t, kv_heads * head_dim))
+        else:
+            k_heads, k_dim = tc.linear_num_key_heads, tc.linear_key_head_dim
+            v_heads, v_dim = tc.linear_num_value_heads, tc.linear_value_head_dim
+            key_dim, value_dim = k_heads * k_dim, v_heads * v_dim
+            conv = torch.nn.functional.silu(r["conv1d"])[:, :, :t].transpose(1, 2)
+            q, k, v = torch.split(conv, [key_dim, key_dim, value_dim], dim=-1)
+            rec(i, "gdn_q", q.reshape(1, t, key_dim))
+            rec(i, "gdn_k", k.reshape(1, t, key_dim))
+            rec(i, "gdn_v", v.reshape(1, t, value_dim))
+            rec(i, "gdn_out", r["gdn_out"].reshape(1, t, value_dim))
+            rec(i, "gdn_normed", r["gdn_normed"])
+
+    rec(None, "final_norm", final["norm"])
+    logits = final["norm"].float() @ model.lm_head.weight.float().T
+    rec(None, "logits", logits)
+
+    ordered: list[dict] = [o for o in ops if o["name"] == "embed"]
+    for i, layer in enumerate(text.layers):
+        order = (
+            QWEN3_5_MOE_FULL_ORDER
+            if layer.layer_type == "full_attention"
+            else QWEN3_5_MOE_GDN_ORDER
+        )
+        for name in order:
+            found = next(
+                (o for o in ops if o["layer"] == i and o["name"] == name), None
+            )
+            if found is None:
+                print(f"tiny_trace: no op {i} {name}", file=sys.stderr)
+                return 2
+            ordered.append(found)
+    ordered += [
+        o for o in ops if o["layer"] is None and o["name"] in ("final_norm", "logits")
+    ]
+    out = {
+        "family": "qwen3_5_moe",
+        "model_dir": model_dir.name,
+        "prompt_ids": ids,
+        "ops": ordered,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out) + "\n")
+    print(f"tiny_trace: wrote {len(out['ops'])} ops to {out_path}", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--model-dir", required=True, type=Path)
@@ -763,6 +1053,8 @@ def main() -> int:
     ids = [int(x) for x in args.prompt_ids.split(",")]
     if arch == "Qwen3_5ForConditionalGeneration":
         return trace_qwen3_5(args.model_dir, ids, args.out)
+    if arch == "Qwen3_5MoeForConditionalGeneration":
+        return trace_qwen3_5_moe(args.model_dir, ids, args.out)
     if arch != "GptOssForCausalLM":
         print(
             f"tiny_trace: unsupported architectures {cfg_json.get('architectures')}",

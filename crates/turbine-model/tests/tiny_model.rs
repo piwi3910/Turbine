@@ -8061,3 +8061,69 @@ fn qwen3_5_matches_reference() {
         failures.join("\n")
     );
 }
+
+/// P7 Task 34 (S-11): the tiny Qwen3.6 MoE hybrid — [`qwen3_5_matches_reference`]'s layer stack
+/// with a mixture-of-experts FFN (8 SwiGLU experts of width 32 behind `mlp.gate`, top-2 with
+/// renormalised softmax weights, and a shared expert of width 32 scaled by
+/// `sigmoid(x · shared_expert_gate)`) — on the CPU executor equals transformers (5.9.0, its
+/// torch GDN fallback) op by op on a 5-token prefill against the committed trace
+/// (`tests/fixtures/tiny-qwen3_5_moe-trace.json`, `scripts/golden/tiny_trace.py`'s `qwen3_5_moe`
+/// branch). Breaks if the router, the expert routing, the fused expert load or the shared-expert
+/// gate is off, on top of the dense hybrid's load-time de-interleave, per-head Q/K norm, partial
+/// RoPE, output gate, conv, recurrence and gated norm. The per-op bound is
+/// [`qwen3_5_matches_reference`]'s (max |d| over 2e-2 and nine tenths of the op's own largest
+/// value; the recurrence amplifies BF16 rounding, a structural error is O(value) and still
+/// fails).
+#[test]
+fn qwen3_5_moe_matches_reference() {
+    let reference = reference_trace("tiny-qwen3_5_moe-trace.json");
+    let tmp = TempDir::new("tiny-qwen35moe");
+    let spec = write_tiny_qwen3_5_moe(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv =
+        SequenceKv::new(&mem, spec.config.kv_layout(BLOCK_TOKENS), MAX_SEQ_LEN).expect("kv");
+    exec.set_trace(true);
+    let tokens = &reference.prompt;
+    let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+    kv.forward(&mut exec, tokens, &positions).expect("prefill");
+    let trace = exec.take_trace();
+
+    let mut worst: Vec<(String, f32)> = Vec::new();
+    let mut failures = Vec::new();
+    for ReferenceOp {
+        layer,
+        name,
+        shape,
+        data: want,
+    } in &reference.ops
+    {
+        let got = trace
+            .iter()
+            .find(|t| t.layer == *layer && t.name == name)
+            .unwrap_or_else(|| panic!("the executor did not record {layer:?} {name}"));
+        assert_eq!(&got.shape[..], &shape[..], "{layer:?} {name} shape");
+        let stats = turbine_model::testing::trace::DiffStats::of(want, &got.data);
+        worst.push((format!("{layer:?} {name}"), stats.max_abs));
+        let bad = stats.max_abs > 2e-2 && stats.max_abs > stats.max_ref * 0.9;
+        if bad {
+            failures.push(format!(
+                "{layer:?} {name}: max |d| {} ({} ulps), max |ref| {}",
+                stats.max_abs, stats.max_ulps, stats.max_ref
+            ));
+        }
+    }
+    println!(
+        "qwen3_5_moe_against_transformers ({} ops over {} layers):",
+        reference.ops.len(),
+        spec.config.num_layers
+    );
+    for (op, d) in &worst {
+        println!("  {op}: max |d| {d}");
+    }
+    assert!(
+        failures.is_empty(),
+        "op mismatch against transformers:\n{}",
+        failures.join("\n")
+    );
+}
