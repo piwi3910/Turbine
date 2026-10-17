@@ -4836,3 +4836,23 @@ The scheduler slot pool, the jump-forward refusal and the hybrid metrics scaffol
    slot allocation (`state_allocation`) stays as today. Conservative (charges every block's snapshot
    share), avoids OOM; `SnapshotPool` capacity = the snapshot-bearing full blocks the sized pool
    holds. Revisit with measured resident snapshot bytes if a separate tank term is warranted.
+
+## P7 Task 32 snapshot store — lead calls round 3 (2026-10-17)
+
+The `copy_state`, slot threading, hybrid L0 budget and snapshot plumbing landed; the store half and
+the S-12 test remain. Decisions:
+
+1. **Buffer handoff:** keep the one-time `ModelExecutor::set_state_snapshots(StateSnapshots)` handoff
+   (the buffer is KV-owned L0 memory, re-pointed if the pool moves) rather than a per-forward view;
+   `copy_state` keeps its decided signature and runs before the step.
+2. **Capacity:** one snapshot entry per L0 block (`SnapshotPool` sized to `pool.total_blocks()`) —
+   conservative, bounded, and avoids per-sequence fragmentation.
+3. **Boundary capture:** drive the GDN kernel's `boundary_states` with `boundary_tokens =
+   kv.block_tokens` (one contiguous boundary row per full block, covering chunked-prefill splits
+   that land on block boundaries) and STORE only the rows the interval rule wants — every
+   `hybrid_snapshot_interval_blocks`-th full block plus the sequence's last full block (interior rows
+   are captured and discarded; ~0.9 ms of device writes for a 16-block 9B prefill at 1 TB/s). The
+   store maps a boundary row to the block's `KvKey` and writes `Directory::set_snapshot`, so
+   `MatchedBlock.snapshot` is populated on later hits.
+4. **Entry lifetime:** the `SnapshotPool` lives with the KV hierarchy; freeing or evicting a block
+   releases its entry (the directory's free path), so a reused `BlockId` cannot return stale bytes.
