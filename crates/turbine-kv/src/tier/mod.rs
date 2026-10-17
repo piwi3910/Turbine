@@ -107,6 +107,11 @@ pub enum TierError {
 pub trait KvTier: Send + Sync {
     fn id(&self) -> TierId;
     fn enabled(&self) -> bool;
+    /// P7 S-12 (Task 33): the exact snapshot tail a hybrid block's record appends to its KV
+    /// bytes (0 for an attention-only model), so a slot can hold the whole record. Set once,
+    /// when the engine marks the model hybrid; a tier that sizes slots to the L0-format block
+    /// overrides it, the rest (which store any record as-is) ignore it.
+    fn set_snapshot_bytes(&self, _bytes: u64) {}
     fn capacity_bytes(&self) -> u64;
     fn used_bytes(&self) -> u64;
     fn pressure(&self) -> PressureState;

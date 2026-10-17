@@ -14,6 +14,7 @@
 //! protocol reserves slots of that size.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -106,6 +107,12 @@ pub struct L1PinnedTier {
     alloc: Arc<dyn PinnedMemory>,
     clock: Arc<dyn Clock>,
     state: Mutex<L1State>,
+    /// P7 S-12 (Task 33): the exact snapshot tail a hybrid block's record appends to
+    /// `block_bytes` (`0` for an attention-only model). The largest slot is
+    /// `block_bytes + snapshot_bytes`; set once, when the engine marks the model hybrid
+    /// ([`KvTier::set_snapshot_bytes`]). A slot is sized to the record it stores, so an
+    /// attention-only block still takes a `block_bytes` slot.
+    snapshot_bytes: AtomicU64,
 }
 
 fn encode(loc: Loc) -> TierSlot {
@@ -145,6 +152,7 @@ impl L1PinnedTier {
                 room_epoch: 0,
                 reformatted: 0,
             }),
+            snapshot_bytes: AtomicU64::new(0),
         }
     }
 
@@ -384,14 +392,23 @@ impl L1PinnedTier {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A block fits a slot when it is not empty and no larger than an L0-format block.
+    /// P7 S-12 (Task 33): the largest record a slot holds (`block_bytes` plus a hybrid block's
+    /// snapshot tail). A slot is sized to the record it stores, so an attention-only block still
+    /// takes a `block_bytes` slot.
+    pub(crate) fn max_record_bytes(&self) -> u64 {
+        self.cfg
+            .block_bytes
+            .saturating_add(self.snapshot_bytes.load(Ordering::Relaxed))
+    }
+
+    /// A block fits a slot when it is not empty and no larger than a full record.
     fn check_len(&self, len: usize) -> Result<(), TierError> {
-        if len > 0 && len as u64 <= self.cfg.block_bytes {
+        if len > 0 && len as u64 <= self.max_record_bytes() {
             Ok(())
         } else {
             Err(TierError::Io(format!(
                 "block is {len} bytes, L1 slots hold 1 to {} bytes",
-                self.cfg.block_bytes
+                self.max_record_bytes()
             )))
         }
     }
@@ -404,6 +421,11 @@ impl KvTier for L1PinnedTier {
 
     fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// P7 S-12 (Task 33): a hybrid block's record is `block_bytes + snapshot_bytes`.
+    fn set_snapshot_bytes(&self, bytes: u64) {
+        self.snapshot_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Usable bytes: whole slots in whole slabs up to `max_bytes` (0 when disabled).
@@ -514,7 +536,7 @@ impl KvTier for L1PinnedTier {
     fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
         let _ = format;
         let len = bytes as usize;
-        if !self.enabled || len == 0 || bytes > self.cfg.block_bytes {
+        if !self.enabled || len == 0 || bytes > self.max_record_bytes() {
             return 0;
         }
         let s = self.lock();
@@ -545,7 +567,7 @@ impl KvTier for L1PinnedTier {
     /// no reserved slot (a copy-stream write in flight); an empty one is reformatted at once.
     fn begin_drain(&self, bytes: u64) -> bool {
         let len = bytes as usize;
-        if !self.enabled || len == 0 || bytes > self.cfg.block_bytes {
+        if !self.enabled || len == 0 || bytes > self.max_record_bytes() {
             return false;
         }
         let mut s = self.lock();

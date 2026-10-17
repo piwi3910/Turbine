@@ -1115,8 +1115,22 @@ impl KvHierarchy {
             .iter()
             .map(|b| self.format_bytes(b.location.format))
             .collect();
-        let snapshots: Vec<Option<crate::state::SnapshotRef>> =
-            m.blocks.iter().map(|b| b.snapshot).collect();
+        // P7 S-12 (Task 33): a matched lower-tier block whose record carries a snapshot tail is
+        // a restorable snapshot at its promoted block. The planner only needs to see that one is
+        // there, so a tier block gets a provisional ref (entry `u32::MAX`) that
+        // [`KvHierarchy::resolve_tier_snapshot`] replaces with the promoted block's fresh entry.
+        let snapshots: Vec<Option<SnapshotRef>> = m
+            .blocks
+            .iter()
+            .map(|b| {
+                b.snapshot.or_else(|| {
+                    (b.location.snapshot_bytes > 0).then_some(SnapshotRef {
+                        block: BlockId(b.location.slot as u32),
+                        entry: u32::MAX,
+                    })
+                })
+            })
+            .collect();
         let inputs = PlanInputs {
             matched: &tiers,
             prompt_tokens: req.prompt.len() as u32,
@@ -1183,10 +1197,14 @@ impl KvHierarchy {
         }
         let mut blocks: SmallVec<[BlockId; 16]> = SmallVec::new();
         let mut promotions = Vec::new();
+        // P7 S-12 (Task 33): parallel to `blocks`, the fresh L0 snapshot entry a promoted block
+        // got (`None` for an L0 block or a promoted block without a snapshot tail).
+        let mut block_snapshots: SmallVec<[Option<SnapshotRef>; 16]> = SmallVec::new();
         let mut cut = k;
         for (i, mb) in m.blocks[..k].iter().enumerate() {
             if mb.tier == TierId::L0 {
                 blocks.push(BlockId(mb.location.slot as u32));
+                block_snapshots.push(mb.snapshot);
                 if self.prefetch.attached(&mb.key) {
                     self.metrics.prefetch_outcome(PrefetchOutcome::Used);
                 }
@@ -1224,6 +1242,7 @@ impl KvHierarchy {
                             .insert(t.id, (req.request, ids[0]));
                         promotions.push(ids[0]);
                         blocks.push(ids[0]);
+                        block_snapshots.push(snapshot);
                     }
                     Err(_) => {
                         pool.release(&ids);
@@ -1253,6 +1272,12 @@ impl KvHierarchy {
                 pool.release(&[s]);
             }
         }
+        // P7 S-12 (Task 33): resolve a tier hit's provisional snapshot ref to the promoted
+        // block's fresh L0 entry, so the scheduler restores the state from the promoted block
+        // instead of recomputing it. The planner already picked the snapshot's block index
+        // (`state_recompute_from`); a truncation above reset both fields, so a plan whose
+        // promotions fell short never restores.
+        self.resolve_tier_snapshot(&mut plan, &block_snapshots, bt);
         // P5p S-5: allocate the private tail block in the source's page class (a recent
         // window's BF16 source gets a window-class private block). On failure the plan falls
         // back to whole blocks — the tail is an optimization, never a requirement.
@@ -3660,6 +3685,15 @@ impl KvHierarchy {
     pub fn set_hybrid_state(&mut self, layout: turbine_core::types::StateLayout, blocks: u32) {
         self.cfg.hybrid = true;
         self.snapshot_pool = Some(SnapshotPool::new(layout, blocks));
+        // P7 S-12 (Task 33): a hybrid block's tier record is `[kv][snapshot]`, so the lower
+        // tiers must size a slot for the whole record (`block_bytes + bytes_per_sequence`).
+        let snapshot_bytes = layout.bytes_per_sequence();
+        if let Some(l1) = self.l1.as_ref() {
+            l1.set_snapshot_bytes(snapshot_bytes);
+        }
+        if let Some(l2) = self.l2.as_ref() {
+            l2.set_snapshot_bytes(snapshot_bytes);
+        }
     }
 
     /// P7 S-12 (Task 33): enables copying a block's snapshot tail into its tier record on
@@ -3709,6 +3743,38 @@ impl KvHierarchy {
     pub fn snapshot_record(&mut self, block: BlockId, snapshot: SnapshotRef) {
         if let Some(key) = self.l0_keys.get(&block).copied() {
             self.dir.set_snapshot(&key, Some(snapshot));
+        }
+    }
+
+    /// P7 S-12 (Task 33): resolves a tier hit's provisional snapshot ref (entry `u32::MAX`,
+    /// [`KvHierarchy::attach_prefix`]) to the promoted block's fresh L0 entry, so the scheduler
+    /// restores the state from the promoted block instead of recomputing it. The planner already
+    /// picked the snapshot block's index (`state_recompute_from − 1`), parallel to
+    /// `block_snapshots` (the plan's blocks). An L0 snapshot (a real entry) or a plan without one
+    /// is left untouched; a promoted block that got no fresh entry (a full snapshot pool) falls
+    /// back to recomputing the state from zero.
+    fn resolve_tier_snapshot(
+        &self,
+        plan: &mut KvPlan,
+        block_snapshots: &[Option<SnapshotRef>],
+        block_tokens: u32,
+    ) {
+        let Some(from) = plan.state_recompute_from else {
+            return;
+        };
+        let idx = from as usize;
+        if idx == 0 || !plan.state_snapshot.is_some_and(|r| r.entry == u32::MAX) {
+            return;
+        }
+        match block_snapshots.get(idx - 1).copied().flatten() {
+            Some(fresh) => plan.state_snapshot = Some(fresh),
+            None => {
+                plan.state_snapshot = None;
+                plan.state_recompute_from = Some(0);
+                plan.recompute_tokens = plan
+                    .recompute_tokens
+                    .saturating_add(from.saturating_mul(block_tokens));
+            }
         }
     }
 
@@ -4444,6 +4510,110 @@ pub(crate) mod tests {
         }
         assert_eq!(r.h.snapshot_bytes(TierId::L0), 0, "no L0 entries left");
         assert_eq!(r.h.snapshot_bytes(TierId::L2), 0, "no L2 tails left");
+    }
+
+    /// P7 S-12 (Task 33): a pure lower-tier prefix hit promotes a snapshot-bearing block and the
+    /// plan restores its snapshot — `plan.state_snapshot` names the promoted L0 block's fresh
+    /// entry (not the tier record, and not a recompute from zero) and the state recompute starts
+    /// at that block's boundary. Breaks if the planner sees no snapshot for a tier block, or the
+    /// ref is left pointing at the tier record.
+    #[test]
+    fn tier_hit_restores_promoted_snapshot() {
+        use crate::state::{MemSnapshotStore, SnapshotStore};
+        use turbine_core::config::ModuleName;
+        use turbine_core::types::{StateDtype, StateLayout};
+
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let fmt = fmt16();
+        let bb = fmt.layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc.clone()));
+        let mut r = rig_tiers("cost_aware", 8, Some(l1.clone()), None, clock, |kv| {
+            kv.cpu.format = ModuleName::new("l0").expect("l0");
+        });
+
+        let layout = StateLayout {
+            linear_layers: 4,
+            recurrent_bytes_per_layer: 1024,
+            conv_bytes_per_layer: 512,
+            dtype: Some(StateDtype::F32),
+        };
+        let entry = layout.bytes_per_sequence();
+        let blocks = r.pool.total_blocks();
+        r.h.set_hybrid_state(layout, blocks);
+        r.h.set_snapshot_tier_travel(true);
+        let store = MemSnapshotStore::new(blocks, entry);
+        r.backend.set_snapshot_store(store.clone());
+
+        // Two full 16-token blocks cached, each carrying its own known snapshot pattern.
+        let prompt: Vec<u32> = (0..40).collect();
+        run(&mut r, &prompt);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &prompt, 16);
+        assert_eq!(keys.len(), 2, "40 tokens = 2 full blocks + a partial");
+        let pattern = |b: u32| -> Vec<u8> {
+            (0..entry as usize)
+                .map(|i| ((i + b as usize * 7) % 251) as u8)
+                .collect()
+        };
+        let mut patterns = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            let block = BlockId(r.h.dir.get(k).unwrap().location(TierId::L0).unwrap().slot as u32);
+            let snap = r.h.snapshot_alloc(block).expect("a snapshot entry");
+            let p = pattern(i as u32);
+            store.write(snap.entry, &p).expect("write the pattern");
+            r.h.snapshot_record(block, snap);
+            patterns.push(p);
+        }
+
+        // Demote both blocks to L1: no L0 copy (and no directory snapshot) is left, so a hit is a
+        // pure lower-tier hit whose only snapshot is the tier record's exact tail.
+        for k in &keys {
+            assert!(r.h.submit_demotion(&mut r.pool, *k, TierId::L0, TierId::L1));
+        }
+        settle(&mut r);
+        assert_eq!(r.h.snapshot_bytes(TierId::L0), 0, "no L0 entries left");
+        assert_eq!(
+            r.h.snapshot_bytes(TierId::L1),
+            2 * entry,
+            "both tails in L1"
+        );
+
+        // The hit promotes the blocks and restores the nearest snapshot at the cutoff — the last
+        // promoted block — into the sequence's slot instead of recomputing the state.
+        let id = RequestId::new_v4();
+        assert_eq!(attach(&mut r, id, &prompt), AttachOutcome::Promoting);
+        let mut ready = Vec::new();
+        for _ in 0..8 {
+            r.clock.advance(Duration::from_millis(10));
+            ready = r.h.poll(&mut r.pool, &mut r.backend);
+            if !ready.is_empty() {
+                break;
+            }
+        }
+        let (_, a) = ready.pop().expect("the promotions landed");
+        let cut = a.plan.cutoff_blocks();
+        assert!(cut >= 1, "the tier blocks are promoted");
+        let snapshot = a
+            .plan
+            .state_snapshot
+            .expect("a tier hit restores the promoted block's snapshot");
+        let last = a.blocks[cut as usize - 1];
+        assert_eq!(snapshot.block, last, "the ref names the promoted L0 block");
+        assert_eq!(
+            a.plan.state_recompute_from,
+            Some(cut),
+            "the state recompute starts at the restored block's boundary"
+        );
+        let mut out = vec![0u8; entry as usize];
+        store
+            .read(snapshot.entry, &mut out)
+            .expect("read the promoted entry");
+        assert_eq!(
+            out,
+            patterns[cut as usize - 1],
+            "the promoted entry holds the tail"
+        );
     }
 
     /// The mechanism (leaf-first chain, copy then free, promotion before reuse) holds whatever
