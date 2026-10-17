@@ -47,7 +47,8 @@ use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_quantized,
     write_tiny_family_with_head_dim, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
     write_tiny_olmoe_quantized, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
-    write_tiny_qwen3_5, write_tiny_qwen3_5_with, write_tiny_qwen3moe_quantized,
+    write_tiny_qwen3_5, write_tiny_qwen3_5_moe, write_tiny_qwen3_5_with,
+    write_tiny_qwen3moe_quantized,
 };
 use turbine_model::testing::trace::{
     DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
@@ -4885,6 +4886,7 @@ fn decoder_spec(cfg: &ModelArchConfig) -> DecoderSpec {
         "qwen3" => families::qwen3::decoder_spec(),
         "gpt_oss" => families::gpt_oss::decoder_spec(),
         "qwen3_5" => families::qwen3_5::decoder_spec(),
+        "qwen3_5_moe" => families::qwen3_5_moe::decoder_spec(),
         other => panic!("no tiny decoder spec for family {other}"),
     }
 }
@@ -7675,6 +7677,22 @@ fn weights_skipped_logged_for_vision_and_mtp() {
 fn qwen3_5_tiny_builds() {
     let tmp = TempDir::new("tiny-qwen35-build");
     let spec = write_tiny_qwen3_5(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let _ = cpu_decoder(&spec, &mem);
+}
+
+/// P7 Task 34 (S-11): the tiny Qwen3.6 MoE hybrid (the tiny Qwen3.5 layer stack with a
+/// mixture-of-experts FFN: 8 SwiGLU experts of width 32 behind `mlp.gate`, top-2 with
+/// renormalised softmax weights, and a shared expert of width 32 scaled by
+/// `sigmoid(x · shared_expert_gate)`) builds on the CPU executor's shared-expert path.
+#[test]
+fn qwen3_5_moe_tiny_builds() {
+    let tmp = TempDir::new("tiny-qwen35moe-build");
+    let spec = write_tiny_qwen3_5_moe(tmp.path(), SEED);
+    assert_eq!(spec.config.family.0.name(), "qwen3_5_moe");
+    let moe = spec.config.moe.expect("MoE config");
+    assert_eq!((moe.num_experts, moe.experts_per_token), (8, 2));
+    assert_eq!(moe.shared_inter, Some(32));
     let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
     let _ = cpu_decoder(&spec, &mem);
 }

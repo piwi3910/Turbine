@@ -69,6 +69,10 @@ const S_UP: usize = 5;
 const S_DOWN: usize = 6;
 const ACT_GATE_UP: usize = 7;
 const ACT_DOWN: usize = 8;
+/// Tensors a [`Moe`] with `shared` appends to [`HookWeights`], in order: `shared_w_gate`
+/// `[shared_inter, hidden]`, `shared_w_up`, `shared_w_down` `[hidden, shared_inter]` and
+/// `shared_gate_w` `[hidden]`.
+const SHARED_TENSORS: usize = 4;
 /// Parameter indices of [`HookWeights`] of a gpt-oss layer ([`Style::GptOss`]): the router
 /// `[experts, hidden]` (index 0 as above) and its F32 bias `[experts]`, then per fused
 /// projection its U8 MXFP4 data `[experts, n, k/2]`, E8M0 scales `[experts, n, k/32]` and bias
@@ -109,16 +113,30 @@ enum Style {
 /// The sparse mixture of experts.
 pub struct Moe {
     style: Style,
+    /// The block also runs a shared expert (`mlp.shared_expert.*` + `mlp.shared_expert_gate`),
+    /// scaled by `sigmoid(x · shared_expert_gate)` and added to the routed experts' output
+    /// (Qwen3.5/3.6 MoE, P7 S-11). The kernel adds it once per call, so it is passed to the one
+    /// call of a single-device layer.
+    shared: bool,
 }
 
 /// The [`Moe`] hook: SwiGLU experts.
 pub const MOE: &dyn FfnHook = &Moe {
     style: Style::SwiGlu,
+    shared: false,
+};
+
+/// The [`Moe`] hook of a family with a shared expert (Qwen3.5/3.6 MoE, [`Style::SwiGlu`] plus
+/// `mlp.shared_expert.*`).
+pub const MOE_SHARED: &dyn FfnHook = &Moe {
+    style: Style::SwiGlu,
+    shared: true,
 };
 
 /// The [`Moe`] hook of gpt-oss ([`Style::GptOss`]).
 pub const MOE_GPT_OSS: &dyn FfnHook = &Moe {
     style: Style::GptOss,
+    shared: false,
 };
 
 impl Style {
@@ -183,33 +201,42 @@ fn route_cfg(d: &DecoderDims, moe: &MoeConfig, style: Style) -> MoeRouteConfig {
 }
 
 /// The `moe_experts` call over the local experts `[begin, end)`.
-fn experts_cfg(
-    d: &DecoderDims,
-    moe: &MoeConfig,
-    (begin, end): (u32, u32),
-    style: Style,
-) -> MoeExpertsConfig {
-    let gpt_oss = style == Style::GptOss;
-    MoeExpertsConfig {
-        hidden: d.hidden as u32,
-        inter: moe.expert_intermediate,
-        num_experts: moe.num_experts,
-        top_k: moe.experts_per_token,
-        expert_begin: begin,
-        expert_end: end,
-        dtype: d.act,
-        // A format without a row never gets here (`check_weight_format`).
-        weight_dtype: style.weight_dtype(d.quant).unwrap_or(ExpertDtype::Bf16),
-        activation: if gpt_oss {
-            ExpertActivation::GptOssClamp {
-                limit: GPT_OSS_SWIGLU_LIMIT,
-            }
-        } else {
-            ExpertActivation::SwiGlu
-        },
-        biases: gpt_oss,
-        gate_up_interleaved: gpt_oss,
-        ..Default::default()
+impl Moe {
+    fn experts_cfg(
+        &self,
+        d: &DecoderDims,
+        moe: &MoeConfig,
+        (begin, end): (u32, u32),
+    ) -> MoeExpertsConfig {
+        let style = self.style;
+        let gpt_oss = style == Style::GptOss;
+        MoeExpertsConfig {
+            hidden: d.hidden as u32,
+            inter: moe.expert_intermediate,
+            num_experts: moe.num_experts,
+            top_k: moe.experts_per_token,
+            expert_begin: begin,
+            expert_end: end,
+            dtype: d.act,
+            // A format without a row never gets here (`check_weight_format`).
+            weight_dtype: style.weight_dtype(d.quant).unwrap_or(ExpertDtype::Bf16),
+            activation: if gpt_oss {
+                ExpertActivation::GptOssClamp {
+                    limit: GPT_OSS_SWIGLU_LIMIT,
+                }
+            } else {
+                ExpertActivation::SwiGlu
+            },
+            biases: gpt_oss,
+            gate_up_interleaved: gpt_oss,
+            // The shared expert is added once per call, so a split (expert-parallel) call must
+            // not carry it (`check` refuses a shared hook under EP).
+            shared_inter: if self.shared && d.ep.is_none() {
+                moe.shared_inter
+            } else {
+                None
+            },
+        }
     }
 }
 
@@ -480,7 +507,21 @@ impl FfnHook for Moe {
     }
 
     fn check(&self, d: &DecoderDims) -> Result<(), ModelError> {
-        moe_of(d).map(drop)
+        let moe = moe_of(d)?;
+        if self.shared {
+            if d.ep.is_some() {
+                return Err(invalid(
+                    "a shared expert is not implemented under expert parallelism".into(),
+                ));
+            }
+            if moe.shared_inter.is_none() {
+                return Err(invalid(
+                    "the shared-expert hook needs a config with shared_expert_intermediate_size"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The F32-output router GEMM, `moe_route` and `moe_experts`; nothing for a config without
@@ -495,7 +536,7 @@ impl FfnHook for Moe {
         ];
         for layer in 0..d.layers {
             for run in local_runs(d, &moe, layer) {
-                let op = OpConfig::MoeExperts(experts_cfg(d, &moe, run, self.style));
+                let op = OpConfig::MoeExperts(self.experts_cfg(d, &moe, run));
                 if !ops.contains(&op) {
                     ops.push(op);
                 }
@@ -603,6 +644,29 @@ impl FfnHook for Moe {
             let down = down.input_scale.expect("fp8 tensor input scale");
             tensors.push(upload_f32(&mem, &down)?);
         }
+        if self.shared {
+            // The shared expert's SwiGLU weights and its scalar gate, BF16 (the kernel adds it
+            // in the activation dtype: a quantized checkpoint's shared expert is dequantized on
+            // load, not run as its own qgemm). Appended in [`SHARED_TENSORS`] order.
+            let si = moe
+                .shared_inter
+                .expect("the shared-expert hook checks shared_inter") as usize;
+            let sp = format!("{prefix}.mlp.shared_expert");
+            let gate =
+                d.take_weight(weights, &format!("{sp}.gate_proj.weight"), &[si, d.hidden])?;
+            let up = d.take_weight(weights, &format!("{sp}.up_proj.weight"), &[si, d.hidden])?;
+            let down =
+                d.take_weight(weights, &format!("{sp}.down_proj.weight"), &[d.hidden, si])?;
+            // `shared_expert_gate` is `[1, hidden]` in the checkpoint; the kernel reads `[hidden]`.
+            let gate_w = take_fused(
+                weights,
+                &format!("{prefix}.mlp.shared_expert_gate.weight"),
+                d.act,
+                &[1, d.hidden],
+                &[d.hidden],
+            )?;
+            tensors.extend([gate, up, down, gate_w]);
+        }
         Ok(HookWeights::tensors(tensors))
     }
 
@@ -663,7 +727,7 @@ impl FfnHook for Moe {
         }
         let calls: Vec<MoeExpertsConfig> = local_runs(d, &moe, run.layer)
             .into_iter()
-            .map(|r| experts_cfg(d, &moe, r, self.style))
+            .map(|r| self.experts_cfg(d, &moe, r))
             .collect();
         // The group sizes on the host (a blocking read of experts + 1 ints), only when the
         // provider of a call needs them for this many routed rows.
@@ -701,13 +765,16 @@ impl FfnHook for Moe {
         // Each call adds its experts' weighted outputs in ascending expert order, so the calls
         // in ascending order add a token's experts in ascending order (one device's).
         let mut local = 0;
+        // The shared expert appends its tensors after the routed parameters ([`SHARED_TENSORS`]
+        // of them): the fixed indices below (the fp8 scales/activations) must not read them.
+        let base = w.0.len() - if self.shared { SHARED_TENSORS } else { 0 };
         for experts in calls {
             let n = experts.num_local_experts() as usize;
             let weight = |i: usize| w.0[i].view().rows(local, n);
-            let quantized = |i: usize| w.0.get(i).map(|t| t.view().rows(local, n));
+            let quantized = |i: usize| (i < base).then(|| w.0[i].view().rows(local, n));
             // gpt-oss: the fused gate/up stack stands for both (`w_up` is unused when the gate
             // and up rows are interleaved).
-            let (w_gate, w_up, w_down, extra) = match self.style {
+            let (w_gate, w_up, w_down, mut extra) = match self.style {
                 Style::SwiGlu => (
                     weight(W_GATE),
                     weight(W_UP),
@@ -734,6 +801,15 @@ impl FfnHook for Moe {
                     },
                 ),
             };
+            // The shared expert is added once per call: the one call of a single-device layer
+            // (its weights are the last [`SHARED_TENSORS`] of the layer, BF16).
+            if self.shared && local == 0 {
+                let s = w.0.len() - SHARED_TENSORS;
+                extra.shared_w_gate = Some(w.0[s].view());
+                extra.shared_w_up = Some(w.0[s + 1].view());
+                extra.shared_w_down = Some(w.0[s + 2].view());
+                extra.shared_gate_w = Some(w.0[s + 3].view());
+            }
             run.op(OpConfig::MoeExperts(experts), || {
                 run.registry
                     .moe_experts(&experts)
@@ -770,7 +846,7 @@ impl FfnHook for Moe {
         (0..d.layers)
             .flat_map(|layer| local_runs(d, &moe, layer))
             .all(|run| {
-                let c = experts_cfg(d, &moe, run, self.style);
+                let c = self.experts_cfg(d, &moe, run);
                 !registry
                     .moe_experts(&c)
                     .needs_host_offsets(&c, c.routed_rows(rows))

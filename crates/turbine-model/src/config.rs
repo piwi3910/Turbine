@@ -134,6 +134,9 @@ pub struct MoeConfig {
     pub expert_intermediate: u32,
     /// Renormalise the selected top-k softmax weights to sum to 1 (`false` for OLMoE).
     pub norm_topk_prob: bool,
+    /// Width of the shared expert added to every token (`shared_expert_intermediate_size`,
+    /// Qwen3.5/3.6 MoE, P7 S-11); `None` for a family without one.
+    pub shared_inter: Option<u32>,
 }
 
 /// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers (P7 S-11):
@@ -459,7 +462,10 @@ struct RawConfig {
     num_key_value_heads: Option<u32>,
     #[serde(default)]
     head_dim: Option<u32>,
-    intermediate_size: u32,
+    /// The dense MLP's width. A mixture of experts may omit it (Qwen3.6 MoE carries only
+    /// `moe_intermediate_size`); the family's expert width is then the model's.
+    #[serde(default)]
+    intermediate_size: Option<u32>,
     rms_norm_eps: f32,
     #[serde(default)]
     rope_theta: Option<f64>,
@@ -602,7 +608,9 @@ pub fn load_model_config_with(
         ("num_hidden_layers", raw.num_hidden_layers),
         ("hidden_size", raw.hidden_size),
         ("head_dim", head_dim),
-        ("intermediate_size", raw.intermediate_size),
+        // A mixture of experts may omit `intermediate_size` (Qwen3.6 MoE carries only
+        // `moe_intermediate_size`); its value is resolved from the family below.
+        ("intermediate_size", raw.intermediate_size.unwrap_or(1)),
         ("vocab_size", raw.vocab_size),
         ("max_position_embeddings", raw.max_position_embeddings),
     ] {
@@ -665,9 +673,12 @@ pub fn load_model_config_with(
 
     // A mixture of experts reports its experts' width as the model's intermediate size
     // (Qwen3-MoE's dense `intermediate_size` is unused; OLMoE's and Mixtral's are the experts').
-    let intermediate = family_cfg
-        .moe
-        .map_or(raw.intermediate_size, |m| m.expert_intermediate);
+    // Qwen3.6 MoE omits `intermediate_size` entirely: the family's expert width is the model's.
+    let intermediate = match (family_cfg.moe, raw.intermediate_size) {
+        (Some(m), _) => m.expert_intermediate,
+        (None, Some(dense)) => dense,
+        (None, None) => return Err(invalid("missing field `intermediate_size`".to_string())),
+    };
     // Every weight size and offset (slots, stacks, buffers, the total in `shape`) is computed in
     // `usize` from these dimensions: refuse a config whose weights could not be addressed at 4
     // bytes per element (an upper bound on every model's parameters, so nothing below can wrap).
@@ -1131,6 +1142,7 @@ mod tests {
                 experts_per_token: 8,
                 expert_intermediate: 1024,
                 norm_topk_prob: false,
+                shared_inter: None,
             })
         );
         assert!(cfg.qk_norm);
@@ -1383,7 +1395,8 @@ mod tests {
              families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
              qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
              (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), qwen3_5 \
-             (Qwen3_5ForConditionalGeneration)"
+             (Qwen3_5ForConditionalGeneration), qwen3_5_moe \
+             (Qwen3_5MoeForConditionalGeneration)"
         );
         fs::remove_dir_all(dir).unwrap();
 
@@ -2054,6 +2067,7 @@ mod tests {
                 experts_per_token: 8,
                 expert_intermediate: 768,
                 norm_topk_prob: true,
+                shared_inter: None,
             })
         );
         // The experts' width, not the unused dense intermediate_size (6144).
@@ -2082,6 +2096,7 @@ mod tests {
                 experts_per_token: 2,
                 expert_intermediate: 14_336,
                 norm_topk_prob: true,
+                shared_inter: None,
             })
         );
         assert!(!mixtral.qk_norm_per_head && !mixtral.qk_norm);
@@ -2090,6 +2105,52 @@ mod tests {
             mixtral.kv_layout(128).block_bytes(),
             128 * 2 * 8 * 128 * 2 * 32
         );
+
+        // The Phase 7 Qwen3.6 MoE hybrid (S-11): the dense Qwen3.5 layer stack (Gated DeltaNet
+        // + gated full attention, `full_attention_interval` 4) with a 256-expert MoE and a
+        // shared expert, from the pinned FP8 checkpoint's real `config.json`.
+        let qwen35moe = load_model_config(&family_fixture("qwen3.6-35b-a3b-fp8")).unwrap();
+        assert_eq!(qwen35moe.family.0.name(), "qwen3_5_moe");
+        assert_eq!(
+            qwen35moe.hf_architecture,
+            "Qwen3_5MoeForConditionalGeneration"
+        );
+        assert_eq!((qwen35moe.num_layers, qwen35moe.hidden), (40, 2048));
+        assert_eq!(
+            (
+                qwen35moe.num_attention_heads,
+                qwen35moe.num_kv_heads,
+                qwen35moe.head_dim
+            ),
+            (16, 2, 256)
+        );
+        assert_eq!(
+            qwen35moe.moe,
+            Some(MoeConfig {
+                num_experts: 256,
+                experts_per_token: 8,
+                expert_intermediate: 512,
+                norm_topk_prob: true,
+                shared_inter: Some(512),
+            })
+        );
+        assert_eq!(
+            qwen35moe.gdn,
+            Some(crate::config::GdnDims {
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+            })
+        );
+        assert_eq!(qwen35moe.full_attention_interval, Some(4));
+        assert!(qwen35moe.attn_output_gate && qwen35moe.unit_offset_norms);
+        assert!(qwen35moe.qk_norm_per_head && !qwen35moe.qk_norm);
+        assert!(!qwen35moe.tie_word_embeddings);
+        assert_eq!(qwen35moe.vocab_size, 248_320);
+        assert_eq!(qwen35moe.rope_theta, 10_000_000.0);
+        assert_eq!(qwen35moe.rotary_dim, 64);
     }
 
     /// Features no executor implements are refused naming the key (kept as the run-ahead

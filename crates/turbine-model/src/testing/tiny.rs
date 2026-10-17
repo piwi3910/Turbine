@@ -474,6 +474,89 @@ fn qwen3_5_config_json() -> serde_json::Value {
     })
 }
 
+/// Writes the tiny `Qwen3_5MoeForConditionalGeneration` checkpoint into `dir` (Phase 7 S-11):
+/// [`write_tiny_qwen3_5`]'s layer stack (8 layers, `full_attention_interval` 4, Gated DeltaNet
+/// layers and gated full-attention layers) with a mixture-of-experts FFN: 8 SwiGLU experts of
+/// width 32 per layer behind a `mlp.gate` router with top-2 routing and softmax renormalisation,
+/// plus a shared expert of width 32 scaled by `sigmoid(x · shared_expert_gate)`. The tensors are
+/// named as `Qwen/Qwen3.6-35B-A3B-FP8` stores them, under `model.language_model`. Same files
+/// and determinism as [`write_tiny_llama_with`].
+pub fn write_tiny_qwen3_5_moe(dir: &Path, seed: u64) -> TinySpec {
+    write_tiny_qwen3_5_moe_with(dir, seed, &TinyOptions::default())
+}
+
+/// [`write_tiny_qwen3_5_moe`] with extra files and tensors ([`TinyOptions::extra`]).
+pub fn write_tiny_qwen3_5_moe_with(dir: &Path, seed: u64, extra: &TinyOptions) -> TinySpec {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        head_dim: 64,
+        extra: extra.extra.clone(),
+        omit: extra.omit.clone(),
+        ship_lm_head: extra.ship_lm_head,
+    };
+    write_tiny_slots(
+        dir,
+        seed,
+        &qwen3_5_moe_config_json(),
+        &opts,
+        Some(crate::families::qwen3_5_moe::qwen3_5_moe_checkpoint_slots),
+    )
+}
+
+/// `config.json` of [`write_tiny_qwen3_5_moe`]: the keys of `Qwen/Qwen3.6-35B-A3B-FP8` at tiny
+/// size, under the multimodal wrapper's `text_config`.
+fn qwen3_5_moe_config_json() -> serde_json::Value {
+    let text = json!({
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe_text",
+        "attention_bias": false,
+        "attn_output_gate": true,
+        "bos_token_id": BOS.1,
+        "eos_token_id": TINY_EOS,
+        "full_attention_interval": 4,
+        "head_dim": 64,
+        "hidden_act": "silu",
+        "hidden_size": 64,
+        "initializer_range": 0.02,
+        "intermediate_size": 128,
+        "layer_types": [
+            "linear_attention", "linear_attention", "linear_attention", "full_attention",
+            "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        ],
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_value_head_dim": 8,
+        "mamba_ssm_dtype": "float32",
+        "max_position_embeddings": TINY_MAX_POSITIONS,
+        "moe_intermediate_size": 32,
+        "num_attention_heads": 4,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 8,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000,
+            "partial_rotary_factor": 0.25,
+        },
+        "shared_expert_intermediate_size": 32,
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "use_cache": true,
+        "vocab_size": TINY_VOCAB,
+    });
+    json!({
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "model_type": "qwen3_5_moe",
+        "text_config": text,
+        "tie_word_embeddings": false,
+    })
+}
+
 /// Writes the tiny `GptOssForCausalLM` checkpoint into `dir` (Phase 7 S-8): 4 layers alternating
 /// a sliding window of `sliding_window` positions (layers 0 and 2) and full attention, hidden
 /// 64, 4 query / 2 KV heads of dimension 64 with biased projections and one sink logit per
@@ -1131,6 +1214,7 @@ mod tests {
                 experts_per_token: 2,
                 expert_intermediate: 32,
                 norm_topk_prob: false,
+                shared_inter: None,
             })
         );
         assert!(cfg.qk_norm);
