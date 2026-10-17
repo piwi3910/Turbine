@@ -925,8 +925,8 @@ pub(crate) fn linear_layers(cfg: &ModelArchConfig) -> usize {
 
 /// Device bytes of a hybrid family's Gated DeltaNet buffers (P7 S-11): the per-token
 /// projections, the conv output, the gate/decay inputs and their F32 host round trip, plus
-/// `linear_layers × max_seqs` recurrent (F32) and convolution states and the per-layer slot
-/// table (I32).
+/// `linear_layers × max_seqs` recurrent (F32) and convolution states, the per-layer slot
+/// table (I32), and the per-block boundary rows a prefill chunk snapshots (P7 S-12 Task 33).
 fn gdn_workspace_bytes(cfg: &ModelArchConfig, d: &DecoderDims, limits: ExecutorLimits) -> u64 {
     let Some(g) = d.gdn else {
         return 0;
@@ -938,7 +938,13 @@ fn gdn_workspace_bytes(cfg: &ModelArchConfig, d: &DecoderDims, limits: ExecutorL
     let layers = linear_layers(cfg) as u64;
     let per_token = es * (2 * g.conv_dim() + 2 * g.value_dim() + 2 * g.v_heads as usize) as u64
         + f32 * 2 * u64::from(g.v_heads);
-    t * per_token + layers * n * (g.recurrent_bytes() + g.conv_bytes()) + 4 * layers * n
+    // Boundary rows: one per full block of a chunk, `linear_layers · max_batch_tokens /
+    // block_tokens` of them, each a recurrent state (F32) and a conv tail (activation dtype).
+    let rows = (u64::from(limits.max_batch_tokens) / u64::from(limits.block_tokens.max(1))).max(1);
+    let state_elems = u64::from(g.v_heads) * u64::from(g.v_dim) * u64::from(g.k_dim);
+    let conv_elems = g.conv_dim() as u64 * u64::from(g.conv_kernel.saturating_sub(1));
+    let boundary = layers * rows * (f32 * state_elems + es * conv_elems);
+    t * per_token + layers * n * (g.recurrent_bytes() + g.conv_bytes()) + 4 * layers * n + boundary
 }
 
 /// Whether a checkpoint weight is an RMSNorm weight (the `(1 + weight)` offset applies to it):
@@ -1215,6 +1221,21 @@ pub struct DecoderExecutor {
     /// P7 S-12: the snapshot boundaries this step must fill after the state is final,
     /// `(sequence, slot, entries)`.
     pending_snapshots: PendingSnapshots,
+    /// P7 S-12 (Task 33): the per-block boundary states the Gated DeltaNet and conv1d kernels
+    /// write for the full blocks *inside* a prefill chunk, F32
+    /// `[linear_layers · max_rows, v_heads, v_dim, k_dim]`; `None` without linear layers. A
+    /// snapshot request for an interior block boundary reads its row here instead of the live
+    /// slot (whose state is only the step's end).
+    boundary_state: Option<Tensor>,
+    /// The conv window tails at the same boundaries, `[linear_layers · max_rows, conv_dim,
+    /// kernel − 1]` in the activation dtype; `None` without linear layers.
+    boundary_conv: Option<Tensor>,
+    /// Rows the boundary buffers hold (`max_batch_tokens / block_tokens`, at least 1).
+    boundary_max_rows: usize,
+    /// This step captures boundary rows (a prefill with an interior snapshot request).
+    boundary_capture: bool,
+    /// The step's total boundary rows across its sequences.
+    boundary_rows: u32,
 }
 
 impl DecoderExecutor {
@@ -1771,6 +1792,37 @@ impl DecoderExecutor {
                 beta: Tensor::empty(&mem, &[t, g.v_heads as usize], DType::F32)?,
             }),
         };
+        // P7 S-12 (Task 33): one boundary row per full block of a prefill chunk, per linear
+        // layer. A chunk holds at most `max_batch_tokens / block_tokens` full blocks, and the
+        // layer's rows are contiguous, so a `[layers · max_rows, ...]` buffer views cleanly.
+        let boundary_max_rows = (t / limits.layout.block_tokens.max(1) as usize).max(1);
+        let (boundary_state, boundary_conv) = match d.gdn {
+            None => (None, None),
+            Some(g) => {
+                let layers = linear_layers(cfg);
+                (
+                    Some(Tensor::empty(
+                        &mem,
+                        &[
+                            layers * boundary_max_rows,
+                            g.v_heads as usize,
+                            g.v_dim as usize,
+                            g.k_dim as usize,
+                        ],
+                        DType::F32,
+                    )?),
+                    Some(Tensor::empty(
+                        &mem,
+                        &[
+                            layers * boundary_max_rows,
+                            g.conv_dim(),
+                            (g.conv_kernel - 1) as usize,
+                        ],
+                        d.act,
+                    )?),
+                )
+            }
+        };
         let bufs = Buffers {
             inv_freq,
             x: act(d.hidden)?,
@@ -1874,6 +1926,11 @@ impl DecoderExecutor {
             snapshots: None,
             state_written: Vec::new(),
             pending_snapshots: Vec::new(),
+            boundary_state,
+            boundary_conv,
+            boundary_max_rows,
+            boundary_capture: false,
+            boundary_rows: 0,
         })
     }
 
@@ -2852,6 +2909,39 @@ impl DecoderExecutor {
             &[p.num_seqs],
             DType::I32,
         );
+        // P7 S-12 (Task 33): this layer's boundary rows for the step, when a snapshot request
+        // falls on a full block inside the prefill chunk. The kernel counts boundary rows from
+        // the chunk start, so row `o / block_tokens − 1` holds the state after `o` chunk tokens;
+        // the engine only asks for offsets on a block boundary of a block-aligned chunk.
+        let (boundary_states, boundary_conv_states, boundary_tokens) = if self.boundary_capture {
+            let rows = self.boundary_rows as usize;
+            let max_rows = self.boundary_max_rows;
+            let linear_layer = l.slot_base / self.limits.max_seqs as usize;
+            let state_elems = g.v_heads as usize * g.v_dim as usize * g.k_dim as usize;
+            let conv_elems = g.conv_dim() * (g.conv_kernel as usize - 1);
+            let vh = g.v_heads as usize;
+            let vd = g.v_dim as usize;
+            let kd = g.k_dim as usize;
+            let bs = self.boundary_state.as_ref().map(|buf| {
+                TensorView::contiguous(
+                    buf.storage.whole(),
+                    linear_layer * max_rows * state_elems,
+                    &[rows, vh, vd, kd],
+                    DType::F32,
+                )
+            });
+            let bc = self.boundary_conv.as_ref().map(|buf| {
+                TensorView::contiguous(
+                    buf.storage.whole(),
+                    linear_layer * max_rows * conv_elems,
+                    &[rows, g.conv_dim(), g.conv_kernel as usize - 1],
+                    d.act,
+                )
+            });
+            (bs, bc, self.limits.layout.block_tokens)
+        } else {
+            (None, None, 0)
+        };
 
         // in_proj_qkv → causal conv1d (silu) → q | k | v.
         let conv_in = at(&gb.qkv);
@@ -2875,8 +2965,8 @@ impl DecoderExecutor {
                 state_slots: state_slots.clone(),
                 cu_seqlens: cu.clone(),
                 out: conv_out.clone(),
-                boundary_conv_states: None,
-                boundary_tokens: 0,
+                boundary_conv_states,
+                boundary_tokens,
                 activation: 1,
             })
         })?;
@@ -2921,8 +3011,8 @@ impl DecoderExecutor {
                 state_slots: state_slots.clone(),
                 cu_seqlens: cu.clone(),
                 out: out.clone(),
-                boundary_states: None,
-                boundary_tokens: 0,
+                boundary_states,
+                boundary_tokens,
             })
         })?;
         self.record(li, "gdn_out", out.clone())?;
@@ -3015,6 +3105,8 @@ impl DecoderExecutor {
     /// snapshot or a fork). Records the step's snapshot boundaries from
     /// [`SeqSlice::snapshot_blocks`]; the upload is skipped when the table is unchanged.
     fn resolve_gdn_slots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
+        self.boundary_capture = false;
+        self.boundary_rows = 0;
         if self.gdn_state.is_none() {
             return Ok(());
         }
@@ -3107,6 +3199,21 @@ impl DecoderExecutor {
                 .write_bytes(&bytes)?;
             self.gdn_slot_cache = host;
         }
+        // P7 S-12 (Task 33): a snapshot request on a full block *inside* a prefill chunk needs
+        // the kernel's per-block boundary rows, not the live slot (the step's end state). The
+        // kernel writes a row per block for every sequence, so sized for the whole batch.
+        let bt = self.limits.layout.block_tokens.max(1);
+        self.boundary_capture = self.boundary_state.is_some()
+            && batch.seqs.iter().any(|s| {
+                s.snapshot_blocks
+                    .iter()
+                    .any(|(o, _)| *o > 0 && *o < s.q_len)
+            });
+        self.boundary_rows = if self.boundary_capture {
+            batch.seqs.iter().map(|s| s.q_len / bt).sum()
+        } else {
+            0
+        };
         Ok(())
     }
 
@@ -3171,9 +3278,10 @@ impl DecoderExecutor {
     }
 
     /// Fills this step's snapshot boundaries (P7 S-12): for each sequence, the state at the
-    /// requested end-of-step offset into its entry. Only a boundary at the end of the step
-    /// (`offset == q_len`) is written here — an interior boundary of a chunked prefill is not
-    /// snapshotted yet. Called after the layers ran and the stream is synchronised.
+    /// requested offset into its entry. An end-of-step boundary (`offset == q_len`) writes the
+    /// live slot's final state; an interior boundary of a chunked prefill (`offset` a full block
+    /// inside the chunk) writes the kernel's corresponding boundary row (P7 S-12 Task 33). Called
+    /// after the layers ran and the stream is synchronised.
     fn write_pending_snapshots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
         if self.pending_snapshots.is_empty() {
             return Ok(());
@@ -3191,34 +3299,78 @@ impl DecoderExecutor {
                 layers * (rec + conv)
             )));
         }
-        let q_len = |seq: SeqId| {
-            batch
-                .seqs
-                .iter()
-                .find(|s| s.seq == seq)
-                .map_or(0, |s| s.q_len)
-        };
+        // Each sequence's first boundary row in the batch's boundary buffers: rows are
+        // chunk-relative, so sequence `s` owns `q_len / block_tokens` rows from its base.
+        let bt = self.limits.layout.block_tokens.max(1);
+        let mut row_base: HashMap<SeqId, u32> = HashMap::new();
+        let mut acc = 0u32;
+        for s in batch.seqs {
+            row_base.insert(s.seq, acc);
+            acc += s.q_len / bt;
+        }
         let pending = std::mem::take(&mut self.pending_snapshots);
         for (seq, slot, entries) in pending {
-            let end = q_len(seq);
-            let hits: Vec<u32> = entries
-                .iter()
-                .filter(|(offset, _)| *offset == end && end > 0)
-                .map(|(_, entry)| *entry)
-                .collect();
-            if hits.is_empty() {
+            let Some(slice) = batch.seqs.iter().find(|s| s.seq == seq) else {
                 continue;
-            }
-            let state = self.read_slot_state(slot)?;
-            for entry in hits {
+            };
+            let q_len = slice.q_len;
+            let chunk_start = slice.kv_len.saturating_sub(q_len);
+            let base = row_base.get(&seq).copied().unwrap_or(0);
+            // The live slot's end state is read lazily, only when an end-of-step boundary asks.
+            let mut live: Option<Vec<u8>> = None;
+            for (offset, entry) in entries {
+                let bytes = if offset == q_len && q_len > 0 {
+                    match &live {
+                        Some(b) => b.clone(),
+                        None => {
+                            let b = self.read_slot_state(slot)?;
+                            live = Some(b.clone());
+                            b
+                        }
+                    }
+                } else if offset > 0 && offset < q_len && offset % bt == 0 && chunk_start % bt == 0
+                {
+                    let row = base + offset / bt - 1;
+                    self.read_boundary_state(row as usize)?
+                } else {
+                    continue;
+                };
                 self.snapshots
                     .as_ref()
                     .expect("snapshots")
-                    .write(entry, &state)
+                    .write(entry, &bytes)
                     .map_err(ModelError::from)?;
             }
         }
         Ok(())
+    }
+
+    /// The host bytes of the state at boundary row `row` of the batch's boundary buffers (P7 S-12
+    /// Task 33): every linear layer's recurrent state (F32) then its conv window tail, in
+    /// [`turbine_core::types::StateLayout`] order, as an entry lays them out.
+    fn read_boundary_state(&self, row: usize) -> Result<Vec<u8>, ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(Vec::new());
+        };
+        let (Some(bstate), Some(bconv)) =
+            (self.boundary_state.as_ref(), self.boundary_conv.as_ref())
+        else {
+            return Err(invalid(
+                "a boundary snapshot without the boundary buffers".into(),
+            ));
+        };
+        let g = self.dims.gdn.expect("gdn dims");
+        let state_elems = g.v_heads as usize * g.v_dim as usize * g.k_dim as usize;
+        let conv_elems = g.conv_dim() * (g.conv_kernel as usize - 1);
+        let max_rows = self.boundary_max_rows;
+        let mut out = Vec::with_capacity(layers * (rec + conv));
+        for gl in 0..layers {
+            let rec_off = (gl * max_rows + row) * state_elems * 4;
+            out.extend_from_slice(&bstate.storage.whole().sub(rec_off, rec).read_bytes()?);
+            let conv_off = (gl * max_rows + row) * conv_elems * self.dims.act.size_bytes();
+            out.extend_from_slice(&bconv.storage.whole().sub(conv_off, conv).read_bytes()?);
+        }
+        Ok(out)
     }
 
     /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the

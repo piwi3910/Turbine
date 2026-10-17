@@ -2102,26 +2102,34 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
-            // P7 S-12 (Task 32): reserve a snapshot entry for the full block this step completes
-            // when the interval rule wants it (every `kv.hybrid_snapshot_interval_blocks`-th full
-            // block, 1-based). The block ends exactly at the step's end (`kv_len % block_tokens
-            // == 0`), so the executor writes its boundary state at offset `q_len`. Only a prefill
-            // chunk that lands on a block boundary (and a decode that completes one) is
-            // captured; the engine's snapshot store half.
+            // P7 S-12 (Task 32/33): reserve a snapshot entry for each full block this item
+            // completes that the interval rule wants (every `kv.hybrid_snapshot_interval_blocks`-th
+            // full block, 1-based) and for the sequence's last full block inside the chunk. A
+            // single-chunk prefill does not end on a block boundary, so the interior boundaries
+            // are captured too: the executor fills them from the kernel's per-block boundary rows
+            // (the kernel writes one per `kv.block_tokens` from the chunk's start), so the engine
+            // only asks for an interior boundary when the chunk itself starts on a block boundary.
             let mut row_snaps: SmallVec<[(u32, SnapshotRef); 2]> = SmallVec::new();
             if let Some(interval) = self.hybrid_interval {
                 let bt = self.pool.layout().block_tokens.max(1);
-                if it.kv_len % bt == 0 && it.kv_len > 0 {
-                    let block_index = it.kv_len / bt;
-                    if block_index >= 1
-                        && u64::from(block_index).is_multiple_of(u64::from(interval))
-                        && let Some(&block) = plan.items[it.index]
-                            .block_table
-                            .blocks
-                            .get(block_index as usize - 1)
+                let chunk_start = it.kv_len.saturating_sub(it.len);
+                let first = chunk_start / bt + 1;
+                let last = it.kv_len / bt;
+                let table = &plan.items[it.index].block_table.blocks;
+                for m in first..=last {
+                    let interior = m * bt < it.kv_len;
+                    // An interior boundary maps to a kernel row only when the chunk starts on a
+                    // block boundary (the row is counted from the chunk start).
+                    if interior && chunk_start % bt != 0 {
+                        continue;
+                    }
+                    if !u64::from(m).is_multiple_of(u64::from(interval)) && m != last {
+                        continue;
+                    }
+                    if let Some(&block) = table.get(m as usize - 1)
                         && let Some(ref_) = self.kv.snapshot_alloc(block)
                     {
-                        row_snaps.push((it.len, ref_));
+                        row_snaps.push((m * bt - chunk_start, ref_));
                         self.snapshot_pending.insert(block, ref_);
                     }
                 }
@@ -4110,7 +4118,7 @@ mod tests {
         let t = engine_with_kv(
             exec,
             Arc::clone(&tokenizer),
-            params(4, 16),
+            params(4, 64),
             false,
             kv,
             |_, _, _| None,
