@@ -1072,6 +1072,8 @@ impl KvHierarchy {
             lossy_penalty: &penalties,
             allow_lossy,
             partial_tokens: m.partial.as_ref().map_or(0, |p| p.tokens),
+            hybrid: false,
+            snapshots: &[],
         };
         let mut plan = plan_prefix(&inputs);
         // The planner's inputs and costs, for the `kv_plan` DEBUG event: the cost of no reuse,
@@ -1531,6 +1533,7 @@ impl KvHierarchy {
                 child_count: 0,
                 tokens: tokens[i * bt..(i + 1) * bt].into(),
                 lineage,
+                snapshot: None,
             };
             // A full block outranks an opportunistic partial entry: at capacity, one leaf
             // partial entry makes room (P5p S-5; its L0 slot the next tick frees).
@@ -1679,6 +1682,7 @@ impl KvHierarchy {
             child_count: 0,
             tokens: tokens[full * bt..].into(),
             lineage: Lineage::Exact,
+            snapshot: None,
         };
         match self.dir.insert_partial(kv) {
             Ok(()) => {
@@ -2062,6 +2066,8 @@ impl KvHierarchy {
                     recompute_tokens: prompt - p.attach.cached_tokens,
                     reason: PlanReason::TierDegraded,
                     partial_tokens: 0,
+                    state_snapshot: None,
+                    state_recompute_from: None,
                 };
                 self.metrics
                     .plan(PlanReason::TierDegraded, p.attach.plan.recompute_tokens);
@@ -3875,6 +3881,8 @@ fn truncated_plan(
         recompute_tokens: prompt_tokens - used.len() as u32 * block_tokens,
         reason,
         partial_tokens: 0,
+        state_snapshot: None,
+        state_recompute_from: None,
     }
 }
 

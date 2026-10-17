@@ -1052,6 +1052,8 @@ mod tests {
             lossy_penalty: &[],
             allow_lossy: true,
             partial_tokens: 0,
+            hybrid: false,
+            snapshots: &[],
         });
         assert_eq!(
             (plan.cutoff_blocks(), plan.reason),
@@ -1367,6 +1369,8 @@ mod tests {
             lossy_penalty: &[],
             allow_lossy: true,
             partial_tokens: 0,
+            hybrid: false,
+            snapshots: &[],
         });
         assert_eq!(plan.reason, PlanReason::RetrieveCheaper);
 
