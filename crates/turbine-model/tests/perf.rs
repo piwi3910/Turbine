@@ -176,6 +176,8 @@ fn step(
     let mut slices = Vec::with_capacity(seqs.len());
     for (s, &(table, toks, start)) in seqs.iter().enumerate() {
         slices.push(SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(s as u64 + 1),
             q_start: tokens.len() as u32,
             q_len: toks.len() as u32,
@@ -1535,6 +1537,8 @@ fn served_step(
     let mut slices = Vec::with_capacity(seqs.len());
     for (s, &(table, toks, start)) in seqs.iter().enumerate() {
         slices.push(SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(s as u64 + 1),
             q_start: tokens.len() as u32,
             q_len: toks.len() as u32,

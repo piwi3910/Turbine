@@ -103,6 +103,10 @@ pub struct HierarchyConfig {
     /// `kv.cpu.slab_drains_per_tick` (P5p S-18): L1 slabs the ladder may start draining per
     /// tick (and draining at once) when L1's rung has no free slot; 0 = 6b's fallback only.
     pub slab_drains_per_tick: u32,
+    /// P7 S-12 (Task 32): the model keeps per-sequence state (a hybrid family). A hybrid hit
+    /// reuses whole blocks only and restores the nearest snapshot at or before its cutoff. The
+    /// server sets it from the executor's [`turbine_core::types::StateLayout`] at startup.
+    pub hybrid: bool,
 }
 
 /// The compression ladder's settings (P6b S-6): `kv.ladder.*` and the pressure controller's
@@ -178,6 +182,8 @@ impl HierarchyConfig {
             allow_lossy: kv.lossy_reuse == LossyReuse::Allow,
             partial_prefix_reuse: kv.partial_prefix_reuse,
             slab_drains_per_tick: kv.cpu.slab_drains_per_tick,
+            // P7 S-12: the model's state layout is not known here; the server sets it.
+            hybrid: false,
             lossy_penalty: crate::codec::registry()
                 .iter()
                 .map(|c| {
@@ -1051,6 +1057,8 @@ impl KvHierarchy {
             .iter()
             .map(|b| self.format_bytes(b.location.format))
             .collect();
+        let snapshots: Vec<Option<crate::state::SnapshotRef>> =
+            m.blocks.iter().map(|b| b.snapshot).collect();
         let inputs = PlanInputs {
             matched: &tiers,
             prompt_tokens: req.prompt.len() as u32,
@@ -1072,8 +1080,8 @@ impl KvHierarchy {
             lossy_penalty: &penalties,
             allow_lossy,
             partial_tokens: m.partial.as_ref().map_or(0, |p| p.tokens),
-            hybrid: false,
-            snapshots: &[],
+            hybrid: self.cfg.hybrid,
+            snapshots: &snapshots,
         };
         let mut plan = plan_prefix(&inputs);
         // The planner's inputs and costs, for the `kv_plan` DEBUG event: the cost of no reuse,
@@ -3531,6 +3539,12 @@ impl KvHierarchy {
         if let Some(l) = self.ladder.as_mut() {
             l.cfg.dwell = dwell;
         }
+    }
+
+    /// P7 S-12 (Task 32): marks the model as a hybrid family (per-sequence state). A hybrid
+    /// lookup restores the nearest snapshot at or before its cutoff and never takes a tail copy.
+    pub fn set_hybrid(&mut self, hybrid: bool) {
+        self.cfg.hybrid = hybrid;
     }
 
     pub fn window_maintain(&mut self, pool: &mut BlockPool) {

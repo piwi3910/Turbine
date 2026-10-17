@@ -114,6 +114,7 @@ fn step_plan(step: u64, batch: &BatchInput<'_>) -> StepPlan {
                     positions: batch.positions[r].to_vec(),
                     block_table: s.block_table.to_vec(),
                     is_prefill: s.q_len > 1,
+                    state_slot: s.state_slot,
                 }
             })
             .collect(),
@@ -471,6 +472,23 @@ impl ModelExecutor for TpExecutor {
         };
         self.run(plan, |leader| leader.copy_blocks(kv, src, dst))
     }
+
+    /// P7 S-12 (Task 32): only rank 0's executor holds the snapshot buffer today; a tensor-parallel
+    /// group with hybrid state is refused. Attention-only groups (the empty list) pass through.
+    fn set_state_snapshots(&mut self, snapshots: turbine_model::executor::StateSnapshots) {
+        self.leader.set_state_snapshots(snapshots);
+    }
+
+    fn copy_state(&mut self, copies: &[turbine_kv::state::StateCopy]) -> Result<(), ModelError> {
+        if copies.is_empty() {
+            return Ok(());
+        }
+        Err(ModelError::Kernel(
+            turbine_kernels::KernelError::Unsupported {
+                message: "hybrid state copies are not wired for a tensor-parallel group".into(),
+            },
+        ))
+    }
 }
 
 impl Drop for TpExecutor {
@@ -624,6 +642,8 @@ impl WorkerRank {
                 ));
             };
             slices.push(SeqSlice {
+                state_slot: s.state_slot,
+                snapshot_blocks: &[],
                 seq: s.seq_id,
                 q_start: tokens.len() as u32,
                 q_len: s.tokens.len() as u32,
@@ -1552,6 +1572,8 @@ mod tests {
     ) -> Result<u32, ModelError> {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: tokens.len() as u32,

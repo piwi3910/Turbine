@@ -736,6 +736,8 @@ impl SequenceKv {
         self.cached_len = p0;
         let view = self.view();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(0),
             q_start: 0,
             q_len: t as u32,
@@ -818,6 +820,8 @@ mod tests {
         let b = [BlockId(0), BlockId(3), BlockId(6)];
         let seqs = [
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(10),
                 q_start: 0,
                 q_len: 1,
@@ -828,6 +832,8 @@ mod tests {
                 logits_rows: 1,
             },
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(11),
                 q_start: 1,
                 q_len: 5,
@@ -956,6 +962,8 @@ mod tests {
             block_formats: &'a [u8],
         ) -> SeqSlice<'a> {
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(seq),
                 q_start,
                 q_len,

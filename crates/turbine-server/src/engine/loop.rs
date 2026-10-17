@@ -103,7 +103,7 @@ use turbine_kv::BlockPool;
 use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
-    TokenFeed,
+    StateLoc, StateSnapshots, TokenFeed,
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_reliability::budget::PoolKind;
@@ -115,6 +115,7 @@ use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     LastIteration, SchedRequest, Scheduler, SubmitError,
 };
+use turbine_tensor::{DType, Tensor};
 
 use super::deadlines::{Deadlines, Timeouts};
 use super::pp::PipelineStats;
@@ -412,7 +413,33 @@ struct InFlight {
 
 impl EngineLoop {
     /// The engine over `p`; its diagnostics documents are published at once.
-    pub fn new(p: EngineParts) -> EngineLoop {
+    pub fn new(mut p: EngineParts) -> EngineLoop {
+        // P7 S-12 (Task 32): a hybrid family keeps per-sequence state. The engine allocates the
+        // KV-owned snapshot byte buffer over the L0 pool's memory (one entry per L0 block, the
+        // budget's conservative bound), hands it to the executor, and marks the KV hierarchy as
+        // hybrid so a prefix hit restores the nearest snapshot.
+        let mut hybrid_state_bytes = 0u64;
+        if let Some(layout) = p.executor.state_layout() {
+            let entries = u64::from(p.pool.total_blocks());
+            let entry_bytes = layout.bytes_per_sequence();
+            if entries > 0 && entry_bytes > 0 {
+                let mem = Arc::clone(p.pool.view().storage.memory());
+                let words = usize::try_from(entries.saturating_mul(entry_bytes)).unwrap_or(0);
+                match Tensor::empty(&mem, &[words], DType::U8) {
+                    Ok(buffer) => {
+                        p.executor
+                            .set_state_snapshots(StateSnapshots { buffer, layout });
+                        p.kv.set_hybrid(true);
+                        hybrid_state_bytes = entries.saturating_mul(entry_bytes);
+                    }
+                    Err(e) => tracing::warn!(
+                        event = "hybrid_state_snapshots_unavailable",
+                        error = %e,
+                        "no snapshot buffer; hybrid prefix reuse is off"
+                    ),
+                }
+            }
+        }
         let overlap = p.overlap && p.executor.overlaps() && p.executor.reduces_logits();
         tracing::info!(
             event = "overlap_scheduling",
@@ -486,6 +513,10 @@ impl EngineLoop {
             jump_forward_max_tokens: p.jump_forward_max_tokens,
             ranks: p.ranks,
         };
+        engine
+            .metrics
+            .server
+            .set_hybrid_state_bytes(hybrid_state_bytes);
         engine.publish(false);
         engine.publish_stats();
         engine
@@ -708,6 +739,7 @@ impl EngineLoop {
     /// [`EngineLoop::launch_pipe`]'s device work: `None` when the plan has only forks.
     fn try_launch(&mut self, plan: &IterationPlan) -> Result<Option<Built>, IterationError> {
         self.fork_copies(plan)?;
+        self.state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -723,7 +755,7 @@ impl EngineLoop {
                 ));
             }
         };
-        let slices = seq_slices(plan, &built);
+        let slices = seq_slices(plan, &built, &self.sched);
         let view = self.pool.view();
         self.exec
             .launch(
@@ -744,7 +776,7 @@ impl EngineLoop {
         self.iteration_requests = f.requests.clone();
         let phase = phase_of(&f.plan);
         let result = {
-            let slices = seq_slices(&f.plan, &f.built);
+            let slices = seq_slices(&f.plan, &f.built, &self.sched);
             let view = self.pool.view();
             self.exec.forward(&BatchInput {
                 tokens: &f.built.tokens,
@@ -1767,6 +1799,7 @@ impl EngineLoop {
         plan: &IterationPlan,
     ) -> Result<Option<(Vec<RowInfo>, Logits)>, IterationError> {
         self.fork_copies(plan)?;
+        self.state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -1815,6 +1848,24 @@ impl EngineLoop {
         self.exec
             .copy_blocks(&self.pool.view(), &src, &dst)
             .map_err(|e| IterationError::model("copy_blocks failed", e))
+    }
+
+    /// P7 S-12 (Task 32): the hybrid state copies of `plan`, ordered after the block copies and
+    /// before the step (a prefix hit restores a snapshot into the sequence's live slot; an
+    /// `n > 1` fork copies the parent's slot into the child's). Counts the restores.
+    fn state_copies(&mut self, plan: &IterationPlan) -> Result<(), IterationError> {
+        if plan.state_copies.is_empty() {
+            return Ok(());
+        }
+        self.exec
+            .copy_state(&plan.state_copies)
+            .map_err(|e| IterationError::model("copy_state failed", e))?;
+        for c in &plan.state_copies {
+            if matches!((c.src, c.dst), (StateLoc::Snapshot(_), StateLoc::Slot(_))) {
+                self.metrics.server.hybrid_state_snapshot("restored");
+            }
+        }
+        Ok(())
     }
 
     /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
@@ -2027,7 +2078,7 @@ impl EngineLoop {
 
     /// Runs the forward pass over `built` (one ragged batch of `plan`'s items).
     fn forward(&mut self, plan: &IterationPlan, built: &Built) -> Result<Logits, IterationError> {
-        let slices = seq_slices(plan, built);
+        let slices = seq_slices(plan, built, &self.sched);
         let phase = phase_of(plan);
         let started = Instant::now();
         let view = self.pool.view();
@@ -2500,6 +2551,9 @@ impl EngineLoop {
         if let Err(error) = self.fork_copies(&next.plan) {
             return self.launch_failed(next, prev, error);
         }
+        if let Err(error) = self.state_copies(&next.plan) {
+            return self.launch_failed(next, prev, error);
+        }
         // The tail copies of this plan will have run once the iteration completes (overlap
         // scheduling completes it next turn).
         self.tail_done.extend(
@@ -2538,7 +2592,7 @@ impl EngineLoop {
             }
         }
         let (launched, launch_time) = {
-            let slices = seq_slices(&next.plan, &built);
+            let slices = seq_slices(&next.plan, &built, &self.sched);
             let view = self.pool.view();
             let started = Instant::now();
             let launched = self.exec.launch(
@@ -3305,7 +3359,11 @@ impl EngineLoop {
 }
 
 /// The [`SeqSlice`] of each row of `built`, a batch of `plan`.
-fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>> {
+fn seq_slices<'a>(
+    plan: &'a IterationPlan,
+    built: &'a Built,
+    sched: &Scheduler,
+) -> Vec<SeqSlice<'a>> {
     built
         .slices
         .iter()
@@ -3313,6 +3371,8 @@ fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>
         .zip(&built.formats)
         .map(
             |((&(index, q_start, q_len, kv_len), row), formats)| SeqSlice {
+                state_slot: sched.state_slot_of(row.seq).map(|s| s.0),
+                snapshot_blocks: &[],
                 seq: row.seq,
                 q_start,
                 q_len,

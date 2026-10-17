@@ -113,6 +113,11 @@ pub struct StepSeq {
     /// Logical block ids allocated by the leader; every rank uses the same ids.
     pub block_table: Vec<BlockId>,
     pub is_prefill: bool,
+    /// P7 S-12 (Task 32): the sequence's hybrid live-state slot (leader-allocated), `None` for an
+    /// attention-only family or a rank without state. Every rank indexes its own state shard
+    /// with it.
+    #[serde(default)]
+    pub state_slot: Option<u32>,
 }
 
 /// Runs one rank's share of a step (implemented in `turbine-server` over `turbine-model`).
@@ -1537,6 +1542,7 @@ mod tests {
                 positions: vec![0, 1, 2],
                 block_table: vec![BlockId(4)],
                 is_prefill: true,
+                state_slot: None,
             }],
             copies: vec![(BlockId(4), BlockId(5))],
             ledger: vec![RankLedger {

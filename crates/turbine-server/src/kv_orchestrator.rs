@@ -669,6 +669,12 @@ impl KvOrchestrator {
         self.h.set_ladder_dwell(dwell);
     }
 
+    /// P7 S-12 (Task 32): marks the model as a hybrid family (per-sequence state); the hierarchy
+    /// then restores a hit's nearest block snapshot instead of taking a tail copy.
+    pub fn set_hybrid(&mut self, hybrid: bool) {
+        self.h.set_hybrid(hybrid);
+    }
+
     /// The lock-free reclaim requests the Phase 3 controller issues (`KvReclaimer`).
     pub fn reclaimer(&self) -> Arc<KvReclaimHandle> {
         self.h.reclaimer()
