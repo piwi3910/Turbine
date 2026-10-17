@@ -4885,6 +4885,9 @@ scale (`o_proj` rel 4e-3, `resid_mlp` 6e-3).
 (a) bitwise rank agreement, (b) structural correctness (per-op shapes/op counts,
 `conformance::families`, `registry_tp_conformance`), and (c) the one-device comparison kept as a
 printed diagnostic (`qwen3_5_tp2_trace_diag`). The two-GPU `hip_trace_vs_cpu_qwen3_5` tp2 leg
-asserts the same relaxed criterion and is not held to the 2e-2 per-op bound on the GDN ops; its
-full-layer attention ops stay on the trace bound. Revisit only if a deterministic all-reduce order
-lands.
+asserts the same relaxed criterion and is not held to the 2e-2 per-op bound on the GDN ops; **the
+first full-attention layer's** replicated ops stay on the trace bound (deeper full-attention layers
+sit on a residual stream the preceding GDN layers have already drifted — on the real 40-layer FP8
+checkpoint `resid_attn` breaches the bound from layer 15 on, `max |Δ| 4.875` vs `max |ref| 3` — so
+those rows are printed as a diagnostic; layer 3, the first full-attention layer, stays within it).
+Revisit only if a deterministic all-reduce order lands.

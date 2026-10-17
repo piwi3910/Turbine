@@ -702,7 +702,7 @@ Interfaces:
 - [ ] Write failing tests `tiny_model qwen3_5_moe_matches_reference` (CPU vs committed tiny transformers trace), `qwen3_5_moe_tp2_matches_tp1_on_host`, `qwen3_5_moe_ep2_matches_tp1_on_host`, `qwen3_5_tp2_matches_tp1_on_host` (dense hybrid with kv heads 4). Run: `scripts/remote-cargo.sh test -p turbine-model --test tiny_model qwen3_5` — expect FAIL with "unregistered architecture Qwen3_5MoeForConditionalGeneration"
 - [ ] Generate the tiny trace fixture; implement the family, the TP spec and EP registration — run, expect PASS; `families::tests::layer_kinds_and_state_layout` — expect PASS.
 - [ ] Lab (ask the user first; 38 GB): `scripts/fetch-checkpoint.sh novanas qwen3.6-35b-a3b-fp8` — expect `ok`
-- [ ] Lab: `TURBINE_TEST_MODEL_DIR=/models/qwen3.6-35b-a3b-fp8 scripts/lab-test.sh novanas --gpus 2 -- -p turbine-model --test golden hip_trace_vs_cpu_qwen3_5` (the test runs tp 2 when two devices are visible) — expect exit 0
+- [ ] Lab: `TURBINE_TEST_MODEL_DIR=/models/qwen3.6-35b-a3b-fp8 scripts/lab-test.sh novanas --gpus 2 -- --release -p turbine-model --test golden hip_trace_vs_cpu_qwen3_5` (the test runs tp 2 when two devices are visible; `--release` — the test early-returns under `cfg!(debug_assertions)`) — expect exit 0
 - [ ] Gate: `scripts/gate.sh` and `scripts/lab-test.sh novanas --tier quick` — expect `gate: ok` and exit 0
 - [ ] Commit: `feat(model): Qwen3.6 MoE hybrid with shared expert, FP8 experts, TP2 and EP2`
 
