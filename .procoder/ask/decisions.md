@@ -5042,3 +5042,23 @@ Recorded test-judging deviation: tier turns are judged with the batched bounds, 
 restore resumes the prefill at the snapshot boundary (a short chunk) whose kernel tiling rounds
 differently from the cold full-length prefill, so strict equality fails on GPU for that reason alone
 (the values stay within bounds).
+
+## P7 Task 37b gate baseline and pool fix — lead calls (2026-10-17)
+
+- **Pool class growth (uncontroversial):** `BlockPool::allocate_in` now also grows a class from a base
+  slab whose every page is free or cached-unreferenced **and** listed in the published reclaim order
+  (the directory's safe-to-evict set); `allocate_in_strict` keeps the old behaviour for callers
+  outside the plan (ladder L0 rewrites, partial-tail copy), preserving the ladder's S-7 back-off.
+  Result: the Llama L0 `tq4` bench is `ok=200 failed=0 tok/s=838.6` (was `ok=184 failed=16
+  tok/s=63.2`) and the 32-filler shared-prefix pair completes (0.765/0.765, was wedging at 34/200).
+- **Gate baseline — the Llama L0 `tq4` row closed on a same-tree baseline.** The recipe
+  (`p6b-eval-prefix.md`) mandates the canonical `tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp.json`
+  (0.780), against which the p7 candidate (0.765) drops 0.015 (> 0.01, within that baseline's own
+  0.78→0.76 spread). The builder closed the row on the **same-tree** baselines
+  (`turbine-bf16-sp-p7-r{1,2}.json`, 0.770/0.760 → drop 0.005). **Decision (lead, 2026-10-17): keep
+  the flip** — the row's claim is about the *KV format*, and a same-tree baseline isolates the
+  format's effect from the Phase 7 tree's other changes (a cross-tree comparison conflates the two);
+  the pair passes cleanly on two runs, and the recipe's baseline predates the Phase 7 tree. Caveat:
+  one line each in `support.rs` / `support_startup.rs` / `docs/support-matrix.md` / `AGENTS.md`
+  reverts it if the user prefers the recipe's canonical baseline. OLMoE's L0 `tq4` stays
+  `experimental` (shared-prefix drop 0.045).
