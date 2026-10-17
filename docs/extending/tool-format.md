@@ -1,6 +1,6 @@
 # Adding a tool-call format
 
-A tool format is how a model writes tool calls: the special tokens it needs, the llguidance grammar that constrains `tool_choice` `auto` / `required` / named output, the parser that turns a finished output into `tool_calls`, and the `auto`-mode test of whether an output opens like a call. Point name `tool_format`; selected by `model.tool_call_parser`, else the family's `default_tool_format()`; bound to the served tokenizer once at startup (`formats::bind`). Registered: `llama3_json`, `hermes`, `mistral`.
+A tool format is how a model writes tool calls: the special tokens it needs, the llguidance grammar that constrains `tool_choice` `auto` / `required` / named output, the parser that turns a finished output into `tool_calls`, and the `auto`-mode test of whether an output opens like a call. Point name `tool_format`; selected by `model.tool_call_parser`, else the family's `default_tool_format()`; bound to the served tokenizer once at startup (`formats::bind`). Registered: `llama3_json`, `hermes`, `mistral`, `harmony`, `qwen3_xml`.
 
 ## The trait
 
@@ -15,6 +15,16 @@ A tool format is how a model writes tool calls: the special tokens it needs, the
 | `parser()`                                         | A fresh `Box<dyn ToolCallParser>` whose `parse(text)` returns `ToolParse::Calls` for well-formed calls and `ToolParse::Content` (unchanged text) for anything else. Call ids come from `envelope::CallIds`.                                                                                                                    |
 | `opens_like_call(text, first_token, &BoundTokens)` | `auto` streaming: `Opening::Call` (hold for the parser), `Content` (stream it) or `Undecided` (e.g. whitespace or a prefix of the opener so far).                                                                                                                                                                              |
 | `sample_call()`                                    | One call as the model writes it: `get_weather` with `{"location": "Oslo", "unit": "celsius"}` (the suite's `fixture_tools`).                                                                                                                                                                                                   |
+
+## Formats that ship with the tool family
+
+- **`hermes`** (`hermes` / `hermes2` templates): `<tool_call>{"name": …, "arguments": {…}}</tool_call>` for Qwen3 and Qwen3-MoE.
+- **`mistral`**: `[TOOL_CALLS] [{…}]` for Mistral and Mixtral.
+- **`llama3_json`**: the Llama 3.1/3.2 python-tag JSON form.
+- **`harmony`** (gpt-oss, Phase 7 S-9): the OpenAI harmony channel syntax. A call is a commentary-channel message addressed to a function — `<|start|>assistant<|channel|>commentary to=functions.<name> <|constrain|>json<|message|>{…}<|call|>`; the analysis channel's text is reasoning (the `harmony` reasoning parser reads it, see [reasoning-parser.md](reasoning-parser.md)) and the final channel is content. `special_tokens` requires `<|start|>`, `<|channel|>`, `<|message|>`, `<|constrain|>`, `<|call|>`, `<|end|>` and `<|return|>`; `grammar` constrains `required` / named calls to the commentary-channel call form (the analysis channel is left free for reasoning). A tool call written in the analysis channel is still parsed as a call.
+- **`qwen3_xml`** (Qwen3.5/3.6, Phase 7 S-18): the XML tool form their chat template renders — `<tool_call>\n<function=<name>\n<parameter=<key>\n<value>\n…</parameter>\n</function>\n</tool_call>` (`TOOL_CALL_OPEN` / `TOOL_CALL_CLOSE` / `FUNCTION_OPEN` / `FUNCTION_CLOSE` / `PARAMETER_OPEN` / `PARAMETER_CLOSE`; the markers bind as plain text, the format declares no required special tokens). A family uses it by default through `default_tool_format()` (`qwen3_xml` for Qwen3.5/3.6).
+
+Adding one of these to a family is only `default_tool_format()` in its module — the format itself is already registered.
 
 ## Files to add
 
@@ -70,3 +80,5 @@ A format no served model uses changes nothing on the GPU path. When it becomes t
 - The grammar and the parser must agree: `round_trip` feeds `sample_call()` through each compiled grammar token by token; whitespace the grammar forbids but the model writes makes constrained requests fail on the lab even when parsing works.
 - Never put format-specific strings (`<|python_tag|>`, `[TOOL_CALLS]`) in `crates/turbine-server`; everything the server needs goes through `BoundToolFormat`.
 - `turbine_tool_calls_total{parser}` is labelled with the name: keep it a short fixed word.
+- **Harmony's markers are all required**: a real gpt-oss tokenizer carries them, but a checkpoint whose tokenizer lacks one refuses the format at startup. Its channel state must survive markers arriving split across tokens — the parser withholds a partial marker rather than emitting it (the `harmony_round_trip` test feeds the output one char at a time).
+- **`qwen3_xml`'s markers bind as plain text**: unlike harmony they are not special tokens, so a tokenizer need not carry them and the parser matches them in the decoded string; a stray `</parameter>` the model writes mid-value must not truncate the call. Its grammar is the template's form, not JSON, so a constrained `required` call is XML and the parser must accept exactly that.
