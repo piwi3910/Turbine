@@ -31,6 +31,10 @@ safetensors.workspace = true
 # Phase 2 structured output needs no tokenizer upgrade); default features off (no onig C
 # library), fancy-regex for the Llama-3 pre-tokenizer
 tokenizers.workspace = true
+# P7 S-12 (Task 32): the hybrid state-copy descriptions (`StateCopy`, `StateLoc`,
+# `SnapshotRef`, `StateSlotPool`) the executor's `copy_state` and the scheduler's plan exchange;
+# turbine-kv depends on neither turbine-model nor turbine-kernels, so this is not a cycle.
+turbine-kv.workspace = true
 # The model's Jinja chat template (Llama-3.2 ships it in tokenizer_config.json)
 minijinja.workspace = true
 # pycompat: the Python string/dict methods the template calls (`.strip()`, …)
@@ -54,8 +58,5 @@ toktrie_hf_tokenizers.workspace = true
 unsafe_code = "forbid"
 
 [dev-dependencies]
-# The TurboQuant codec (records, rotation signs, codebooks) the TurboQuant L0
-# pages of tiny_model's `tq_kv_matches_reference` are encoded and checked with
-turbine-kv.workspace = true
 # structured::tests: constrained outputs validate against their schema
 jsonschema.workspace = true

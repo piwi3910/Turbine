@@ -237,6 +237,8 @@ fn forward(
     let mut slices = Vec::new();
     for (i, &(new, start, table)) in seqs.iter().enumerate() {
         slices.push(SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(i as u64 + 1),
             q_start: tokens.len() as u32,
             q_len: new.len() as u32,

@@ -573,6 +573,11 @@ pub struct PreparedModel {
     pub stage: Option<PpStage>,
     /// Bytes of the weights this rank loads: its shard, or the whole model.
     pub weight_bytes: u64,
+    /// P7 S-12 (Task 32): the model keeps per-sequence state (a hybrid family); its L0 pool
+    /// budget then charges `ceil(state bytes / interval)` per block for block-boundary snapshots.
+    pub hybrid: bool,
+    /// `kv.hybrid_snapshot_interval_blocks` (`≥ 1`): full blocks between snapshots.
+    pub hybrid_snapshot_interval_blocks: u32,
 }
 
 /// The model's identity (P4 §Data namespace key): BLAKE3 of `config.json` and of the
@@ -1013,6 +1018,7 @@ fn prepare_with(
     // The resolved RoPE parameters scope the prefix namespace (P6a S-16): a `model.rope_scaling`
     // override leaves config.json, hence its hash, unchanged.
     let identity = model_identity(dir)?.with_rope(&arch.rope_identity());
+    let hybrid = !arch.state.is_empty();
     Ok(PreparedModel {
         provider,
         arch,
@@ -1053,6 +1059,8 @@ fn prepare_with(
         expert,
         stage,
         weight_bytes: weights,
+        hybrid,
+        hybrid_snapshot_interval_blocks: config.kv.hybrid_snapshot_interval_blocks,
     })
 }
 
@@ -1688,9 +1696,27 @@ pub(crate) fn pool_blocks(
     prepared: &PreparedModel,
     budget: &DeviceBudget,
 ) -> Result<u32, StartupError> {
+    // P7 S-12 (Task 32): a hybrid family also holds a block-boundary snapshot for the block, and
+    // the budget charges the amortized `ceil(state bytes / interval)` beside the block's own
+    // bytes. Size the L0 pool from that effective per-block cost (the live-state reservation is
+    // already taken out of `budget.pool(PoolKind::Kv)`).
+    let layout = prepared.pool.layout;
+    let block = layout.block_bytes().max(1);
+    let snapshot = if prepared.hybrid {
+        prepared
+            .arch
+            .state
+            .bytes_per_sequence()
+            .div_ceil(u64::from(prepared.hybrid_snapshot_interval_blocks.max(1)))
+    } else {
+        0
+    };
+    let per_block = block.saturating_add(snapshot).max(1);
+    let kv_bytes = budget.pool(PoolKind::Kv);
+    let blocks = (kv_bytes / per_block) as u32;
     let measured = kv_pool_config(
-        prepared.pool.layout,
-        budget.pool(PoolKind::Kv),
+        layout,
+        u64::from(blocks).saturating_mul(block),
         prepared.scheduler.max_running_requests,
     )?;
     Ok(measured.num_blocks.min(prepared.pool.num_blocks))
@@ -1784,6 +1810,8 @@ pub(crate) fn warm_up(
             .map(|b| pool.format_code(*b))
             .collect::<Vec<u8>>()];
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(0),
             q_start: 0,
             q_len: 1,

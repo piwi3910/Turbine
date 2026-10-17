@@ -4,10 +4,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId};
+use turbine_core::types::{BlockId, KvLayout, ModelShape, SeqId, StateLayout};
 use turbine_kernels::{KernelError, KernelProvider, KernelRegistry, OpConfig, OpRequirement};
 use turbine_tensor::tensor::contiguous_strides;
-use turbine_tensor::{DeviceMemory, KvPoolView, Tensor, TensorView};
+use turbine_tensor::{DType, DeviceMemory, KvPoolView, Tensor, TensorView};
 
 use crate::ModelError;
 use crate::config::ModelArchConfig;
@@ -27,6 +27,9 @@ pub use decoder::{
 };
 pub use graphs::{DecodeGraphs, GraphBackend, GraphCache, GraphCounters, GraphKey, GraphStep};
 pub use profile::{OpProfile, OpProfileEntry};
+// P7 S-12 (Task 32): the hybrid state-copy vocabulary the executor's `copy_state` and the
+// scheduler's plan share.
+pub use turbine_kv::state::{SnapshotRef, StateCopy, StateLoc, StateSlot};
 
 /// How an executor runs its forward pass (Phase 2c). `Default` is what the server runs with
 /// `execution.fused_ops: true` ([`ExecutorOptions::from_fused_ops`]).
@@ -248,6 +251,16 @@ pub struct SeqSlice<'a> {
     /// position order and never device-reduced; 1 keeps today's one row per sequence (the
     /// last position). 1 ≤ `logits_rows` ≤ `q_len`.
     pub logits_rows: u32,
+    /// P7 S-12 (Task 32): this sequence's hybrid live-state slot, the scheduler's
+    /// `StateSlotPool` slot allocated with the sequence. `None` for an attention-only family (and
+    /// for a direct caller that runs the hybrid's own fallback slot map).
+    pub state_slot: Option<u32>,
+    /// P7 S-12 (Task 32): snapshot entries this step must fill with the boundary state of the
+    /// sequence, `(token offset within the step, entry)`. The engine allocates the entry when a
+    /// full block that carries a snapshot fills and lists it here with the token offset at which
+    /// the boundary falls this step; the executor writes the state at that offset into the
+    /// entry's buffer. Empty for an attention-only family and a step with no snapshot boundary.
+    pub snapshot_blocks: &'a [(u32, SnapshotRef)],
 }
 
 /// What the device reduction of one logits row computes (P2c S-4): the `top_n` largest raw
@@ -337,6 +350,47 @@ pub struct BatchInput<'a> {
     pub positions: &'a [u32],
     pub seqs: &'a [SeqSlice<'a>],
     pub kv: &'a KvPoolView<'a>,
+}
+
+/// The hybrid snapshot byte buffer (P7 S-12, Task 32): KV-owned L0 memory the engine allocates
+/// with one `layout.bytes_per_sequence()` entry per [`turbine_kv::state::SnapshotPool`] entry,
+/// set on the executor once (`ModelExecutor::set_state_snapshots`). The executor writes a
+/// sequence's boundary state into an entry ([`SeqSlice::snapshot_blocks`]) and restores a live
+/// slot from one ([`StateLoc::Snapshot`]).
+pub struct StateSnapshots {
+    /// `entries × bytes_per_sequence` bytes; entry `e` starts at `e × bytes_per_sequence`.
+    pub buffer: Tensor,
+    pub layout: StateLayout,
+}
+
+impl StateSnapshots {
+    /// Bytes of one entry.
+    pub fn entry_bytes(&self) -> u64 {
+        self.layout.bytes_per_sequence()
+    }
+
+    /// The byte range of entry `e`, panicking when it is outside the buffer.
+    pub fn entry(&self, e: u32) -> TensorView<'_> {
+        let bytes = usize::try_from(self.entry_bytes()).expect("entry bytes");
+        let start = bytes * e as usize;
+        let total = self.buffer.storage.whole().len();
+        assert!(
+            start + bytes <= total,
+            "snapshot entry {e} outside {} entries",
+            total / bytes.max(1)
+        );
+        TensorView::contiguous(self.buffer.storage.whole(), start, &[bytes], DType::U8)
+    }
+
+    /// Entry `e`'s bytes.
+    pub fn read(&self, e: u32) -> Result<Vec<u8>, turbine_tensor::MemoryError> {
+        self.entry(e).slice.read_bytes()
+    }
+
+    /// Writes `bytes` into entry `e`.
+    pub fn write(&self, e: u32, bytes: &[u8]) -> Result<(), turbine_tensor::MemoryError> {
+        self.entry(e).slice.write_bytes(bytes)
+    }
 }
 
 /// The logits of one forward, one slot per sequence in `seqs` order: its full rows of `data`
@@ -584,6 +638,32 @@ pub trait ModelExecutor: Send {
         src: &[BlockId],
         dst: &[BlockId],
     ) -> Result<(), ModelError>;
+    /// P7 S-12 (Task 32): the hybrid snapshot byte buffer (KV-owned L0 memory), set once before
+    /// the first forward. A hybrid executor writes boundary state into entries and restores
+    /// slots from them; an attention-only executor ignores it.
+    fn set_state_snapshots(&mut self, snapshots: StateSnapshots) {
+        let _ = snapshots;
+    }
+    /// P7 S-12 (Task 32): the per-sequence state layout of a hybrid family, `None` for an
+    /// attention-only one. The engine sizes the snapshot buffer and the scheduler's
+    /// `StateSlotPool` from it.
+    fn state_layout(&self) -> Option<StateLayout> {
+        None
+    }
+    /// P7 S-12 (Task 32): copies hybrid per-sequence state between live slots and snapshot
+    /// entries before the next forward, on the same stream (a prefix hit restores
+    /// `Snapshot → Slot`; an `n > 1` fork copies `Slot → Slot`; a block-boundary snapshot stores
+    /// `Slot → Snapshot`). A rank copies its own shard of the state. Executors without state
+    /// accept only an empty list.
+    fn copy_state(&mut self, copies: &[StateCopy]) -> Result<(), ModelError> {
+        if copies.is_empty() {
+            Ok(())
+        } else {
+            Err(ModelError::Kernel(KernelError::Unsupported {
+                message: "this executor has no hybrid per-sequence state".into(),
+            }))
+        }
+    }
 }
 
 #[cfg(test)]

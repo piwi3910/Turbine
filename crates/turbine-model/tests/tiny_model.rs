@@ -769,6 +769,8 @@ fn forward_rejects_invalid_batches() {
     let view = kv.view();
     let table: Vec<BlockId> = (0..4).map(BlockId).collect();
     let seq = |id, q_start, q_len, kv_len| SeqSlice {
+        state_slot: None,
+        snapshot_blocks: &[],
         seq: SeqId(id),
         q_start,
         q_len,
@@ -805,6 +807,8 @@ fn forward_rejects_invalid_batches() {
         &[1],
         &[0],
         &[SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             block_table: &[],
             block_formats: &[],
             ..seq(0, 0, 1, 1)
@@ -816,6 +820,8 @@ fn forward_rejects_invalid_batches() {
         &[1],
         &[0],
         &[SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             block_table: &outside,
             block_formats: &[],
             ..seq(0, 0, 1, 1)
@@ -1886,6 +1892,8 @@ fn paged_llama_single_sequence() {
     let run = |exec: &mut DecoderExecutor, tokens: &[u32], start: u32| {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(42),
             q_start: 0,
             q_len: tokens.len() as u32,
@@ -1955,6 +1963,8 @@ fn ragged_batch_rows_match_single_sequences() {
     // Sequence A's first 20 tokens are prefilled alone; its 21st arrives as a decode in the
     // ragged batch, alongside B's and C's whole prompts.
     let prefill_a = [SeqSlice {
+        state_slot: None,
+        snapshot_blocks: &[],
         seq: SeqId(1),
         q_start: 0,
         q_len: 20,
@@ -1976,6 +1986,8 @@ fn ragged_batch_rows_match_single_sequences() {
     let positions: Vec<u32> = std::iter::once(20).chain(0..17).chain(0..3).collect();
     let seqs = [
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: 1,
@@ -1986,6 +1998,8 @@ fn ragged_batch_rows_match_single_sequences() {
             logits_rows: 1,
         },
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(2),
             q_start: 1,
             q_len: 17,
@@ -1996,6 +2010,8 @@ fn ragged_batch_rows_match_single_sequences() {
             logits_rows: 1,
         },
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(3),
             q_start: 18,
             q_len: 3,
@@ -2027,6 +2043,8 @@ fn ragged_batch_rows_match_single_sequences() {
     let fork = [BlockId(9)];
     let decode = |exec: &mut DecoderExecutor, table: &[BlockId]| {
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(3),
             q_start: 0,
             q_len: 1,
@@ -2138,6 +2156,8 @@ fn run_seq(
 ) -> Vec<f32> {
     let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
     let seqs = [SeqSlice {
+        state_slot: None,
+        snapshot_blocks: &[],
         seq: SeqId(1),
         q_start: 0,
         q_len: tokens.len() as u32,
@@ -2836,6 +2856,8 @@ fn olmoe_decode_single_device_copy() {
             let mut seqs = Vec::new();
             for (s, toks, start) in parts {
                 seqs.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(*s as u64 + 1),
                     q_start: tokens.len() as u32,
                     q_len: toks.len() as u32,
@@ -3003,6 +3025,8 @@ fn paged_matches_contiguous() {
                 for s in 0..LENS.len() {
                     positions.extend(kv_lens[s] - q_lens[s]..kv_lens[s]);
                     seqs.push(SeqSlice {
+                        state_slot: None,
+                        snapshot_blocks: &[],
                         seq: SeqId(100 + s as u64),
                         q_start,
                         q_len: q_lens[s],
@@ -3131,6 +3155,8 @@ fn multi_row_logits_match_single_steps() {
         // Sequence 1's prompt; sequence 2 prefill for the reduced decode beside it.
         let positions: Vec<u32> = (0..PRE).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: PRE,
@@ -3150,6 +3176,8 @@ fn multi_row_logits_match_single_steps() {
         let b: Vec<u32> = (0..4).map(|i| (i * 53 + 5) % spec.vocab).collect();
         let positions = (0..4).collect::<Vec<u32>>();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(2),
             q_start: 0,
             q_len: 4,
@@ -3179,6 +3207,8 @@ fn multi_row_logits_match_single_steps() {
                 tokens: &[9],
                 positions: &[4],
                 seqs: &[SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(2),
                     q_start: 0,
                     q_len: 1,
@@ -3204,6 +3234,8 @@ fn multi_row_logits_match_single_steps() {
         for (i, &t) in forced.iter().enumerate() {
             let positions = [PRE + i as u32];
             let seqs = [SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(1),
                 q_start: 0,
                 q_len: 1,
@@ -3231,6 +3263,8 @@ fn multi_row_logits_match_single_steps() {
         let positions: Vec<u32> = (PRE..PRE + ROWS).chain(std::iter::once(4)).collect();
         let seqs = [
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(1),
                 q_start: 0,
                 q_len: ROWS,
@@ -3241,6 +3275,8 @@ fn multi_row_logits_match_single_steps() {
                 logits_rows: ROWS,
             },
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(2),
                 q_start: ROWS,
                 q_len: 1,
@@ -3302,6 +3338,8 @@ fn multi_row_logits_match_single_steps() {
         // `logits_rows` beyond `q_len` (and 0) are refused.
         for rows in [0, ROWS + 1] {
             let seqs = [SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(1),
                 q_start: 0,
                 q_len: 2,
@@ -3326,6 +3364,8 @@ fn multi_row_logits_match_single_steps() {
         // `max_seqs`, which sizes the head buffers).
         let seqs = [
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(1),
                 q_start: 0,
                 q_len: PRE + ROWS,
@@ -3336,6 +3376,8 @@ fn multi_row_logits_match_single_steps() {
                 logits_rows: PRE + ROWS,
             },
             SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(2),
                 q_start: PRE + ROWS,
                 q_len: 1,
@@ -3616,6 +3658,8 @@ fn graph_decode_run(
         let tokens: Vec<u32> = (0..len).map(|p| token(s, p)).collect();
         let positions: Vec<u32> = (0..len).collect();
         let slice = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(s as u64 + 1),
             q_start: 0,
             q_len: len,
@@ -3639,6 +3683,8 @@ fn graph_decode_run(
         let tokens: Vec<u32> = (0..seqs).map(|s| token(s, positions[s])).collect();
         let slices: Vec<SeqSlice<'_>> = (0..seqs)
             .map(|s| SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(s as u64 + 1),
                 q_start: s as u32,
                 q_len: 1,
@@ -4397,6 +4443,8 @@ fn check_reduced_rows(
                 let seqs: Vec<SeqSlice<'_>> = (0..3)
                     .map(|s| {
                         let slice = SeqSlice {
+                            state_slot: None,
+                            snapshot_blocks: &[],
                             seq: SeqId(s as u64 + 1),
                             q_start,
                             q_len: q_lens[s],
@@ -4611,6 +4659,8 @@ fn check_launch_ahead(
             .iter()
             .map(|&s| {
                 let slice = SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(s as u64 + 1),
                     q_start,
                     q_len: q_lens[s],
@@ -4713,6 +4763,8 @@ fn check_launch_ahead(
     }
     let seqs: Vec<SeqSlice<'_>> = (0..3)
         .map(|s| SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(s as u64 + 1),
             q_start: s as u32,
             q_len: 1,
@@ -4737,6 +4789,8 @@ fn check_launch_ahead(
     let seqs: Vec<SeqSlice<'_>> = seqs
         .iter()
         .map(|s| SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             kv_len: s.kv_len + 1,
             ..*s
         })
@@ -4872,6 +4926,8 @@ fn decode_fused_rope_matches_separate_rope() {
                 .iter()
                 .enumerate()
                 .map(|(s, table)| SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(s as u64 + 1),
                     q_start: s as u32,
                     q_len: 1,
@@ -4942,6 +4998,8 @@ fn op_profile_accounts_forward() {
             .iter()
             .enumerate()
             .map(|(s, table)| SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(s as u64 + 1),
                 q_start: s as u32,
                 q_len: 1,
@@ -5067,6 +5125,8 @@ fn single_sequence(
     let run = |exec: &mut dyn ModelExecutor, tokens: &[u32], start: u32| {
         let positions: Vec<u32> = (start..start + tokens.len() as u32).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: tokens.len() as u32,
@@ -5263,6 +5323,8 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
     let positions: Vec<u32> = prompts.iter().flat_map(|p| 0..p.len() as u32).collect();
     let seqs = [
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: lens[0],
@@ -5273,6 +5335,8 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
             logits_rows: 1,
         },
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(2),
             q_start: lens[0],
             q_len: lens[1],
@@ -5301,6 +5365,8 @@ fn greedy_pair(exec: &mut dyn ModelExecutor, kv: &KvPoolView<'_>, vocab: u32) ->
         lens = [lens[0] + 1, lens[1] + 1];
         let seqs: Vec<SeqSlice<'_>> = (0..2)
             .map(|s| SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(s as u64 + 1),
                 q_start: s as u32,
                 q_len: 1,
@@ -7117,6 +7183,8 @@ fn scripted_pair(
     let positions: Vec<u32> = prompts.iter().flat_map(|p| 0..p.len() as u32).collect();
     let seqs = [
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: lens[0],
@@ -7127,6 +7195,8 @@ fn scripted_pair(
             logits_rows: 1,
         },
         SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(2),
             q_start: lens[0],
             q_len: lens[1],
@@ -7151,6 +7221,8 @@ fn scripted_pair(
         lens = [lens[0] + 1, lens[1] + 1];
         let seqs: Vec<SeqSlice<'_>> = (0..2)
             .map(|s| SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(s as u64 + 1),
                 q_start: s as u32,
                 q_len: 1,

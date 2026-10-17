@@ -107,6 +107,8 @@ fn prefill(
     let positions: Vec<u32> = (0..n).collect();
     let table: Vec<BlockId> = (0..POOL_BLOCKS).map(BlockId).collect();
     let seqs = [SeqSlice {
+        state_slot: None,
+        snapshot_blocks: &[],
         seq: SeqId(1),
         q_start: 0,
         q_len: n,
@@ -212,6 +214,7 @@ fn hostmem_tp2_3b_prefill_split_diagnosis() {
                         };
                         let row = overlap_split_row(
                             &[SeqSlice {
+                            state_slot: None, snapshot_blocks: &[],
                                 seq: SeqId(1),
                                 q_start: 0,
                                 q_len: n,

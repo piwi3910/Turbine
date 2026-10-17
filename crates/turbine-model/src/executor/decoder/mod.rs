@@ -72,7 +72,7 @@ use super::logits::{self, LogitsHead};
 use super::profile::{self, OpProfile, Profiler};
 use super::{
     BatchInput, ExecutorLimits, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, SeqSlice,
-    Split, TokenFeed, feed_runs, rope,
+    Split, StateCopy, StateLoc, StateSlot, StateSnapshots, TokenFeed, feed_runs, rope,
 };
 use crate::ModelError;
 use crate::config::{GdnDims, ModelArchConfig, MoeConfig};
@@ -1112,6 +1112,10 @@ struct TpBuffers {
     gathered: Tensor,
 }
 
+/// The snapshot boundaries one step fills: per sequence, its state slot and the
+/// `(token offset within the step, snapshot entry)` pairs to write after the step (P7 S-12).
+type PendingSnapshots = Vec<(SeqId, u32, Vec<(u32, u32)>)>;
+
 /// The decoder executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
 /// tokens over the paged KV pool, on one device (or as one rank of a tensor-parallel group,
 /// [`DecoderExecutor::new_tp`]), for any [`DecoderSpec`].
@@ -1191,15 +1195,26 @@ pub struct DecoderExecutor {
     /// I32 `[linear_layers · max_seqs]`: sequence `s` of layer `l` uses slot `l · max_seqs + s`
     /// (uploaded per forward).
     gdn_slots: Option<Tensor>,
-    /// Host `SeqId → slot` map of the private state slots (CPU only for now).
+    /// Host `SeqId → slot` map of the private state slots, used only when a caller supplies no
+    /// [`SeqSlice::state_slot`] (P7 S-12; the engine's scheduler owns the real slots).
     state_slots: HashMap<SeqId, u32>,
-    /// Slot `i`'s owning sequence, `None` when free.
+    /// Slot `i`'s owning sequence, `None` when free (the private fallback map).
     slot_owners: Vec<Option<SeqId>>,
-    /// Free slots (below `slot_owners.len()`), for reuse.
+    /// Free slots (below `slot_owners.len()`), for reuse (the private fallback map).
     free_slots: Vec<u32>,
     /// Host copy of the uploaded `gdn_slots` table, so an unchanged table is not re-uploaded
     /// (which would synchronise the stream) every decode step.
     gdn_slot_cache: Vec<i32>,
+    /// P7 S-12 (Task 32): the snapshot byte buffer the engine set
+    /// ([`ModelExecutor::set_state_snapshots`]); `None` without hybrid state.
+    snapshots: Option<StateSnapshots>,
+    /// P7 S-12: slots written by [`DecoderExecutor::copy_state`] since the last
+    /// [`DecoderExecutor::resolve_gdn_slots`]; a fresh sequence whose slot is set is not zeroed
+    /// (its state was just restored or forked).
+    state_written: Vec<bool>,
+    /// P7 S-12: the snapshot boundaries this step must fill after the state is final,
+    /// `(sequence, slot, entries)`.
+    pending_snapshots: PendingSnapshots,
 }
 
 impl DecoderExecutor {
@@ -1856,6 +1871,9 @@ impl DecoderExecutor {
             slot_owners: Vec::new(),
             free_slots: Vec::new(),
             gdn_slot_cache: Vec::new(),
+            snapshots: None,
+            state_written: Vec::new(),
+            pending_snapshots: Vec::new(),
         })
     }
 
@@ -2030,6 +2048,8 @@ impl DecoderExecutor {
                 first.push(*s);
             } else if start >= split {
                 second.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_start: s.q_start - split as u32,
                     logits_rows: 1,
                     ..*s
@@ -2037,6 +2057,8 @@ impl DecoderExecutor {
             } else {
                 let head = (split - start) as u32;
                 first.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_len: head,
                     kv_len: s.kv_len - (s.q_len - head),
                     reduce: None,
@@ -2044,6 +2066,8 @@ impl DecoderExecutor {
                     ..*s
                 });
                 second.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_start: 0,
                     q_len: s.q_len - head,
                     ..*s
@@ -2974,10 +2998,22 @@ impl DecoderExecutor {
         })
     }
 
-    /// Allocates the private per-sequence Gated DeltaNet state slots of `batch` (P7 S-11) before
-    /// it is packed: a sequence that starts fresh (no cached prefix, `kv_len == q_len`) has its
-    /// recurrent and conv state zeroed. A private slot map until Task 32 replaces it with
-    /// [`turbine_kv::state::StatePool`]; the upload is skipped when the table is unchanged.
+    /// The hybrid state's `(linear_layers, recurrent bytes per layer, conv bytes per layer)`.
+    fn gdn_state_sizes(&self) -> Option<(usize, usize, usize)> {
+        let g = self.dims.gdn?;
+        let layers = linear_layers(&self.cfg);
+        let rec = (g.v_heads * g.v_dim * g.k_dim) as usize * 4;
+        let conv = g.conv_dim() * (g.conv_kernel as usize - 1) * self.dims.act.size_bytes();
+        Some((layers, rec, conv))
+    }
+
+    /// Resolves each sequence's Gated DeltaNet state slot for `batch` (P7 S-12, Task 32) before it
+    /// is packed: the scheduler's per-sequence slot when the slice carries one
+    /// ([`SeqSlice::state_slot`]), else the private fallback map of a direct caller. A sequence
+    /// that starts fresh (no cached prefix, `kv_len == q_len`) has its recurrent and conv state
+    /// zeroed, unless [`DecoderExecutor::copy_state`] just wrote that slot this turn (a restored
+    /// snapshot or a fork). Records the step's snapshot boundaries from
+    /// [`SeqSlice::snapshot_blocks`]; the upload is skipped when the table is unchanged.
     fn resolve_gdn_slots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
         if self.gdn_state.is_none() {
             return Ok(());
@@ -2987,33 +3023,52 @@ impl DecoderExecutor {
         let g = self.dims.gdn.expect("gdn dims");
         let mut host = vec![0i32; layers * n];
         let mut fresh: Vec<u32> = Vec::new();
+        self.pending_snapshots.clear();
         for (s, seq) in batch.seqs.iter().enumerate() {
-            let slot = match self.state_slots.get(&seq.seq) {
-                Some(slot) => *slot,
-                None => {
-                    let slot = match self.free_slots.pop() {
-                        Some(slot) => slot,
-                        None => {
-                            let slot = self.slot_owners.len() as u32;
-                            if slot as usize >= n {
-                                return Err(invalid(format!(
-                                    "Gated DeltaNet state slots exhausted: {n} sequences"
-                                )));
+            let slot = match seq.state_slot {
+                Some(slot) => slot,
+                None => match self.state_slots.get(&seq.seq) {
+                    Some(slot) => *slot,
+                    None => {
+                        let slot = match self.free_slots.pop() {
+                            Some(slot) => slot,
+                            None => {
+                                let slot = self.slot_owners.len() as u32;
+                                if slot as usize >= n {
+                                    return Err(invalid(format!(
+                                        "Gated DeltaNet state slots exhausted: {n} sequences"
+                                    )));
+                                }
+                                self.slot_owners.push(None);
+                                slot
                             }
-                            self.slot_owners.push(None);
-                            slot
-                        }
-                    };
-                    self.slot_owners[slot as usize] = Some(seq.seq);
-                    self.state_slots.insert(seq.seq, slot);
-                    slot
-                }
+                        };
+                        self.slot_owners[slot as usize] = Some(seq.seq);
+                        self.state_slots.insert(seq.seq, slot);
+                        slot
+                    }
+                },
             };
             for l in 0..layers {
                 host[l * n + s] = (l * n + slot as usize) as i32;
             }
-            if seq.kv_len == seq.q_len {
+            let written = self
+                .state_written
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(false);
+            if seq.kv_len == seq.q_len && !written {
                 fresh.push(slot);
+            }
+            if !seq.snapshot_blocks.is_empty() {
+                self.pending_snapshots.push((
+                    seq.seq,
+                    slot,
+                    seq.snapshot_blocks
+                        .iter()
+                        .map(|(offset, r)| (*offset, r.entry))
+                        .collect(),
+                ));
             }
         }
         if !fresh.is_empty() {
@@ -3039,6 +3094,9 @@ impl DecoderExecutor {
                 }
             }
         }
+        let written_len = self.state_written.len().max(n);
+        self.state_written.resize(written_len, false);
+        self.state_written.iter_mut().for_each(|w| *w = false);
         if host != self.gdn_slot_cache {
             let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
             self.gdn_slots
@@ -3048,6 +3106,117 @@ impl DecoderExecutor {
                 .whole()
                 .write_bytes(&bytes)?;
             self.gdn_slot_cache = host;
+        }
+        Ok(())
+    }
+
+    /// The host bytes of one sequence slot's whole state (its `layers` recurrent then conv parts,
+    /// in layer order), as a [`StateSnapshots`] entry lays them out.
+    fn read_slot_state(&self, slot: u32) -> Result<Vec<u8>, ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(Vec::new());
+        };
+        let n = self.limits.max_seqs as usize;
+        let state = self.gdn_state.as_ref().expect("state");
+        let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+        let mut out = Vec::with_capacity(layers * (rec + conv));
+        for l in 0..layers {
+            let idx = l * n + slot as usize;
+            out.extend_from_slice(&state.storage.whole().sub(idx * rec, rec).read_bytes()?);
+            out.extend_from_slice(
+                &conv_state
+                    .storage
+                    .whole()
+                    .sub(idx * conv, conv)
+                    .read_bytes()?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Writes `bytes` (a [`StateSnapshots`] entry's layout) into sequence slot `slot`.
+    fn write_slot_state(&mut self, slot: u32, bytes: &[u8]) -> Result<(), ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(());
+        };
+        let n = self.limits.max_seqs as usize;
+        let expect = layers * (rec + conv);
+        if bytes.len() != expect {
+            return Err(invalid(format!(
+                "state copy of {} bytes, a slot holds {expect}",
+                bytes.len()
+            )));
+        }
+        let state = self.gdn_state.as_ref().expect("state");
+        let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+        for l in 0..layers {
+            let idx = l * n + slot as usize;
+            let at = l * (rec + conv);
+            state
+                .storage
+                .whole()
+                .sub(idx * rec, rec)
+                .write_bytes(&bytes[at..at + rec])?;
+            conv_state
+                .storage
+                .whole()
+                .sub(idx * conv, conv)
+                .write_bytes(&bytes[at + rec..at + rec + conv])?;
+        }
+        if self.state_written.len() <= slot as usize {
+            self.state_written.resize(slot as usize + 1, false);
+        }
+        self.state_written[slot as usize] = true;
+        Ok(())
+    }
+
+    /// Fills this step's snapshot boundaries (P7 S-12): for each sequence, the state at the
+    /// requested end-of-step offset into its entry. Only a boundary at the end of the step
+    /// (`offset == q_len`) is written here — an interior boundary of a chunked prefill is not
+    /// snapshotted yet. Called after the layers ran and the stream is synchronised.
+    fn write_pending_snapshots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
+        if self.pending_snapshots.is_empty() {
+            return Ok(());
+        }
+        let entry_bytes = self
+            .snapshots
+            .as_ref()
+            .map_or(0, StateSnapshots::entry_bytes) as usize;
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(());
+        };
+        if entry_bytes != layers * (rec + conv) {
+            return Err(invalid(format!(
+                "snapshot entry of {entry_bytes} bytes, the state holds {}",
+                layers * (rec + conv)
+            )));
+        }
+        let q_len = |seq: SeqId| {
+            batch
+                .seqs
+                .iter()
+                .find(|s| s.seq == seq)
+                .map_or(0, |s| s.q_len)
+        };
+        let pending = std::mem::take(&mut self.pending_snapshots);
+        for (seq, slot, entries) in pending {
+            let end = q_len(seq);
+            let hits: Vec<u32> = entries
+                .iter()
+                .filter(|(offset, _)| *offset == end && end > 0)
+                .map(|(_, entry)| *entry)
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            let state = self.read_slot_state(slot)?;
+            for entry in hits {
+                self.snapshots
+                    .as_ref()
+                    .expect("snapshots")
+                    .write(entry, &state)
+                    .map_err(ModelError::from)?;
+            }
         }
         Ok(())
     }
@@ -3317,7 +3486,58 @@ impl ModelExecutor for DecoderExecutor {
             ));
         }
         self.launch(batch, &[])?;
-        self.collect()
+        let logits = self.collect()?;
+        // P7 S-12: fill the step's block-boundary snapshots now the state is final.
+        self.write_pending_snapshots(batch)?;
+        Ok(logits)
+    }
+
+    /// P7 S-12 (Task 32): the KV-owned snapshot byte buffer, set once by the engine.
+    fn set_state_snapshots(&mut self, snapshots: StateSnapshots) {
+        self.snapshots = Some(snapshots);
+    }
+
+    /// P7 S-12: the per-sequence state layout, `None` for an attention-only family.
+    fn state_layout(&self) -> Option<turbine_core::types::StateLayout> {
+        (self.gdn_state.is_some()).then_some(self.cfg.state)
+    }
+
+    /// P7 S-12 (Task 32): copies hybrid per-sequence state between live slots and snapshot
+    /// entries (the whole recurrent and conv state of every linear layer, in
+    /// [`turbine_core::types::StateLayout`] order).
+    fn copy_state(&mut self, copies: &[StateCopy]) -> Result<(), ModelError> {
+        if self.gdn_state.is_none() {
+            return if copies.is_empty() {
+                Ok(())
+            } else {
+                Err(ModelError::Kernel(KernelError::Unsupported {
+                    message: "this executor has no hybrid per-sequence state".into(),
+                }))
+            };
+        }
+        for c in copies {
+            let bytes = match c.src {
+                StateLoc::Slot(StateSlot(s)) => self.read_slot_state(s)?,
+                StateLoc::Snapshot(r) => self
+                    .snapshots
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("a state snapshot of an executor without the buffer".into())
+                    })?
+                    .read(r.entry)?,
+            };
+            match c.dst {
+                StateLoc::Slot(StateSlot(s)) => self.write_slot_state(s, &bytes)?,
+                StateLoc::Snapshot(r) => self
+                    .snapshots
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("a state snapshot of an executor without the buffer".into())
+                    })?
+                    .write(r.entry, &bytes)?,
+            }
+        }
+        Ok(())
     }
 
     /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch. Never
@@ -3760,6 +3980,8 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(s, table)| SeqSlice {
+                            state_slot: None,
+                            snapshot_blocks: &[],
                             seq: SeqId(s as u64 + 1),
                             q_start: s as u32,
                             q_len: 1,
@@ -3838,6 +4060,8 @@ mod tests {
         // A prefill is never a decode graph.
         let table: Vec<BlockId> = (0..3).map(BlockId).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: 2,
@@ -3863,6 +4087,8 @@ mod tests {
             .enumerate()
             .map(|(i, &(q_len, cached))| {
                 let s = SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(i as u64 + 1),
                     q_start: start,
                     q_len,

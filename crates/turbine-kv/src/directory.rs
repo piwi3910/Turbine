@@ -143,6 +143,10 @@ pub struct MatchedBlock {
     /// `Some(codec)` when the block is served lossy: a copy in a lossy codec, or an entry of
     /// lossy lineage (P6b S-3). Never `Some` in a lookup that denied lossy reuse.
     pub lossy: Option<&'static str>,
+    /// P7 S-12 (Task 32): the per-sequence state snapshot the block carries, when it has one and
+    /// the model keeps hybrid state; `None` otherwise. The planner's cutoff restores the nearest
+    /// snapshot at or before it.
+    pub snapshot: Option<crate::state::SnapshotRef>,
 }
 
 /// A token-granular match beyond the matched full blocks (P5p S-4): the first `tokens` tokens
@@ -567,6 +571,7 @@ impl KvDirectory {
                         tier: location.tier,
                         location,
                         lossy: served_lossy,
+                        snapshot: self.blocks.get(&k).and_then(|b| b.snapshot),
                     });
                 }
                 None => {
