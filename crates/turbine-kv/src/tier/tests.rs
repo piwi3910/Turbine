@@ -507,6 +507,68 @@ fn l1_grows_and_shrinks() {
     );
 }
 
+/// P7 S-12 (Task 33): a hybrid block's tier record is `[kv][snapshot]`, so a lower tier must
+/// size a slot for the whole record (`block_bytes + snapshot_bytes`) once the engine marks the
+/// model hybrid. Breaks if a tier caps its slot at the L0-format block only: a demotion of a
+/// snapshot-bearing block then fails `TierError::Io` and the block is dropped, not demoted.
+#[test]
+fn hybrid_record_fits_a_sized_slot() {
+    const SNAP: usize = 12_000;
+    let record: Vec<u8> = (0..BLOCK as usize + SNAP).map(|i| i as u8).collect();
+    let mut out = vec![0u8; record.len()];
+
+    // L1: a record past `block_bytes` does not fit until the model is marked hybrid.
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(
+        L1Config {
+            enabled: true,
+            max_bytes: 2 * 24_000,
+            slab_bytes: 24_000,
+            block_bytes: BLOCK,
+            memory_kind: MemoryKind::Dedicated,
+        },
+        alloc,
+        clock(),
+    );
+    assert!(matches!(
+        l1.put(key(1), TierBlockRef::Host(&record)),
+        Err(TierError::Io(_))
+    ));
+    l1.set_snapshot_bytes(SNAP as u64);
+    l1.put(key(1), TierBlockRef::Host(&record)).unwrap();
+    l1.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, record, "L1 round-trips the whole hybrid record");
+    let too_big = vec![0u8; record.len() + 1];
+    assert!(matches!(
+        l1.put(key(2), TierBlockRef::Host(&too_big)),
+        Err(TierError::Io(_))
+    ));
+
+    // L2: same, in a slab file sized to the record.
+    let dir = tempfile::tempdir().unwrap();
+    let l2 = L2NvmeTier::open(
+        L2Config {
+            path: dir.path().to_path_buf(),
+            max_bytes: 4096 + 32_768,
+            slab_bytes: 32_768,
+            max_queue_depth: 8,
+            block_bytes: BLOCK,
+            namespace: NamespaceKey([7; 32]),
+        },
+        clock(),
+        KvMetrics::unregistered(),
+    )
+    .unwrap();
+    assert!(matches!(
+        l2.put(key(1), TierBlockRef::Host(&record)),
+        Err(TierError::Io(_))
+    ));
+    l2.set_snapshot_bytes(SNAP as u64);
+    l2.put(key(1), TierBlockRef::Host(&record)).unwrap();
+    l2.get(&key(1), TierBlockMut::Host(&mut out)).unwrap();
+    assert_eq!(out, record, "L2 round-trips the whole hybrid record");
+}
+
 /// P6b S-6: at its size limit L1 gives an empty slab of another slot size to a block of a new
 /// size (a ladder rewrite into another format), as L2 reformats an empty slab; a slab that still
 /// holds a block keeps its size. Breaks if a rewrite into a new format is refused while a slab
