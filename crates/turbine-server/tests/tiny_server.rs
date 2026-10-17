@@ -137,6 +137,9 @@ struct Setup<'a> {
     capture_logs: bool,
     /// Serve the tiny OLMoE (8 experts top-2, `tiny-olmoe`) instead of the tiny Llama.
     olmoe: bool,
+    /// Serve the tiny `Qwen3_5ForConditionalGeneration` hybrid (per-sequence state snapshots,
+    /// `tiny-qwen3_5`) instead of the tiny Llama.
+    qwen3_5: bool,
     /// More environment variables for the server.
     env: &'a [(&'a str, String)],
     /// Rewrite the tiny Llama into the weight format this `quantization_config` declares
@@ -160,6 +163,7 @@ impl Default for Setup<'_> {
             template_with_tools: true,
             capture_logs: false,
             olmoe: false,
+            qwen3_5: false,
             env: &[],
             quantization: None,
             kv_extra: "",
@@ -222,13 +226,17 @@ impl TinyServer {
 
     fn launch(setup: &Setup<'_>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
-        let model = if setup.olmoe {
+        let model = if setup.qwen3_5 {
+            "tiny-qwen3_5"
+        } else if setup.olmoe {
             "tiny-olmoe"
         } else {
             "tiny-llama"
         };
         let model_dir = dir.path().join(model);
-        if setup.olmoe {
+        if setup.qwen3_5 {
+            turbine_model::testing::tiny::write_tiny_qwen3_5(&model_dir, 7);
+        } else if setup.olmoe {
             write_tiny_olmoe(&model_dir, 7);
         } else {
             write_tiny_llama_with(
@@ -1672,6 +1680,51 @@ fn diagnostics_shapes() {
     drop(held);
     drop(waiting);
 }
+
+/// P7 S-12 (Task 33): `/turbine/v1/kv` reports `state_bytes` on every tier, and a hybrid
+/// family's live block-boundary snapshots show up in L0. A tiny `Qwen3_5ForConditionalGeneration`
+/// (cpu backend) with `kv.hybrid_snapshot_interval_blocks: 1` snapshots the state at every full
+/// block; after a completion that fills full blocks, L0's `state_bytes` is positive, echoed on
+/// the `l0` tier, while the lower tiers (nothing is demoted here) report none. Breaks if the
+/// field is missing, an attention-only model reports state bytes, or a stored snapshot's entry
+/// is not counted.
+#[test]
+fn kv_document_reports_state_bytes() {
+    // An attention-only model reports none everywhere.
+    let llama = TinyServer::start("");
+    let doc = llama.get("/turbine/v1/kv").json();
+    for i in 0..3 {
+        assert_eq!(
+            doc["tiers"][i]["state_bytes"].as_u64().unwrap_or(0),
+            0,
+            "attention-only tier {i}: {doc}"
+        );
+    }
+
+    let server = TinyServer::launch(&Setup {
+        qwen3_5: true,
+        kv_extra: "  hybrid_snapshot_interval_blocks: 1\n",
+        ..Setup::default()
+    });
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello", "max_tokens": 300,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let state = |tier: &Value| tier["state_bytes"].as_u64().unwrap_or(0);
+    // The engine publishes its documents each iteration; wait for the snapshot to be counted.
+    wait_for(Duration::from_secs(10), "L0 reports state bytes", || {
+        state(&server.kv_tier()) > 0
+    });
+    let l0 = server.kv_tier();
+    assert!(state(&l0) > 0, "{l0}");
+    let doc = server.get("/turbine/v1/kv").json();
+    assert_eq!(state(&doc["tiers"][0]), state(&l0), "{doc}");
+    assert_eq!(state(&doc["tiers"][1]), 0, "{doc}");
+    assert_eq!(state(&doc["tiers"][2]), 0, "{doc}");
+}
+
 #[test]
 fn request_validation() {
     let server = TinyServer::start("");

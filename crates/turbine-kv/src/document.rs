@@ -56,6 +56,12 @@ pub struct KvTierDocument {
     /// full blocks).
     #[serde(skip_serializing_if = "is_zero")]
     pub partial_entries: u64,
+    /// P7 S-12 (Task 33): the bytes of the hybrid state snapshots the tier holds, stored in the
+    /// block's tier record next to its KV bytes. L0 counts the live snapshot entries (the entry
+    /// bytes of every block that carries a snapshot); L1/L2 count the snapshot tails of the
+    /// blocks stored there. Zero for an attention-only model (no [`TierState`] of its own).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub state_bytes: u64,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -156,6 +162,7 @@ impl KvDocument {
                 state: None,
                 formats: BTreeMap::new(),
                 partial_entries: 0,
+                state_bytes: 0,
             }],
             ranks: Vec::new(),
             summary: None,

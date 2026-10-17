@@ -3570,6 +3570,20 @@ impl KvHierarchy {
         self.cfg.hybrid_snapshot_interval_blocks.max(1)
     }
 
+    /// P7 S-12 (Task 33): the hybrid snapshot bytes held in `tier`. L0 counts the live snapshot
+    /// entries (every allocated [`SnapshotPool`] entry times its `layout.bytes_per_sequence()`);
+    /// L1/L2 count the snapshot tails of the blocks whose records the tier stores. Zero for an
+    /// attention-only model.
+    pub fn snapshot_bytes(&self, tier: TierId) -> u64 {
+        match tier {
+            TierId::L0 => self
+                .snapshot_pool
+                .as_ref()
+                .map_or(0, |p| u64::from(p.capacity() - p.free()) * p.entry_bytes()),
+            _ => 0,
+        }
+    }
+
     /// Reserves (or returns) `block`'s snapshot entry (P7 S-12); `None` for an attention-only
     /// model or when every entry is in use. The entry's bytes are written by the executor with
     /// the block's boundary state; the ref is recorded on the directory with
@@ -3865,6 +3879,7 @@ impl KvHierarchy {
                 est_bandwidth_bytes_per_second: None,
             }),
             formats: formats.remove(&TierId::L0).unwrap_or_default(),
+            state_bytes: self.snapshot_bytes(TierId::L0),
         }];
         for id in [TierId::L1, TierId::L2] {
             let t = self.tier(id);
@@ -3890,6 +3905,7 @@ impl KvHierarchy {
                 }),
                 formats: formats.remove(&id).unwrap_or_default(),
                 partial_entries: 0,
+                state_bytes: self.snapshot_bytes(id),
             });
         }
         KvDocument {
@@ -4102,6 +4118,48 @@ pub(crate) mod tests {
     #[test]
     fn demote_promote_round_trip() {
         round_trip("cost_aware");
+    }
+
+    /// P7 S-12 (Task 33): `/turbine/v1/kv` reports `state_bytes` per tier — the bytes of the
+    /// live hybrid snapshot entries in L0 and zero for every tier of an attention-only model.
+    /// Breaks if the field is dropped, L0 stops counting allocated entries, or a released entry
+    /// keeps its bytes counted.
+    #[test]
+    fn kv_document_reports_state_bytes() {
+        use turbine_core::types::{StateDtype, StateLayout};
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut r = rig(8, None, None, clock);
+        // The field is flattened away while zero (like `partial_entries`), so absent means zero.
+        let bytes = |doc: &serde_json::Value, i: usize| {
+            doc["tiers"][i]["state_bytes"].as_u64().unwrap_or(0)
+        };
+        let doc = serde_json::to_value(r.h.document(&r.pool, (0, 0))).unwrap();
+        assert_eq!(bytes(&doc, 0), 0, "attention-only L0");
+        assert_eq!(bytes(&doc, 1), 0, "attention-only L1");
+        assert_eq!(bytes(&doc, 2), 0, "attention-only L2");
+
+        let layout = StateLayout {
+            linear_layers: 4,
+            recurrent_bytes_per_layer: 1024,
+            conv_bytes_per_layer: 512,
+            dtype: Some(StateDtype::F32),
+        };
+        let entry = layout.bytes_per_sequence();
+        let blocks = r.pool.total_blocks();
+        r.h.set_hybrid_state(layout, blocks);
+        assert_eq!(r.h.snapshot_bytes(TierId::L0), 0, "no entries in use yet");
+        r.h.snapshot_alloc(BlockId(1));
+        r.h.snapshot_alloc(BlockId(2));
+        assert_eq!(r.h.snapshot_bytes(TierId::L0), 2 * entry);
+        let doc = serde_json::to_value(r.h.document(&r.pool, (0, 0))).unwrap();
+        assert_eq!(bytes(&doc, 0), 2 * entry, "{doc}");
+        assert_eq!(bytes(&doc, 1), 0);
+        r.h.release_snapshot(BlockId(1));
+        assert_eq!(
+            r.h.snapshot_bytes(TierId::L0),
+            entry,
+            "a release drops those bytes"
+        );
     }
 
     /// The mechanism (leaf-first chain, copy then free, promotion before reuse) holds whatever
