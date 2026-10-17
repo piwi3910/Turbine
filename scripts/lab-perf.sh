@@ -44,7 +44,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--reasoning-effort low|medium|high] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--reasoning-effort low|medium|high] [--chat-template-kwargs <json>] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
 	exit 2
 }
 
@@ -107,6 +107,7 @@ SETS=()
 PLACEMENT=""
 EVAL=0
 REASONING_EFFORT=""
+CHAT_KWARGS=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--placement)
@@ -124,6 +125,14 @@ while [[ $# -gt 0 ]]; do
 		# Sent to both engines (turbine-bench and turbine-golden eval).
 		[[ $# -ge 2 && "$2" =~ ^(low|medium|high)$ ]] || usage
 		REASONING_EFFORT="$2"
+		shift 2
+		;;
+	--chat-template-kwargs)
+		# A JSON object sent as each chat request's `chat_template_kwargs` (the Phase 7 hybrids
+		# run thinking off: '{"enable_thinking":false}'). Defaults to that for qwen3.5-9b and
+		# qwen36; sent to the GSM8K eval.
+		[[ $# -ge 2 ]] || usage
+		CHAT_KWARGS="$2"
 		shift 2
 		;;
 	--runs)
@@ -176,6 +185,11 @@ else
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -z "$CHAT_KWARGS" ]]; then
+	case "$MODEL" in
+	qwen3.5-9b | qwen36) CHAT_KWARGS='{"enable_thinking":false}' ;;
+	esac
+fi
 if [[ -n "$CONFIG" ]]; then
 	if [[ ! -f "$CONFIG" || ! -r "$CONFIG" ]]; then
 		echo "lab-perf: config file not found or unreadable: ${CONFIG}" >&2
@@ -304,6 +318,7 @@ vllm_eval() {
 	local cmd=("$GOLDEN" eval --url "http://${ADDR}:18100" --tasks tests/eval/gsm8k-200.jsonl
 		--concurrency 16 --output json)
 	[[ -z "$REASONING_EFFORT" ]] || cmd+=(--reasoning-effort "$REASONING_EFFORT")
+	[[ -z "$CHAT_KWARGS" ]] || cmd+=(--chat-template-kwargs "$CHAT_KWARGS")
 	say "vllm: GSM8K (--eval)"
 	echo "+ ${cmd[*]} > ${report}"
 	[[ $DRY_RUN -eq 0 ]] || return 0

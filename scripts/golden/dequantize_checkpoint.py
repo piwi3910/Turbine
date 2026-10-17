@@ -790,11 +790,15 @@ def dequantize(
                 value, scheme, used = decode_layer(torch, tensors, pk, prefix)
                 if not torch.isfinite(value).all():
                     raise DequantError(f"{prefix}: non-finite dequantized value")
-                if fused_expert_tensor(prefix + "_blocks"):
+                if pk.name == "openai_mxfp4" and fused_expert_tensor(prefix + "_blocks"):
                     # gpt-oss writes the decoded experts as the fused BF16 parameter of
                     # transformers' GptOssExperts: [E, k, n], the transpose of the packed
                     # [E, n, k] (transformers' own dequantize ends in transpose(1, 2)); the
-                    # `_bias` tensor already carries the plain layout's name.
+                    # `_bias` tensor already carries the plain layout's name. Only the
+                    # openai_mxfp4 packaging has fused experts: an FP8 checkpoint's
+                    # `…experts.<i>.<proj>` is a per-expert 2D layer whose name ends in
+                    # `_proj`, and `fused_expert_tensor(prefix + "_blocks")` would match it
+                    # by accident.
                     writer.add(prefix, value.to(torch.bfloat16).transpose(1, 2))
                     consumed.update(used)
                     if tensors.has(prefix + "_bias"):

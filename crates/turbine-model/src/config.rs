@@ -405,6 +405,12 @@ impl ModelArchConfig {
         for base in &self.family.0.weight_slots(self) {
             for slot in format.slots(base) {
                 if let Some(entry) = index.get(&slot.name) {
+                    // A `float32_stored` slot (Qwen3.5's `linear_attn.norm.weight`, `A_log`,
+                    // `dt_bias`) may be F32 instead of the format's dtype; the loader converts
+                    // it on load ([`crate::loader`]), so it is not a dtype violation here either.
+                    if slot.float32_stored && entry.dtype == crate::safetensors::Dtype::F32 {
+                        continue;
+                    }
                     format.check_tensor(entry)?;
                 }
             }
@@ -1383,6 +1389,43 @@ mod tests {
         ::safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
     }
 
+    /// Rewrites the BF16 tensor `name` of `dir`'s `model.safetensors` as F32 (each BF16 value
+    /// widened), the shape unchanged.
+    fn rewrite_as_f32(dir: &Path, index: &SafetensorsIndex, name: &str) {
+        use ::safetensors::Dtype;
+        use ::safetensors::tensor::TensorView;
+        let file = fs::read(dir.join("model.safetensors")).unwrap();
+        let tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = index
+            .entries()
+            .map(|e| {
+                let bytes = &file[e.range.start as usize..e.range.end as usize];
+                if e.name == name {
+                    let f32_bytes: Vec<u8> = bytes
+                        .chunks_exact(2)
+                        .flat_map(|b| {
+                            half::bf16::from_le_bytes([b[0], b[1]])
+                                .to_f32()
+                                .to_le_bytes()
+                        })
+                        .collect();
+                    (e.name.clone(), Dtype::F32, e.shape.clone(), f32_bytes)
+                } else {
+                    (e.name.clone(), e.dtype, e.shape.clone(), bytes.to_vec())
+                }
+            })
+            .collect();
+        let views: Vec<(String, TensorView<'_>)> = tensors
+            .iter()
+            .map(|(n, dtype, shape, data)| {
+                (
+                    n.clone(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        ::safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+    }
+
     #[test]
     fn rejects_unsupported() {
         let dir = edited_config("unregistered", |v| {
@@ -1460,6 +1503,42 @@ mod tests {
             ("rope_scaling.rope_type", "dynamic", "default, llama3, yarn")
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Phase 7 Task 35: a `float32_stored` slot (Qwen3.5's Gated DeltaNet `linear_attn.norm.weight`,
+    /// `A_log`, `dt_bias`) may be F32 in the released checkpoint — transformers casts it to the
+    /// model dtype, and the loader converts it on load — so `check_supported_weights` accepts F32
+    /// there while a plain BF16 layer still rejects it. Breaks if the exemption is dropped from
+    /// the startup check (the real Qwen3.5-9B checkpoint then refuses with
+    /// `unsupported tensor dtype = F32 (…linear_attn.norm.weight)`).
+    #[test]
+    fn float32_stored_slots_accept_f32() {
+        let tiny = TempDir::new("config-f32-norm");
+        let spec = crate::testing::tiny::write_tiny_qwen3_5(tiny.path(), 5);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        spec.config.check_supported_weights(&index).unwrap();
+        let name_of = |suffix: &str| {
+            index
+                .entries()
+                .map(|e| e.name.clone())
+                .find(|n| n.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no tensor ending in {suffix}"))
+        };
+        let norm = name_of(".linear_attn.norm.weight");
+        rewrite_as_f32(tiny.path(), &index, &norm);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        assert_eq!(index.get(&norm).unwrap().dtype, ::safetensors::Dtype::F32);
+        spec.config
+            .check_supported_weights(&index)
+            .expect("an F32 Gated DeltaNet norm weight is converted on load");
+
+        // A non-`float32_stored` layer stays BF16-only.
+        let proj = name_of(".linear_attn.in_proj_z.weight");
+        rewrite_as_f32(tiny.path(), &index, &proj);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        let err = spec.config.check_supported_weights(&index).unwrap_err();
+        assert!(err.to_string().contains(&proj), "{err}");
+        assert_eq!(unsupported(err).0, "tensor dtype");
     }
 
     /// The committed transformers values (`tests/fixtures/yarn_params.json`, written by

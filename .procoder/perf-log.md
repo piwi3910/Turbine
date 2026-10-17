@@ -2332,3 +2332,45 @@ gate is the binding one.
   comparable.
 
 - P7 closed: GptOssForCausalLM/mxfp4/bf16/tp1 golden c1/c16 dd94f669; GSM8K 0.925 vs vLLM 0.930 (drop 0.005); throughput 2.07x (with the fixed-length-workload caveat above)
+
+### P7 hybrid gates — Qwen3.5-9B and Qwen3.6-35B-A3B-FP8 (plan Task 35, branch `p7-t35`, 2026-10-17)
+
+Fixtures are thinking off (`chat_template_kwargs: {"enable_thinking": false}` in each slug's own
+`tests/golden/<slug>/prompts.jsonl`, so the reference render and the replayed render agree);
+`turbine-golden compare/capture/eval` gained `--chat-template-kwargs` in this task for the eval and
+capture legs.
+
+- Qwen3.5-9B reference: `tests/golden/qwen3.5-9b/reference.jsonl`, transformers 5.9.0 BF16 CPU
+  (FP32 LM head) on `Qwen/Qwen3.5-9B` revision `c202236235762e1c871ad0ccb60c8ee5ba337b9a`,
+  16 prompts × 32 tokens. Engine spread: `scripts/lab/golden-engine-spread.sh p7t35 qwen3.5-9b`
+  (commit `c1fdfce4`, R9700 0) captured 20 sets (default c1-cold/c1-warm, `gemm_autotune=false`
+  c1-heuristic, `fused_ops=false` c1-unfused, par-00..15).
+- Qwen3.5-9B golden c1 **FAILS**: `engine_spread.py` reports `vs ref c1-cold prefix 11/16`
+  (need 16), likely 1.78 / tail 5.29, engine noise likely max 8.43 / tail max 11.36 — **OVER CAP**
+  (`tests/golden/qwen3.5-9b/engine_spread.json`). Only 9/16 prompts keep a 32-token identical
+  prefix (p01–p05, p07, p08, p10, p13). The engine's top candidates match the reference within
+  ~0.5 nats where the tokens agree (p10 position 0: token 760 −0.030 vs −0.033, 42373 −3.688 vs
+  −3.609), but 7/16 prompts flip a near-tie (p06 at position 9, p09 at 0, p11 at 1,
+  p12/p14/p15/p16 at 0–2) and the flip is config-independent (default, heuristic and unfused all
+  flip the same prompts). The Gated DeltaNet recurrence amplifies BF16 rounding over the
+  sequence, so no meaningful tolerance closes it (the proposed 8.59 / 11.30 would make the gate
+  vacuous). **A family correctness investigation (Turbine's GDN vs transformers' torch fallback
+  on the real checkpoint) is needed before the row can close — design question, not decided here.**
+- Qwen3.6-35B-A3B-FP8 golden, GSM8K and tp2/ep2 gates: **not run**. The transformers reference is
+  unavailable: the 72 GB dequantized BF16 copy (`scripts/golden/dequantize_checkpoint.py`, ~3 min)
+  runs at ~30 min per short prompt on CPU — the Gated DeltaNet torch fallback has no fused kernel
+  on CPU — and the 2,091-token `p09` alone takes hours, so a 16-prompt reference is ~8–12 h on
+  `novanas` (MemAvailable 116 GB > the 90 GB rule; `cpuhost` has 17 GB free, so not an option
+  either). The same family numerics apply, so the row cannot close regardless.
+- Fixture bug found and fixed: `scripts/golden/dequantize_checkpoint.py`'s fused-expert test
+  matched a per-expert FP8 layer (`…experts.<i>.<proj>_blocks`) and took the gpt-oss transpose
+  path on a 2-D weight (`Dimension out of range … got 2`); the path is now `openai_mxfp4`-only.
+- Serving-path bug found and fixed: `ModelConfig::check_supported_weights` refused the real
+  checkpoints' F32 `linear_attn.norm.weight` / `A_log` (`float32_stored` slots the loader
+  converts), so the server died at startup with `unsupported tensor dtype = F32
+  (model.language_model.layers.0.linear_attn.norm.weight)`; it now skips them as `loader::plan`
+  does.
+
+- P7 open: Qwen3_5ForConditionalGeneration/bf16/bf16/tp1 — golden c1 9/16 identical prefixes (need 16), engine_spread likely 8.59 / tail 11.30 OVER CAP (the GDN recurrence amplifies BF16 rounding on the real checkpoint); row stays `experimental`
+- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/tp2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
+- P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/ep2 — reference not generated (CPU transformers ~8–12 h); row stays `experimental`
