@@ -4794,3 +4794,26 @@ de-interleave, a missing gate or conv, the doubled norm) still yields a ~O(value
 this bound catches; a less chaotic tiny checkpoint (a `write_tiny_qwen3_5` change) is the
 alternative if a tighter signal is wanted. The real-checkpoint lab trace
 (`hip_trace_vs_cpu_qwen3_5`) asserts the greedy token and passed.
+
+## P7 Task 32 interfaces — lead calls (2026-10-17)
+
+The KV foundation (`StateSlotPool`/`SnapshotPool`, directory snapshot refs, planner rules,
+`kv.hybrid_snapshot_interval_blocks`) landed gate-clean; the cross-crate integration needed five
+interface choices the plan left open. Lead calls (safe, reversible internal interfaces):
+
+1. **Snapshot entry addressing:** `StepSeq.snapshot_blocks: Vec<(u32 /*token offset within the step*/,
+   SnapshotRef)>` — the ref carries the reserved entry. The engine allocates the entry (via the
+   `SnapshotPool`) when a block fills and passes the ref in the step.
+2. **Snapshot byte ownership:** the snapshot bytes are KV-owned L0 memory that travels with the block
+   (Task 33); the executor receives a view per forward (like `KvPoolView`) and the `SnapshotPool`
+   allocates entries over that buffer. `SnapshotPool` itself owns no device memory.
+3. **Cutoff vs restore point:** keep the plan's test semantics — the KV cutoff stays at the match
+   (`KvPlan.state_recompute_from`), the state restores from the nearest snapshot ≤ cutoff, and the
+   engine prefills the recompute window in place (re-running attention over already-reused KV).
+4. **Who plans the restore:** the scheduler reads `PrefixAttach.plan.state_snapshot` and emits
+   `StateCopy { src: StateLoc::Snapshot(ref), dst: StateLoc::Slot(slot) }`; the engine allocates the
+   slot and the entry.
+5. **Interval/eviction ownership:** the engine loop computes the snapshot set (every
+   `hybrid_snapshot_interval_blocks`-th full block plus the finished sequence's last block) and
+   allocates entries; the KV directory holds the refs and releases/relocates them on eviction
+   (Task 33 moves the bytes).
