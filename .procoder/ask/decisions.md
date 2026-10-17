@@ -4817,3 +4817,22 @@ interface choices the plan left open. Lead calls (safe, reversible internal inte
    `hybrid_snapshot_interval_blocks`-th full block plus the finished sequence's last block) and
    allocates entries; the KV directory holds the refs and releases/relocates them on eviction
    (Task 33 moves the bytes).
+
+## P7 Task 32 integration — lead calls round 2 (2026-10-17)
+
+The scheduler slot pool, the jump-forward refusal and the hybrid metrics scaffolding landed
+(gate ok); three more interface choices:
+
+1. **Slot ownership: the scheduler.** `Scheduler::state_slots: StateSlotPool` (capacity
+   `max_running_requests`) allocates at admission and releases on finish/cancel/preemption; the
+   engine allocates only the snapshot *entries*. This is what makes the S-12 leak assertion
+   (`StateSlotPool::free()` back to its start value) checkable.
+2. **`jump_forward` "explicit":** present-as-true in the config file or a `--set` override. A hybrid
+   with the default (`true`, never set) runs jump-forward off + the startup WARN; an explicit `true`
+   exits 2 `jump_forward_hybrid`; an explicit `false` is off with the WARN.
+3. **Hybrid L0 budget:** the amortized per-block cost is
+   `block_bytes + ceil(layout.bytes_per_sequence() / hybrid_snapshot_interval_blocks)` — the snapshot
+   tank's share is charged per resident full block when sizing the hybrid L0 pool; the live-state
+   slot allocation (`state_allocation`) stays as today. Conservative (charges every block's snapshot
+   share), avoids OOM; `SnapshotPool` capacity = the snapshot-bearing full blocks the sized pool
+   holds. Revisit with measured resident snapshot bytes if a separate tank term is warranted.
