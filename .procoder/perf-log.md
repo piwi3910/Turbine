@@ -2473,3 +2473,36 @@ BENCH 47fbbbcf llama commit=47fbbbcf gpu=0 tests=skipped golden1=PASS: golden16=
   was clean and the server counted 223 `ok`); the two clean runs agree at 0.765.
 - OLMoE stays `experimental`: its shared-prefix drop 0.045 > 0.01 is a separate numerics matter (not this
   pool bug).
+
+## P7 exit (plan Task 39, 2026-10-18; branch `p7-t39` from `p7-stack` 212ae15e)
+
+The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this task; one stale-test fix (below).
+
+- **Gate:** `scripts/gate.sh --full` → `gate: ok crates=all passed=1122 failed=0`.
+- **Lab one-GPU full tier** (`scripts/lab-test.sh novanas --tier full`, run `1017200458-326a237f`): **1263 passed, 3 failed** —
+  - `turbine-server --test lab_openai harmony_channels` — environmental (`TURBINE_LAB_URL is not set`), the known lab-run panic; expected, not a regression.
+  - `turbine-kernels --test lab pinned_copy_kernel_is_bit_exact` — the known perf-threshold flake (copy kernel 5.60 GB/s vs the copy engine's 7.97 GB/s, < 80 %). Rerun alone (`1017224810-12e00eae`): `6 passed; 0 failed`, so a flake (the p7t16b run saw the same 5.25/8.60 pattern).
+  - `turbine-kernels --test hip_batch_invariance moe_decode_tier_timings` — **a real stale expectation, not a flake** (`assertion left == right failed: small-m, prefill WMMA and grouped WMMA; left: 6, right: 3`). The test counted the `turbine_hip_moe_*` impls bound for a BF16 spec, but Task 16 step 2 (`573ce8b1`) added `turbine_hip_moe_quant_loop` / `turbine_hip_moe_quant_grouped`, and `turbine_moe_experts_supported` is path-agnostic (`kernels/rocm/src/moe.cpp:195`), so all six bind. **Fixed on this branch** (`crates/turbine-kernels/tests/hip_batch_invariance.rs` filters `!name.starts_with("turbine_hip_moe_quant")`, the same exclusion the sibling `moe_rows_are_batch_invariant` already carries). Rerun alone (`1017224017-3dbd1d6c`): `8 passed; 0 failed` (was 7/1).
+- **Lab two-GPU fault-injection full tier** (`scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full`, run `1017200518-0a6bfdd5`): **exit 0**, 29 passed, 0 failed — inventory (3), hostmem two-GPU (13), tp profile (1), tp2 collectives / hostmem graphs / prefix reuse (4+1+4), `kv_gpu` (4).
+- **Bench** (`scripts/lab-bench.sh --golden16`, GPU 0, client on `novanas`; the 5p exit lines are Llama 864.0 / OLMoE 636.1, −3 % = 838.1 / 617.0):
+  - `BENCH p7t39-llama llama commit=212ae15e gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0219 ok=200 failed=0 tok/s=863.9 itl_p50=15.3 ttft_p50=208 decode_fwd_ms=14.9` — **PASS** (863.9 ≥ 838.1; 0.9999× the 5p exit).
+  - `BENCH p7t39-olmoe olmoe commit=212ae15e gpu=0 tests=skipped golden1=PASS: golden16=PASS: client=novanas weight_format=bf16 kv=bf16 conc=16 host_share=0.0144 ok=200 failed=0 tok/s=638.8 itl_p50=23.2 ttft_p50=128 decode_fwd_ms=22.5` — **PASS** (638.8 ≥ 617.0; 1.004× the 5p exit).
+- **Task 10 runbook** (reports committed under `tests/bench/phase-7-model-families/`; see its `README.md`). Every closed row's lab config was served and its golden c1/c16 (and, where lossy, GSM8K) re-run on `212ae15e`:
+
+  | row (`PHASE7_ROWS` id) | config | golden c1 / c16 | GSM8K c16 | c16 tok/s | `BENCH` label |
+  | --- | --- | --- | --- | --- | --- |
+  | `Qwen3ForCausalLM/bf16/bf16/tp1` | `phase7-novanas-qwen3-4b.yaml` | PASS / PASS | 0.915 vs vLLM 0.920 (Task 11) | 614.1 | `p7t39-qwen3-4b` |
+  | `Qwen3MoeForCausalLM/fp8_block/bf16/tp2` | `phase7-novanas-qwen3moe-tp2.yaml` | PASS / PASS | PASS (run `1017221439-09973688`) | 398.0 | `qwen3moe-tp2-novanas` |
+  | `Qwen3MoeForCausalLM/fp8_block/bf16/ep2` | `phase7-novanas-qwen3moe-ep2.yaml` | PASS / PASS | PASS (run `1017222135-3f768ec5`) | 206.7 | `qwen3moe-ep2-novanas` |
+  | `MistralForCausalLM/bf16/bf16/tp1` | `phase7-novanas-mistral-7b.yaml` | PASS / PASS | 0.550 vs vLLM 0.530 (Task 20) | 413.5 | `p7t39-mistral-7b` |
+  | `GptOssForCausalLM/mxfp4/bf16/tp1` | `phase7-novanas-gpt-oss-20b.yaml` | **FAIL (15/16)** / PASS | 0.925 vs vLLM 0.930 (Task 27) | n/a (see caveat) | `p7t39-gpt-oss-20b` |
+  | `OlmoeForCausalLM/bf16/fp8_e4m3/tp1` | `phase2-novanas-olmoe.yaml` + `kv.dtype=fp8_e4m3` | PASS / PASS | 0.6573 vs 0.6603 (Task 36) | 564.7 | `p7t39-olmoe-fp8kv` |
+  | `LlamaForCausalLM/bf16/tq4/tp1` | `phase2-novanas-llama.yaml` + `kv.dtype=tq4` | PASS / PASS (batched + strict) | 0.765 vs 0.770/0.760 (Task 37b) | 840.7 | `p7t39-llama-tq4` |
+
+  No regression of the Phase 2 Llama/OLMoE golden: `tests/golden/llama-3.2-3b-instruct/` and `tests/golden/olmoe-1b-7b-0125-instruct/` both c1/c16 PASS.
+
+  **gpt-oss finding (reproducible, for the lead):** golden **c1 is 15/16 — p15 `max_abs_logprob_diff_likely` 0.3546 against the slug's strict bound 0.35** (tail 2.0083 ≤ 2.41); the 14-prompt rule is met, only the "every prompt" bound clause fails. It reproduces bit-for-bit on a clean re-run (`p7t39-gpt-oss-20b-r2`, host idle): p15 = 0.3546 again. The Task 27 gate recorded c1 **16/16** at commit `dd94f669` with the same 0.35/2.41 bounds, so a Phase 7 commit after `dd94f669` moved p15 by ≥ 0.0046 — a real numerical drift, not run noise. c16 (batched 0.48/2.64) passes 16/16. The row is `supported` today; whether to widen its strict bound or bisect the drift is a lead call, not taken here. (The gpt-oss c16 `tok/s` is not comparable: the fixed-length reasoning workload leaves the final channel empty on most requests — `ok=29/200` then `17/200`, `stream finished without content` — and `host_share` reads ~1.0; documented in Task 27.)
+- **Support matrix** (`cargo run -p turbine-server -- --support-matrix --output json`): exactly the 9 baseline `supported` rows plus the 4 P7-closed rows (13 total) — baseline `LlamaForCausalLM/{bf16, fp8, fp8_block, awq_int4, gptq_int4}/bf16`, `LlamaForCausalLM/bf16/{fp8_e4m3, tq4}`, `OlmoeForCausalLM/bf16/{bf16, fp8_e4m3}`; P7 `Qwen3ForCausalLM/bf16/bf16`, `Qwen3MoeForCausalLM/fp8_block/bf16`, `MistralForCausalLM/bf16/bf16`, `GptOssForCausalLM/mxfp4/bf16`. `cargo test -p turbine-core support::tests::phase7_rows` → PASS. Stay `experimental`: `Qwen3_5ForConditionalGeneration/bf16/bf16/tp1`, `Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/{tp2,ep2}` (GDN recurrence), `MixtralForCausalLM/fp8/bf16/{tp2,ep2}` (ep2 `missing_top_k`), `LlamaForCausalLM/mxfp4/bf16/tp1`, `LlamaForCausalLM/mxfp4_a4/bf16/tp1`, `OlmoeForCausalLM/bf16/tq4/tp1` (shared-prefix drop 0.045).
+- **Disk** (`ssh novanas 'du -sh /home/piwi/turbine-models/*'`; `/` 889 G, 76 % used; build caches on the iSCSI bind mounts `/dev/sda[/turbine-ci/remote]` and `/dev/sda[/turbine-ci/cache/slots]`): the Phase 7 closed checkpoints — `qwen3-4b-instruct-2507` 7.6 G, `qwen3-30b-a3b-instruct-2507-fp8` 30 G, `mistral-7b-instruct-v0.3` 14 G, `gpt-oss-20b` 13 G (+`gpt-oss-20b-bf16` 39 G dequant fixture), `mixtral-8x7b-instruct-v0.1-fp8` 44 G, `qwen3.5-9b` 19 G, `qwen3.6-35b-a3b-fp8` 35 G (+`-bf16` 67 G dequant fixture); Phase 1/2 `llama-3.2-3b-instruct` 6.1 G, `olmoe-1b-7b-0125-instruct` 13 G.
+- **Not run: the overload soak** (`scripts/overload-soak.sh novanas --duration 10m`). Task 39 requires the user's approval first; left as a pending item.
+
