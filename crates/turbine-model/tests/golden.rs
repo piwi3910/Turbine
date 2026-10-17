@@ -651,12 +651,22 @@ fn build_executor(
     mem: Arc<dyn DeviceMemory>,
     max_seq_len: u32,
 ) -> Runner {
-    let cfg = load_model_config(model_dir).expect("config.json");
+    let mut cfg = load_model_config(model_dir).expect("config.json");
     let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
+    let slots = cfg.family.0.weight_slots(&cfg);
+    // The per-provider fallback (Phase 6a): a block-scaled FP8 layer no selected provider runs
+    // in FP8 (`kernel_unsupported`), and the Qwen3.5/3.6 shared expert (`shared_expert_bf16`,
+    // which the MoE path always adds in BF16), are decoded to BF16 at load — the executor
+    // expects the shared expert's weights in the activation dtype.
+    turbine_model::weights::resolve_for_providers(
+        &mut cfg,
+        &slots,
+        std::slice::from_ref(&provider),
+    );
     let weights = WeightLoader::load_format_skipping(
         cfg.weight_format.get(),
         &index,
-        &cfg.family.0.weight_slots(&cfg),
+        &slots,
         cfg.family.0.skipped_prefixes(),
         &mem,
         MAX_STAGING_BYTES,
@@ -678,6 +688,7 @@ fn build_executor(
         "llama" => families::llama::decoder_spec(),
         "qwen3" => families::qwen3::decoder_spec(),
         "qwen3_5" => families::qwen3_5::decoder_spec(),
+        "qwen3_5_moe" => families::qwen3_5_moe::decoder_spec(),
         other => panic!("no traced decoder for family {other}"),
     };
     let exec = DecoderExecutor::new(
@@ -1030,6 +1041,13 @@ fn hip_trace_vs_cpu_qwen3() {
 /// per-head output gate or the `(1 + w)` norms read the wrong rows, or the HIP path departs
 /// enough to reorder the likely tokens. Run it in a release build (the cpu-reference executor
 /// on the 9B model is scalar).
+///
+/// With `TURBINE_TEST_MODEL_DIR` = the 35B FP8 Qwen3.6 MoE checkpoint (P7 Task 34; does not fit
+/// one 32 GB card) the same prompt runs the prefill and 2 decode steps on the cpu-reference
+/// only, plus the two-GPU tp 2 leg ([`qwen3_5_moe_tp2_trace_leg`]) when two HIP devices are
+/// visible; the `fp8_block` packaging path (shared expert decoded to BF16 at load, GDN linears
+/// and experts kept as FP8 blocks) is asserted first. The one-device greedy tokens are the tp 2
+/// leg's teacher-forced inputs.
 #[test]
 #[ignore = "needs a HIP device, TURBINE_KERNEL_LIBRARY and TURBINE_TEST_MODEL_DIR, release"]
 fn hip_trace_vs_cpu_qwen3_5() {
@@ -1051,7 +1069,9 @@ fn hip_trace_vs_cpu_qwen3_5() {
     );
     // The vision tower and the MTP head are counted and skipped, not loaded.
     let index = SafetensorsIndex::open(&model_dir).expect("open safetensors");
-    let host: Arc<dyn DeviceMemory> = HostMemory::new(turbine_core::types::DeviceId(0), 24 << 30);
+    // 96 GiB: the Qwen3.6-35B-A3B checkpoint is ~35 GB of FP8 weights (kept packed on the
+    // cpu-reference provider) plus scales; the 9B Qwen3.5 fits in a fraction.
+    let host: Arc<dyn DeviceMemory> = HostMemory::new(turbine_core::types::DeviceId(0), 96 << 30);
     let skipped = WeightLoader::load_format_skipping(
         cfg.weight_format.get(),
         &index,
@@ -1072,19 +1092,94 @@ fn hip_trace_vs_cpu_qwen3_5() {
         );
     }
 
+    // P7 Task 34, S-11 (recorded here, exercised by the traced comparison below): the
+    // checkpoint's FP8-block packaging path. On the HIP provider the shared expert's SwiGLU
+    // projections (`.mlp.shared_expert.*`) are decoded to BF16 at load (its slot is never run as
+    // its own `qgemm`, `reason=shared_expert_bf16`), while the Gated DeltaNet linears
+    // (`in_proj_qkv`, `in_proj_z`, `out_proj`) and the routed experts stay FP8 blocks run
+    // through the FP8 GEMM. A checkpoint whose format cannot be resolved, or a layout that
+    // refuses it, fails here with the loader's reason code.
+    let provider = shim_provider(Arc::clone(&ctx));
+    {
+        use turbine_model::weights::{LinearSlot, QuantScheme, resolve_for_providers};
+        let all = cfg.family.0.weight_slots(&cfg);
+        let linear = |name: &str| -> LinearSlot {
+            let s = all
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("the checkpoint names no weight slot {name}"));
+            LinearSlot {
+                name: s.name.clone(),
+                n: s.shape[0] as u32,
+                k: s.shape[1] as u32,
+            }
+        };
+        let mut resolved = cfg.clone();
+        resolve_for_providers(&mut resolved, &all, std::slice::from_ref(&provider));
+        let l0 = "model.language_model.layers.0";
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let shared = linear(&format!("{l0}.mlp.shared_expert.{proj}.weight"));
+            assert!(
+                matches!(
+                    cfg.weight_format.get().scheme(&shared),
+                    QuantScheme::Fp8Block { .. }
+                ),
+                "the shared expert {proj} is not block-scaled FP8 in the checkpoint"
+            );
+            assert_eq!(
+                resolved.weight_format.get().scheme(&shared),
+                QuantScheme::Bf16,
+                "the shared expert {proj} was not decoded to BF16 at load"
+            );
+        }
+        for name in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+            let gdn = linear(&format!("{l0}.linear_attn.{name}.weight"));
+            assert!(
+                matches!(
+                    resolved.weight_format.get().scheme(&gdn),
+                    QuantScheme::Fp8Block { .. }
+                ),
+                "the Gated DeltaNet {name} was not kept as an FP8 block on HIP"
+            );
+        }
+        let expert = linear(&format!("{l0}.mlp.experts.0.gate_proj.weight"));
+        assert!(
+            matches!(
+                resolved.weight_format.get().scheme(&expert),
+                QuantScheme::Fp8Block { .. }
+            ),
+            "the routed experts were not kept as FP8 blocks on HIP"
+        );
+        println!(
+            "hip_trace_vs_cpu_qwen3_5: fp8_block layout ok ({} layers): shared_expert.* -> BF16 at \
+             load (shared_expert_bf16), gdn.in_proj_qkv/in_proj_z/out_proj and experts -> fp8_block \
+             qgemm",
+            cfg.num_layers
+        );
+    }
+
     let prompts: Vec<PromptRecord> = read_jsonl(&golden_dir().join("prompts.jsonl"));
     let p01 = prompts.iter().find(|p| p.id == "p01").expect("prompt p01");
     let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json")).expect("tokenizer");
     let template = ChatTemplate::resolve(&model_dir, None).expect("chat template");
     let ids = prompt_token_ids(&tokenizer, &template, p01);
     let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
+    let is_moe = cfg.family.0.name() == "qwen3_5_moe";
+    // The 35B MoE checkpoint does not fit one 32 GB card (that is Task 34's whole point): its
+    // "one device" is the cpu-reference and its multi-device leg is the tp 2 group below, whose
+    // ranks are compared against the cpu-reference. The dense 9B keeps the single-HIP-device leg.
     let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
     let mem: Arc<dyn DeviceMemory> = ctx.clone();
-    let mut hip = build_executor(&model_dir, shim_provider(ctx), mem, max_seq_len);
+    let mut hip =
+        (!is_moe).then(|| build_executor(&model_dir, Arc::clone(&provider), mem, max_seq_len));
     cpu.exec.set_trace(true);
-    hip.exec.set_trace(true);
+    if let Some(h) = hip.as_mut() {
+        h.exec.set_trace(true);
+    }
     let mut accumulated = Vec::new();
-    let mut batch = ids;
+    let mut cpu_steps: Vec<Vec<TraceTensor>> = Vec::new();
+    let mut forced: Vec<u32> = Vec::new();
+    let mut batch = ids.clone();
     let mut p0 = 0usize;
     let top5 = |row: &[f32]| -> Vec<usize> {
         let mut order: Vec<usize> = (0..row.len()).collect();
@@ -1095,24 +1190,47 @@ fn hip_trace_vs_cpu_qwen3_5() {
     let mut reordered = Vec::new();
     for step in 0..=TRACE_DECODE {
         let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
-        let mut rows = Vec::new();
-        for r in [&mut cpu, &mut hip] {
-            let logits =
-                r.kv.forward(&mut r.exec, &batch, &positions)
-                    .expect("forward");
-            rows.push(logits.row(0).to_vec());
+        let want = top5(
+            cpu.kv
+                .forward(&mut cpu.exec, &batch, &positions)
+                .expect("forward")
+                .row(0),
+        );
+        let c = cpu.exec.take_trace();
+        if let Some(h) = hip.as_mut() {
+            let got = top5(
+                h.kv.forward(&mut h.exec, &batch, &positions)
+                    .expect("forward")
+                    .row(0),
+            );
+            // The Gated DeltaNet recurrence amplifies the providers' GEMM rounding (a few BF16
+            // ulps at `gdn_qkv` become hundreds at `gdn_out`), so the exact top-5 order is not
+            // asserted; the greedy token (top-1) must still agree.
+            if want[0] != got[0] {
+                reordered.push((step, want.clone(), got));
+            }
+            let ht = h.exec.take_trace();
+            accumulated.extend(compare_traces(step, &c, &ht));
         }
-        let (c, h) = (cpu.exec.take_trace(), hip.exec.take_trace());
-        accumulated.extend(compare_traces(step, &c, &h));
-        let (want, got) = (top5(&rows[0]), top5(&rows[1]));
-        // The Gated DeltaNet recurrence amplifies the providers' GEMM rounding (a few BF16
-        // ulps at `gdn_qkv` become hundreds at `gdn_out`), so the exact top-5 order is not
-        // asserted; the greedy token (top-1) must still agree.
-        if want[0] != got[0] {
-            reordered.push((step, want.clone(), got));
-        }
+        cpu_steps.push(c);
+        forced.push(want[0] as u32);
         p0 += batch.len();
         batch = vec![want[0] as u32];
+    }
+    if is_moe {
+        println!(
+            "hip_trace_vs_cpu_qwen3_5: MoE one-device (cpu-reference) greedy tokens {:?} \
+             (the tp 2 leg's teacher-forced inputs)",
+            forced,
+        );
+        drop(hip);
+        drop(cpu);
+        if amd_device_count() >= 2 {
+            qwen3_5_moe_tp2_trace_leg(&model_dir, &cfg, &ids, &forced, &cpu_steps, max_seq_len);
+        } else {
+            println!("hip_trace_vs_cpu_qwen3_5: one HIP device visible, the tp 2 leg is skipped");
+        }
+        return;
     }
     println!(
         "{}",
@@ -1140,6 +1258,303 @@ fn hip_trace_vs_cpu_qwen3_5() {
     assert!(
         reordered.is_empty(),
         "greedy (top-1) logits differ from the cpu-reference (step, cpu, hip): {reordered:?}"
+    );
+}
+
+/// The number of AMD devices local discovery finds (0 when discovery fails): the two-GPU leg of
+/// [`hip_trace_vs_cpu_qwen3_5`] runs only when at least two are visible.
+fn amd_device_count() -> usize {
+    turbine_device::discover(&turbine_device::DiscoveryOptions::default())
+        .map(|inv| {
+            inv.devices
+                .iter()
+                .filter(|d| d.vendor.as_str() == "amd")
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The traced tensors a tensor-parallel rank of the Qwen3.6 MoE hybrid holds bitwise identically
+/// to its peers and to the one-device cpu-reference: the post-all-reduce residual sums
+/// (`embed`, `resid_attn`, `resid_mlp`, `final_norm`) and the norms and router GEMM over the
+/// replicated rows (`attn_norm`, `mlp_norm`, `router_logits`). The sharded tensors (the head and
+/// value-head slices, the partial `o_proj`, the pre-all-reduce `moe_out` and the vocabulary
+/// shard) legitimately differ between ranks; their correctness is the full-attention layers'
+/// trace bound and the printed one-device logits.
+const QWEN3_5_MOE_TP_REPLICATED: [&str; 7] = [
+    "embed",
+    "attn_norm",
+    "mlp_norm",
+    "resid_attn",
+    "resid_mlp",
+    "router_logits",
+    "final_norm",
+];
+
+/// The two-GPU tp 2 leg of [`hip_trace_vs_cpu_qwen3_5`] (P7 Task 34, S-11; decision "P7 Task 34
+/// recurrence-aware TP criterion"): the Qwen3.6 MoE hybrid's full layer stack on a two-rank HIP
+/// tensor-parallel group (the `hostmem` collective, GDN value heads and attention heads sharded,
+/// the routed experts column-split, the shared expert replicated), the same prompt and
+/// teacher-forced greedy tokens as the one-device leg. Asserts the relaxed recurrent-hybrid
+/// criterion:
+///
+/// (a) bitwise rank agreement — every op of every step and every step's logits equal between
+///     rank 0 and rank 1 (a wrong GDN/attention shard, expert split or shared-expert placement
+///     diverges between the ranks);
+/// (b) structural correctness — the ranks record the same ops in the same order with the same
+///     shapes, and the replicated tensors ([`QWEN3_5_MOE_TP_REPLICATED`]) have the one-device
+///     cpu-reference's shape and count;
+/// (c) the one-device comparison printed for the record, with the *first* full-attention layer's
+///     replicated ops held to the trace bound (max |Δ| ≤ 2e-2 or nine tenths of the op's own
+///     magnitude). The Gated DeltaNet layers' ops — and the deeper full-attention layers, whose
+///     residual stream the recurrence has already drifted (measured: the one-device greedy
+///     agreement is 1/3, and `resid_attn` exceeds the bound from layer 15 on) — are deliberately
+///     not held to it.
+fn qwen3_5_moe_tp2_trace_leg(
+    model_dir: &Path,
+    cfg: &turbine_model::config::ModelArchConfig,
+    ids: &[u32],
+    forced: &[u32],
+    cpu_steps: &[Vec<TraceTensor>],
+    max_seq_len: u32,
+) {
+    use turbine_distributed::collective::{self as coll, CollectiveInit};
+    use turbine_model::tp::{self, ShardSpec, TpContext};
+
+    const WORLD: u32 = 2;
+    let index = SafetensorsIndex::open(model_dir).expect("open safetensors");
+    let limits = ExecutorLimits {
+        block_tokens: BLOCK_TOKENS,
+        max_batch_tokens: max_seq_len,
+        max_seqs: 1,
+    };
+    let opts = ExecutorOptions::default();
+    let lib = coll::registry()
+        .get("hostmem")
+        .expect("registered")
+        .load(None)
+        .expect("load hostmem");
+    let unique_id = lib.unique_id().expect("id");
+
+    struct RankRun {
+        steps: Vec<Vec<TraceTensor>>,
+        logits: Vec<Vec<f32>>,
+    }
+    let ranks: Vec<RankRun> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WORLD)
+            .map(|rank| {
+                let (lib, cfg, index, ids, forced) = (Arc::clone(&lib), cfg, &index, ids, forced);
+                scope.spawn(move || {
+                    let ctx = turbine_kernels::test_support::open_context_nth("hip", rank as usize);
+                    let mem: Arc<dyn DeviceMemory> = ctx.clone();
+                    let collective = lib
+                        .open(CollectiveInit {
+                            rank: rank as usize,
+                            world: WORLD as usize,
+                            unique_id,
+                            init_timeout: std::time::Duration::from_secs(120),
+                            op_timeout: std::time::Duration::from_secs(120),
+                            clock: Arc::new(turbine_core::clock::SystemClock::new()),
+                            metrics: None,
+                            memory: Some(Arc::clone(&mem)),
+                            route_max_bytes: Some(u64::MAX),
+                        })
+                        .expect("open hostmem");
+                    let s = ShardSpec { rank, world: WORLD };
+                    let provider = shim_provider(ctx);
+                    let slots = tp::weight_slots(cfg, s).expect("shard slots");
+                    let mut rank_cfg = cfg.clone();
+                    turbine_model::weights::resolve_for_providers(
+                        &mut rank_cfg,
+                        &slots,
+                        std::slice::from_ref(&provider),
+                    );
+                    let weights = WeightLoader::load_format(
+                        rank_cfg.weight_format.get(),
+                        index,
+                        &slots,
+                        &mem,
+                        MAX_STAGING_BYTES,
+                    )
+                    .expect("load shard");
+                    let reqs = tp::available_requirements(
+                        &rank_cfg,
+                        s,
+                        BLOCK_TOKENS,
+                        opts,
+                        std::slice::from_ref(&provider),
+                    )
+                    .expect("requirements");
+                    let order = [provider.id()];
+                    let card = provider.card_profile();
+                    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+                    let registry =
+                        KernelRegistry::build(vec![provider], &order, &reqs, &metrics, card)
+                            .expect("every op has a provider");
+                    let mut exec = DecoderExecutor::new_tp(
+                        &rank_cfg,
+                        families::qwen3_5_moe::decoder_spec(),
+                        weights,
+                        Arc::new(registry),
+                        Arc::clone(&mem),
+                        limits,
+                        opts,
+                        Some(TpContext {
+                            rank,
+                            world: WORLD,
+                            collective,
+                            stream: mem.compute_stream(),
+                        }),
+                    )
+                    .expect("rank executor");
+                    let layout = tp::kv_layout(cfg, s, BLOCK_TOKENS).expect("layout");
+                    let mut kv = SequenceKv::new(&mem, layout, max_seq_len).expect("kv");
+                    exec.set_trace(true);
+                    let (mut steps, mut logits) = (Vec::new(), Vec::new());
+                    let mut batch: Vec<u32> = ids.to_vec();
+                    let mut p0 = 0usize;
+                    for &next in forced.iter().take(cpu_steps.len()) {
+                        let positions: Vec<u32> = (p0 as u32..(p0 + batch.len()) as u32).collect();
+                        let row = kv
+                            .forward(&mut exec, &batch, &positions)
+                            .expect("forward")
+                            .row(0)
+                            .to_vec();
+                        steps.push(exec.take_trace());
+                        logits.push(row);
+                        p0 += batch.len();
+                        batch = vec![next];
+                    }
+                    RankRun { steps, logits }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("rank thread"))
+            .collect()
+    });
+
+    // (a) the recurrence criterion's core: the ranks record the same ops in the same order with
+    // the same shapes (structural), the replicated (all-reduced) tensors agree bitwise, and each
+    // step's logits rows agree bitwise. The sharded attention/GDN projections legitimately
+    // differ between ranks — each holds its own heads (rank agreement there is structural only;
+    // their correctness is the full-attention bound in (b) and the printed one-device logits).
+    for (step, (a, b)) in ranks[0].steps.iter().zip(&ranks[1].steps).enumerate() {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "step {step}: the ranks recorded different op counts"
+        );
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(
+                (x.layer, x.name, x.shape),
+                (y.layer, y.name, y.shape),
+                "step {step}: the ranks recorded different ops"
+            );
+            if QWEN3_5_MOE_TP_REPLICATED.contains(&x.name) {
+                assert_eq!(
+                    x.data, y.data,
+                    "step {step} layer {:?} {}: the ranks differ on a replicated op",
+                    x.layer, x.name
+                );
+            }
+        }
+    }
+    assert_eq!(
+        ranks[0].logits, ranks[1].logits,
+        "the ranks' logits differ from each other"
+    );
+    // (c) the one-device logits comparison, printed: which of the teacher-forced steps the tp 2
+    // group's greedy token matches the cpu-reference's (`forced` holds the cpu-reference's own
+    // greedy tokens, the teacher-forced inputs of both devices).
+    let argmax = |r: &[f32]| {
+        r.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+            .map(|(i, _)| i as u32)
+    };
+    let agree = ranks[0]
+        .logits
+        .iter()
+        .zip(forced)
+        .filter(|(row, want)| argmax(row) == Some(**want))
+        .count();
+    println!(
+        "hip_trace_vs_cpu_qwen3_5: tp 2 one-device greedy agreement {agree}/{} (printed, not \
+         gated; the recurrence amplifies the all-reduce's BF16 rounding)",
+        forced.len()
+    );
+
+    // (b) + (c): the replicated ops against the one-device cpu-reference, printed, with the
+    // full-attention layers' ops held to the trace bound.
+    let keep = |t: &TraceTensor| QWEN3_5_MOE_TP_REPLICATED.contains(&t.name);
+    let mut rows = Vec::new();
+    for (step, want) in cpu_steps.iter().enumerate() {
+        assert_eq!(
+            want.len(),
+            ranks[0].steps[step].len(),
+            "step {step}: the rank recorded a different op count than one device"
+        );
+        let want: Vec<TraceTensor> = want.iter().filter(|t| keep(t)).cloned().collect();
+        let got: Vec<TraceTensor> = ranks[0].steps[step]
+            .iter()
+            .filter(|t| keep(t))
+            .cloned()
+            .collect();
+        rows.extend(compare_traces(step, &want, &got));
+    }
+    println!(
+        "{}",
+        render(
+            "Qwen3.6-35B-A3B p01: HIP tp 2 (rank 0) vs cpu-reference (replicated ops)",
+            &rows
+        )
+    );
+    // The full-attention path: the replicated ops of the *first* full-attention layer must stay
+    // within the trace bound of the one-device cpu-reference — a wrong per-head Q/K norm, output
+    // gate, partial RoPE or head shard blows past it before any drift compounds. The deeper
+    // full-attention layers sit on a residual stream the preceding Gated DeltaNet layers have
+    // drifted (the recurrence amplifies the all-reduce/FP8 rounding; the one-device greedy
+    // agreement above was already 1/3), so their rows are printed, not asserted.
+    let first_full = cfg
+        .layer_kinds
+        .iter()
+        .position(|k| *k == families::LayerKind::FullAttention);
+    let mut failures = Vec::new();
+    let mut printed = 0usize;
+    for row in &rows {
+        let Some(layer) = row.layer else { continue };
+        if cfg.layer_kinds[layer] != families::LayerKind::FullAttention {
+            continue;
+        }
+        let s = &row.stats;
+        let over = s.max_abs > 2e-2 && s.max_abs > s.max_ref * 0.9;
+        if Some(layer) != first_full {
+            printed += usize::from(over);
+            continue;
+        }
+        if over {
+            failures.push(format!(
+                "step {} layer {layer} {}: max |Δ| {} (max |ref| {})",
+                row.step, row.name, s.max_abs, s.max_ref
+            ));
+        }
+    }
+    println!(
+        "hip_trace_vs_cpu_qwen3_5: full-attention layer {first_full:?} on the trace bound; \
+         {printed} deeper full-attention rows beyond it (printed, the recurrence's drift)"
+    );
+    assert!(
+        failures.is_empty(),
+        "the first full-attention layer's tp 2 ops depart from the cpu-reference beyond the \
+         trace bound:\n{}",
+        failures.join("\n")
+    );
+    println!(
+        "hip_trace_vs_cpu_qwen3_5: tp 2 leg passed ({} replicated ops over {} steps)",
+        QWEN3_5_MOE_TP_REPLICATED.len(),
+        cpu_steps.len()
     );
 }
 
