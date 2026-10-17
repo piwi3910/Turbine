@@ -637,6 +637,11 @@ pub struct KvHierarchy {
     /// P7 S-12 (Task 32): the block-boundary snapshot entries (one per L0 block). `None` until
     /// the server marks the model hybrid (`set_hybrid_state`). Freed with the block.
     snapshot_pool: Option<SnapshotPool>,
+    /// P7 S-12 (Task 33): whether a demotion copies a block's snapshot tail into its tier
+    /// record and a promotion restores it. Off by default: a backend that cannot move the tail
+    /// (the server's device copy path until it carries it) would otherwise file a stale ref.
+    /// Enabled for the simulator and, on the server, once the device path carries the tail.
+    snapshot_tier_travel: bool,
     l0_state: PressureState,
     prefill_tps: f64,
     reclaim: Arc<KvReclaimHandle>,
@@ -776,6 +781,7 @@ impl KvHierarchy {
             requests: HashMap::new(),
             l0_keys: HashMap::new(),
             snapshot_pool: None,
+            snapshot_tier_travel: false,
             l0_state: PressureState::Green,
             prefill_tps: Self::DEFAULT_PREFILL_TPS,
             reclaim: Arc::new(KvReclaimHandle::new()),
@@ -948,11 +954,51 @@ impl KvHierarchy {
             from_bytes: self.format_bytes(src),
             to: dst,
             to_bytes: self.format_bytes(dst),
+            snapshot_bytes: self.source_snapshot_bytes(key, from),
         })
     }
 
+    /// Bytes of one snapshot entry (0 without hybrid state).
+    fn snapshot_entry_bytes(&self) -> u64 {
+        self.snapshot_pool
+            .as_ref()
+            .map_or(0, SnapshotPool::entry_bytes)
+    }
+
+    /// The snapshot tail a copy of `key` out of `from` carries (P7 S-12, Task 33): an L0 source
+    /// has one when the block's directory entry holds a snapshot, a lower-tier source when its
+    /// record's location does. The tail is the same at both ends of the copy.
+    fn source_snapshot_bytes(&self, key: &KvKey, from: TierId) -> u64 {
+        if !self.snapshot_tier_travel {
+            return 0;
+        }
+        if from == TierId::L0 {
+            if self.dir.get(key).and_then(|b| b.snapshot).is_some() {
+                self.snapshot_entry_bytes()
+            } else {
+                0
+            }
+        } else {
+            self.dir
+                .get(key)
+                .and_then(|b| b.location(from))
+                .map_or(0, |l| l.snapshot_bytes)
+        }
+    }
+
+    /// The L0 snapshot ref a copy of `key` out of `from` reads (a demotion of an L0 block with a
+    /// snapshot); `None` for a lower-tier source, whose record already carries the tail.
+    fn source_snapshot(&self, key: &KvKey, from: TierId) -> Option<SnapshotRef> {
+        if from == TierId::L0 {
+            self.dir.get(key).and_then(|b| b.snapshot)
+        } else {
+            None
+        }
+    }
+
     /// A copy request of `key` along `path` with its formats; the bytes it counts in flight
-    /// are the smaller copy's (the lower tier's, which crosses the host link).
+    /// are the smaller KV copy's (the lower tier's, which crosses the host link) plus the
+    /// snapshot tail. `snapshot` is the L0 entry the copy reads from or writes to.
     #[allow(clippy::too_many_arguments)]
     fn copy_request(
         &self,
@@ -962,28 +1008,30 @@ impl KvHierarchy {
         purpose: TransferPurpose,
         src_slot: u64,
         dst_slot: u64,
+        snapshot: Option<SnapshotRef>,
     ) -> Option<TransferRequest> {
         let codec = self.copy_codec(&key, path.from(), path.to())?;
         Some(TransferRequest {
             path,
             key,
-            bytes: codec.from_bytes.min(codec.to_bytes),
+            bytes: codec.from_bytes.min(codec.to_bytes) + codec.snapshot_bytes,
             owner,
             purpose,
             src_slot,
             dst_slot,
             codec,
+            snapshot,
         })
     }
 
     /// Blocks of `tier`'s format a demotion of `key` from `from` into `tier` takes (more than
     /// one for a lossless-tail block stored at the larger L0 format).
     /// The bytes a demotion of `key` from `from` into `tier` stores: the codec's destination
-    /// size ([`KvHierarchy::copy_codec`], the tier's format when the rung has no slot), the
-    /// currency [`KvHierarchy::make_room`] counts in.
+    /// size ([`KvHierarchy::copy_codec`], the tier's format when the rung has no slot) plus its
+    /// snapshot tail, the currency [`KvHierarchy::make_room`] counts in.
     fn demotion_bytes(&self, key: &KvKey, from: TierId, tier: TierId) -> u64 {
         self.copy_codec(key, from, tier)
-            .map_or(1, |c| c.to_bytes.max(1))
+            .map_or(1, |c| c.to_record_bytes().max(1))
     }
 
     /// Admission-time prefix match (S-3, S-9): the planner's cutoff, L0 blocks attached by
@@ -1149,6 +1197,13 @@ impl KvHierarchy {
                 };
                 let path = TransferPath::between(mb.tier, TierId::L0)
                     .expect("a lower local tier has a path to L0");
+                // P7 S-12 (Task 33): a promoted block's snapshot gets a fresh L0 entry (the
+                // demotion released the old one); the entry's bytes are written by the copy.
+                let snapshot = if mb.location.snapshot_bytes > 0 {
+                    self.snapshot_alloc(ids[0])
+                } else {
+                    None
+                };
                 let tr = self
                     .copy_request(
                         path,
@@ -1157,6 +1212,7 @@ impl KvHierarchy {
                         TransferPurpose::Promote,
                         mb.location.slot,
                         u64::from(ids[0].0),
+                        snapshot,
                     )
                     .expect("a matched block has a copy in its tier");
                 match self.transfer.submit(tr) {
@@ -1171,6 +1227,9 @@ impl KvHierarchy {
                     }
                     Err(_) => {
                         pool.release(&ids);
+                        if let Some(s) = snapshot {
+                            self.release_snapshot(s.block);
+                        }
                         cut = i;
                         break;
                     }
@@ -1511,6 +1570,7 @@ impl KvHierarchy {
                             tier: TierId::L0,
                             slot: u64::from(block.0),
                             format: l0_tag(pool, block),
+                            snapshot_bytes: 0,
                         },
                     );
                     pool.set_keyed(block);
@@ -1536,6 +1596,7 @@ impl KvHierarchy {
                     tier: TierId::L0,
                     slot: u64::from(block.0),
                     format: l0_tag(pool, block),
+                    snapshot_bytes: 0,
                 }]),
                 access_count: 0,
                 last_access: now,
@@ -1685,6 +1746,7 @@ impl KvHierarchy {
                 tier: TierId::L0,
                 slot: u64::from(block.0),
                 format: l0_tag(pool, block),
+                snapshot_bytes: 0,
             }]),
             access_count: 0,
             last_access: self.now(),
@@ -1828,6 +1890,7 @@ impl KvHierarchy {
                         tier: to,
                         slot,
                         format: req.codec.to,
+                        snapshot_bytes: req.codec.snapshot_bytes,
                     },
                 );
                 if keep {
@@ -1889,8 +1952,12 @@ impl KvHierarchy {
                         tier: TierId::L0,
                         slot: req.dst_slot,
                         format: req.codec.to,
+                        snapshot_bytes: 0,
                     },
                 );
+                // A hybrid block's snapshot entry moves with its page: the entry is keyed by
+                // BlockId, and the block's L0 page is now `dst` (P7 S-12, Task 33).
+                self.rekey_snapshot(src, dst);
                 // The source page is unreferenced (checked above) and keyed: the rewrite's
                 // copy replaces it. Its key mapping goes with the page — a stale entry would
                 // drop the new copy's location when the pool hands the page out again.
@@ -1919,6 +1986,7 @@ impl KvHierarchy {
                         tier,
                         slot,
                         format: req.codec.to,
+                        snapshot_bytes: req.codec.snapshot_bytes,
                     },
                 );
                 self.metrics.eviction(tier, EvictReason::Compressed);
@@ -1946,8 +2014,14 @@ impl KvHierarchy {
                             tier: TierId::L0,
                             slot: u64::from(block.0),
                             format: L0_FORMAT,
+                            snapshot_bytes: 0,
                         },
                     );
+                    // P7 S-12 (Task 33): the promoted (or prefetched) block's fresh snapshot
+                    // entry is now populated; record it on the directory.
+                    if let Some(r) = req.snapshot {
+                        self.snapshot_record(block, r);
+                    }
                 }
                 self.metrics.promotion(from, TierId::L0);
                 self.stats.promotions += 1;
@@ -2036,6 +2110,9 @@ impl KvHierarchy {
             TransferPurpose::Prefetch => {
                 self.prefetch_inflight.remove(&ticket);
                 pool.release(&[BlockId(req.dst_slot as u32)]);
+                if let Some(r) = req.snapshot {
+                    self.release_snapshot(r.block);
+                }
                 self.prefetch.reject(1);
                 self.metrics.prefetch_outcome(PrefetchOutcome::Rejected);
             }
@@ -2045,6 +2122,9 @@ impl KvHierarchy {
                 self.promotions_by_ticket.remove(&ticket);
                 let owner = req.owner.expect("promotions have an owner");
                 let failed = BlockId(req.dst_slot as u32);
+                if let Some(r) = req.snapshot {
+                    self.release_snapshot(r.block);
+                }
                 let Some(mut p) = self.pending.remove(&owner) else {
                     pool.release(&[failed]);
                     return;
@@ -2692,8 +2772,16 @@ impl KvHierarchy {
             return false;
         };
         let path = TransferPath::between(from, to).expect("a demotion path exists");
-        let Some(req) = self.copy_request(path, key, None, TransferPurpose::Demote, src_slot, 0)
-        else {
+        let snapshot = self.source_snapshot(&key, from);
+        let Some(req) = self.copy_request(
+            path,
+            key,
+            None,
+            TransferPurpose::Demote,
+            src_slot,
+            0,
+            snapshot,
+        ) else {
             return false;
         };
         let bytes = req.codec.to_bytes;
@@ -3179,6 +3267,7 @@ impl KvHierarchy {
                             from_bytes: self.format_bytes(loc.format),
                             to,
                             to_bytes: self.format_bytes(to),
+                            snapshot_bytes: 0,
                         },
                     );
                     return false;
@@ -3197,16 +3286,24 @@ impl KvHierarchy {
             from_bytes: self.format_bytes(loc.format),
             to,
             to_bytes: self.format_bytes(to),
+            // A lower tier's record carries the snapshot tail; an L0 rewrite's snapshot stays in
+            // the pool entry (re-keyed to the destination page on completion).
+            snapshot_bytes: if tier == TierId::L0 {
+                0
+            } else {
+                loc.snapshot_bytes
+            },
         };
         let req = TransferRequest {
             path,
             key,
-            bytes: codec.from_bytes.min(codec.to_bytes),
+            bytes: codec.from_bytes.min(codec.to_bytes) + codec.snapshot_bytes,
             owner: None,
             purpose: TransferPurpose::Compress,
             src_slot: loc.slot,
             dst_slot: dst.map_or(loc.slot, |b| u64::from(b.0)),
             codec,
+            snapshot: None,
         };
         if self.transfer.submit(req).is_err() {
             // The queue is full: the destination page goes back (a lower tier's rewrite has
@@ -3565,6 +3662,15 @@ impl KvHierarchy {
         self.snapshot_pool = Some(SnapshotPool::new(layout, blocks));
     }
 
+    /// P7 S-12 (Task 33): enables copying a block's snapshot tail into its tier record on
+    /// demotion and restoring it on promotion. The server enables it only when its transfer
+    /// backend can move the tail; a backend that cannot would file a ref to bytes it never
+    /// wrote. Off until then, so a hybrid block whose snapshot cannot travel has its state
+    /// recomputed on return (correct, just slower) rather than restored from stale bytes.
+    pub fn set_snapshot_tier_travel(&mut self, enabled: bool) {
+        self.snapshot_tier_travel = enabled;
+    }
+
     /// `kv.hybrid_snapshot_interval_blocks` (P7 S-12), always `≥ 1`.
     pub fn snapshot_interval(&self) -> u32 {
         self.cfg.hybrid_snapshot_interval_blocks.max(1)
@@ -3572,7 +3678,7 @@ impl KvHierarchy {
 
     /// P7 S-12 (Task 33): the hybrid snapshot bytes held in `tier`. L0 counts the live snapshot
     /// entries (every allocated [`SnapshotPool`] entry times its `layout.bytes_per_sequence()`);
-    /// L1/L2 count the snapshot tails of the blocks whose records the tier stores. Zero for an
+    /// L1/L2 sum the snapshot tails of the blocks whose records the tier stores. Zero for an
     /// attention-only model.
     pub fn snapshot_bytes(&self, tier: TierId) -> u64 {
         match tier {
@@ -3580,7 +3686,12 @@ impl KvHierarchy {
                 .snapshot_pool
                 .as_ref()
                 .map_or(0, |p| u64::from(p.capacity() - p.free()) * p.entry_bytes()),
-            _ => 0,
+            t => self
+                .dir
+                .iter()
+                .filter_map(|b| b.location(t))
+                .map(|l| l.snapshot_bytes)
+                .sum(),
         }
     }
 
@@ -3610,6 +3721,23 @@ impl KvHierarchy {
             && let Some(key) = self.l0_keys.get(&block).copied()
         {
             self.dir.set_snapshot(&key, None);
+        }
+    }
+
+    /// Moves `old`'s snapshot entry to `new` when an L0 rewrite replaces the block's page (P7
+    /// S-12, Task 33): the entry is keyed by `BlockId`, and the directory's ref follows.
+    fn rekey_snapshot(&mut self, old: BlockId, new: BlockId) {
+        let Some(pool) = self.snapshot_pool.as_mut() else {
+            return;
+        };
+        if !pool.rekey(old, new) {
+            return;
+        }
+        if let Some(entry) = pool.entry_of(new)
+            && let Some(key) = self.l0_keys.get(&new).copied()
+        {
+            self.dir
+                .set_snapshot(&key, Some(SnapshotRef { block: new, entry }));
         }
     }
 
@@ -3767,6 +3895,12 @@ impl KvHierarchy {
             let loc = b.location(from).expect("the fastest tier has a copy");
             let (src_slot, target) = (loc.slot, self.lossy_target(key, loc));
             let Ok(ids) = pool.allocate(1) else { break };
+            // A prefetched hybrid block gets a fresh snapshot entry for its tail (P7 S-12).
+            let snapshot = if loc.snapshot_bytes > 0 {
+                self.snapshot_alloc(ids[0])
+            } else {
+                None
+            };
             let req = self
                 .copy_request(
                     TransferPath::between(from, TierId::L0).expect("lower tier to L0"),
@@ -3775,6 +3909,7 @@ impl KvHierarchy {
                     TransferPurpose::Prefetch,
                     src_slot,
                     u64::from(ids[0].0),
+                    snapshot,
                 )
                 .expect("the fastest tier has a copy");
             match self.transfer.submit(req) {
@@ -3787,6 +3922,9 @@ impl KvHierarchy {
                 }
                 Err(_) => {
                     pool.release(&ids);
+                    if let Some(s) = snapshot {
+                        self.release_snapshot(s.block);
+                    }
                     break;
                 }
             }
@@ -4160,6 +4298,152 @@ pub(crate) mod tests {
             entry,
             "a release drops those bytes"
         );
+    }
+
+    /// P7 S-12 (Task 33): a hybrid block's snapshot bytes travel with it through L1 and L2 — a
+    /// demotion to L1 (`l0` format) and then to L2 (`tq4` format) keeps the exact tail, a
+    /// promotion back into L0 writes it into a fresh entry, and an eviction drops the block and
+    /// its tail together. Breaks if a tier record loses the snapshot, the tail is transcoded
+    /// with the KV bytes, the L0 entry is not released on demotion or re-allocated on promotion,
+    /// or an eviction strands the bytes.
+    #[test]
+    fn state_snapshot_follows_block() {
+        use crate::state::{MemSnapshotStore, SnapshotStore};
+        use crate::tier::TierBlockMut;
+        use turbine_core::config::ModuleName;
+        use turbine_core::types::{StateDtype, StateLayout};
+
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let fmt = fmt16();
+        let bb = fmt.layout.block_bytes();
+        let l1 = Arc::new(MemTier::new(TierId::L1, 16 * bb, arc.clone()));
+        let l2 = Arc::new(MemTier::new(TierId::L2, 16 * bb, arc.clone()));
+        let mut r = rig_tiers(
+            "cost_aware",
+            8,
+            Some(l1.clone()),
+            Some(l2.clone()),
+            clock,
+            |kv| {
+                kv.cpu.format = ModuleName::new("l0").expect("l0");
+                kv.nvme.format = ModuleName::new("tq4").expect("tq4");
+            },
+        );
+
+        // A hybrid model: one snapshot entry per L0 block, sized by the state layout.
+        let layout = StateLayout {
+            linear_layers: 4,
+            recurrent_bytes_per_layer: 1024,
+            conv_bytes_per_layer: 512,
+            dtype: Some(StateDtype::F32),
+        };
+        let entry = layout.bytes_per_sequence();
+        let blocks = r.pool.total_blocks();
+        r.h.set_hybrid_state(layout, blocks);
+        r.h.set_snapshot_tier_travel(true);
+        let store = MemSnapshotStore::new(blocks, entry);
+        r.backend.set_snapshot_store(store.clone());
+
+        // Two full 16-token blocks cached, each carrying a known snapshot pattern.
+        let prompt: Vec<u32> = (0..40).collect();
+        run(&mut r, &prompt);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &prompt, 16);
+        assert_eq!(keys.len(), 2, "40 tokens = 2 full blocks + a partial");
+        let pattern: Vec<u8> = (0..entry as usize).map(|i| (i % 251) as u8).collect();
+        for k in &keys {
+            let block = BlockId(r.h.dir.get(k).unwrap().location(TierId::L0).unwrap().slot as u32);
+            let snap = r.h.snapshot_alloc(block).expect("a snapshot entry");
+            store
+                .write(snap.entry, &pattern)
+                .expect("write the pattern");
+            r.h.snapshot_record(block, snap);
+        }
+        assert_eq!(r.h.snapshot_bytes(TierId::L0), 2 * entry);
+        let key = keys[0];
+
+        // Demote block 0 to L1 (`l0`): the record's tail is exact, the L0 entry is released.
+        assert!(r.h.submit_demotion(&mut r.pool, key, TierId::L0, TierId::L1));
+        settle(&mut r);
+        assert!(!l1.is_empty(), "the block landed in L1");
+        let l0_kv = r.h.format_bytes(L0_FORMAT);
+        let mut buf = vec![0u8; l0_kv as usize + entry as usize];
+        l1.get(&key, TierBlockMut::Host(&mut buf))
+            .expect("L1 record");
+        assert_eq!(
+            &buf[l0_kv as usize..],
+            &pattern[..],
+            "L1 keeps the tail exact"
+        );
+        assert_eq!(r.h.snapshot_bytes(TierId::L1), entry);
+        assert_eq!(
+            r.h.snapshot_bytes(TierId::L0),
+            entry,
+            "block 0's L0 entry was released on demotion"
+        );
+
+        // Demote L1 -> L2 (`tq4`): the KV part transcodes, the tail stays exact.
+        assert!(r.h.submit_demotion(&mut r.pool, key, TierId::L1, TierId::L2));
+        settle(&mut r);
+        let tq4_kv = r.h.format_bytes("tq4");
+        let mut buf = vec![0u8; tq4_kv as usize + entry as usize];
+        l2.get(&key, TierBlockMut::Host(&mut buf))
+            .expect("L2 record");
+        assert_eq!(
+            &buf[tq4_kv as usize..],
+            &pattern[..],
+            "L2 keeps the tail exact"
+        );
+        assert_eq!(r.h.snapshot_bytes(TierId::L2), entry);
+        assert_eq!(r.h.snapshot_bytes(TierId::L1), 0, "the L1 copy left");
+
+        // Promote L2 -> L0: a fresh L0 entry holds the same bytes and the block's ref follows.
+        let id = RequestId::new_v4();
+        assert_eq!(attach(&mut r, id, &prompt), AttachOutcome::Promoting);
+        let mut ready = Vec::new();
+        for _ in 0..8 {
+            r.clock.advance(Duration::from_millis(10));
+            ready = r.h.poll(&mut r.pool, &mut r.backend);
+            if !ready.is_empty() {
+                break;
+            }
+        }
+        let (_, attach) = ready.pop().expect("the promotions landed");
+        // The L2 copy is `tq4` (lossy), so the promoted block is filed under a lossy key
+        // (P6b S-3); its fresh snapshot ref is on that entry, keyed by the promoted block.
+        let promoted = attach.blocks[0];
+        let filed =
+            *r.h.l0_keys
+                .get(&promoted)
+                .expect("the promoted block is keyed");
+        let snap =
+            r.h.dir
+                .get(&filed)
+                .expect("the filed key")
+                .snapshot
+                .expect("a fresh snapshot ref on the promoted block");
+        assert_eq!(snap.block, promoted, "the ref names the new L0 block");
+        let mut out = vec![0u8; entry as usize];
+        store
+            .read(snap.entry, &mut out)
+            .expect("read the fresh entry");
+        assert_eq!(out, pattern, "the promoted entry holds the same bytes");
+        assert_eq!(
+            r.h.snapshot_bytes(TierId::L0),
+            2 * entry,
+            "both blocks' entries"
+        );
+
+        // An eviction drops the block and its tail together (the exact L2 copy and the lossy
+        // L0 copy the promotion made).
+        r.pool.release(&attach.blocks);
+        r.h.request_done(&mut r.pool, id, false);
+        for k in [keys[0], keys[1], filed] {
+            r.h.drop_everywhere(&mut r.pool, &k, EvictReason::Capacity);
+        }
+        assert_eq!(r.h.snapshot_bytes(TierId::L0), 0, "no L0 entries left");
+        assert_eq!(r.h.snapshot_bytes(TierId::L2), 0, "no L2 tails left");
     }
 
     /// The mechanism (leaf-first chain, copy then free, promotion before reuse) holds whatever

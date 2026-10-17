@@ -337,6 +337,7 @@ impl TierWorker for WorkerTiers {
                             src_slot: u64::from(block.0),
                             dst_slot: u64::from(block.0),
                             codec: TransferCodec::l0(self.shard_bytes),
+                            snapshot: None,
                         },
                     };
                     match self.backend.start(&t) {
@@ -1002,6 +1003,7 @@ mod tests {
                 src_slot: 1,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         let started = Instant::now();
@@ -1057,6 +1059,7 @@ mod tests {
                 src_slot: 2,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         assert!(
@@ -1093,6 +1096,7 @@ mod tests {
                 src_slot: 1,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         let err = g
@@ -1132,6 +1136,7 @@ mod tests {
                 src_slot: 1,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         g.driver.backend(&mut g.local).start(&t).expect("starts");
@@ -1243,6 +1248,7 @@ mod tests {
                 src_slot: 1,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         let took = g
@@ -1293,6 +1299,7 @@ mod tests {
                 src_slot: 1,
                 dst_slot: 0,
                 codec: TransferCodec::l0(layout().block_bytes()),
+                snapshot: None,
             },
         };
         g.driver

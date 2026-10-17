@@ -22,7 +22,8 @@ pub use metrics::KvMetrics;
 pub use pool::{BlockPool, BlockPoolConfig, PoolError};
 pub use reclaim::L0Reclaimer;
 pub use state::{
-    KvError, SnapshotPool, SnapshotRef, StateCopy, StateLoc, StateSlot, StateSlotPool,
+    KvError, MemSnapshotStore, SnapshotPool, SnapshotRef, SnapshotStore, StateCopy, StateLoc,
+    StateSlot, StateSlotPool,
 };
 pub use table::{BlockTable, blocks_for_tokens};
 

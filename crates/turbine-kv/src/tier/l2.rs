@@ -26,8 +26,10 @@ use crate::identity::{KvKey, NamespaceKey};
 use crate::metrics::{EvictReason, KvMetrics};
 
 pub const SLAB_MAGIC: &[u8; 8] = b"TKVSLAB1";
-const SLAB_VERSION: u32 = 2;
-/// Bytes of the codec name in a version 2 header.
+/// Bumped from 2 by P7 Task 33: a hybrid block's slot holds `[kv in the tier format][snapshot
+/// exact]`, so a slot's bytes are the record's, not just the KV codec's.
+const SLAB_VERSION: u32 = 3;
+/// Bytes of the codec name in a version 2+ header.
 const FORMAT_NAME_BYTES: usize = 16;
 /// Slot and header alignment (the `O_DIRECT` requirement on the lab NVMe drives).
 const ALIGN: usize = 4096;

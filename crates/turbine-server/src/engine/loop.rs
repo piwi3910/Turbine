@@ -124,7 +124,7 @@ use super::stages::{IterationStages, Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
-use crate::kv_orchestrator::{CopyMark, KvOrchestrator};
+use crate::kv_orchestrator::{CopyMark, DeviceSnapshotStore, KvOrchestrator};
 use crate::metrics::{Outcome, ReasonLabels, TokenKind};
 use crate::reliability::EngineReliability;
 
@@ -438,9 +438,19 @@ impl EngineLoop {
                 let words = usize::try_from(entries.saturating_mul(entry_bytes)).unwrap_or(0);
                 match Tensor::empty(&mem, &[words], DType::U8) {
                     Ok(buffer) => {
+                        // P7 S-12 (Task 33): the same buffer backs the device-path snapshot
+                        // store, so a demoted block's snapshot travels with it through L1/L2.
+                        let snap_mem = Arc::clone(buffer.storage.memory());
+                        let snap_base = buffer.storage.ptr();
                         p.executor
                             .set_state_snapshots(StateSnapshots { buffer, layout });
                         p.kv.set_hybrid_state(layout, p.pool.total_blocks());
+                        p.kv.set_snapshot_store(Arc::new(DeviceSnapshotStore::new(
+                            snap_mem,
+                            snap_base,
+                            p.pool.total_blocks(),
+                            entry_bytes,
+                        )));
                         hybrid_interval = Some(p.kv.snapshot_interval());
                         hybrid_state_bytes = entries.saturating_mul(entry_bytes);
                     }
