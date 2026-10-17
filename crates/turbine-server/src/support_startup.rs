@@ -125,6 +125,65 @@ pub fn model_feature_refusal(model_dir: &Path) -> Result<(), ConfigError> {
     }
 }
 
+/// The verified jump-forward (`structured_output.jump_forward`) for the configured model (P7
+/// S-12, Task 32). A family with per-sequence state (a hybrid) has no stateless attention model
+/// for the forced-token run to verify against, so jump-forward is off for it: the returned
+/// value is `false`. An **explicit** `structured_output.jump_forward: true` — in the YAML file
+/// or a `--set` override — is a configuration error (exit 2, also under `--check-config`) whose
+/// reason starts with `jump_forward_hybrid`. Attention-only families keep the configured value.
+/// `hybrid` reports whether the model keeps state, so a caller logs the startup WARN once.
+pub fn hybrid_jump_forward(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    overrides: &[turbine_core::config::Override],
+) -> Result<(bool, bool), ConfigError> {
+    let hybrid = turbine_model::config::load_model_config(&cfg.model.path)
+        .is_ok_and(|arch| !arch.state.is_empty());
+    if !hybrid || !cfg.structured_output.jump_forward {
+        return Ok((cfg.structured_output.jump_forward, hybrid));
+    }
+    if jump_forward_explicit(config_path, overrides) {
+        return Err(invalid(
+            "structured_output.jump_forward",
+            "jump_forward_hybrid: jump-forward is not supported by a family with per-sequence \
+             state (a hybrid); remove the key or set it false"
+                .into(),
+        ));
+    }
+    Ok((false, hybrid))
+}
+
+/// Whether `structured_output.jump_forward` is present as `true` in the YAML file `path` or in
+/// an override — the marker that distinguishes an explicit `true` (refused for a hybrid) from
+/// the configuration default.
+fn jump_forward_explicit(
+    path: Option<&Path>,
+    overrides: &[turbine_core::config::Override],
+) -> bool {
+    let set_true = overrides
+        .iter()
+        .any(|o| o.key == "structured_output.jump_forward" && o.value.as_bool() == Some(true));
+    set_true
+        || path.is_some_and(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .is_some_and(|text| yaml_jump_forward_true(&text))
+        })
+}
+
+/// Whether the YAML `text` sets `structured_output.jump_forward` to `true`.
+fn yaml_jump_forward_true(text: &str) -> bool {
+    let Ok(v) = serde_norway::from_str::<serde_norway::Value>(text) else {
+        return false;
+    };
+    let Some(so) = v.get("structured_output") else {
+        return false;
+    };
+    so.get("jump_forward")
+        .and_then(serde_norway::Value::as_bool)
+        == Some(true)
+}
+
 /// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
 /// the enabled tiers, from L1 down, and, with the ladder on, `kv.ladder.max_format` (the
 /// lossiest format a tier can reach).

@@ -50,7 +50,10 @@ use turbine_core::config::Config;
 use turbine_core::request::FinishReason;
 use turbine_core::types::{BlockId, PressureState, RequestId, SeqId, StateLayout};
 use turbine_kv::hierarchy::PrefixAttach;
-use turbine_kv::{BlockPool, BlockTable, PoolError, blocks_for_tokens};
+use turbine_kv::{
+    BlockPool, BlockTable, PoolError, StateCopy, StateLoc, StateSlot, StateSlotPool,
+    blocks_for_tokens,
+};
 use turbine_reliability::admission::RejectionReason;
 use turbine_reliability::ledger::Reservation;
 use turbine_reliability::throttle::{AdmissionMode, ThrottlePlan};
@@ -219,12 +222,19 @@ pub struct IterationPlan {
     /// planned with the sequence's first prefill chunk: `(seq, src, dst)` executed before the
     /// forward, with the fork copies.
     pub tail_copies: Vec<(SeqId, BlockId, BlockId)>,
+    /// Hybrid per-sequence state copies (P7 S-12, Task 32): a prefix hit restores
+    /// `Snapshot -> Slot`, an `n > 1` fork copies `Slot -> Slot`. Executed before the step,
+    /// after [`IterationPlan::tail_copies`].
+    pub state_copies: Vec<StateCopy>,
 }
 
 impl IterationPlan {
     /// Nothing to execute: the caller sleeps until a submission or cancellation (rule 4).
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.forks.is_empty() && self.tail_copies.is_empty()
+        self.items.is_empty()
+            && self.forks.is_empty()
+            && self.tail_copies.is_empty()
+            && self.state_copies.is_empty()
     }
 
     pub fn prefill_tokens(&self) -> u32 {
@@ -428,6 +438,10 @@ struct SeqEntry {
     /// (preemption, finish, removal) and decided by every plan: planned, or dropped for a
     /// plain decode when the budget, the logits-row capacity or the pool cannot cover it.
     extend_pending: Option<Vec<u32>>,
+    /// This sequence's hybrid state slot (P7 S-12, Task 32), allocated when the sequence starts
+    /// (its first admission) for a family with state, released on finish, cancel and preemption.
+    /// `None` for attention-only families.
+    state_slot: Option<StateSlot>,
 }
 
 /// A plan awaiting `complete`.
@@ -509,6 +523,11 @@ pub struct Scheduler {
     /// The model's per-sequence state (P7 S-1): every request's worst-case reservation holds
     /// it beside the KV blocks (`ResourceEstimate::state_bytes`).
     state_bytes: u64,
+    /// The hybrid per-sequence state slots (P7 S-12, Task 32): one slot per sequence, allocated
+    /// with the sequence and released on finish, cancel and preemption. `None` for a family
+    /// without state ([`StateLayout::is_empty`]). Sized `max_running_requests` sequences — the
+    /// same allocation the admission gate charges (`configure_state_capacity`).
+    state_slots: Option<StateSlotPool>,
     iteration: u64,
     admissions: u64,
     preemptions_total: u64,
@@ -541,6 +560,7 @@ impl Scheduler {
             busy: HashMap::new(),
             micro_batches: 1,
             state_bytes: 0,
+            state_slots: None,
             iteration: 0,
             admissions: 0,
             preemptions_total: 0,
@@ -621,8 +641,36 @@ impl Scheduler {
     /// KV blocks and releases both together (finish, cancel, preemption).
     pub fn with_state_layout(mut self, state: StateLayout) -> Scheduler {
         self.state_bytes = state.bytes_per_sequence();
+        // One slot per sequence, and the whole allocation covers `max_running_requests`
+        // sequences (P7 review fix, decision 2026-10-08 A): `n` choices of one request take `n`
+        // of them, and `n × state` above the whole allocation was refused at submission.
+        self.state_slots = (!state.is_empty())
+            .then(|| StateSlotPool::new(state, self.params.max_running_requests));
         self.configure_state_capacity();
         self
+    }
+
+    /// The hybrid state-slot pool (P7 S-12): the engine reads it to size its state buffers and
+    /// to assert no slot leaked. `None` for a family without state.
+    pub fn state_slots(&self) -> Option<&StateSlotPool> {
+        self.state_slots.as_ref()
+    }
+
+    /// The slot of `seq`, if it holds one (P7 S-12): the engine copies a prefix hit's snapshot
+    /// into it.
+    pub fn state_slot_of(&self, seq: SeqId) -> Option<StateSlot> {
+        self.seqs.get(&seq)?.state_slot
+    }
+
+    /// Returns `seq`'s state slot to the pool (finish, cancel, preemption); a sequence without
+    /// one (attention-only family, or already released) is a no-op.
+    fn release_state_slot(&mut self, seq: SeqId) {
+        let slot = self.seqs.get_mut(&seq).and_then(|e| e.state_slot.take());
+        if let Some(slot) = slot
+            && let Some(pool) = self.state_slots.as_mut()
+        {
+            pool.release(slot);
+        }
     }
 
     /// The state allocation covers `max_running_requests` sequences (P7 review fix, decision
@@ -816,6 +864,7 @@ impl Scheduler {
                     last_step: 0,
                     tail_pending: None,
                     extend_pending: None,
+                    state_slot: None,
                 },
             );
         }
@@ -1298,7 +1347,7 @@ impl Scheduler {
                 {
                     break;
                 }
-                self.admit(head, now);
+                self.admit(head, now, &mut plan);
                 admitted_now += 1;
                 for seq in self.prefill_seqs(head) {
                     if budget == 0 || plan.items.len() >= seq_cap {
@@ -1896,6 +1945,18 @@ impl Scheduler {
                     // The fresh tail block is paid like any other block of the request.
                     res.commit_bytes(pool.layout().block_bytes());
                 }
+                // A hybrid fork copies the parent's live state into the child's slot (P7 S-12,
+                // Task 32): the copy is executed before the step, after the block copies.
+                let (parent_slot, child_slot) = (
+                    self.seqs.get(&parent).and_then(|p| p.state_slot),
+                    self.seqs.get(&child).and_then(|c| c.state_slot),
+                );
+                if let (Some(src), Some(dst)) = (parent_slot, child_slot) {
+                    plan.state_copies.push(StateCopy {
+                        src: StateLoc::Slot(src),
+                        dst: StateLoc::Slot(dst),
+                    });
+                }
                 let c = self.seqs.get_mut(&child).expect("child tracked");
                 c.table = table;
                 c.awaiting_fork = false;
@@ -2121,7 +2182,7 @@ impl Scheduler {
         pool.available_blocks() >= blocks_for_tokens(len, self.params.block_tokens) + watermark
     }
 
-    fn admit(&mut self, id: RequestId, now: Duration) {
+    fn admit(&mut self, id: RequestId, now: Duration, plan: &mut IterationPlan) {
         self.queue.remove(id);
         let admission = self.admissions;
         self.admissions += 1;
@@ -2142,13 +2203,33 @@ impl Scheduler {
         // block is ever written. A preempted request recomputes from scratch.
         let mut prefix = r.req.cached_prefix.take();
         for (i, seq) in seqs.iter().enumerate() {
-            let e = self.seqs.get_mut(seq).expect("sequence tracked");
-            if e.state != RequestState::Waiting {
+            if self
+                .seqs
+                .get(seq)
+                .is_none_or(|e| e.state != RequestState::Waiting)
+            {
                 continue;
             }
+            // One state slot per starting sequence (P7 S-12, Task 32); the whole allocation
+            // covers `max_running_requests` sequences, so `n` choices above it were refused at
+            // submission. A fork's child gets its own slot; its state copy is planned in
+            // `plan_forks` once the parent's shared prefill completes.
+            let slot = match self.state_slots.as_mut() {
+                Some(pool) => match pool.alloc() {
+                    Ok(slot) => Some(slot),
+                    Err(e) => {
+                        tracing::error!(event = "scheduler_bug", request_id = %id.0, seq = seq.0, error = %e, "state slot allocation failed after admission");
+                        debug_assert!(false, "{e}");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let e = self.seqs.get_mut(seq).expect("sequence tracked");
             e.set_state(RequestState::Prefilling, *seq);
             e.awaiting_fork = i > 0 && !shared_done;
             e.target = prompt + e.generated;
+            e.state_slot = slot;
             if i == 0
                 && let Some(a) = prefix.take()
             {
@@ -2159,6 +2240,16 @@ impl Scheduler {
                 // The tail copy is planned with the sequence's first prefill chunk; wherever
                 // the table drops before that, the pending copy is dropped with it.
                 e.tail_pending = a.tail_copy.map(|t| (t.src, t.dst));
+                // A hybrid prefix hit restores the nearest snapshot into the sequence's slot
+                // (P7 S-12, decision 2026-10-08 1 B): the scheduler plans the copy, the engine
+                // executes it before the step (after the block copies). The KV cutoff stays at
+                // the match; the tokens after the snapshot are recomputed in place.
+                if let (Some(snapshot), Some(slot)) = (a.plan.state_snapshot, e.state_slot) {
+                    plan.state_copies.push(StateCopy {
+                        src: StateLoc::Snapshot(snapshot),
+                        dst: StateLoc::Slot(slot),
+                    });
+                }
             }
         }
         debug_assert!(
@@ -2208,6 +2299,8 @@ impl Scheduler {
                 e.set_state(RequestState::Waiting, seq);
                 plan.preempted.push((seq, preempt_reason));
             }
+            // The recompute rebuilds the state from scratch; the slot goes back (P7 S-12).
+            self.release_state_slot(seq);
         }
         self.queue.push(id, key);
         preempted_now.insert(id);
@@ -2244,6 +2337,7 @@ impl Scheduler {
             e.tail_pending = None;
             e.extend_pending = None;
         }
+        self.release_state_slot(seq);
         self.retire_if_done(id);
     }
 
@@ -2287,6 +2381,11 @@ impl Scheduler {
         }
         for seq in &r.req.seqs {
             if let Some(mut e) = self.seqs.remove(seq) {
+                if let Some(slot) = e.state_slot.take()
+                    && let Some(slots) = self.state_slots.as_mut()
+                {
+                    slots.release(slot);
+                }
                 pool.release(&e.table.blocks);
                 e.tail_pending = None;
                 e.extend_pending = None;
@@ -2592,6 +2691,122 @@ mod tests {
         let plan = s.plan(&mut p, &IterationLimits::default());
         assert_eq!(kinds(&plan), [(2, BatchKind::Prefill { start: 0, len: 8 })]);
         assert!(!s.has_unstarted_admitted());
+    }
+
+    fn state_layout() -> StateLayout {
+        StateLayout {
+            linear_layers: 2,
+            recurrent_bytes_per_layer: 1024,
+            conv_bytes_per_layer: 256,
+            dtype: Some(turbine_core::types::StateDtype::F32),
+        }
+    }
+
+    /// P7 S-12 (Task 32): a hybrid sequence takes one state slot at admission and returns it on
+    /// finish and on cancel, so the pool ends where it started; an attention-only family never
+    /// touches the pool (no pool at all). Breaks if a slot leaks on finish or cancel, or is
+    /// taken before the sequence starts.
+    #[test]
+    fn state_slots_alloc_and_release() {
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_running_requests: 2,
+                ..params()
+            },
+            Arc::new(clock.clone()),
+        )
+        .with_state_layout(state_layout());
+        let mut p = pool(64);
+        assert_eq!(s.state_slots().unwrap().free(), 2);
+        s.submit(request(1, 1, 8, 4), p.total_blocks()).unwrap();
+        assert_eq!(s.state_slots().unwrap().free(), 2, "no slot before admit");
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(
+            s.state_slots().unwrap().free(),
+            1,
+            "a slot per admitted seq"
+        );
+        assert!(
+            plan.state_copies.is_empty(),
+            "a fresh prefill restores nothing"
+        );
+        complete_all(&mut s, &mut p, &plan, &[1]);
+        assert_eq!(s.state_slots().unwrap().free(), 2, "finish frees the slot");
+
+        // A cancelled request returns its slot too (after its plan in flight completes).
+        s.submit(request(2, 2, 8, 4), p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(s.state_slots().unwrap().free(), 1);
+        complete_all(&mut s, &mut p, &plan, &[]);
+        s.cancel(
+            RequestId(uuid::Uuid::from_u128(2)),
+            CancelReason::ClientDisconnect,
+        );
+        let _ = s.plan(&mut p, &IterationLimits::default());
+        assert_eq!(s.state_slots().unwrap().free(), 2, "cancel frees the slot");
+
+        // An attention-only scheduler has no pool.
+        let plain = Scheduler::new(params(), Arc::new(FakeClock::new(Duration::ZERO)));
+        assert!(plain.state_slots().is_none());
+    }
+
+    /// P7 S-12 (Task 32, decision 2026-10-08 1 B): a prefix hit whose plan carries a snapshot
+    /// plans one `Snapshot -> Slot` state copy into the sequence's own slot; a hit without a
+    /// snapshot (or an attention-only family) plans none. Breaks if the copy targets another
+    /// slot or is emitted without a snapshot.
+    #[test]
+    fn prefix_hit_plans_snapshot_restore() {
+        use turbine_kv::SnapshotRef;
+        use turbine_kv::hierarchy::PrefixAttach;
+        use turbine_kv::planner::{KvPlan, PlanReason};
+
+        let clock = FakeClock::new(Duration::ZERO);
+        let mut s = Scheduler::new(
+            SchedulerParams {
+                max_running_requests: 2,
+                ..params()
+            },
+            Arc::new(clock.clone()),
+        )
+        .with_state_layout(state_layout());
+        let mut p = pool(64);
+        let blocks = p.allocate(3).unwrap();
+        let snap = SnapshotRef {
+            block: blocks[1],
+            entry: 0,
+        };
+        let attach = PrefixAttach {
+            blocks: blocks.iter().copied().collect(),
+            cached_tokens: 48,
+            lossy_tokens: 0,
+            plan: KvPlan {
+                reuse_l0: 3,
+                promote: Vec::new(),
+                recompute_tokens: 0,
+                partial_tokens: 0,
+                reason: PlanReason::AllL0,
+                state_snapshot: Some(snap),
+                state_recompute_from: Some(2),
+            },
+            tail_copy: None,
+        };
+        // A prompt longer than the cached prefix: the remainder (16 tokens) is prefilled, so
+        // the request is admitted and takes its slot.
+        let mut r = request(1, 1, 64, 4);
+        r.attach_prefix(attach, 16);
+        s.submit(r, p.total_blocks()).unwrap();
+        let plan = s.plan(&mut p, &IterationLimits::default());
+        let slot = s.state_slot_of(SeqId(1)).expect("a slot");
+        assert_eq!(
+            plan.state_copies,
+            vec![StateCopy {
+                src: StateLoc::Snapshot(snap),
+                dst: StateLoc::Slot(slot),
+            }]
+        );
+        complete_all(&mut s, &mut p, &plan, &[1]);
+        assert_eq!(s.state_slots().unwrap().free(), 2);
     }
 
     #[test]

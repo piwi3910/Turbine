@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::write_tiny_llama;
+use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_qwen3_5};
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
@@ -192,6 +192,33 @@ fn invalid_config_exits_2_before_bind() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "support: supported (amd/*/*/bf16/bf16/none)\nconfig ok"
     );
+}
+
+/// P7 S-12 (Task 32): a family with per-sequence state (a hybrid) refuses an explicit
+/// `structured_output.jump_forward: true` — exit 2 naming `jump_forward_hybrid`, before any
+/// port binds and under `--check-config` too. Breaks if a hybrid silently accepts jump-forward.
+#[test]
+fn jump_forward_on_hybrid_exits_2() {
+    let model = TempDir::new("turbine-server-jf-hybrid");
+    let spec = write_tiny_qwen3_5(model.path(), 3);
+    let cfg = TempConfig::new(
+        "jump-forward-hybrid",
+        &format!("model:\n  path: {}\n", spec.dir.display()),
+    );
+    let out = wait_with_timeout(
+        spawn_server(
+            &[
+                "--check-config",
+                "--set",
+                "structured_output.jump_forward=true",
+            ],
+            &cfg.path,
+        ),
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("jump_forward_hybrid"), "stderr: {stderr}");
 }
 
 /// Phase 2m: a module key naming no registered module is a configuration error — exit 2 before
