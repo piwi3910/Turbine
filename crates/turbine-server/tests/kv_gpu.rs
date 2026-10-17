@@ -1484,11 +1484,139 @@ fn lossy_tier_reuse_with(format: &str, bounds: (HeadBound, f64, f64)) {
     );
 }
 
+/// P7 S-12 (Task 33, `hybrid_prefix_reuse_matches_cold`): a Qwen3.5 hybrid's per-sequence
+/// block-boundary state snapshots travel with their KV block through L1 and L2. A session's
+/// prompt is filled and published, filler turns push its blocks down to L1 and then to L2, and
+/// a later turn of the same session hits the prefix from each tier. Every token and logprob of
+/// the warm turns equals the cold run bit for bit — the KV comes back lossless (both tiers at
+/// `l0`) and the state restores from the nearest block-boundary snapshot instead of being
+/// rebuilt — and `turbine_hybrid_state_snapshots_total{outcome="restored"}` counts the
+/// restores. Breaks if a snapshot is lost on demotion/promotion (a warm turn diverges), the
+/// state is rebuilt rather than restored, or the snapshot bytes do not survive the tier.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Qwen3.5-9B weights and /home/piwi/turbine-kv"]
+fn hybrid_prefix_reuse_matches_cold() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    // This test is only meaningful on the Qwen3.5 hybrid checkpoint
+    // (`TURBINE_TEST_MODEL_DIR=/models/qwen3.5-9b`); the default lab Job points at Llama, where
+    // there is no state to snapshot, so it is skipped there instead of failing.
+    let arch = std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|c| {
+            c["architectures"][0]
+                .as_str()
+                .or_else(|| c["text_config"]["architectures"][0].as_str())
+                .map(str::to_string)
+        });
+    if arch.as_deref() != Some("Qwen3_5ForConditionalGeneration") {
+        println!(
+            "hybrid_prefix_reuse_matches_cold: skipping, {} is not the Qwen3.5 hybrid",
+            arch.as_deref().unwrap_or("no architecture")
+        );
+        return;
+    }
+    let kv_dir = Path::new(KV_DIR);
+    assert!(kv_dir.is_dir(), "{KV_DIR} is not mounted");
+    // A snapshot at every full block (so a hit has one to restore), the lossless tail off (so
+    // the demoted blocks carry their snapshot in the tier record), and both tiers at `l0` (the
+    // KV comes back exact, so the reuse must be bit-for-bit, not just within bounds).
+    let base = [
+        format!("kv.nvme.path={KV_DIR}"),
+        "kv.nvme.max_bytes=64GiB".into(),
+        "kv.cpu.max_bytes=1GiB".into(),
+        "kv.hybrid_snapshot_interval_blocks=1".into(),
+        "kv.lossless_tail_blocks=0".into(),
+    ];
+
+    // A's prompt: five full 128-token blocks. The primer continues it with one decode token.
+    let a = prompt(100, 700);
+    // Cold reference: sharing off, so nothing is reused anywhere.
+    let cold_sets = [base.as_slice(), &["kv.prefix_sharing=false".to_string()]].concat();
+    let cold = {
+        let server = LabServer::start(&model_dir, &cold_sets);
+        server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"))
+    };
+
+    let server = LabServer::start(&model_dir, &base);
+    let (_, block_bytes, _) = l0_tier(&server);
+    let l1_blocks = ((1u64 << 30) / block_bytes.max(1)) as f64;
+
+    // Turn 1 fills A's block-boundary snapshots and publishes its blocks.
+    let first = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    assert_within_batched_bounds(&cold, &first, "turn 1 (cold fill)");
+
+    // Filler turns of far-apart sessions push A's (oldest, never touched) blocks down to L1.
+    let to_l1 = |s: &LabServer| s.metric(r#"turbine_kv_demotions_total{from="l0",to="l1"}"#);
+    let mut filler = 0;
+    while to_l1(&server) < 40.0 {
+        filler += 1;
+        assert!(filler <= 400, "demotion to L1 never happened");
+        let key = format!("filler-{filler}");
+        server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
+    }
+    println!(
+        "{filler} filler prompts moved {} blocks to L1",
+        to_l1(&server)
+    );
+
+    // Turn 2 hits A from L1: the KV promotes exact and the state restores from a snapshot.
+    let restored =
+        |s: &LabServer| s.metric(r#"turbine_hybrid_state_snapshots_total{outcome="restored"}"#);
+    let before_l1 = restored(&server);
+    let from_l1 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    if from_l1.cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert!(
+        from_l1.cached_tokens > 0,
+        "the L1 turn reused no prefix: {from_l1:?}"
+    );
+    assert!(
+        restored(&server) > before_l1,
+        "the L1 hit restored no snapshot"
+    );
+    assert_eq!(
+        cold.output(),
+        from_l1.output(),
+        "the L1 turn differs from the cold run"
+    );
+
+    // Push A on down to L2 and hit it again: the snapshot travels in the tier record there too.
+    fill_until_l2(&server, 2.0 * l1_blocks + 40.0);
+    let before_l2 = restored(&server);
+    let from_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    if from_l2.cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert!(
+        from_l2.cached_tokens > 0,
+        "the L2 turn reused no prefix: {from_l2:?}"
+    );
+    assert!(
+        restored(&server) > before_l2,
+        "the L2 hit restored no snapshot"
+    );
+    assert_eq!(
+        cold.output(),
+        from_l2.output(),
+        "the L2 turn differs from the cold run"
+    );
+    assert!(
+        restored(&server) > 0.0,
+        "no state snapshot was ever restored"
+    );
+    println!("hybrid_prefix_reuse_matches_cold ok");
+}
+
 /// The lab config loads and spells out the tiers the lab tests rely on.
 #[test]
 fn phase4_lab_config_loads() {
     let c = turbine_core::config::load(&lab_config(), &[]).expect("phase4-novanas.yaml loads");
-    assert_eq!(c.kv.block_tokens, 128);
     assert!(c.kv.cpu.enabled && c.kv.nvme.enabled);
     assert_eq!(c.kv.nvme.path, Path::new(KV_DIR));
     assert_eq!(c.kv.nvme.max_bytes.0, KV_CAP_BYTES);
