@@ -4909,3 +4909,17 @@ How a block's snapshot bytes travel with it through the tiers. The transfer path
 keeps Task 32's KV-owned buffer with the one-time `set_state_snapshots` handoff (the executor holds
 only a view). The device copy path is validated by the `kv_gpu hybrid_prefix_reuse_matches_cold` lab
 leg, not on the host.
+
+## P7 Task 33 snapshot entry lifetime across demotion — lead call (2026-10-17)
+
+The directory holds `SnapshotRef { block, entry }` and `SnapshotPool` is BlockId-keyed, but a demoted
+L0 `BlockId` is freed and reused, so a reused entry could feed a stale restore.
+
+**Decision (lead, 2026-10-17): the L0 snapshot entry is transient; the authoritative snapshot bytes
+live in the tier record.** On demotion the bytes are copied into the tier record
+(`[kv][snapshot]`) and the L0 entry is released back to the `SnapshotPool` (freeing the BlockId does
+not strand an entry); on promotion a fresh L0 entry is allocated, the tier record's bytes are copied
+back into it, and the block's `SnapshotRef` is set to `{new L0 BlockId, new entry}`. `SnapshotPool`
+entries therefore only ever refer to L0-resident blocks, which keeps round-3's "one entry per L0
+block, freed with the block" rule and makes a stale read impossible. Implement option (a)'s tier
+travel with this lifetime rule.
