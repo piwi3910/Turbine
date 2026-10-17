@@ -4983,3 +4983,21 @@ The snapshot bytes now travel through L1/L2 (`state_snapshot_follows_block` PASS
   `tq4` row stays `experimental` with the failing gate recorded; the pool class-growth deadlock is a
   real serving-path bug (the window it interacts with is Task 17's) recorded for a follow-up fix — it
   is not Task 37's scope, and it is not papered over by relaxing the gate.
+
+## P7 Task 33 capture and demotion gaps — lead calls (2026-10-17)
+
+With the tier-slot sizing fixed (gate ok, 1120 tests), `kv_gpu hybrid_prefix_reuse_matches_cold` is
+still red for two reasons the builder flagged:
+
+- **Snapshot capture in a multi-block prefill step:** the engine captures only when a *step* ends on a
+  block boundary (`loop.rs` `it.kv_len % bt == 0`), so a single-chunk prefill of 859 tokens (one
+  2048-cap chunk) yields no snapshot ≤ 768 and turn 2 has no cutoff to restore. **Decision:** the
+  capture stores snapshots from the boundary rows *within* a step — the kernel already produces a
+  boundary state per `kv.block_tokens` (`boundary_tokens = kv.block_tokens`, decision "P7 Task 32
+  snapshot store") — for the interval blocks (`kv.hybrid_snapshot_interval_blocks`) and the
+  sequence's last full block inside the chunk. **Do NOT align `scheduler.prefill_chunk_tokens` to
+  `kv.block_tokens`** — that would change every model's prefill batching.
+- **Demotion vs drop under filler load:** A's blocks are dropped rather than demoted, so no tier hit
+  occurs and the L1 leg never reaches the restore assertion. **Decision:** fix the victim/caching
+  path so cached-unreferenced blocks are demoted to the tier rather than dropped (within Task 33's
+  scope); the cost-aware policy must not drop cacheable blocks while tier capacity is available.
