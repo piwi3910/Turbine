@@ -11,11 +11,13 @@
 //! Phase 6b (S-5): the pool is carved into page classes, one per KV format, from the one
 //! allocation. The base class (the L0 dtype, `kv.dtype`) owns every page at construction;
 //! [`BlockPool::with_page_classes`] splits the base pages into slabs of `slab_blocks` pages, and
-//! [`BlockPool::allocate_in`] turns a wholly free base slab into a slab of smaller pages of
-//! another format on demand. A slab returns to the base class as soon as its last page is
-//! freed. A page's format is fixed for its life ([`BlockPool::format_of`]), and its bytes are
-//! exactly its class's page ([`BlockPool::block_segments`]), so a block's bytes always match
-//! its tag. The bytes of every class sum to the one allocation ([`BlockPool::class_usage`]).
+//! [`BlockPool::allocate_in`] turns a base slab into a slab of smaller pages of another format
+//! on demand — a wholly free slab, or (P7 Task 37) one whose pages are all free or
+//! cached-unreferenced, which it reclaims like [`BlockPool::allocate`] does. A slab returns to
+//! the base class as soon as its last page is freed. A page's format is fixed for its life
+//! ([`BlockPool::format_of`]), and its bytes are exactly its class's page
+//! ([`BlockPool::block_segments`]), so a block's bytes always match its tag. The bytes of every
+//! class sum to the one allocation ([`BlockPool::class_usage`]).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -422,14 +424,92 @@ impl BlockPool {
             .collect()
     }
 
+    /// Base slabs a class can take by reclaiming their cached base pages, ordered least-reusable
+    /// first (P7 Task 37 — the L0 `tq4` window deadlock). A slab qualifies when it is base-owned,
+    /// every page is free or cached-unreferenced, and every cached page is in the published
+    /// reclaim order: the order is the directory's safe-to-evict set, which excludes referenced
+    /// pages and copies in flight ([`KvHierarchy::eligible`]), so reclaiming only its pages never
+    /// undercuts a copy that is still reading its page. Excludes wholly free slabs, which
+    /// [`BlockPool::convertible_slabs`] reports and need no reclaim.
+    fn reclaimable_base_slabs(&self) -> Vec<usize> {
+        let Some(s) = &self.slabs else {
+            return Vec::new();
+        };
+        let slab_blocks = s.slab_blocks;
+        let in_order = |b: u32| self.reclaim_order.contains(&BlockId(b));
+        // Slabs named by the order, least-reusable first (the order's own priority).
+        let mut candidates: Vec<usize> = Vec::new();
+        for b in &self.reclaim_order {
+            if b.0 >= self.base_blocks {
+                continue;
+            }
+            let slab = (b.0 / slab_blocks) as usize;
+            if !candidates.contains(&slab) {
+                candidates.push(slab);
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|&i| {
+                s.owner[i].is_none()
+                    && (i as u32 * slab_blocks..(i as u32 + 1) * slab_blocks).all(|b| {
+                        self.refcounts[b as usize] == 0 && (!self.keyed[b as usize] || in_order(b))
+                    })
+            })
+            .collect()
+    }
+
+    /// Reclaims (drops) the cached-unreferenced base pages of `slab`, reporting each through
+    /// `take_reclaimed` so the directory forgets their L0 copies, exactly like
+    /// [`BlockPool::allocate`]'s reclaim. The caller has checked the slab is reclaimable.
+    fn reclaim_slab_cached_pages(&mut self, slab: usize) {
+        let slab_blocks = self
+            .slabs
+            .as_ref()
+            .expect("reclaim_slab_cached_pages needs page classes")
+            .slab_blocks;
+        let first = slab as u32 * slab_blocks;
+        for b in first..first + slab_blocks {
+            if self.keyed[b as usize] && self.refcounts[b as usize] == 0 {
+                self.keyed[b as usize] = false;
+                self.cached -= 1;
+                self.reclaimed.push(BlockId(b));
+            }
+        }
+    }
+
     /// `n` fresh pages of format `format` with refcount 1, or `Exhausted` with nothing
-    /// allocated. The base format is [`BlockPool::allocate`]; another class takes free pages
-    /// of its slabs, then carves wholly free base slabs. Cached pages of other classes are not
-    /// reclaimed here (the ladder evicts them explicitly, S-7).
+    /// allocated. The base format is [`BlockPool::allocate`]; another class takes free pages of
+    /// its slabs, then carves base slabs — wholly free ones first, then ones whose pages are all
+    /// free or cached-unreferenced *and safe to evict*, whose cached pages it reclaims
+    /// (`allocate`'s semantics, reported through `take_reclaimed`; P7 Task 37 — this is what lets
+    /// the L0 `tq4` window class grow under load instead of starving). Cached pages of other
+    /// *classes* are not reclaimed here (the ladder evicts them explicitly, S-7).
     pub fn allocate_in(
         &mut self,
         format: &str,
         n: u32,
+    ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
+        self.allocate_in_impl(format, n, true)
+    }
+
+    /// [`BlockPool::allocate_in`] without the reclaim: a class grows only from wholly free base
+    /// slabs. Used by callers that run outside the iteration's plan (the ladder's L0 rewrites),
+    /// where reclaiming cached base pages would race the reclaim order's refresh and change the
+    /// S-7 "no room" back-off.
+    pub fn allocate_in_strict(
+        &mut self,
+        format: &str,
+        n: u32,
+    ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
+        self.allocate_in_impl(format, n, false)
+    }
+
+    fn allocate_in_impl(
+        &mut self,
+        format: &str,
+        n: u32,
+        reclaim: bool,
     ) -> Result<SmallVec<[BlockId; 8]>, PoolError> {
         if format == self.base_format() {
             return self.allocate(n);
@@ -441,23 +521,45 @@ impl BlockPool {
         else {
             return Err(PoolError::UnknownFormat(format.to_string()));
         };
+        let pps = self.slabs.as_ref().expect("class found above").classes[ci].pages_per_slab;
+        let class_free = self.slabs.as_ref().expect("class found above").classes[ci]
+            .free
+            .len() as u32;
+        // Wholly free base slabs, then slabs a class can take by reclaiming their cached
+        // unreferenced base pages (P7 Task 37). The two sets are disjoint.
         let convertible = self.convertible_slabs();
-        let base_blocks = self.base_blocks;
-        let s = self.slabs.as_mut().expect("class found above");
-        let pps = s.classes[ci].pages_per_slab;
-        let free = s.classes[ci].free.len() as u32;
-        let available = free.saturating_add(pps.saturating_mul(convertible.len() as u32));
+        let reclaimable = if reclaim {
+            self.reclaimable_base_slabs()
+        } else {
+            Vec::new()
+        };
+        let available = class_free
+            .saturating_add(pps.saturating_mul((convertible.len() + reclaimable.len()) as u32));
         if n > available {
             return Err(PoolError::Exhausted {
                 requested: n,
                 available,
             });
         }
-        let mut carve = convertible.into_iter();
-        while (s.classes[ci].free.len() as u32) < n {
-            let slab = carve
-                .next()
-                .expect("counted above: enough convertible slabs");
+        // As few slabs as cover the request: the wholly free ones first (no eviction), then the
+        // reclaimable ones in policy order.
+        let need = n.saturating_sub(class_free).div_ceil(pps.max(1)) as usize;
+        let mut take: Vec<(usize, bool)> = Vec::with_capacity(need);
+        for slab in convertible.into_iter().take(need) {
+            take.push((slab, false));
+        }
+        for slab in reclaimable.into_iter().take(need - take.len()) {
+            take.push((slab, true));
+        }
+        // Reclaim the chosen slabs' cached base pages before carving them.
+        for &(slab, reclaim) in &take {
+            if reclaim {
+                self.reclaim_slab_cached_pages(slab);
+            }
+        }
+        let base_blocks = self.base_blocks;
+        let s = self.slabs.as_mut().expect("class found above");
+        for &(slab, _) in &take {
             s.owner[slab] = Some(ci);
             let first = slab as u32 * s.slab_blocks;
             let carved = first..first + s.slab_blocks;
@@ -1416,6 +1518,173 @@ mod tests {
         };
         assert!(matches!(bad(&[base_again], 4), PoolError::InvalidClass(_)));
         assert!(matches!(bad(&classes, 0), PoolError::InvalidClass(_)));
+    }
+
+    /// P7 Task 37: the L0 `tq4` window deadlock. With `kv.dtype: tq4` and the default
+    /// `kv.recent_window_blocks: 1`, every live sequence needs a fresh BF16 window page, but the
+    /// pool could only grow the window class from a *wholly free* base slab — and once the base
+    /// pool fills, its cached-unreferenced pages keep every slab partly occupied, so the class
+    /// starves and decodes defer forever (`decode_deferred kv_exhausted`). Here a full base pool
+    /// with cached pages and one live sequence needs a window page: the least-reusable
+    /// all-cached slab is reclaimed and carved. Breaks if a class grows only from a fully-free
+    /// slab, if reclaiming does not report the evicted pages (the directory would keep their L0
+    /// copies and the accounting would drift), or if it evicts a slab other than the one holding
+    /// the least-reusable page.
+    #[test]
+    fn window_class_grows_from_reclaimed_cached_base_pages() {
+        // A tq4 pool (9216-byte base pages) with the recent window's BF16 class (32768-byte
+        // pages, the P6b S-5 class), four base pages a slab.
+        let layout = KvLayout {
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 128,
+            dtype: DType::Tq4,
+            block_tokens: 16,
+        };
+        let classes = [PageClass {
+            format: "bf16",
+            page_bytes: 2 * 2 * 16 * 2 * 128 * 2,
+        }];
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 23);
+        let mut p = BlockPool::new(
+            BlockPoolConfig {
+                layout,
+                num_blocks: 12,
+            },
+            mem,
+        )
+        .unwrap()
+        .with_page_classes(&classes, 4)
+        .unwrap();
+        // Fill the whole base pool: block 0 stays referenced (the live sequence), blocks 1..11
+        // finish and remain cached-unreferenced, so no slab is wholly free.
+        let live = p.allocate(12).unwrap();
+        for &b in &live[1..] {
+            p.set_keyed(b);
+        }
+        p.set_keyed(live[0]);
+        p.release(&live[1..]);
+        assert_eq!(p.free_blocks(), 0, "the base pool is full");
+        assert_eq!(p.cached_unreferenced(), 11);
+        assert_eq!(p.referenced_blocks(), 1, "one live sequence holds block 0");
+        // Slab 0 = {0,1,2,3} (0 referenced), slab 1 = {4..7}, slab 2 = {8..11}; the published
+        // order names block 9 (slab 2) as the least reusable, so slab 2 leads and slab 1
+        // follows.
+        p.set_reclaim_order(vec![
+            BlockId(9),
+            BlockId(8),
+            BlockId(10),
+            BlockId(11),
+            BlockId(5),
+            BlockId(4),
+            BlockId(6),
+            BlockId(7),
+        ]);
+        let before = p.class_usage();
+        // Before the fix this was Exhausted { requested: 1, available: 0 }: the class had no
+        // wholly free slab. The window page now grows from the reclaimed slab.
+        let win = p
+            .allocate_in("bf16", 1)
+            .expect("the window class grows from a reclaimed cached base slab");
+        assert_eq!(win.len(), 1);
+        assert_eq!(p.format_of(win[0]), "bf16");
+        // The evicted pages are slab 2's, the slab holding the least-reusable page, reported so
+        // the directory forgets their L0 copies.
+        assert_eq!(
+            p.take_reclaimed(),
+            vec![BlockId(8), BlockId(9), BlockId(10), BlockId(11)],
+            "the slab holding the least-reusable page is the victim"
+        );
+        assert!(p.take_reclaimed().is_empty());
+        assert!(
+            !p.is_keyed(BlockId(9)),
+            "the least-reusable page is evicted"
+        );
+        assert!(p.is_keyed(BlockId(5)), "the next slab is untouched");
+        assert_eq!(
+            p.cached_unreferenced(),
+            7,
+            "slab 2's four pages left the cache"
+        );
+        // Exact accounting: the base class loses the carved slab, the window class gains its
+        // page, the class bytes still sum to the one allocation.
+        let class =
+            |u: &[PageClassUsage], f: &str| *u.iter().find(|u| u.class.format == f).unwrap();
+        let after = p.class_usage();
+        assert_eq!(class(&before, "tq4").pages, 12);
+        assert_eq!(
+            class(&after, "tq4").pages,
+            8,
+            "one four-page slab carved away"
+        );
+        assert_eq!(class(&before, "bf16").pages, 0);
+        assert_eq!(class(&after, "bf16").pages, 1);
+        assert_eq!(
+            after.iter().map(|u| u.bytes).sum::<u64>(),
+            12 * layout.block_bytes(),
+        );
+        assert_eq!(p.used_blocks() + p.free_blocks(), p.total_blocks());
+        assert_eq!(
+            p.free_blocks(),
+            0,
+            "every remaining base page is cached or held"
+        );
+        assert_eq!(
+            p.referenced_blocks(),
+            2,
+            "the live sequence's block and the window page"
+        );
+    }
+
+    /// P7 Task 37: the strict class growth used by the ladder's rewrites never reclaims — a class
+    /// grows only from a wholly free slab. Here a full base pool with cached pages leaves no free
+    /// slab, so `allocate_in_strict` is `Exhausted` and nothing changes: the S-7 `no_room`
+    /// back-off is preserved (the reclaiming [`BlockPool::allocate_in`] is what the window path
+    /// uses).
+    #[test]
+    fn strict_class_growth_does_not_reclaim() {
+        let layout = KvLayout {
+            num_layers: 2,
+            num_kv_heads: 2,
+            head_dim: 128,
+            dtype: DType::Tq4,
+            block_tokens: 16,
+        };
+        let classes = [PageClass {
+            format: "bf16",
+            page_bytes: 2 * 2 * 16 * 2 * 128 * 2,
+        }];
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 23);
+        let mut p = BlockPool::new(
+            BlockPoolConfig {
+                layout,
+                num_blocks: 12,
+            },
+            mem,
+        )
+        .unwrap()
+        .with_page_classes(&classes, 4)
+        .unwrap();
+        let live = p.allocate(12).unwrap();
+        for &b in &live[1..] {
+            p.set_keyed(b);
+        }
+        p.release(&live[1..]);
+        p.set_reclaim_order((0..12).map(BlockId).collect());
+        let before = p.class_usage();
+        assert!(matches!(
+            p.allocate_in_strict("bf16", 1),
+            Err(PoolError::Exhausted {
+                requested: 1,
+                available: 0
+            })
+        ));
+        assert!(p.take_reclaimed().is_empty());
+        assert_eq!(
+            p.class_usage(),
+            before,
+            "a failed allocation changes nothing"
+        );
     }
 
     /// Phase 4: a keyed block stays cached at reference count 0; `allocate` reclaims cached
