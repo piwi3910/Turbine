@@ -816,6 +816,7 @@ pub(crate) mod tests {
             tier: TierId::L0,
             slot,
             format: crate::tier::L0_FORMAT,
+            snapshot_bytes: 0,
         }
     }
 
@@ -911,6 +912,7 @@ pub(crate) mod tests {
                 tier,
                 slot: i as u64,
                 format: crate::tier::L0_FORMAT,
+                snapshot_bytes: 0,
             };
             dir.insert(block(
                 keys[i],
@@ -1086,6 +1088,7 @@ pub(crate) mod tests {
                         tier: TierId::L1,
                         slot: i as u64,
                         format: crate::tier::L0_FORMAT,
+                        snapshot_bytes: 0,
                     }
                 } else {
                     l0(i as u64)

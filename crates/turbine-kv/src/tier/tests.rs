@@ -124,7 +124,7 @@ fn nvme_checksum_and_restart() {
     let slab = t.slab_path(0);
     let mut raw = std::fs::read(&slab).unwrap();
     assert_eq!(&raw[..8], SLAB_MAGIC);
-    assert_eq!(&raw[8..12], &2u32.to_le_bytes(), "format version 2");
+    assert_eq!(&raw[8..12], &3u32.to_le_bytes(), "format version 3");
     assert_eq!(
         &raw[60..76],
         b"l0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",

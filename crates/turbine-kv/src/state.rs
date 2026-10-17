@@ -7,8 +7,11 @@
 //! they belong to and hands the executor their device locations.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use turbine_core::types::{BlockId, StateLayout};
+
+use crate::tier::TierError;
 
 /// A hybrid-state pool error. Exhaustion is a bounded-queue refusal (spec §21 rule 4): the
 /// caller waits for a free slot rather than growing the pool.
@@ -167,6 +170,24 @@ impl SnapshotPool {
         true
     }
 
+    /// Moves `from`'s snapshot entry to `to` (P7 S-12, Task 33): an L0 rewrite replaces the
+    /// block's page, so the entry's `BlockId` key follows. Returns whether `from` had an entry;
+    /// a `to` that already has one keeps it (its bytes are the same block's).
+    pub fn rekey(&mut self, from: BlockId, to: BlockId) -> bool {
+        let Some(entry) = self.by_block.remove(&from) else {
+            return false;
+        };
+        if self.by_block.contains_key(&to) {
+            // `to` already owns an entry; `from`'s goes back to the pool.
+            self.owner[entry as usize] = None;
+            self.free.push(entry);
+            return false;
+        }
+        self.owner[entry as usize] = Some(to);
+        self.by_block.insert(to, entry);
+        true
+    }
+
     /// Free entries.
     pub fn free(&self) -> u32 {
         self.free.len() as u32
@@ -189,6 +210,81 @@ impl SnapshotPool {
     /// Bytes the pool holds (the budget's snapshot term).
     pub fn bytes(&self) -> u64 {
         u64::from(self.entries).saturating_mul(self.layout.bytes_per_sequence())
+    }
+}
+
+/// The L0 hybrid-state snapshot bytes a transfer reads from and writes to (P7 S-12, Task 33):
+/// the [`SnapshotPool`]'s entries are index bookkeeping over this buffer, which is KV-owned L0
+/// memory (the executor's `StateSnapshots` on the server). A demotion of an L0 block that
+/// carries a snapshot reads the referenced entry and appends it to the tier record; a promotion
+/// writes the record's tail into a fresh entry (decision "P7 Task 33 snapshot transfer", (a)).
+pub trait SnapshotStore: Send + Sync {
+    /// Bytes of one entry.
+    fn entry_bytes(&self) -> u64;
+
+    /// Copies entry `entry`'s bytes into `dst` (which must be `entry_bytes()` long).
+    fn read(&self, entry: u32, dst: &mut [u8]) -> Result<(), TierError>;
+
+    /// Writes `src` (which must be `entry_bytes()` long) into entry `entry`.
+    fn write(&self, entry: u32, src: &[u8]) -> Result<(), TierError>;
+}
+
+/// A host-memory [`SnapshotStore`] (P7 S-12, Task 33): `entries × entry_bytes` zeroed bytes. The
+/// simulator, the host I/O path and the CPU tests use it; the server's device path wraps the
+/// executor's snapshot buffer instead.
+#[derive(Debug)]
+pub struct MemSnapshotStore {
+    entry_bytes: usize,
+    bytes: Mutex<Vec<u8>>,
+}
+
+impl MemSnapshotStore {
+    pub fn new(entries: u32, entry_bytes: u64) -> Arc<MemSnapshotStore> {
+        let entry_bytes = entry_bytes as usize;
+        Arc::new(MemSnapshotStore {
+            entry_bytes,
+            bytes: Mutex::new(vec![0u8; entries as usize * entry_bytes]),
+        })
+    }
+
+    /// A snapshot of the whole buffer (tests).
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn range(&self, entry: u32, len: usize) -> Result<std::ops::Range<usize>, TierError> {
+        let start = entry as usize * self.entry_bytes;
+        let end = start + self.entry_bytes;
+        if len != self.entry_bytes {
+            return Err(TierError::Io(format!(
+                "snapshot entry is {} bytes, buffer {len}",
+                self.entry_bytes
+            )));
+        }
+        if end > self.bytes.lock().unwrap_or_else(|e| e.into_inner()).len() {
+            return Err(TierError::Missing);
+        }
+        Ok(start..end)
+    }
+}
+
+impl SnapshotStore for MemSnapshotStore {
+    fn entry_bytes(&self) -> u64 {
+        self.entry_bytes as u64
+    }
+
+    fn read(&self, entry: u32, dst: &mut [u8]) -> Result<(), TierError> {
+        let range = self.range(entry, dst.len())?;
+        let bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
+        dst.copy_from_slice(&bytes[range]);
+        Ok(())
+    }
+
+    fn write(&self, entry: u32, src: &[u8]) -> Result<(), TierError> {
+        let range = self.range(entry, src.len())?;
+        let mut bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
+        bytes[range].copy_from_slice(src);
+        Ok(())
     }
 }
 
