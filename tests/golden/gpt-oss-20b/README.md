@@ -74,6 +74,26 @@ nothing hit the cap, so the bounds are the observed spread. The token rule is un
 Re-run the script and re-derive the bounds if the reference, the prompts or the gate placement
 change.
 
+## Date dependence of the chat prompts (2026-10-17)
+
+**This fixture is not reproducible off its capture date.** The chat records (`kind: chat`,
+p10–p16) are rendered by the server through the checkpoint's Harmony `chat_template.jinja`,
+whose system message is `{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n\n" }}` — the
+host clock in UTC. The `date_string` kwarg the shared prompt set carries is **unused by this
+template**, so the rendered prefix (and the served logprobs) change with the day the server
+runs. The `kind: completion` records (p01–p09) send a pre-rendered `prompt` string and are
+date-free.
+
+The reference's own `captured` stamps are mixed — p10–p13 `2026-10-14`, p14–p16 `2026-10-16` —
+and the Task 27 gate ran on `2026-10-16` UTC, which is why it passed. A clean re-run of the
+*gate commit* `dd94f669` on `2026-10-17` fails c1 15/16 (p15 `max_abs_logprob_diff_likely`
+0.3546 > 0.35); pinning `strftime_now` to `2026-10-16` reproduces the recorded gate report
+bit-for-bit (16/16, p15 0.1675). Nothing between `dd94f669` and the tip changes a logprob
+(bisect P1–P6 in `.procoder/perf-log.md`, "P7 gpt-oss golden c1 drift"). Re-gate only after
+pinning the date — either a bundled date-fixed copy of the checkpoint template set through
+`model.chat_template`, the p10–p16 records converted to pre-rendered completions, or a
+reference regenerated with one pinned date (lead call).
+
 ## Fixture provenance
 
 - novanas CPU, one fixture job at a time under `fixture.lock` (queue entry `p7-ref-gpt-oss`),

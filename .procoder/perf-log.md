@@ -2333,6 +2333,26 @@ gate is the binding one.
 
 - P7 closed: GptOssForCausalLM/mxfp4/bf16/tp1 golden c1/c16 dd94f669; GSM8K 0.925 vs vLLM 0.930 (drop 0.005); throughput 2.07x (with the fixed-length-workload caveat above)
 
+### P7 gpt-oss golden c1 drift — root cause: the fixture is date-dependent (Task 39b, branch `p7-t39b`, 2026-10-17)
+
+The Task 39 finding above (golden c1 15/16, p15 `max_abs_logprob_diff_likely` 0.3546 > 0.35) is **not a code regression**: it is the gpt-oss fixture's chat prompts rendering the
+wall-clock date, and no commit in `dd94f669..bf317832` is responsible. Bisected with `scripts/lab-bench.sh --model gpt-oss-20b --mt-only --multi-turn-sessions 1` (golden c1 strict, GPU 0, host idle):
+
+| probe | tree | setting | p15 likely / tail | c1 |
+| --- | --- | --- | --- | --- |
+| recorded Task 27 gate (`agent-p7-t27/target/lab-bench/dd94f669-gpt-oss-20b`) | `dd94f669` | config default | **0.1675** / 1.0011 | **16/16 PASS** |
+| P1 | `f4afca5a` (p7-t27 merge into p7-stack) | default | 0.3546 / 2.0083 | 15/16 |
+| P2 | `dd94f669` | default | 0.3546 / 2.0083 | 15/16 |
+| P3 | `dd94f669` | + the Task 27 kernel library (`agent-p7-t27/kbuild/libturbine_hip.so`) | 0.3546 / 2.0083 | 15/16 |
+| P4 | `dd94f669` | `gemm_autotune=false fused_ops=false decode_graphs=false overlap_scheduling=false` | 0.0262 / 0.5815 | 15/16 (p16 0.4059) |
+| P5 | `dd94f669` | `gemm_autotune=false` | 0.3546 / 2.0083 | 15/16 |
+| P6 | `dd94f669` | `model.chat_template` = the checkpoint template with `strftime_now("%Y-%m-%d")` pinned to `2026-10-16` | **0.1675** / 1.0011 | **16/16 PASS** |
+
+- P1 and P2 are **bit-identical to each other and to Task 39's `bf317832` run** (all 16 prompts), so nothing between `dd94f669` and the tip moved a logprob; P3 (swapping in the Task 27-built kernel library) is bit-identical to P2, so the kernel library is not the variable either. The forwards differ only from p10 on. The p01–p09 prompts of `tests/golden/gpt-oss-20b/prompts.jsonl` are `kind: completion` (a pre-rendered `prompt` string) and are identical across every run; p10–p16 are `kind: chat` (`messages`, rendered by the server) and all differ.
+- **Root cause:** the checkpoint's Harmony `chat_template.jinja` renders the system message as `{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n\n" }}` (line 202), and `strftime_now` is the host clock in UTC (`crates/turbine-model/src/chat_template.rs`). The fixture's `date_string` kwarg is unused by this template (the README already says so). So every chat prompt's rendered prefix — and the served logprobs — depend on the day the server runs. The reference's own `captured` stamps are mixed: p10–p13 were captured `2026-10-14`, p14–p16 `2026-10-16`; the Task 27 gate ran on `2026-10-16` UTC, so p01–p09 (date-free) and the engine matched, and the run passed. Any other UTC day renders a different date and moves the chat prompts; today's `2026-10-17` runs put p15 at 0.3546.
+- **P6 proof:** with the date pinned to `2026-10-16` (the gate's day), the `dd94f669` tree reproduces the recorded Task 27 `golden1.txt` **bit-for-bit** (all 16 prompts, p15 0.1675, p16 0.3406, 16/16 PASS). So the committed reference and bounds are fine; the gate is just not reproducible off its capture date.
+- **Left to the lead (design question, not decided here):** how to make the gpt-oss golden date-independent — (a) pin the date for the gate (a bundled copy of the checkpoint template with the date line fixed, pointed at by `model.chat_template` in the lab config or by `lab-bench`); (b) convert the p10–p16 records to pre-rendered `kind: completion` prompts (as p01–p09) with each record's own date baked, which also fixes the reference's mixed `2026-10-14` / `2026-10-16` stamps; or (c) regenerate the reference once with a single pinned date. The strict bound 0.35 should **not** be widened: it is not the problem, and P6 shows the gate passes at 0.1675 when the input is deterministic.
+
 ### P7 hybrid gates — Qwen3.5-9B and Qwen3.6-35B-A3B-FP8 (plan Task 35, branch `p7-t35`, 2026-10-17)
 
 Fixtures are thinking off (`chat_template_kwargs: {"enable_thinking": false}` in each slug's own
