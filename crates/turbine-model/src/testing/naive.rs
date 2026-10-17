@@ -31,7 +31,7 @@ use turbine_kernels::cpu::quant::{e2m1_value, e8m0_value};
 use turbine_kernels::torch_topk;
 
 use crate::config::{ModelArchConfig, RopeScaling};
-use crate::executor::decoder::is_norm_weight;
+use crate::executor::decoder::unit_offset_applies;
 use crate::families::LayerKind;
 
 fn bf(v: f32) -> f32 {
@@ -90,7 +90,7 @@ impl Naive {
                         .collect();
                     // transformers' `output · (1 + weight)` RMSNorm form, folded at load as
                     // the executor folds it (the sum is rounded back to the activation dtype).
-                    if cfg.unit_offset_norms && is_norm_weight(name) {
+                    if cfg.unit_offset_norms && unit_offset_applies(name) {
                         for v in &mut values {
                             *v = bf(*v + 1.0);
                         }
@@ -671,10 +671,12 @@ impl Naive {
 }
 
 /// transformers' rotary inverse frequencies (`_compute_llama3_parameters` with Llama-3
-/// scaling, the plain `theta^(-2i/d)` without), in f64 then f32.
+/// scaling, the plain `theta^(-2i/d)` without), in f64 then f32. The exponent's dimension `d` is
+/// the rotary one (`head_dim * partial_rotary_factor`, transformers'
+/// `compute_default_rope_parameters`), not `head_dim`.
 fn inv_freq(cfg: &ModelArchConfig) -> Vec<f32> {
-    let d = f64::from(cfg.head_dim);
-    (0..cfg.head_dim / 2)
+    let d = f64::from(cfg.rotary_dim);
+    (0..cfg.rotary_dim / 2)
         .map(|i| {
             let f = cfg.rope_theta.powf(-(2.0 * f64::from(i)) / d);
             let scaled = match cfg.rope_scaling {

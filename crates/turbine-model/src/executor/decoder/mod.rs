@@ -950,6 +950,14 @@ pub(crate) fn is_norm_weight(name: &str) -> bool {
     )
 }
 
+/// Whether the `(1 + weight)` offset applies to a checkpoint weight: an RMSNorm weight
+/// ([`is_norm_weight`]) of transformers' `Qwen3_5RMSNorm` form. The Gated DeltaNet layers' gated
+/// norm (`linear_attn.norm.weight`) is a plain `Qwen3_5RMSNormGated` weight
+/// (`weight * rms(x) * silu(z)`) and keeps its stored value.
+pub(crate) fn unit_offset_applies(name: &str) -> bool {
+    is_norm_weight(name) && !name.contains(".linear_attn.")
+}
+
 /// Adds 1 to every element of the `[n]` norm tensor `t` (transformers' `output · (1 + weight)`
 /// form, [`ModelArchConfig::unit_offset_norms`]) in place, in the activation dtype.
 fn unit_offset_norm(t: &Tensor) -> Result<(), ModelError> {
@@ -1601,7 +1609,7 @@ impl DecoderExecutor {
         // weight before the layers read them.
         if cfg.unit_offset_norms {
             for (name, t) in weights.tensors.iter() {
-                if name.ends_with(".weight") && is_norm_weight(name) {
+                if name.ends_with(".weight") && unit_offset_applies(name) {
                     unit_offset_norm(t)?;
                 }
             }
@@ -1722,7 +1730,10 @@ impl DecoderExecutor {
         let n = max_seqs as usize;
         let act = |cols: usize| Tensor::empty(&mem, &[t, cols], d.act);
         let mut inv_freq = Tensor::empty(&mem, &[d.rotary_dim / 2], DType::F32)?;
-        let freqs = rope::inv_freq(cfg.rope_theta, cfg.head_dim, cfg.rope_scaling.as_ref());
+        // `inv_freq[i] = theta^(-2i / rotary_dim)`: the exponent's dimension is the rotary one
+        // (`head_dim * partial_rotary_factor`), not `head_dim` (transformers'
+        // `compute_default_rope_parameters`).
+        let freqs = rope::inv_freq(cfg.rope_theta, cfg.rotary_dim, cfg.rope_scaling.as_ref());
         let freq_bytes: Vec<u8> = freqs
             .iter()
             .take(d.rotary_dim / 2)
