@@ -5001,3 +5001,24 @@ still red for two reasons the builder flagged:
   occurs and the L1 leg never reaches the restore assertion. **Decision:** fix the victim/caching
   path so cached-unreferenced blocks are demoted to the tier rather than dropped (within Task 33's
   scope); the cost-aware policy must not drop cacheable blocks while tier capacity is available.
+
+## P7 Task 33 demote-vs-drop and capture — lead calls round 2 (2026-10-17)
+
+T33c landed the tier-hit restore and the L1/L2 slot widening (gate ok, 1120 tests), but the lab
+`kv_gpu hybrid_prefix_reuse_matches_cold` is still red for two reasons:
+
+- **Demote vs drop:** A's blocks are dropped at eviction because they carry no reuse evidence
+  (`hierarchy.rs` `has_reuse_evidence = access_count > 0 || session.is_some() || child_count >= 2`),
+  which is the landed decision "Phase 4: capacity demotion only for blocks with reuse evidence".
+  **Decision:** that Phase 4 policy **stands** (no behaviour change for other models); the lab
+  scenario must warm A's prefix (a second identical request at L0, so the blocks gain reuse evidence)
+  before the filler load forces the demotion, then hit L1/L2 on the third turn. This is a test-design
+  fix, not a policy change.
+- **Within-step capture:** the engine captures a snapshot only when a *step* ends on a block
+  boundary, so A's 859-token single-chunk prefill has no snapshot ≤ a turn-2 cutoff. **Decision (as
+  recorded earlier):** capture from the per-block boundary rows *within* a step
+  (`boundary_tokens = kv.block_tokens`), not by aligning `scheduler.prefill_chunk_tokens`. Implement
+  it in the engine/executor capture path.
+
+Multi-shard hybrid snapshot tiers stay unsupported/untested (single-card gates), noted in
+`tier/sharded.rs`.
