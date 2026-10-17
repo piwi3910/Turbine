@@ -120,6 +120,13 @@ impl ModelFamily for Qwen3_5Moe {
         qwen3_5_moe_slots(cfg)
     }
 
+    /// Tensor and expert parallel are allowed (P7 Task 34, S-11): as the dense hybrid for the
+    /// attention and Gated DeltaNet layers, the routed experts shard by `crate::ep`, and the
+    /// shared expert is replicated (added on EP rank 0 only).
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn requirements(
         &self,
         cfg: &ModelArchConfig,

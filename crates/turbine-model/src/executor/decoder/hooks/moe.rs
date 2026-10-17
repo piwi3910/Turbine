@@ -202,6 +202,14 @@ fn route_cfg(d: &DecoderDims, moe: &MoeConfig, style: Style) -> MoeRouteConfig {
 
 /// The `moe_experts` call over the local experts `[begin, end)`.
 impl Moe {
+    /// Whether this rank adds the shared expert's contribution: on one device the one call
+    /// adds it; under expert parallelism the shared expert is replicated, not sharded, so only
+    /// rank 0 adds it and the group's all-reduce sums it exactly once (P7 Task 34, decision
+    /// "P7 Task 34 TP/EP sharding"). Every rank still runs the routed experts.
+    fn adds_shared(&self, d: &DecoderDims) -> bool {
+        self.shared && d.ep.as_ref().is_none_or(|e| e.rank == 0)
+    }
+
     fn experts_cfg(
         &self,
         d: &DecoderDims,
@@ -229,9 +237,12 @@ impl Moe {
             },
             biases: gpt_oss,
             gate_up_interleaved: gpt_oss,
-            // The shared expert is added once per call, so a split (expert-parallel) call must
-            // not carry it (`check` refuses a shared hook under EP).
-            shared_inter: if self.shared && d.ep.is_none() {
+            // The shared expert is added once per layer, by the single call that starts at
+            // expert 0 (`forward` sets its weights only for that call, `local == 0`): on one
+            // device the one call; under expert parallelism only rank 0, whose first run starts
+            // at 0, so the group's combine sums the replicated shared expert in exactly once
+            // (P7 Task 34, decision "P7 Task 34 TP/EP sharding").
+            shared_inter: if self.adds_shared(d) && begin == 0 {
                 moe.shared_inter
             } else {
                 None
@@ -508,18 +519,10 @@ impl FfnHook for Moe {
 
     fn check(&self, d: &DecoderDims) -> Result<(), ModelError> {
         let moe = moe_of(d)?;
-        if self.shared {
-            if d.ep.is_some() {
-                return Err(invalid(
-                    "a shared expert is not implemented under expert parallelism".into(),
-                ));
-            }
-            if moe.shared_inter.is_none() {
-                return Err(invalid(
-                    "the shared-expert hook needs a config with shared_expert_intermediate_size"
-                        .into(),
-                ));
-            }
+        if self.shared && moe.shared_inter.is_none() {
+            return Err(invalid(
+                "the shared-expert hook needs a config with shared_expert_intermediate_size".into(),
+            ));
         }
         Ok(())
     }
@@ -801,9 +804,10 @@ impl FfnHook for Moe {
                     },
                 ),
             };
-            // The shared expert is added once per call: the one call of a single-device layer
-            // (its weights are the last [`SHARED_TENSORS`] of the layer, BF16).
-            if self.shared && local == 0 {
+            // The shared expert is added once per call: the one call of a single-device layer,
+            // or rank 0's first call under expert parallelism (its weights are the last
+            // [`SHARED_TENSORS`] of the layer, BF16).
+            if self.adds_shared(d) && local == 0 {
                 let s = w.0.len() - SHARED_TENSORS;
                 extra.shared_w_gate = Some(w.0[s].view());
                 extra.shared_w_up = Some(w.0[s + 1].view());

@@ -33,9 +33,9 @@ use turbine_kernels::cpu::quant::{dequantize, fp8_e4m3_round, fp8_e4m3_value};
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 
 use super::common::{
-    Follows, Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
-    quantization_config, read_owned, scheme_unsupported, shard_like, shard_misaligned,
-    write_fixture,
+    Follows, Owned, bf16_bytes, bf16_values, f32_bytes, is_shared_expert, matches_ignore,
+    module_of, pow2_at_least, quantization_config, read_owned, scheme_unsupported, shard_like,
+    shard_misaligned, write_fixture,
 };
 use super::{ActivationQuant, LinearSlot, QuantScheme, WeightFormat};
 use crate::ModelError;
@@ -153,7 +153,11 @@ impl Fp8Layout {
                 Some(p) if p.shape.len() == 2 => (p.name.clone(), [p.shape[0], p.shape[1]]),
                 _ => (slot.name.clone(), [n, k]),
             };
-            let reason = if !self.derive(slot).1 {
+            let reason = if is_shared_expert(&slot.name) {
+                // The Qwen3.5/3.6 shared expert is added by the BF16 MoE path, never run as its
+                // own qgemm: decode its block-scaled FP8 to BF16 at load (P7 Task 34).
+                Some("shared_expert_bf16")
+            } else if !self.derive(slot).1 {
                 Some("shard_misaligned")
             } else if !(supports(&qgemm(n, k)) && supports(&qgemm(whole[0], whole[1]))) {
                 Some("kernel_unsupported")

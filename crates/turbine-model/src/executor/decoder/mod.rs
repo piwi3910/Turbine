@@ -3497,9 +3497,17 @@ impl ModelExecutor for DecoderExecutor {
         self.snapshots = Some(snapshots);
     }
 
-    /// P7 S-12: the per-sequence state layout, `None` for an attention-only family.
+    /// P7 S-12: the per-sequence state layout, `None` for an attention-only family. A
+    /// tensor-parallel rank's state is sharded to its value heads (`self.dims.gdn` is the rank's
+    /// configuration, P7 Task 34), not the model's.
     fn state_layout(&self) -> Option<turbine_core::types::StateLayout> {
-        (self.gdn_state.is_some()).then_some(self.cfg.state)
+        let g = self.dims.gdn?;
+        Some(turbine_core::types::StateLayout {
+            linear_layers: linear_layers(&self.cfg) as u32,
+            recurrent_bytes_per_layer: g.recurrent_bytes(),
+            conv_bytes_per_layer: g.conv_bytes(),
+            dtype: Some(turbine_core::types::StateDtype::F32),
+        })
     }
 
     /// P7 S-12 (Task 32): copies hybrid per-sequence state between live slots and snapshot
