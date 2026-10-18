@@ -5062,3 +5062,35 @@ differently from the cold full-length prefill, so strict equality fails on GPU f
   one line each in `support.rs` / `support_startup.rs` / `docs/support-matrix.md` / `AGENTS.md`
   reverts it if the user prefers the recipe's canonical baseline. OLMoE's L0 `tq4` stays
   `experimental` (shared-prefix drop 0.045).
+
+## P7 exit: gpt-oss strict c1 drift — lead call (2026-10-18)
+
+The Task 39 runbook re-run found `GptOssForCausalLM/mxfp4/bf16/tp1` golden c1 at **15/16** — p15
+`max_abs_logprob_diff_likely` 0.3546 against the slug's strict bound 0.35 (tail 2.0083 ≤ 2.41) — while
+the 14-prompt rule is met and c16 (batched 0.48/2.64) passes 16/16. It reproduces bit-for-bit on a
+host-idle re-run, so it is a real numerical drift introduced by a Phase 7 commit after Task 27's gate
+(`dd94f669`, which recorded c1 16/16 with the same bounds), not run noise.
+
+**Decision (lead, 2026-10-18): keep the row `supported` pending a bisect** — the c16 gate and the
+14-prompt rule pass and the margin is ~1e-2 nats, but a `supported` row's gate should hold, so a
+`lab-bench --golden16 --model gpt-oss-20b` bisect over the Phase 7 commits after `dd94f669` will
+locate the change; a bug gets fixed, and if it is benign rounding from a legitimate change the strict
+bound is widened with the bisect as justification. Until then the strict c1 verdict is recorded as
+FAIL with this evidence.
+
+## P7 exit: gpt-oss c1 date-dependent fixture — lead call (2026-10-18)
+
+The T39b bisect proved no code regression: the checkpoint's Harmony `chat_template.jinja` renders
+`strftime_now("%Y-%m-%d")` — the host UTC clock, `crates/turbine-model/src/chat_template.rs` — for the
+chat-kind prompts p10–p16, so the golden c1 gate only passes on the reference's capture date. Pinning
+the date to 2026-10-16 reproduces Task 27's 16/16 bit-for-bit, and `dd94f669` and the tip are
+bit-identical on the same day (so nothing between them moved a logprob). p01–p09 are completion-kind
+and date-free.
+
+**Decision (lead, 2026-10-18): make the fixture date-independent with a bundled date-fixed template.**
+Add a copy of the checkpoint's Harmony template with the date pinned (one file in the repo), point the
+gpt-oss lab config's `model.chat_template` at it, teach `hf_reference.py` to accept the same template
+(`--chat-template`), regenerate `tests/golden/gpt-oss-20b/reference.jsonl` with it, and re-run the
+golden c1/c16 — expecting 16/16 on any day. This keeps the fixture exercising the real server-side
+chat path (unlike converting p10–p16 to pre-rendered completion prompts, which would drop that
+coverage), which is what the bisect's evidence supports. The S-8 lab-gate box then closes.
