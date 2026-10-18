@@ -1767,13 +1767,32 @@ mod tests {
             S::None,
         );
         assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
+        // Mixtral FP8 closed its gate on gfx1201 (perf-log "P7 Mixtral gate", 2026-10-18):
+        // supported there, still experimental on the other AMD archs (family row, any arch).
+        let k = key(
+            "amd",
+            "gfx1201",
+            "MixtralForCausalLM",
+            W::Fp8,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
+        let k = key(
+            "amd",
+            "gfx942",
+            "MixtralForCausalLM",
+            W::Fp8,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Experimental, "{k}");
         // Phase 7 families (S-13): experimental on AMD (any arch) until their gate closes, the
         // row view naming the pending gate; experimental on the CPU reference; another weight
         // format stays refused by its format row.
         for (architecture, w) in [
             ("Qwen3MoeForCausalLM", W::Bf16),
             ("MixtralForCausalLM", W::Bf16),
-            ("MixtralForCausalLM", W::Fp8),
             ("Qwen3_5ForConditionalGeneration", W::Bf16),
             ("Qwen3_5MoeForConditionalGeneration", W::Fp8Block),
         ] {
