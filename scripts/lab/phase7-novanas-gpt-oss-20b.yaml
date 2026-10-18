@@ -11,6 +11,13 @@ server:
 model:
   path: /models/gpt-oss-20b
   served_name: openai/gpt-oss-20b
+  # The checkpoint's Harmony template pins the system message's date with
+  # `strftime_now("%Y-%m-%d")` (the host UTC clock), which makes the golden c1 fixture
+  # (p10-p16, chat-kind) date-dependent. This copy fixes the date to 2026-10-16 (the reference's
+  # capture date) and is byte-identical otherwise; `scripts/golden/hf_reference.py --chat-template`
+  # renders the reference with the same file. Relative to the tree root (the server's cwd in
+  # lab-bench.sh and the lab-serve Job).
+  chat_template: tests/golden/gpt-oss-20b/chat_template.jinja
 execution:
   backend: hip
   gemm_autotune: true

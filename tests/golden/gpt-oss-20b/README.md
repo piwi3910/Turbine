@@ -32,6 +32,11 @@ merges.
   `apply_chat_template` and `turbine-golden` replays the same kwargs through the chat route, so
   reference and candidate tokenize identically. The `date_string` kwarg of the shared file is
   kept (unused by the gpt-oss template).
+- `chat_template.jinja` (this directory): the checkpoint's Harmony template with the system
+  message's `strftime_now("%Y-%m-%d")` pinned to the literal `"2026-10-16"`, byte-identical
+  otherwise; `model.chat_template` in `scripts/lab/phase7-novanas-gpt-oss-20b.yaml` names it and
+  `hf_reference.py --chat-template` renders the reference with it (see "Date independence"
+  below). `reference.jsonl` was regenerated with it on 2026-10-18 (engine string unchanged).
 ## Tolerance
 
 `tolerance.json` was seeded at the quantized floor — Llama-3.2-3B's strict and batched bounds
@@ -74,25 +79,46 @@ nothing hit the cap, so the bounds are the observed spread. The token rule is un
 Re-run the script and re-derive the bounds if the reference, the prompts or the gate placement
 change.
 
-## Date dependence of the chat prompts (2026-10-17)
+## Date independence (2026-10-18)
 
-**This fixture is not reproducible off its capture date.** The chat records (`kind: chat`,
-p10–p16) are rendered by the server through the checkpoint's Harmony `chat_template.jinja`,
-whose system message is `{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n\n" }}` — the
-host clock in UTC. The `date_string` kwarg the shared prompt set carries is **unused by this
-template**, so the rendered prefix (and the served logprobs) change with the day the server
-runs. The `kind: completion` records (p01–p09) send a pre-rendered `prompt` string and are
-date-free.
+**The fixture is date-independent now.** The checkpoint's Harmony `chat_template.jinja` renders the
+system message as `{{- "Current date: " + strftime_now("%Y-%m-%d") + "\n\n" }}` — the host clock in
+UTC (`crates/turbine-model/src/chat_template.rs`) — for the `kind: chat` records (p10–p16); the
+`date_string` kwarg the shared prompt set carries is **unused by this template**. So the rendered
+prefix (and the served logprobs) used to change with the day the server ran, and the c1 gate only
+passed on the reference's capture date (`kind: completion` p01–p09 send a pre-rendered `prompt`
+string and were always date-free). The drift, the bisect and the root cause are in
+`.procoder/perf-log.md`, "P7 gpt-oss golden c1 drift — root cause" (Tasks 39/39b).
 
-The reference's own `captured` stamps are mixed — p10–p13 `2026-10-14`, p14–p16 `2026-10-16` —
-and the Task 27 gate ran on `2026-10-16` UTC, which is why it passed. A clean re-run of the
-*gate commit* `dd94f669` on `2026-10-17` fails c1 15/16 (p15 `max_abs_logprob_diff_likely`
-0.3546 > 0.35); pinning `strftime_now` to `2026-10-16` reproduces the recorded gate report
-bit-for-bit (16/16, p15 0.1675). Nothing between `dd94f669` and the tip changes a logprob
-(bisect P1–P6 in `.procoder/perf-log.md`, "P7 gpt-oss golden c1 drift"). Re-gate only after
-pinning the date — either a bundled date-fixed copy of the checkpoint template set through
-`model.chat_template`, the p10–p16 records converted to pre-rendered completions, or a
-reference regenerated with one pinned date (lead call).
+Fix (lead call 2026-10-18, `.procoder/ask/decisions.md`, "P7 exit: gpt-oss c1 date-dependent
+fixture — lead call"): `tests/golden/gpt-oss-20b/chat_template.jinja` is the checkpoint template
+with `strftime_now("%Y-%m-%d")` replaced by the literal `"2026-10-16"` (the date the reference and
+the Task 27 gate were captured at; one line differs, everything else byte-identical). The slug's
+lab config sets `model.chat_template` to it (relative to the tree root, the server's cwd in
+`lab-bench.sh` and the lab-serve Job) and `scripts/golden/hf_reference.py --chat-template` renders
+the reference with the same file, so reference and candidate render identically on any day. This
+keeps the fixture exercising the real server-side chat path; the alternative — pre-rendering
+p10–p16 as `kind: completion` records — would drop that coverage.
+
+The regenerated `reference.jsonl` is self-consistent at the pinned date: its p10–p16 records render
+`Current date: 2026-10-16` (the committed records had p10–p13 at `2026-10-14` and p14–p16 at
+`2026-10-16`, because the fixture's first generation was interrupted and resumed two days later, so
+the gate itself only ever matched the p14–p16 half). The tolerance is unaffected and stays
+conservative: the engine-spread captures were taken `2026-10-16` and so matched the p14–p16 records
+exactly while judging p10–p13 across the date change.
+
+Gate re-run at the fix (`scripts/lab-bench.sh --model gpt-oss-20b --golden16`, GPU 0, 2026-10-18):
+strict c1 **16/16 PASS** and batched c16 **16/16 PASS** —
+
+    BENCH p7t39c-fix gpt-oss-20b commit=a10ceb35 gpu=0 tests=skipped golden1=PASS: golden16=PASS:
+    client=novanas weight_format=mxfp4 kv=bf16 conc=16 host_share=0.9965 ok=28 failed=172 tok/s=40.8
+    itl_p50=37.5 ttft_p50=9325 decode_fwd_ms=36.9
+
+(the `tok/s` and `ok=`/`failed=` counts are not comparable for this checkpoint: the fixed-length
+reasoning workload leaves the final channel empty on most requests — Task 27, and the `host_share`
+`≈ 1.0` reading follows from that). p15 is 0.1675 against the strict bound 0.35, as at the Task 27
+gate; p10–p13 move from the recorded 0.2380/0.2289/0.2644/0.1388 (inflated by the date mismatch)
+to 0.1220/0.2863/0.2000/0.2151.
 
 ## Fixture provenance
 
@@ -102,4 +128,9 @@ reference regenerated with one pinned date (lead call).
 - Dequantize + transformers cross-check: 2026-10-14 18:34:36–18:37:21 UTC (2 m 45 s; the first
   two attempts failed on the fused-expert support the extension adds — root causes in git
   history).
-- Reference: 2026-10-14, 18:40:04 UTC start, 16 prompts, ~2 min/prompt.
+- Reference: 2026-10-14, 18:40:04 UTC start, 16 prompts, ~2 min/prompt (interrupted after p13 and
+  resumed on 2026-10-16 for p14–p16, which is why the committed `captured` stamps were mixed).
+- Reference regenerated 2026-10-18 with the pinned template (Task 39c): guarded script
+  `.procoder/handoff/p7_t39c_ref.sh`, scratch `/home/piwi/turbine-ci/scratch/p7-t39c`, same
+  `fixture.lock` queue entry `p7-ref-gpt-oss` and pinning; the dequantized BF16 copy already
+  existed, so only the reference stage ran.
