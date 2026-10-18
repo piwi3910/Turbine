@@ -5095,6 +5095,15 @@ golden c1/c16 — expecting 16/16 on any day. This keeps the fixture exercising 
 chat path (unlike converting p10–p16 to pre-rendered completion prompts, which would drop that
 coverage), which is what the bisect's evidence supports. The S-8 lab-gate box then closes.
 
+## P7 hybrid support rows — user decision (2026-10-18)
+
+Asked with three options — (a) keep `experimental` with the documented evidence, (b) `supported`
+under a documented recurrence-aware (advisory) tolerance, (c) Qwen3.5 tp1 only. **Decision (user,
+2026-10-18): (a).** The Qwen3.5-9B and Qwen3.6-35B-A3B hybrid rows stay `experimental` with the GDN
+recurrence-amplification evidence (engine spread 8.4/11.4 nats, 9/16 identical prefixes, tokens
+otherwise within ~0.5 nats); their S-11 lab-gate boxes stay open by design. They remain fully
+implemented and usable.
+
 ## P7 merge rule — user amendment (2026-10-18)
 
 The user amended the handoff's "the user pushes" rule: **the lead merges `p7-stack` into `main`
