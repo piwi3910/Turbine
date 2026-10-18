@@ -1645,13 +1645,13 @@ fn hybrid_prefix_reuse_matches_cold() {
         "the L2 blocks came from an L1 spill"
     );
     let before_l2 = restored(&server);
-    let from_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
-    if from_l2.cached_tokens == 0 {
+    let hit_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    if hit_l2.cached_tokens == 0 {
         dump_kv(&server);
     }
     assert!(
-        from_l2.cached_tokens > 0,
-        "the L2 turn reused no prefix: {from_l2:?}"
+        hit_l2.cached_tokens > 0,
+        "the L2 turn reused no prefix: {hit_l2:?}"
     );
     assert!(
         restored(&server) > before_l2,
@@ -1659,9 +1659,9 @@ fn hybrid_prefix_reuse_matches_cold() {
     );
     assert!(
         from_l2(&server) > 0.0,
-        "the L2 turn promoted nothing from L2 (not a tier hit): {from_l2:?}"
+        "the L2 turn promoted nothing from L2 (not a tier hit): {hit_l2:?}"
     );
-    assert_within_batched_bounds(&cold, &from_l2, "the L2 turn");
+    assert_within_batched_bounds(&cold, &hit_l2, "the L2 turn");
     println!(
         "hybrid L2 leg exercised: {} blocks to L2 over {} fillers",
         to_l2(&server),
