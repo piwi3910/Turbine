@@ -1596,26 +1596,31 @@ fn hybrid_prefix_reuse_matches_cold() {
         promoted_l1(&server)
     );
 
-    // Turn 2 hits A from L1: the KV promotes exact and the state restores from a snapshot.
+    // Turn 2 hits A from a lower tier: the KV promotes exact and the state restores from a
+    // snapshot. With the record-sized L1 accounting the filler load can already spill part of
+    // A — L1's ~16-record capacity is real, unlike the KV-only count that reported ~7 % fill —
+    // so the hit may come from L1 or L2; either way it restored a snapshot and promoted
+    // something. The L2 leg below exercises the L1 -> L2 spill itself.
     let before_l1 = restored(&server);
     let before_promoted = promoted_l1(&server);
+    let before_promoted_l2 = from_l2(&server);
     let from_l1 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
     if from_l1.cached_tokens == 0 {
         dump_kv(&server);
     }
     assert!(
         from_l1.cached_tokens > 0,
-        "the L1 turn reused no prefix: {from_l1:?}"
+        "the tier turn reused no prefix: {from_l1:?}"
     );
     assert!(
         restored(&server) > before_l1,
-        "the L1 hit restored no snapshot"
+        "the tier hit restored no snapshot"
     );
     assert!(
-        promoted_l1(&server) > before_promoted,
-        "the L1 turn promoted nothing from L1 (not a tier hit): {from_l1:?}"
+        promoted_l1(&server) > before_promoted || from_l2(&server) > before_promoted_l2,
+        "the tier turn promoted nothing from a lower tier: {from_l1:?}"
     );
-    assert_within_batched_bounds(&cold, &from_l1, "the L1 turn");
+    assert_within_batched_bounds(&cold, &from_l1, "the tier turn");
 
     // A further L2 leg: push A on down to L2 and hit it again. A hybrid block's tier record
     // carries its snapshot tail (~49 MiB for Qwen3.5-9B), and the L1/L2 slot accounting

@@ -876,6 +876,17 @@ impl KvHierarchy {
         self.transfer.is_busy_with(key) && !self.demoting.contains_key(key)
     }
 
+    /// A copy in flight removes (or replaces, for a rewrite) `key`'s copy in `tier` when it
+    /// lands: a demotion out of the tier, or a ladder/compress rewrite of the tier's copy (P7
+    /// S-12, Task 33 — the source a request would promote). A demotion INTO the tier or an
+    /// L0 -> lower demotion leaves the current copies alone.
+    fn copy_moves_from(&self, key: &KvKey, tier: TierId) -> bool {
+        self.demoting
+            .iter()
+            .any(|(k, d)| k == key && d.from == tier)
+            || self.compressing.contains_key(key)
+    }
+
     fn lookup_slot(tier: TierId) -> usize {
         match tier {
             TierId::L0 => 0,
@@ -1090,8 +1101,19 @@ impl KvHierarchy {
             }
         };
         // Wait while another request computes the next block, or while a matched block is
-        // already on its way into L0 (a second promotion would duplicate its L0 copy).
+        // already on its way into L0 (a second promotion would duplicate its L0 copy), or while
+        // the matched copy itself is being moved out of its tier — P7 S-12 (Task 33): a spill
+        // (L1 -> L2) or a tier rewrite removes that copy when it lands, and a promotion reading
+        // it mid-flight then dies at the tier (its dropped L0 target is released twice, the
+        // engine panics on the request's retire). `incoming` exempts demotions because an
+        // L0 -> lower demotion keeps the readable L0 copy; a lower -> lower one does not keep
+        // the matched copy.
+        let source_being_moved = m
+            .blocks
+            .iter()
+            .any(|b| b.tier != TierId::L0 && self.copy_moves_from(&b.key, b.tier));
         if m.pending.is_some()
+            || source_being_moved
             || m.blocks
                 .iter()
                 .any(|b| b.tier != TierId::L0 && self.incoming(&b.key))
@@ -4760,7 +4782,17 @@ pub(crate) mod tests {
         );
         // Second wave: L1 is full, so the two new demotions' `make_room` spills L1's two
         // lowest-value records to L2 before any new copy is attempted — the L2 leg.
-        demote(&mut r);
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        // The spills are in flight: an attach matched at L1 must wait for them rather than
+        // read a copy the landing removes (a mid-flight promotion would die at the tier and
+        // its dropped L0 target gets released twice — Task 33's lab engine panic).
+        let outcome = Rig::attach(&mut r, RequestId(99), &prompt);
+        assert_eq!(
+            outcome,
+            AttachOutcome::WaitForPrefix,
+            "an attach during a spill's flight waits"
+        );
+        settle(&mut r);
         assert_eq!(
             r.h.metrics.demotion_value(TierId::L1, TierId::L2),
             2,
