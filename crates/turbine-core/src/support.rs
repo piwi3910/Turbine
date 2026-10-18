@@ -1524,8 +1524,9 @@ mod tests {
         // proven gfx1201 Llama weight rows with BF16 KV (fp8, Task 14; fp8_block, Task 15;
         // awq_int4 and gptq_int4, Task 18), the Phase 7 families that closed their S-13 gates
         // (Qwen3 and Mistral BF16 tp1; Qwen3-MoE fp8_block tp2 and ep2; gpt-oss-20b mxfp4 tp1,
-        // Task 27), the proven OLMoE rows (fp8_e4m3 KV) and the gfx1201 Llama L0 `tq4` row
-        // (Task 37b; OLMoE's `tq4` stays `experimental`) are supported before the tracks add rows.
+        // Task 27; Mixtral fp8 tp2 and ep2, 2026-10-18), the proven OLMoE rows (fp8_e4m3 KV) and
+        // the gfx1201 Llama L0 `tq4` row (Task 37b; OLMoE's `tq4` stays `experimental`) are
+        // supported before the tracks add rows.
         for r in SUPPORT_MATRIX
             .iter()
             .filter(|r| r.status == SupportStatus::Supported)
@@ -1547,6 +1548,7 @@ mod tests {
                         Some("LlamaForCausalLM")
                             | Some("Qwen3MoeForCausalLM")
                             | Some("GptOssForCausalLM")
+                            | Some("MixtralForCausalLM")
                     ),
                     "{:?}",
                     r.view()
