@@ -4786,7 +4786,7 @@ pub(crate) mod tests {
         // The spills are in flight: an attach matched at L1 must wait for them rather than
         // read a copy the landing removes (a mid-flight promotion would die at the tier and
         // its dropped L0 target gets released twice — Task 33's lab engine panic).
-        let outcome = Rig::attach(&mut r, RequestId(99), &prompt);
+        let outcome = attach(&mut r, RequestId::new_v4(), &prompt);
         assert_eq!(
             outcome,
             AttachOutcome::WaitForPrefix,
