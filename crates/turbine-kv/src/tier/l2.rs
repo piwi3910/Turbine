@@ -620,16 +620,12 @@ impl KvTier for L2NvmeTier {
         self.snapshot_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// P7 S-12 (Task 33): the exact bytes of one hybrid record — the coded KV block plus the
-    /// snapshot tail (`block_bytes` for an attention-only model).
-    fn record_bytes(&self) -> u64 {
-        self.cfg
+    fn capacity_bytes(&self) -> u64 {
+        let record = self
+            .cfg
             .block_bytes
             .saturating_add(self.snapshot_bytes.load(Ordering::Relaxed))
-    }
-
-    fn capacity_bytes(&self) -> u64 {
-        let record = self.record_bytes().max(1);
+            .max(1);
         // P7 S-12 (Task 33): a slab slots records (`block_bytes` + the snapshot tail's bytes),
         // not KV-only blocks, so the capacity is charged at the effective record size — a slab
         // file holds `floor((slots_per_slab × slot_bytes) / slot_record)` record-sized slots,
