@@ -5094,3 +5094,10 @@ gpt-oss lab config's `model.chat_template` at it, teach `hf_reference.py` to acc
 golden c1/c16 — expecting 16/16 on any day. This keeps the fixture exercising the real server-side
 chat path (unlike converting p10–p16 to pre-rendered completion prompts, which would drop that
 coverage), which is what the bisect's evidence supports. The S-8 lab-gate box then closes.
+
+## P7 merge rule — user amendment (2026-10-18)
+
+The user amended the handoff's "the user pushes" rule: **the lead merges `p7-stack` into `main`
+itself and never stops to ask for that.** `p7-stack` was merged into `main` (merge commit `66e42cc3`,
+clean; `main` was an ancestor). The separate "never push" rule still applies unless the user lifts
+it.

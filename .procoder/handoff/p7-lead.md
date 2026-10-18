@@ -8,8 +8,9 @@ acting. It assumes you have read `AGENTS.md` at the repository root.
 - **Integration branch:** `p7-stack`, checked out in worktree
   `/Volumes/DATA/Development/Turbine/.claude/worktrees/agent-p6b-t2`. The tip is `6cbb3ebb`, and
   `scripts/gate.sh --base main` there is clean: `passed=1085 failed=0`.
-- **`main`** is at `29215016` (Phase 5p exit). Phase 7 is not merged to `main`; it merges at the
-  phase exit (Task 39). The user pushes; you never push.
+- **`main`** is at `66e42cc3` — the Phase 7 merge (2026-10-18). The user amended the rule: the lead
+  merges `p7-stack` into `main` itself and never stops to ask for that; the separate "never push"
+  rule stands unless the user lifts it.
 - **Plan:** `.procoder/plans/phase-7-model-families.md`.
 - **Spec:** `.procoder/specs/phase-7-model-families.md`.
 - **Decisions:** `.procoder/ask/decisions.md`. Read the `P7 …` entries before re-opening any
