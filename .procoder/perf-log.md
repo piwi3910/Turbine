@@ -2396,6 +2396,18 @@ capture legs.
 - P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/tp2 — golden not gated: the committed CPU reference (`tests/golden/qwen3.6-35b-a3b-fp8/reference.jsonl`, 16 prompts, `transformers-5.9.0-bf16-cpu-fp32-logits`) exists, but the GDN recurrence amplifies BF16 rounding as on Qwen3.5-9B; row stays `experimental`
 - P7 open: Qwen3_5MoeForConditionalGeneration/fp8_block/bf16/ep2 — same as tp2 (the recurrence numerics and the unrun tp2/ep2 golden gates, not the reference, keep the row open)
 
+- **P7 S-12 Task 33, L2 leg closed (2026-10-18, branch `p7-t40`):** the hybrid
+  `kv_gpu hybrid_prefix_reuse_matches_cold` L2 leg (a Qwen3.5-9B record's ~49 MiB snapshot
+  tail demoted through L1 → L2 with the block and restored on a tier hit) was SKIPPED because
+  L1 never spilled: its capacity was counted in KV-only block sizes, so it reported ~7 % fill
+  at its ~16-record limit and `make_room` returned early with "free room" no record slot
+  backed. An L1/L2 slab tier with `snapshot_bytes` set now charges `capacity_bytes`,
+  `blocks_total`, `free_slots` and (`make_room`/`record_demand`/`copy_ahead`) the effective
+  record size, so the leg runs unconditionally with `turbine_kv_demotions_total{from="l1",to="l2"}` > 0.
+  Host: `hierarchy::tests::hybrid_l1_spills_records_to_l2`,
+  `tier::tests::hybrid_capacity_counts_records_not_kv_blocks`. The 9/16 golden-c1 numerics
+  above are a separate, open correctness item.
+
 ### P7 L0 tq4 re-gate — `kv.dtype=tq4` on the Phase 7 tree (plan Task 37, S-16, branch `p7-t37`, 2026-10-17)
 
 Re-run of the Phase 6b Task 13 gates, unchanged, on tree `8be49852` (`p7-stack` tip). The

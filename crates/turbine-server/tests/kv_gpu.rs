@@ -570,6 +570,24 @@ fn l0_tier(server: &LabServer) -> (String, u64, u64) {
     )
 }
 
+/// The L1 tier of `GET /turbine/v1/kv`: (block bytes, total blocks, used blocks). For a hybrid
+/// model the accounting charges a record (`[kv][snapshot]`, P7 S-12 Task 33), so `blocks_total`
+/// is the record capacity in L0-format KV blocks.
+fn l1_tier(server: &LabServer) -> (u64, u64, u64) {
+    let (status, text) = request(server.addr, "GET", "/turbine/v1/kv", None);
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).expect("KV document JSON");
+    let l1 = v["tiers"]
+        .as_array()
+        .and_then(|t| t.iter().find(|t| t["tier"] == "l1"))
+        .unwrap_or_else(|| panic!("no l1 tier: {text}"));
+    (
+        l1["block_bytes"].as_u64().unwrap_or(0),
+        l1["blocks_total"].as_u64().unwrap_or(0),
+        l1["blocks_used"].as_u64().unwrap_or(0),
+    )
+}
+
 /// Phase 6a S-13 / S-14: at `kv.dtype: fp8_e4m3` the L0 pool is F8E4M3 with half the block
 /// bytes and at least 1.95× the blocks of the BF16 run (same budget), and prefix reuse answers
 /// within the golden gate's batched bounds of the cold FP8 run (see
@@ -1578,61 +1596,82 @@ fn hybrid_prefix_reuse_matches_cold() {
         promoted_l1(&server)
     );
 
-    // Turn 2 hits A from L1: the KV promotes exact and the state restores from a snapshot.
+    // Turn 2 hits A from a lower tier: the KV promotes exact and the state restores from a
+    // snapshot. With the record-sized L1 accounting the filler load can already spill part of
+    // A — L1's ~16-record capacity is real, unlike the KV-only count that reported ~7 % fill —
+    // so the hit may come from L1 or L2; either way it restored a snapshot and promoted
+    // something. The L2 leg below exercises the L1 -> L2 spill itself.
     let before_l1 = restored(&server);
     let before_promoted = promoted_l1(&server);
+    let before_promoted_l2 = from_l2(&server);
     let from_l1 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
     if from_l1.cached_tokens == 0 {
         dump_kv(&server);
     }
     assert!(
         from_l1.cached_tokens > 0,
-        "the L1 turn reused no prefix: {from_l1:?}"
+        "the tier turn reused no prefix: {from_l1:?}"
     );
     assert!(
         restored(&server) > before_l1,
-        "the L1 hit restored no snapshot"
+        "the tier hit restored no snapshot"
     );
     assert!(
-        promoted_l1(&server) > before_promoted,
-        "the L1 turn promoted nothing from L1 (not a tier hit): {from_l1:?}"
+        promoted_l1(&server) > before_promoted || from_l2(&server) > before_promoted_l2,
+        "the tier turn promoted nothing from a lower tier: {from_l1:?}"
     );
-    assert_within_batched_bounds(&cold, &from_l1, "the L1 turn");
+    assert_within_batched_bounds(&cold, &from_l1, "the tier turn");
 
-    // A further L2 leg: push A on down to L2 and hit it again. With hybrid state a block's tier
-    // record carries its snapshot tail (~49 MiB for Qwen3.5-9B), so L1 holds far fewer blocks
-    // than its KV-only count and L1 -> L2 spill does not fire under this filler load (P7 S-12
-    // gap: `to_l2` stays 0 over the fill). The leg asserts only when a spill is observed, so a
-    // regression that stops it is reported rather than silently passing; the gap itself is an
-    // open P7 S-12 item (an L1 -> L2 spill for hybrid records).
+    // A further L2 leg: push A on down to L2 and hit it again. A hybrid block's tier record
+    // carries its snapshot tail (~49 MiB for Qwen3.5-9B), and the L1/L2 slot accounting
+    // charges that tail — `blocks_total` and the fill count the effective `[kv][snapshot]`
+    // record, so the filler load fills L1 at its ~16-record capacity and the L1 -> L2 spill
+    // fires (`turbine_kv_demotions_total{from="l1",to="l2"}` rises), unlike the KV-only
+    // accounting that reported ~7 % fill at the same records and stalled (Task 33's open L2
+    // leg). Each filler_2k is ~14 records, so once L1 is full every filler spills a full
+    // record batch; 24 spills drain L1's whole population at the leg's start (the ~10 L1-leg
+    // residents in value order, A's five the oldest cacheable among them) plus a turnover, so
+    // A's records are certainly out on the hit that follows. The leg is unconditional: a
+    // regression that stops the spill fails the test instead of silently skipping it.
+    let (_l1_block, _l1_records_total, _l1_used) = l1_tier(&server);
     let mut filler_l2 = 0;
-    while to_l2(&server) < 1.0 && filler_l2 < 60 {
+    while to_l2(&server) < 24.0 {
         filler_l2 += 1;
+        assert!(
+            filler_l2 <= 400,
+            "L1 never spilled to L2 with hybrid records ({} blocks to L2)",
+            to_l2(&server)
+        );
         let key = format!("filler-l2-{filler_l2}");
         server.complete_in(&prompt(2_000 + filler_l2, 1_800), 1, Some(&key));
     }
-    if to_l2(&server) >= 1.0 {
-        let before_l2 = restored(&server);
-        let from_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
-        if from_l2.cached_tokens == 0 {
-            dump_kv(&server);
-        }
-        assert!(
-            from_l2.cached_tokens > 0,
-            "the L2 turn reused no prefix: {from_l2:?}"
-        );
-        assert!(
-            restored(&server) > before_l2,
-            "the L2 hit restored no snapshot"
-        );
-        assert_within_batched_bounds(&cold, &from_l2, "the L2 turn");
-        println!("hybrid L2 leg exercised ({} blocks to L2)", to_l2(&server));
-    } else {
-        println!(
-            "hybrid L2 leg SKIPPED: no L1->L2 spill with hybrid records ({} blocks to L2)",
-            to_l2(&server)
-        );
+    assert!(
+        server.metric(r#"turbine_kv_demotions_total{from="l1",to="l2"}"#) > 0.0,
+        "the L2 blocks came from an L1 spill"
+    );
+    let before_l2 = restored(&server);
+    let hit_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    if hit_l2.cached_tokens == 0 {
+        dump_kv(&server);
     }
+    assert!(
+        hit_l2.cached_tokens > 0,
+        "the L2 turn reused no prefix: {hit_l2:?}"
+    );
+    assert!(
+        restored(&server) > before_l2,
+        "the L2 hit restored no snapshot"
+    );
+    assert!(
+        from_l2(&server) > 0.0,
+        "the L2 turn promoted nothing from L2 (not a tier hit): {hit_l2:?}"
+    );
+    assert_within_batched_bounds(&cold, &hit_l2, "the L2 turn");
+    println!(
+        "hybrid L2 leg exercised: {} blocks to L2 over {} fillers",
+        to_l2(&server),
+        filler_l2
+    );
     assert!(
         restored(&server) > 0.0,
         "no state snapshot was ever restored"

@@ -696,6 +696,13 @@ impl KvMetrics {
             .inc();
     }
 
+    /// Current `turbine_kv_demotions_total` value of one (from, to) series.
+    pub fn demotion_value(&self, from: TierId, to: TierId) -> u64 {
+        self.demotions
+            .get_or_create(&[("from", from.as_str()), ("to", to.as_str())])
+            .get()
+    }
+
     /// One copy-ahead copy into `to` landed (the L0 copy stays).
     pub fn copy_ahead(&self, to: TierId) {
         self.copy_ahead.get_or_create(&[("to", to.as_str())]).inc();

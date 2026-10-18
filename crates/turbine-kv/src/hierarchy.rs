@@ -876,6 +876,17 @@ impl KvHierarchy {
         self.transfer.is_busy_with(key) && !self.demoting.contains_key(key)
     }
 
+    /// A copy in flight removes (or replaces, for a rewrite) `key`'s copy in `tier` when it
+    /// lands: a demotion out of the tier, or a ladder/compress rewrite of the tier's copy (P7
+    /// S-12, Task 33 — the source a request would promote). A demotion INTO the tier or an
+    /// L0 -> lower demotion leaves the current copies alone.
+    fn copy_moves_from(&self, key: &KvKey, tier: TierId) -> bool {
+        self.demoting
+            .iter()
+            .any(|(k, d)| k == key && d.from == tier)
+            || self.compressing.contains_key(key)
+    }
+
     fn lookup_slot(tier: TierId) -> usize {
         match tier {
             TierId::L0 => 0,
@@ -1090,8 +1101,19 @@ impl KvHierarchy {
             }
         };
         // Wait while another request computes the next block, or while a matched block is
-        // already on its way into L0 (a second promotion would duplicate its L0 copy).
+        // already on its way into L0 (a second promotion would duplicate its L0 copy), or while
+        // the matched copy itself is being moved out of its tier — P7 S-12 (Task 33): a spill
+        // (L1 -> L2) or a tier rewrite removes that copy when it lands, and a promotion reading
+        // it mid-flight then dies at the tier (its dropped L0 target is released twice, the
+        // engine panics on the request's retire). `incoming` exempts demotions because an
+        // L0 -> lower demotion keeps the readable L0 copy; a lower -> lower one does not keep
+        // the matched copy.
+        let source_being_moved = m
+            .blocks
+            .iter()
+            .any(|b| b.tier != TierId::L0 && self.copy_moves_from(&b.key, b.tier));
         if m.pending.is_some()
+            || source_being_moved
             || m.blocks
                 .iter()
                 .any(|b| b.tier != TierId::L0 && self.incoming(&b.key))
@@ -2907,7 +2929,7 @@ impl KvHierarchy {
             }
             let bytes = self
                 .copy_codec(&v.key, TierId::L0, to)
-                .map_or(self.cfg.block_bytes, |c| c.to_bytes);
+                .map_or(self.cfg.block_bytes, |c| c.to_record_bytes());
             if used + bytes > ceiling {
                 break;
             }
@@ -2941,7 +2963,12 @@ impl KvHierarchy {
         let Some(t) = self.tier(tier).cloned() else {
             return 0;
         };
-        let unit = self.format_bytes(self.rung(tier)).max(1);
+        // P7 S-12 (Task 33): a hybrid tier slots records (`[kv][snapshot]`), so the room and
+        // what a victim frees are counted in record bytes — the tiers report `capacity_bytes`
+        // in that currency too. With KV-only units `room/unit` budgets for slots no hybrid
+        // slab backs, every further demotion ends `Full` at the tier, and the L1 → L2 spill
+        // never fires (Task 33's open L2 leg).
+        let unit = self.record_unit(tier);
         let room = t
             .capacity_bytes()
             .saturating_sub(t.used_bytes() + self.inflight_into(tier));
@@ -2955,7 +2982,7 @@ impl KvHierarchy {
             .iter()
             .filter(|(_, d)| d.from == tier)
             .filter_map(|(k, _)| self.dir.get(k)?.location(tier))
-            .map(|l| self.format_bytes(l.format))
+            .map(|l| l.snapshot_bytes + self.format_bytes(l.format))
             .sum();
         let pending = (leaving / unit) as usize;
         let spill = tier == TierId::L1 && self.storage_accepts_demotions();
@@ -2970,7 +2997,7 @@ impl KvHierarchy {
                 .get(&victim)
                 .is_some_and(|b| b.location(TierId::L2).is_some());
             let cost = self.demotion_bytes(&victim, TierId::L1, TierId::L2);
-            let want = cost.div_ceil(self.format_bytes(self.rung(TierId::L2)).max(1)) as usize;
+            let want = cost.div_ceil(self.record_unit(TierId::L2)) as usize;
             if spill
                 && !has_l2
                 && self.make_room(pool, TierId::L2, want) >= cost
@@ -2984,7 +3011,11 @@ impl KvHierarchy {
                 .dir
                 .get(&victim)
                 .and_then(|b| b.location(tier))
-                .map_or(1, |l| self.format_bytes(l.format).max(1));
+                .map_or(1, |l| {
+                    l.snapshot_bytes
+                        .saturating_add(self.format_bytes(l.format))
+                        .max(1)
+                });
             match self.ladder_victim(pool, &victim, tier) {
                 Some(false) => continue,
                 Some(true) => self.remove_copy(pool, &victim, tier, EvictReason::LadderFloor),
@@ -2995,10 +3026,27 @@ impl KvHierarchy {
         room
     }
 
+    /// Bytes of one record in `tier` at its ladder rung — the encoded KV block plus the hybrid
+    /// state snapshot tail, when the tail travels with its block (P7 S-12, Task 33). A hybrid
+    /// slab tier slots records, so [`KvHierarchy::make_room`], `record_demand` and `copy_ahead`
+    /// count in this currency: charging KV-only bytes makes a hybrid tier report free KV units
+    /// that no record slot backs, every demotion then ends `Full` at the tier, and the L1 → L2
+    /// spill never fires (Task 33's open L2 leg). The tail is [`KvHierarchy::snapshot_entry_bytes`]
+    /// whether or not this particular block carries one, the same conservative bound the L0
+    /// hybrid budget charges. Zero for an attention-only model.
+    fn record_unit(&self, tier: TierId) -> u64 {
+        let kv = self.format_bytes(self.rung(tier));
+        if self.snapshot_tier_travel {
+            kv.saturating_add(self.snapshot_entry_bytes()).max(1)
+        } else {
+            kv.max(1)
+        }
+    }
+
     /// Adds `blocks` demotions into `to` to the ladder's demand; what `to` (L1) has no free room
     /// for spills on into L2.
     fn record_demand(&mut self, to: TierId, blocks: u64) {
-        let bytes = blocks * self.format_bytes(self.rung(to));
+        let bytes = blocks * self.record_unit(to);
         match to {
             TierId::L1 => {
                 self.ladder_demand[0] += bytes;
@@ -3007,9 +3055,8 @@ impl KvHierarchy {
                         .capacity_bytes()
                         .saturating_sub(l1.used_bytes() + self.inflight_into(TierId::L1));
                     let over = bytes.saturating_sub(free);
-                    let unit = self.format_bytes(self.rung(TierId::L1)).max(1);
                     self.ladder_demand[1] +=
-                        over.div_ceil(unit) * self.format_bytes(self.rung(TierId::L2));
+                        over.div_ceil(self.record_unit(TierId::L1)) * self.record_unit(TierId::L2);
                 }
             }
             TierId::L2 => self.ladder_demand[1] += bytes,
@@ -4617,6 +4664,189 @@ pub(crate) mod tests {
             out,
             patterns[cut as usize - 1],
             "the promoted entry holds the tail"
+        );
+    }
+
+    /// P7 S-12 (Task 33, the L2 leg): a hybrid tier's capacity is charged at the effective
+    /// record size — `[kv][snapshot]`, a slab slots records not KV blocks — so a fill of
+    /// hybrid records fills the tier and the L1 → L2 spill fires
+    /// (`turbine_kv_demotions_total{from="l1",to="l2"}` rises), while no demotion ever ends
+    /// `Full` at the tier. Breaks if the tier reports KV-only capacity for a hybrid model:
+    /// [`KvHierarchy::make_room`] then returns early with KV-sized free room that no hybrid
+    /// slab backs, further demotions end `Full` and are dropped, and the spill never fires (the
+    /// lab's `hybrid L2 leg SKIPPED`: L1's KV-only count is ~49 MiB-tail positive and reports
+    /// ~7 % fill at its record capacity).
+    #[test]
+    fn hybrid_l1_spills_records_to_l2() {
+        use crate::state::{MemSnapshotStore, SnapshotStore};
+        use crate::tier::{L1Config, L1PinnedTier, TierBlockMut};
+        use turbine_core::config::ModuleName;
+        use turbine_core::types::{StateDtype, StateLayout};
+        use turbine_tensor::host::HostPinned;
+
+        let clock = FakeClock::new(Duration::ZERO);
+        let arc: Arc<dyn Clock> = Arc::new(clock.clone());
+        let bb = fmt16().layout.block_bytes();
+        // A hybrid record is `block_bytes + snapshot_bytes`; the tail (6,000 B) is close to 3×
+        // the KV block (2,048 B), with slack in each 22,144 B slab — the slab-waste the old
+        // KV-only `make_room` budgets as "free KV slots" that no record slot backs.
+        let layout = StateLayout {
+            linear_layers: 1,
+            recurrent_bytes_per_layer: 6000,
+            conv_bytes_per_layer: 0,
+            dtype: Some(StateDtype::F32),
+        };
+        let entry = layout.bytes_per_sequence();
+        let record = bb + entry;
+        assert_eq!(entry, 6000);
+        let l1: Arc<dyn KvTier> = Arc::new(L1PinnedTier::new(
+            L1Config {
+                enabled: true,
+                // Two 22,144 B slabs: two 8,048 B record slots each (record capacity 4,
+                // KV-only "capacity" 10 × 2,048 per slab).
+                max_bytes: 2 * 22_144,
+                slab_bytes: 22_144,
+                block_bytes: bb,
+                memory_kind: MemoryKind::Dedicated,
+            },
+            Arc::new(HostPinned::new(u64::MAX)),
+            arc.clone(),
+        ));
+        let l2 = Arc::new(MemTier::new(TierId::L2, 128 * bb, arc.clone()));
+        let mut r = rig_tiers(
+            "cost_aware",
+            16,
+            Some(l1.clone()),
+            Some(l2.clone()),
+            clock,
+            |kv| {
+                kv.cpu.format = ModuleName::new("l0").expect("l0");
+                kv.nvme.format = ModuleName::new("l0").expect("l0");
+            },
+        );
+        let blocks = r.pool.total_blocks();
+        r.h.set_hybrid_state(layout, blocks);
+        r.h.set_snapshot_tier_travel(true);
+        let store = MemSnapshotStore::new(blocks, entry);
+        r.backend.set_snapshot_store(store.clone());
+
+        // The record-sized capacity: a hybrid L1 of two slabs holds 4 records, and the whole
+        // frontier documents at the record size (L0-format blocks that no slot backs).
+        assert_eq!(
+            l1.capacity_bytes(),
+            4 * record,
+            "L1 capacity is charged at the effective record size"
+        );
+
+        // Six full 16-token blocks cached, each with a known snapshot pattern.
+        let prompt: Vec<u32> = (0..100).collect();
+        run(&mut r, &prompt);
+        let hasher = Blake3Hasher(r.h.namespaces.get(""));
+        let keys = prefix_keys(&hasher, &prompt, 16);
+        assert_eq!(keys.len(), 6, "100 tokens = 6 full blocks + a partial");
+        let pattern = |b: u32| -> Vec<u8> {
+            (0..entry as usize)
+                .map(|i| ((i + b as usize * 13) % 251) as u8)
+                .collect()
+        };
+        let mut patterns = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            let block = BlockId(r.h.dir.get(k).unwrap().location(TierId::L0).unwrap().slot as u32);
+            let snap = r.h.snapshot_alloc(block).expect("a snapshot entry");
+            let p = pattern(i as u32);
+            store.write(snap.entry, &p).expect("write the pattern");
+            r.h.snapshot_record(block, snap);
+            patterns.push(p);
+        }
+
+        let settle = |r: &mut Rig| {
+            for _ in 0..4 {
+                r.clock.advance(Duration::from_millis(10));
+                r.h.poll(&mut r.pool, &mut r.backend);
+            }
+        };
+        let demote = |r: &mut Rig| {
+            r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+            settle(r);
+        };
+        let in_tier =
+            |r: &Rig, t: TierId| r.h.dir.iter().filter(|b| b.location(t).is_some()).count();
+        // First wave: L1's four record slots take four blocks, nothing spills.
+        demote(&mut r);
+        assert_eq!(in_tier(&r, TierId::L1), 4, "four records fill L1");
+        assert_eq!(l1.used_bytes(), 4 * record, "L1 is full of records");
+        assert_eq!(
+            r.h.metrics.demotion_value(TierId::L1, TierId::L2),
+            0,
+            "nothing spilled yet"
+        );
+        // Second wave: L1 is full, so the two new demotions' `make_room` spills L1's two
+        // lowest-value records to L2 before any new copy is attempted — the L2 leg.
+        r.h.demote_to(&mut r.pool, 0.0, EvictReason::Pressure);
+        // The spills are in flight: an attach matched at L1 must wait for them rather than
+        // read a copy the landing removes (a mid-flight promotion would die at the tier and
+        // its dropped L0 target gets released twice — Task 33's lab engine panic).
+        let outcome = attach(&mut r, RequestId::new_v4(), &prompt);
+        assert_eq!(
+            outcome,
+            AttachOutcome::WaitForPrefix,
+            "an attach during a spill's flight waits"
+        );
+        settle(&mut r);
+        assert_eq!(
+            r.h.metrics.demotion_value(TierId::L1, TierId::L2),
+            2,
+            "the L1 -> L2 spill fired for the hybrid records"
+        );
+        assert_eq!(r.h.stats().transfer_errors, 0, "no record ends Full");
+        assert!(
+            in_tier(&r, TierId::L1) <= 4,
+            "L1 never crosses its record capacity"
+        );
+        assert!(
+            in_tier(&r, TierId::L2) >= 2,
+            "the spilled records landed in L2"
+        );
+        // The spilled records kept their whole record (tail exact): read every L2 record back
+        // and compare its tail against its own pattern.
+        for (i, k) in keys.iter().enumerate() {
+            if !r
+                .h
+                .dir
+                .get(k)
+                .is_some_and(|b| b.location(TierId::L2).is_some())
+            {
+                continue;
+            }
+            let mut buf = vec![0u8; record as usize];
+            l2.get(k, TierBlockMut::Host(&mut buf))
+                .expect("the spilled L2 record");
+            assert_eq!(
+                &buf[bb as usize..],
+                &patterns[i][..],
+                "L2 keeps the spilled record's tail exact ({i})"
+            );
+        }
+        // Third wave: the last two blocks take the slots the spills left; the tiers settle at a
+        // full L1 (4 records) and two records in L2, every demotion accounted.
+        demote(&mut r);
+        assert_eq!(in_tier(&r, TierId::L1), 4);
+        assert_eq!(l1.used_bytes(), 4 * record);
+        assert_eq!(l1.capacity_bytes(), 4 * record);
+        assert_eq!(
+            r.h.metrics.demotion_value(TierId::L0, TierId::L1),
+            6,
+            "all six blocks demoted into L1 on their waves"
+        );
+        assert_eq!(
+            r.h.metrics.demotion_value(TierId::L1, TierId::L2),
+            2,
+            "the two spills stay in L2"
+        );
+        assert_eq!(
+            r.h.snapshot_bytes(TierId::L2),
+            2 * entry,
+            "both tails in L2"
         );
     }
 

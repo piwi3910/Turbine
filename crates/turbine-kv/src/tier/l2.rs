@@ -621,7 +621,25 @@ impl KvTier for L2NvmeTier {
     }
 
     fn capacity_bytes(&self) -> u64 {
-        (self.max_slabs * self.slots_per_slab) as u64 * self.cfg.block_bytes
+        let record = self
+            .cfg
+            .block_bytes
+            .saturating_add(self.snapshot_bytes.load(Ordering::Relaxed))
+            .max(1);
+        // P7 S-12 (Task 33): a slab slots records (`block_bytes` + the snapshot tail's bytes),
+        // not KV-only blocks, so the capacity is charged at the effective record size — a slab
+        // file holds `floor((slots_per_slab × slot_bytes) / slot_record)` record-sized slots,
+        // each slot rounding the record to `ALIGN`. `used_bytes` counts the same currency, so
+        // a full tier reports a full fill and the L1 → L2 spill's `make_room` budgets
+        // record-sized room instead of KV-sized room no slab file backs.
+        let per_slab = {
+            let slot_record = usize::try_from(record)
+                .unwrap_or(usize::MAX)
+                .div_ceil(ALIGN)
+                * ALIGN;
+            (self.slots_per_slab * self.slot_bytes) / slot_record.max(ALIGN)
+        };
+        (self.max_slabs * per_slab) as u64 * record
     }
 
     /// Bytes of the stored blocks (each at its codec's size).
@@ -743,9 +761,11 @@ impl KvTier for L2NvmeTier {
     }
 
     /// Counts what [`store`](Self::store) would find: a free slot of `format` that fits, a new
-    /// slab below the slab limit, or at the limit an empty slab of another format.
+    /// slab below the slab limit, or at the limit an empty slab of another format. A hybrid
+    /// record's slot is the KV bytes plus the snapshot tail (P7 S-12, Task 33).
     fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
-        let len = bytes as usize;
+        // `bytes` is the coded KV block; the slot a hybrid record takes also holds its tail.
+        let len = bytes.saturating_add(self.snapshot_bytes.load(Ordering::Relaxed)) as usize;
         if len == 0 || len > self.max_record_bytes() {
             return 0;
         }

@@ -569,6 +569,122 @@ fn hybrid_record_fits_a_sized_slot() {
     assert_eq!(out, record, "L2 round-trips the whole hybrid record");
 }
 
+/// P7 S-12 (Task 33, the L2 leg): an L1/L2 hybrid tier's capacity is charged at the effective
+/// record size (`[kv][snapshot]`) — `capacity_bytes`, `free_slots` and a fill all count a
+/// hybrid record as `block_bytes + snapshot_bytes`, so a tier per its KV-only block count
+/// reports ~7 % fill at its record capacity and never spills to the next tier (the lab's
+/// `hybrid L2 leg SKIPPED`). Breaks if a hybrid tier reports KV-only capacity (a slot's worth
+/// of KV blocks then overstates the fill's headroom), or `free_slots` counts KV-only slots a
+/// record cannot take.
+#[test]
+fn hybrid_capacity_counts_records_not_kv_blocks() {
+    const SNAP: u64 = 12_350;
+    // Deliberately not a multiple of the record: a hybrid slab of 2×KV slots holds 1 record.
+    let record = (BLOCK + SNAP) as usize;
+
+    // L1: 2 slabs of 25,000 B. KV-only they hold 4 slots of 6,000 B each (48,000 B); as hybrid
+    // records they hold 1 slot of 18,350 B per slab (36,700 B).
+    let alloc = Arc::new(HostPinned::new(u64::MAX));
+    let l1 = L1PinnedTier::new(
+        L1Config {
+            enabled: true,
+            max_bytes: 50_000,
+            slab_bytes: 25_000,
+            block_bytes: BLOCK,
+            memory_kind: MemoryKind::Dedicated,
+        },
+        alloc,
+        clock(),
+    );
+    assert_eq!(
+        l1.capacity_bytes(),
+        48_000,
+        "KV-only before the model is hybrid"
+    );
+    l1.set_snapshot_bytes(SNAP);
+    assert_eq!(
+        l1.capacity_bytes(),
+        2 * record as u64,
+        "the capacity is charged at the hybrid record size"
+    );
+    assert_eq!(
+        l1.free_slots("l0", BLOCK),
+        2,
+        "one record per 25,000 B slab"
+    );
+    let mut buf = vec![0u8; record];
+    for i in 0..2u8 {
+        buf.fill(i);
+        l1.put(key(i), TierBlockRef::Host(&buf)).unwrap();
+        assert_eq!(
+            l1.used_bytes(),
+            u64::from(i + 1) * record as u64,
+            "each hybrid record counts its tail"
+        );
+        assert_eq!(
+            l1.free_slots("l0", BLOCK),
+            1 - u64::from(i),
+            "the record slots are taken"
+        );
+    }
+    assert_eq!(
+        l1.capacity_bytes(),
+        l1.used_bytes(),
+        "L1 is full of records"
+    );
+    buf.fill(9);
+    assert_eq!(
+        l1.put(key(9), TierBlockRef::Host(&buf)),
+        Err(TierError::Full),
+        "no slot for a third record"
+    );
+
+    // L2: one slab of 25,000 B (3 slots of 8,192 B) × 3 slabs. KV-only 54,000 B; as hybrid
+    // records one record of 18,350 B (rounded to a 20,480 B slot) per slab: 55,050 B.
+    let dir = tempfile::tempdir().unwrap();
+    let l2 = L2NvmeTier::open(
+        L2Config {
+            path: dir.path().to_path_buf(),
+            max_bytes: 3 * (4096 + 3 * 8192) + 4096,
+            slab_bytes: 25_000,
+            max_queue_depth: 8,
+            block_bytes: BLOCK,
+            namespace: NamespaceKey([4; 32]),
+        },
+        clock(),
+        KvMetrics::unregistered(),
+    )
+    .unwrap();
+    assert_eq!(
+        l2.capacity_bytes(),
+        54_000,
+        "KV-only before the model is hybrid"
+    );
+    l2.set_snapshot_bytes(SNAP);
+    assert_eq!(
+        l2.capacity_bytes(),
+        3 * record as u64,
+        "L2 capacity is charged at the hybrid record size"
+    );
+    assert_eq!(l2.free_slots("l0", BLOCK), 3, "one record per slab");
+    for i in 0..3u8 {
+        buf.fill(i);
+        l2.put(key(i), TierBlockRef::Host(&buf)).unwrap();
+        assert_eq!(l2.used_bytes(), u64::from(i + 1) * record as u64);
+    }
+    assert_eq!(
+        l2.capacity_bytes(),
+        l2.used_bytes(),
+        "L2 is full of records"
+    );
+    buf.fill(9);
+    assert_eq!(
+        l2.put(key(9), TierBlockRef::Host(&buf)),
+        Err(TierError::Full),
+        "no slot for a fourth record"
+    );
+}
+
 /// P6b S-6: at its size limit L1 gives an empty slab of another slot size to a block of a new
 /// size (a ladder rewrite into another format), as L2 reformats an empty slab; a slab that still
 /// holds a block keeps its size. Breaks if a rewrite into a new format is refused while a slab
