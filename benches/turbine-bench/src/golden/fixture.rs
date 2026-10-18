@@ -89,6 +89,13 @@ pub struct Tolerance {
     pub likely_logprob_floor: f32,
     /// A divergence is excused when the reference top-1/top-2 margin there is below this (nats).
     pub margin_nats: f32,
+    /// A reference top-k id missing from the candidate's top list at a compared position is
+    /// excused when the reference margin there is below this (nats); absent → the clause stays
+    /// hard. The multi-GPU gate of a mixture-of-experts placement whose summation-order rounding
+    /// flips a near-tie's top-list membership (the same noise the `_multi_gpu` logprob bounds are
+    /// calibrated to absorb) opts in with this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_top_k_margin_nats: Option<f32>,
     /// `max_abs_logprob_diff_likely` for runs with more than one prompt in flight (batch
     /// composition changes GEMM rounding); absent → the strict bound applies there too.
     #[serde(default, skip_serializing_if = "Option::is_none")]

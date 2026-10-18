@@ -50,6 +50,14 @@
   rule on 10–13/16 prompts (the excursions concentrate at p14, a reference near-tie that
   placements and batch compositions resolve differently). Llama-fp8 uses 14; this slug's act-quant
   spread is far wider.
+- `missing_top_k_margin_nats` is 0.5 (the same as `margin_nats`): a reference top-5 id missing
+  from the candidate's top-20 at a compared position is excused when the reference margin there is
+  below it. The ep2 gate's only golden-c16 failure is such a case — at p06 position 16, reference
+  top-5 candidate token 28743 (margin 0.28 nats) is absent from the run's top-20 in 6/16 banked
+  ep2-c16 captures (0/16 tp2, no c1), with every judged |Δ| inside the `_multi_gpu` bounds: the
+  same EP summation-order rounding the multi-GPU bounds absorb flips a near-tie's top-list
+  membership (lead call 2026-10-18, `.procoder/ask/decisions.md` "P7 Mixtral ep2 missing_top_k
+  judging rule").
 
 ## Engine spread and multi-GPU bound (2026-10-14)
 

@@ -6,6 +6,7 @@
   "max_abs_logprob_diff_tail": 7.05,
   "likely_logprob_floor": -2.0,
   "margin_nats": 0.5,
+  "missing_top_k_margin_nats": 0.5,
   "max_abs_logprob_diff_likely_batched": 3.35,
   "max_abs_logprob_diff_tail_batched": 7.05,
   "max_abs_logprob_diff_likely_multi_gpu": 5.5,
