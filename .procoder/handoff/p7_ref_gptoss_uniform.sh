@@ -26,7 +26,6 @@ if [ "${1:-}" = --locked ]; then
 			--model-dir "$M" --out "$BF" >"$OUT/dequant.log" 2>&1 || { echo "dequant failed rc=$?"; exit 1; }
 	fi
 	echo "p7-ref-gpt-oss-uniform: generating the uniform 16-prompt reference (pinned template)"
-	rm -f "$OUT/reference.jsonl.tmp"
 	env OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 CUDA_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= ROCR_VISIBLE_DEVICES= \
 		timeout 8h "$UV" run --with protobuf --with sentencepiece scripts/golden/hf_reference.py \
 		--model-dir "$BF" --prompts tests/golden/gpt-oss-20b/prompts.jsonl --out "$OUT/reference.jsonl" \
