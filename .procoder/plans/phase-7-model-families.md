@@ -473,14 +473,14 @@ Interfaces:
   Covers: S-7 AC, S-13
   Depends on: Tasks 9, 21
 
-- [ ] Fixture on cpuhost (command line `p7-ref-mixtral`): dequantize, `hf_reference.py`, copy `reference.jsonl` back; tolerance and README; remove the BF16 copy and the checkpoint copy from cpuhost.
-- [ ] vLLM baseline and ratio (decision 2026-10-08 B): `scripts/lab-perf.sh novanas mixtral --placement tp2 --eval` and `--placement ep2 --eval` — expect `ratio=` ≥ 0.75 `verdict=PASS` (or `verdict=NO_VLLM` under the no-vLLM rule); copy each `vllm-gsm8k.json` to `tests/eval/mixtral-8x7b-instruct-v0.1-fp8/vllm-<placement>.json`
-- [ ] Multi-GPU bound (decision 2026-10-08 A): capture tp2 and ep2 at c1 and c16 (Mixtral does not fit one GPU), derive `_multi_gpu` keys with `engine_spread.py` (multi-GPU captures named `mg-*`) into the slug's `tolerance.json` and README.
-- [ ] Lab: `scripts/lab-cluster.sh --bench-lock mixtral-tp2-novanas` and `--bench-lock mixtral-ep2-novanas` — expect `PASS` lines (`--multi-gpu-bounds` golden c1/c16, `gsm8k=PASS` within the FP8 drop, `tok_s=`); copy each `turbine-<placement>.json` into `tests/eval/mixtral-8x7b-instruct-v0.1-fp8/`
-- [ ] Headroom: in the same lab-cluster runs, `curl -fsS http://127.0.0.1:18000/turbine/v1/kv | jq .ranks` logged with `headroom_bytes` per rank, and the c16 bench with `--prompt-words 512` ends `failed=0` with no `device_oom` in the server log (`grep -c device_oom` = 0)
-- [ ] Record per placement in perf-log; flip passing placements, add a `mixtral_<placement>_gate` refusal for a failing one; copy the faster passing config to `scripts/lab/phase7-novanas-mixtral.yaml`; `scripts/remote-cargo.sh test -p turbine-core support::tests::phase7_rows && scripts/remote-cargo.sh test -p turbine-server --bin turbine-server support_startup::tests::mixtral_placement_refusal` — expect PASS
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
-- [ ] Commit: `test(mixtral): Mixtral FP8 golden, GSM8K, headroom and TP2/EP2 gate`
+- [x] Fixture on cpuhost (command line `p7-ref-mixtral`): dequantize, `hf_reference.py`, copy `reference.jsonl` back; tolerance and README; remove the BF16 copy and the checkpoint copy from cpuhost.
+- [x] vLLM baseline and ratio (decision 2026-10-08 B): `scripts/lab-perf.sh novanas mixtral --placement tp2 --eval` and `--placement ep2 --eval` — expect `ratio=` ≥ 0.75 `verdict=PASS` (or `verdict=NO_VLLM` under the no-vLLM rule); copy each `vllm-gsm8k.json` to `tests/eval/mixtral-8x7b-instruct-v0.1-fp8/vllm-<placement>.json`
+- [x] Multi-GPU bound (decision 2026-10-08 A): capture tp2 and ep2 at c1 and c16 (Mixtral does not fit one GPU), derive `_multi_gpu` keys with `engine_spread.py` (multi-GPU captures named `mg-*`) into the slug's `tolerance.json` and README.
+- [x] Lab: `scripts/lab-cluster.sh --bench-lock mixtral-tp2-novanas` and `--bench-lock mixtral-ep2-novanas` — expect `PASS` lines (`--multi-gpu-bounds` golden c1/c16, `gsm8k=PASS` within the FP8 drop, `tok_s=`); copy each `turbine-<placement>.json` into `tests/eval/mixtral-8x7b-instruct-v0.1-fp8/`. As built (2026-10-18, branch `p7-t41`): tp2 closed on run `1014050253-1e2db74f`; ep2's golden-c16 `missing_top_k` was a near-tie judging gap, closed by the `missing_top_k_margin_nats` tolerance key (lead call 2026-10-18) on run `1018060426-196e0c13` — `lab-cluster: mixtral-ep2-novanas PASS golden1=PASS golden16=PASS gsm8k=PASS tok_s=192.9`.
+- [x] Headroom: in the same lab-cluster runs, `curl -fsS http://127.0.0.1:18000/turbine/v1/kv | jq .ranks` logged with `headroom_bytes` per rank, and the c16 bench with `--prompt-words 512` ends `failed=0` with no `device_oom` in the server log (`grep -c device_oom` = 0)
+- [x] Record per placement in perf-log; flip passing placements, add a `mixtral_<placement>_gate` refusal for a failing one; copy the faster passing config to `scripts/lab/phase7-novanas-mixtral.yaml`; `scripts/remote-cargo.sh test -p turbine-core support::tests::phase7_rows && scripts/remote-cargo.sh test -p turbine-server --bin turbine-server support_startup::tests::mixtral_placement_refusal` — expect PASS
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`
+- [x] Commit: `test(mixtral): Mixtral FP8 golden, GSM8K, headroom and TP2/EP2 gate`
 
 ## Task 23: Attention ABI v2.17 — window and sink fields, d64 and d256 CK instances (S-8, S-11 attention)
 
