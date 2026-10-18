@@ -94,10 +94,19 @@ pub fn compare_prompt(
                     *tier = tier.max((got_lp - lp).abs());
                 }
                 None => {
-                    missing_top_k.get_or_insert(MissingTopK {
-                        position: pos,
-                        token_id: id,
-                    });
+                    // A reference top-k id missing from the candidate's top list is excused at
+                    // a near-tie position (the reference margin there is below
+                    // `missing_top_k_margin_nats`): the same summation-order rounding the
+                    // multi-GPU logprob bounds absorb flips a near-tie's top-list membership.
+                    let excused = tol
+                        .missing_top_k_margin_nats
+                        .is_some_and(|m| margin(ref_row).is_some_and(|mm| mm < m));
+                    if !excused {
+                        missing_top_k.get_or_insert(MissingTopK {
+                            position: pos,
+                            token_id: id,
+                        });
+                    }
                 }
             }
         }
@@ -224,6 +233,7 @@ mod tests {
             max_abs_logprob_diff_tail: 0.55,
             likely_logprob_floor: -2.0,
             margin_nats: 0.5,
+            missing_top_k_margin_nats: None,
             max_abs_logprob_diff_likely_batched: None,
             max_abs_logprob_diff_tail_batched: None,
             max_abs_logprob_diff_likely_multi_gpu: None,
@@ -277,6 +287,42 @@ mod tests {
         let mut top = r.top_logprobs.clone();
         top[1].retain(|e| e.0 != 99);
         assert!(compare_prompt(&r, &r.tokens, &top, &tol()).passed);
+    }
+
+    #[test]
+    fn missing_top_k_excused_at_a_near_tie() {
+        // Reference top-1/top-2 margin 0.2 at position 1 (a near-tie, below margin_nats 0.5).
+        let r = reference([1.0, 0.2, 1.0, 1.0]);
+        let mut top = r.top_logprobs.clone();
+        top[1].retain(|e| e.0 != 21);
+        // Hard by default: the missing id still violates the bound.
+        let hard = compare_prompt(&r, &r.tokens, &top, &tol());
+        assert_eq!(
+            hard.missing_top_k,
+            Some(MissingTopK {
+                position: 1,
+                token_id: 21
+            })
+        );
+        assert!(!hard.logprob_within_bound);
+        // With the opt-in key, the near-tie missing id is excused.
+        let mut t = tol();
+        t.missing_top_k_margin_nats = Some(0.5);
+        let v = compare_prompt(&r, &r.tokens, &top, &t);
+        assert_eq!(v.missing_top_k, None);
+        assert!(v.logprob_within_bound && v.passed);
+        // A wide-margin missing id is not excused even with the key set (position 0 margin 1.0).
+        let mut top = r.top_logprobs.clone();
+        top[0].retain(|e| e.0 != 10);
+        let wide = compare_prompt(&r, &r.tokens, &top, &t);
+        assert_eq!(
+            wide.missing_top_k,
+            Some(MissingTopK {
+                position: 0,
+                token_id: 10
+            })
+        );
+        assert!(!wide.logprob_within_bound);
     }
 
     #[test]

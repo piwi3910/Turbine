@@ -2157,15 +2157,15 @@ the calibrated `_multi_gpu` bounds 5.50 / 10.89 from the 34 spread captures of r
 gsm8k=PASS tok_s=181` — golden c1 and c16 under the multi-GPU bounds, GSM8K c16 0.60 vs the
   vLLM-tp2 baseline 0.59 (`eval-compare --max-drop 0.02` PASS), bench 200/200 with zero
   `device_oom`, headroom 4294967296 bytes on each rank (`/turbine/v1/kv` `ranks`).
-- ep2 — golden16 FAIL. Throughput (`lab-perf --placement ep2`, run `20261013T194819Z`): 162.2 vs
-  63.9 tok/s, ratio 2.54 — PASS. Gate (run `1014064111-0cdd15af`): golden1 PASS, GSM8K c16 0.585
-  vs the vLLM-ep2 baseline 0.56 (PASS), bench 200/200, zero `device_oom`, headroom 4 GiB/rank,
-  194 tok/s — but golden c16 fails on `missing_top_k`, not on any |Δ|: at p06 position 16 a
-  reference top-5 candidate (token 28743) is absent from the run's top-20; every judged |Δ| sits
-  inside the multi-GPU bounds (worst p14: likely 2.97 of 5.5, tail 7.21 of 10.89). Systematic in
-  the banked captures: 6/16 of `mg-ep2-c16-*` show the same missing-1, 0/16 of `mg-tp2-c16-*` and
-  no c1 capture — an EP-specific near-tie whose membership in the top-20 flips with batch
-  composition.
+- ep2 — golden16 FAIL on the committed tree. Throughput (`lab-perf --placement ep2`, run
+  `20261013T194819Z`): 162.2 vs 63.9 tok/s, ratio 2.54 — PASS. Gate (run `1014064111-0cdd15af`):
+  golden1 PASS, GSM8K c16 0.585 vs the vLLM-ep2 baseline 0.56 (PASS), bench 200/200, zero
+  `device_oom`, headroom 4 GiB/rank, 194 tok/s — but golden c16 fails on `missing_top_k`, not on
+  any |Δ|: at p06 position 16 a reference top-5 candidate (token 28743) is absent from the run's
+  top-20; every judged |Δ| sits inside the multi-GPU bounds (worst p14: likely 2.97 of 5.5, tail
+  7.21 of 10.89). Systematic in the banked captures: 6/16 of `mg-ep2-c16-*` show the same
+  missing-1, 0/16 of `mg-tp2-c16-*` and no c1 capture — an EP-specific near-tie whose membership
+  in the top-20 flips with batch composition.
 - Decision A (user, 2026-10-14, `.procoder/ask/decisions.md` "P7 Mixtral ep2 gate"): close
   nothing. `PARALLEL_REFUSALS` cannot express an ep-only refusal, `phase7_rows` forbids an
   `unsupported` `PHASE7_ROWS` row, and the shared arch×weight×kv matrix row cannot close for tp2
@@ -2174,9 +2174,20 @@ gsm8k=PASS tok_s=181` — golden c1 and c16 under the multi-GPU bounds, GSM8K c1
   headroom (worst-case reservations ~1.5 GiB/rank at tp2, ~3 GiB/rank at ep2 at the gate shape);
   the tp2 config is copied to `scripts/lab/phase7-novanas-mixtral.yaml` (the faster passing
   placement).
+- Re-gate 2026-10-18 (branch `p7-t41`, lead call in `.procoder/ask/decisions.md` "P7 Mixtral ep2
+  `missing_top_k` judging rule"): the failure is a judging gap, not a numerics bug — the missing
+  id is a reference top-5 candidate at a near-tie position (reference margin 0.28 nats <
+  `margin_nats` 0.5) whose top-20 membership flips with batch composition, the same EP
+  summation-order rounding the `_multi_gpu` bounds absorb; the `missing_top_k` clause is a hard
+  gate the bound derivation does not fold in. The tolerance opts into a documented near-tie
+  excuse (`missing_top_k_margin_nats: 0.5`, `tests/golden/mixtral-8x7b-instruct-v0.1-fp8/`), and
+  the ep2 gate re-run (`scripts/lab-cluster.sh --bench-lock mixtral-ep2-novanas`, run
+  `1018060426-196e0c13`): `lab-cluster: mixtral-ep2-novanas PASS golden1=PASS golden16=PASS
+  gsm8k=PASS tok_s=192.9` — golden c1 12/16 and c16 11/16 (need 10), every |Δ| inside the
+  multi-GPU bounds, GSM8K 0.64 vs vLLM-ep2 0.56 (PASS), bench 200/200. Both placements now close.
 
-- P7 open: MixtralForCausalLM/fp8/bf16/tp2 — every gate leg passed (3.17× vLLM, GSM8K 0.60 vs 0.59, golden c1/c16 under the multi-GPU bounds, zero OOM, headroom 4 GiB/rank); the row stays `experimental` because the shared matrix row cannot close for tp2 while ep2 is open
-- P7 open: MixtralForCausalLM/fp8/bf16/ep2 — golden16 FAIL on `missing_top_k` (p06 token 28743 at position 16; all |Δ| inside the multi-GPU bounds; 6/16 banked ep2 c16 captures, 0/16 tp2), GSM8K and throughput PASS
+- P7 closed: MixtralForCausalLM/fp8/bf16/tp2 20261009T080307Z 1014050253-1e2db74f
+- P7 closed: MixtralForCausalLM/fp8/bf16/ep2 20261013T194819Z 1018060426-196e0c13
 
 ### P7 Qwen3-MoE gate — Qwen3-30B-A3B-Instruct-2507-FP8 closes tp2 and ep2 (plan Task 18, branch `p7-t18`, 2026-10-14)
 

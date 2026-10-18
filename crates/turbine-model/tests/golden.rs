@@ -100,6 +100,11 @@ struct Tolerance {
     max_abs_logprob_diff_tail: f32,
     likely_logprob_floor: f32,
     margin_nats: f32,
+    /// A reference top-k id missing from the candidate's top list at a compared position is
+    /// excused when the reference margin there is below this (`turbine-golden compare`).
+    #[serde(default)]
+    #[allow(dead_code)]
+    missing_top_k_margin_nats: Option<f32>,
     /// Bounds `turbine-golden compare` applies above concurrency 1 only; these tests generate
     /// one sequence at a time and judge by the strict bounds.
     #[serde(default)]
@@ -205,7 +210,15 @@ fn compare_prompt(
                     *tier = tier.max((got_lp - lp).abs());
                 }
                 None => {
-                    missing_top_k.get_or_insert((pos, id));
+                    // A reference top-k id missing at a near-tie position is excused when the
+                    // tolerance opts in (mirrors `turbine-golden compare`).
+                    let srow = sorted(ref_row);
+                    let excused = tol
+                        .missing_top_k_margin_nats
+                        .is_some_and(|m| srow.len() >= 2 && srow[0].1 - srow[1].1 < m);
+                    if !excused {
+                        missing_top_k.get_or_insert((pos, id));
+                    }
                 }
             }
         }
@@ -283,6 +296,7 @@ fn compare_prompt_applies_the_tolerance_rule() {
         max_abs_logprob_diff_tail: 0.55,
         likely_logprob_floor: -2.0,
         margin_nats: 0.5,
+        missing_top_k_margin_nats: None,
         max_abs_logprob_diff_likely_batched: None,
         max_abs_logprob_diff_tail_batched: None,
         max_abs_logprob_diff_likely_multi_gpu: None,
@@ -358,6 +372,7 @@ fn logprob_bound_has_a_likely_and_a_tail_tier() {
         max_abs_logprob_diff_tail: 0.55,
         likely_logprob_floor: -2.0,
         margin_nats: 0.5,
+        missing_top_k_margin_nats: None,
         max_abs_logprob_diff_likely_batched: None,
         max_abs_logprob_diff_tail_batched: None,
         max_abs_logprob_diff_likely_multi_gpu: None,
