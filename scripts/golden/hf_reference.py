@@ -51,7 +51,13 @@ Usage:
         --prompts tests/golden/prompts.jsonl \
         --out tests/golden/<model-slug>/reference.jsonl \
         [--top-logprobs 20] [--device cpu|cuda] [--model-name <hub-id>] [--bf16-logits] \
-        [--config-override <json>]
+        [--config-override <json>] [--chat-template <file.jinja>]
+
+`--chat-template` (Phase 7 S-8) replaces the tokenizer's chat template with the given file
+before any chat prompt is rendered, e.g. a date-pinned copy of the checkpoint's own
+`chat_template.jinja` whose `strftime_now("%Y-%m-%d")` is fixed (the gpt-oss-20b golden
+fixture); the served config names the same file as `model.chat_template`, so reference and
+candidate render identically. Completion prompts are unaffected.
 
 `--config-override` (Phase 6a S-16) replaces top-level config.json keys with the
 given JSON object's before the model loads, e.g.
@@ -100,6 +106,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--config-override",
         type=json.loads,
         help="JSON object whose keys replace config.json's top-level keys (e.g. rope_scaling)",
+    )
+    p.add_argument(
+        "--chat-template",
+        type=Path,
+        help="render chat prompts with this Jinja template instead of the checkpoint's, e.g. a "
+        "date-pinned copy of it (the served config names the same file as model.chat_template)",
     )
     args = p.parse_args(argv)
     if not 1 <= args.top_logprobs <= 20:
@@ -259,6 +271,8 @@ def run(args: argparse.Namespace) -> None:
         )
     prompts = load_prompts(args.prompts)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
+    if args.chat_template is not None:
+        tokenizer.chat_template = args.chat_template.read_text(encoding="utf-8")
     config = AutoConfig.from_pretrained(args.model_dir)
     for key, value in (args.config_override or {}).items():
         setattr(config, key, value)
