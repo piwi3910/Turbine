@@ -107,6 +107,19 @@ the gate itself only ever matched the p14–p16 half). The tolerance is unaffect
 conservative: the engine-spread captures were taken `2026-10-16` and so matched the p14–p16 records
 exactly while judging p10–p13 across the date change.
 
+Gate re-run at the fix (`scripts/lab-bench.sh --model gpt-oss-20b --golden16`, GPU 0, 2026-10-18):
+strict c1 **16/16 PASS** and batched c16 **16/16 PASS** —
+
+    BENCH p7t39c-fix gpt-oss-20b commit=a10ceb35 gpu=0 tests=skipped golden1=PASS: golden16=PASS:
+    client=novanas weight_format=mxfp4 kv=bf16 conc=16 host_share=0.9965 ok=28 failed=172 tok/s=40.8
+    itl_p50=37.5 ttft_p50=9325 decode_fwd_ms=36.9
+
+(the `tok/s` and `ok=`/`failed=` counts are not comparable for this checkpoint: the fixed-length
+reasoning workload leaves the final channel empty on most requests — Task 27, and the `host_share`
+`≈ 1.0` reading follows from that). p15 is 0.1675 against the strict bound 0.35, as at the Task 27
+gate; p10–p13 move from the recorded 0.2380/0.2289/0.2644/0.1388 (inflated by the date mismatch)
+to 0.1220/0.2863/0.2000/0.2151.
+
 ## Fixture provenance
 
 - novanas CPU, one fixture job at a time under `fixture.lock` (queue entry `p7-ref-gpt-oss`),
