@@ -4672,6 +4672,36 @@ demand a `- P7 closed:` line for both).
 deferred (13/16 banked; its maxima sit under the committed bounds) — not resumed without the
 user's word.
 
+## P7 Mixtral ep2 `missing_top_k` judging rule (2026-10-18)
+
+Re-opens the ep2 golden-c16 failure of the 2026-10-14 decision A (which left "investigates the
+ep2 top-20 instability" as the path to a later close). Evidence (branch `p7-t41`): the failure is
+a judging gap, not a numerics bug. At p06 position 16 a reference top-5 candidate (token 28743,
+reference logprob −3.08) is absent from the run's top-20; the reference margin there is 0.28 nats
+(below `margin_nats` 0.5), every judged |Δ| sits inside the calibrated `_multi_gpu` bounds (worst
+p14: likely 2.97 of 5.5, tail 7.21 of 10.89), and the id's top-20 membership flips with batch
+composition — 10/16 of the banked `mg-ep2-c16-*` captures have it in, 6/16 out, 0/16 of
+`mg-tp2-c16-*`, no c1 capture. That is the same EP summation-order rounding the `_multi_gpu`
+bounds were derived to absorb; the `missing_top_k` clause is a hard gate (`all(logprob_within_bound)`)
+that the bound derivation does not fold in (perf-log 2026-10-16, mxfp4_a4, notes the same). The
+other multi-GPU rows (OLMoE ep2×tp2, Qwen3-MoE ep2) carry no `missing_top_k` allowance — they
+simply never hit it.
+
+- A) Add a documented near-tie excuse: a reference top-k id missing from the candidate's top list
+  at a compared position is excused when the reference margin there is below the tolerance's
+  `missing_top_k_margin_nats` (opt-in key, default off). Set it to 0.5 (== `margin_nats`) for the
+  Mixtral slug, mirroring the existing divergence margin excuse. Re-run the ep2 gate; if c1/c16
+  pass under the multi-GPU bounds, close both Mixtral `fp8/bf16/{tp2,ep2}` rows.
+- B) Keep the rows `experimental` and leave the ep2 top-20 instability unresolved.
+
+**Decision (lead, 2026-10-18):** A. `tests/golden/mixtral-8x7b-instruct-v0.1-fp8/tolerance.json`
+gains `missing_top_k_margin_nats: 0.5`; `turbine-golden compare` and the turbine-model test judge
+excuse a missing id at a near-tie position (documented in the slug README). The ep2 gate re-run
+(`scripts/lab-cluster.sh --bench-lock mixtral-ep2-novanas`, run `1018060426-196e0c13`):
+`lab-cluster: mixtral-ep2-novanas PASS golden1=PASS golden16=PASS gsm8k=PASS tok_s=192.9` — golden
+c1 12/16 and c16 11/16 (need 10), every |Δ| inside the multi-GPU bounds, GSM8K 0.64 vs vLLM-ep2
+0.56 (PASS), bench 200/200. Both rows close (`- P7 closed:` perf-log lines).
+
 ## P7 novanas GPU held by Kuvryn Scout workloads
 
 Two `kuvryn-ai-workloads` pods (vLLM-omni `qwen3-tts-base` on 8105, audio.cpp; ~14 GB VRAM each) held both R9700s on novanas from 2026-10-09 evening, blocking every Phase 7 lab run.

@@ -586,6 +586,20 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         SupportStatus::Supported,
     ),
     family_row("MistralForCausalLM", WeightFormatColumn::Bf16),
+    // Mixtral FP8 closed its S-13 gate on gfx1201 (perf-log "P7 Mixtral gate", 2026-10-18:
+    // tp2 3.17× vLLM at 204.9 tok/s and ep2 2.54× at 162.2, both placements golden c1/c16 on the
+    // multi-GPU bounds — ep2's only failure was a `missing_top_k` near-tie flip, excused by the
+    // `missing_top_k_margin_nats` judging rule (lead call 2026-10-18) — and GSM8K vs vLLM); other
+    // amd archs stay pending.
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("MixtralForCausalLM"),
+        Some(WeightFormatColumn::Fp8),
+        KV_BF16,
+        NO_SPEC,
+        SupportStatus::Supported,
+    ),
     family_row("MixtralForCausalLM", WeightFormatColumn::Bf16),
     family_row("MixtralForCausalLM", WeightFormatColumn::Fp8),
     // gpt-oss-20b (the `openai_mxfp4` packaging, which detects as the `mxfp4` weight column —
