@@ -2,7 +2,7 @@
 
 Phase 7 Task 28, the `mxfp4_a4` gate.
 
-- Checkpoint: `matmelis/Llama_3_2_3B_w_mxfp4_a_mxfp4_gptq` at revision
+- Checkpoint: `matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq` at revision
   `91925ffda6977d097354a99718a20e035f8af80a` (AMD Quark W4A4: fp4 weights and dynamic fp4 input
   activations per 32, E8M0 scales, GPTQ with static groups, SmoothQuant folded into the weights),
   on `novanas` at `/home/piwi/turbine-models/llama-3.2-3b-mxfp4-a4`. Turbine serves it as
@@ -24,7 +24,7 @@ Phase 7 Task 28, the `mxfp4_a4` gate.
     --prompts tests/golden/llama-3.2-3b-instruct-mxfp4-a4/prompts.jsonl \
     --out tests/golden/llama-3.2-3b-instruct-mxfp4-a4/reference.jsonl \
     --act-quant mxfp4 --work-dir <work> --keep-dequantized \
-    --model-name matmelis/Llama_3_2_3B_w_mxfp4_a_mxfp4_gptq
+    --model-name matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq
   ```
 
 - `tolerance.json`: calibrated to transformers' own spread below (the OLMoE method, restricted to
