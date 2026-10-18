@@ -8,9 +8,9 @@ acting. It assumes you have read `AGENTS.md` at the repository root.
 - **Integration branch:** `p7-stack`, checked out in worktree
   `/Volumes/DATA/Development/Turbine/.claude/worktrees/agent-p6b-t2`. The tip is `6cbb3ebb`, and
   `scripts/gate.sh --base main` there is clean: `passed=1085 failed=0`.
-- **`main`** is at `66e42cc3` — the Phase 7 merge (2026-10-18). The user amended the rule: the lead
-  merges `p7-stack` into `main` itself and never stops to ask for that; the separate "never push"
-  rule stands unless the user lifts it.
+- **`main`** is at `6a0d91f5`, pushed to `origin` (`c3bf4acf..6a0d91f5`, 2026-10-18). The user amended
+  the rules that day: the lead merges `p7-stack` into `main` itself **and pushes** — never stops to
+  ask for either. Put no attribution lines in commits.
 - **Plan:** `.procoder/plans/phase-7-model-families.md`.
 - **Spec:** `.procoder/specs/phase-7-model-families.md`.
 - **Decisions:** `.procoder/ask/decisions.md`. Read the `P7 …` entries before re-opening any
@@ -150,7 +150,7 @@ Task 39 is the exit tier:
 
 - Never read, print or pass the HF token. Never run anything on dgx-spark or dgx-spark2.
 - Never evict other workloads. Stop only our own runs, by run id. Never use broad `pkill`.
-- Never push. Put no attribution lines in commits.
+- Push and merge yourself; never stop for that (user amendment 2026-10-18). Put no attribution lines in commits.
 - No cargo on the Mac; `cargo fmt` is the only exception. Use `scripts/gate.sh` and
   `scripts/remote-cargo.sh` on novanas.
 - Never block in the foreground on long remote runs. Run them in the background.

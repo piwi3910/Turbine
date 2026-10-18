@@ -5099,5 +5099,5 @@ coverage), which is what the bisect's evidence supports. The S-8 lab-gate box th
 
 The user amended the handoff's "the user pushes" rule: **the lead merges `p7-stack` into `main`
 itself and never stops to ask for that.** `p7-stack` was merged into `main` (merge commit `66e42cc3`,
-clean; `main` was an ancestor). The separate "never push" rule still applies unless the user lifts
-it.
+clean; `main` was an ancestor). The user then also lifted the "never push" rule the same day:
+`main` is pushed to `origin` (`c3bf4acf..6a0d91f5`, 468 commits).
