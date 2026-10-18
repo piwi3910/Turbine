@@ -2316,6 +2316,44 @@ gate is the binding one.
   clause; (3) the stale BF16 c16 baseline's filler metadata.
 
 - P7 open: LlamaForCausalLM/mxfp4_a4/bf16/tp1 — lab gate 2026-10-17 (branch `p7-t28a`): golden c1/c16 FAIL 10/16 (need 11; `missing_top_k` on 6 prompts, p04 likely 1.4720 > 1.13); GSM8K c16 0.015 (3/200) but the checkpoint is base Llama-3.2-3B (no chat template, eos 128001), so the GSM8K gate against the BF16 Instruct baseline is invalid; row stays experimental
+
+### P7 mxfp4_a4 completion-form re-gate — golden and GSM8K both still FAIL (plan Task 28, branch `p7-t42`, 2026-10-18)
+
+The checkpoint is the **base** Llama-3.2-3B (no chat template, eos 128001), so the golden and the
+GSM8K gate were re-measured in **completion form**: `reference.jsonl` regenerated over the slug's
+completion prompts (`tests/golden/llama-3.2-3b-instruct-mxfp4-a4/prompts.jsonl`, `kind: completion`,
+max_tokens 32; commit `c8677ecc`) with `quant_reference.py --act-quant mxfp4`, and the self-spread
+tolerance re-derived (`p7-t42/mxfp4a4_fixture.sh`, novanas CPU, 2026-10-18):
+
+| variant                  | prefix ok | max likely | max tail |
+| ------------------------ | --------- | ---------- | -------- |
+| bf16 sdpa full sequence  | 11/16     | 0.8533     | 2.7592   |
+| bf16 eager full sequence | 10/16     | 1.1251     | 1.4903   |
+| fp32 sdpa full sequence  | 11/16     | 1.4483     | 4.0080   |
+| fp32 eager full sequence | 10/16     | 1.4483     | 4.0080   |
+
+Tolerance: likely 1.45, tail 4.01, `min_prompts_passing` 10 (was 1.13 / 4.01 / 11).
+
+**Lab gate run 2026-10-18** (branch `p7-t42`, `lab-bench --model llama-mxfp4-a4 --golden16`, run id
+`p7t42-completion`, config `scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml`):
+
+- Golden c1 **FAIL** 13/16 passing (need 10): the passing count clears the min, but the judge's hard
+  `all(logprob_within_bound)` clause still fails — p02/p05 `missing_top_k`, p04 likely **1.4720** >
+  1.45 (the same p04 value as the chat-form run, so p04 is a stable Turbine-vs-transformers gap on
+  this prompt, not a form artifact). Golden c16 **FAIL** 11/16 (need 10): p04 likely 1.8591 > 1.45,
+  p05/p06 `missing_top_k`. Throughput 1140.3 tok/s at c16 (200 requests, 0 failed), ITL p50 10.1 ms.
+- GSM8K-200 **completion form** c16: BF16 base 0.27 (54/200) vs mxfp4_a4 **0.185** (37/200), drop
+  **0.085** > 0.04 (`eval-compare` rc 1). Recorded as
+  `tests/eval/llama-3.2-3b/turbine-bf16-completion.json` and
+  `tests/eval/llama-3.2-3b-instruct-mxfp4-a4/turbine-completion.json`; `gate.json` updated to the
+  completion-form comparison.
+
+- Both legs fail in the correct (completion) form, so per decision "mxfp4_a4" (B) the row stays
+  `experimental`. The chat-form GSM8K 0.015 was indeed a form artifact (the base model does not
+  follow the chat prompt), but the valid completion-form accuracy is still well below the 4-bit
+  drop bound. Open (unchanged): the self-spread tolerance vs the `missing_top_k` clause; p04's
+  stable likely overage; and the W4A4 activation fake-quant keeps the golden weak by construction.
+
 ### P7 gpt-oss gate — gpt-oss-20b (openai_mxfp4) tp1 (plan Task 27, branch `p7-t27-fixture`, 2026-10-16)
 
 - Golden (`tests/golden/gpt-oss-20b/`, tolerance from the dequantized-MXFP4 transformers self-spread; the fixture's `prompts.jsonl` is the shared set with `reasoning_effort: "low"` in every `chat_template_kwargs`, decision Harmony A):
