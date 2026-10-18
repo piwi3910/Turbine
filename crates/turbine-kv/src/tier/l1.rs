@@ -102,7 +102,6 @@ struct L1State {
 pub struct L1PinnedTier {
     cfg: L1Config,
     enabled: bool,
-    slots_per_slab: usize,
     max_slabs: usize,
     alloc: Arc<dyn PinnedMemory>,
     clock: Arc<dyn Clock>,
@@ -136,7 +135,6 @@ impl L1PinnedTier {
         L1PinnedTier {
             cfg,
             enabled: cfg.enabled && !unified && slots_per_slab > 0 && max_slabs > 0,
-            slots_per_slab,
             max_slabs,
             alloc,
             clock,
@@ -431,7 +429,15 @@ impl KvTier for L1PinnedTier {
     /// Usable bytes: whole slots in whole slabs up to `max_bytes` (0 when disabled).
     fn capacity_bytes(&self) -> u64 {
         if self.enabled {
-            (self.max_slabs * self.slots_per_slab) as u64 * self.cfg.block_bytes
+            let record = self.max_record_bytes();
+            // P7 S-12 (Task 33): a hybrid slab slots records (`block_bytes` + the snapshot
+            // tail's bytes), not KV-only blocks, so the capacity is charged at the effective
+            // record size — `floor(slab_bytes / record)` slots of `record` bytes per slab.
+            // `used_bytes` counts the same currency, so a full tier reports a full fill and
+            // `make_room` budgets record-sized room (the L2-leg spill fires) instead of
+            // KV-sized room no hybrid slab backs.
+            let slots_per_slab = (self.cfg.slab_bytes / record.max(1)) as usize;
+            (self.max_slabs * slots_per_slab) as u64 * record
         } else {
             0
         }
@@ -532,18 +538,20 @@ impl KvTier for L1PinnedTier {
 
     /// Slots are sized, not labelled: `format` plays no part. Counts what
     /// [`take_slot`](Self::take_slot) would find: a free slot of the size, a new slab below the
-    /// size limit (not under host RED), or at the limit an empty slab of another size.
+    /// size limit (not under host RED), or at the limit an empty slab of another size. A hybrid
+    /// record's slot is the KV bytes plus the snapshot tail (P7 S-12, Task 33).
     fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
         let _ = format;
-        let len = bytes as usize;
-        if !self.enabled || len == 0 || bytes > self.max_record_bytes() {
+        // `bytes` is the coded KV block; the slot a hybrid record takes also holds its tail.
+        let len = bytes.saturating_add(self.snapshot_bytes.load(Ordering::Relaxed)) as usize;
+        if !self.enabled || len == 0 || len as u64 > self.max_record_bytes() {
             return 0;
         }
         let s = self.lock();
         if s.health.is_degraded() {
             return 0;
         }
-        let per_slab = (self.cfg.slab_bytes / bytes) as usize;
+        let per_slab = (self.cfg.slab_bytes / len as u64) as usize;
         let live = s.slabs.iter().flatten().count();
         let mut n = 0;
         for slab in s.slabs.iter().flatten() {
@@ -565,9 +573,10 @@ impl KvTier for L1PinnedTier {
 
     /// P5p S-18: drains the live slab of another slot size with the fewest stored copies and
     /// no reserved slot (a copy-stream write in flight); an empty one is reformatted at once.
+    /// A hybrid record's drain target is its full record size (P7 S-12, Task 33).
     fn begin_drain(&self, bytes: u64) -> bool {
-        let len = bytes as usize;
-        if !self.enabled || len == 0 || bytes > self.max_record_bytes() {
+        let len = bytes.saturating_add(self.snapshot_bytes.load(Ordering::Relaxed)) as usize;
+        if !self.enabled || len == 0 || len as u64 > self.max_record_bytes() {
             return false;
         }
         let mut s = self.lock();
