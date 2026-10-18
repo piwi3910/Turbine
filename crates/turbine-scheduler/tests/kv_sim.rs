@@ -9,7 +9,7 @@ use turbine_core::clock::{Clock, FakeClock};
 use turbine_core::config::{KvConfig, ModuleName};
 use turbine_core::types::{
     BlockId, DType, DeviceId, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState,
-    RequestId,
+    RequestId, StateDtype, StateLayout,
 };
 use turbine_kv::directory::KvBlock;
 use turbine_kv::hierarchy::{HierarchyConfig, KvHierarchy, PrefetchTarget};
@@ -2049,4 +2049,248 @@ fn cache_aware_starvation_bound() {
         un.max_cached_wait_s,
         un.inversions.len()
     );
+}
+
+/// No emergency reserve to allocate (the hybrid reservation test).
+struct NoReserve;
+
+impl turbine_reliability::reserve::ReserveAllocator for NoReserve {
+    fn allocate(&mut self, _bytes: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn free(&mut self) {}
+}
+
+/// A scheduler behind an admission gate whose ledger holds `kv_pages` pages of 1 MiB and whose
+/// model keeps `state_bytes` of per-sequence state (P7 S-1).
+fn gated_with_state(
+    kv_pages: u64,
+    state_bytes: u64,
+) -> (
+    Scheduler,
+    Arc<turbine_reliability::ledger::Ledger>,
+    turbine_reliability::controller::PressureController,
+) {
+    use turbine_core::config::{ByteSize, ReliabilityConfig};
+    use turbine_reliability::admission::{Admission, AdmissionParams, AdmissionQueue, Calibration};
+    use turbine_reliability::budget::{DeviceBudget, PoolKind};
+    use turbine_reliability::controller::PressureController;
+    use turbine_reliability::ledger::Ledger;
+    use turbine_reliability::metrics::ReliabilityMetrics;
+    use turbine_reliability::reserve::EmergencyReserve;
+    use turbine_reliability::throttle::SchedulerLimits;
+
+    let page = 1u64 << 20;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(Duration::ZERO));
+    let kv_bytes = kv_pages * page;
+    let budget = DeviceBudget {
+        device: DeviceId(0),
+        memory_kind: MemoryKind::Dedicated,
+        budget_bytes: kv_bytes,
+        pools: vec![(PoolKind::Kv, kv_bytes), (PoolKind::Reserve, 0)],
+    };
+    let metrics = ReliabilityMetrics::unregistered();
+    let ledger = Ledger::new(&budget);
+    let reserve = EmergencyReserve::acquire(
+        DeviceId(0),
+        0,
+        &ledger,
+        Box::new(NoReserve),
+        metrics.clone(),
+    )
+    .unwrap();
+    let cfg = ReliabilityConfig {
+        emergency_vram_reserve: ByteSize(0),
+        ..ReliabilityConfig::default()
+    };
+    let (controller, handle) = PressureController::new(
+        &cfg,
+        SchedulerLimits {
+            prefill_chunk_tokens: 64,
+            block_tokens: 16,
+        },
+        budget,
+        Arc::clone(&ledger),
+        reserve,
+        Arc::new(turbine_kv::L0Reclaimer),
+        metrics.clone(),
+        Arc::clone(&clock),
+    );
+    let admission = Admission::new(
+        AdmissionParams {
+            device: DeviceId(0),
+            adaptive: false,
+            max_queue: 16,
+            large_prefill_tokens: 1 << 20,
+            block_bytes: page,
+            prefill_chunk_tokens: 64,
+            workspace_bytes_per_token: 0,
+            calibration: Calibration {
+                prefill_tokens_per_s: 1000.0,
+                decode_step_s: 0.01,
+            },
+        },
+        Arc::clone(&ledger),
+        metrics,
+    );
+    let queue = AdmissionQueue::new(16, Duration::from_secs(60), 0);
+    let gate =
+        turbine_scheduler::AdmissionGate::new(admission, queue, handle, Arc::clone(&clock), 4);
+    let params = SchedulerParams {
+        max_running_requests: 4,
+        max_batch_tokens: 64,
+        prefill_chunk_tokens: 64,
+        max_queued_requests: 16,
+        chunked_prefill: true,
+        block_tokens: 16,
+        free_watermark: 0.0,
+        max_seq_len: 1024,
+        queue_timeout: Duration::from_secs(60),
+        recent_window: None,
+        cache_aware_window: Duration::from_secs(1),
+    };
+    let state = StateLayout {
+        linear_layers: 1,
+        recurrent_bytes_per_layer: state_bytes,
+        conv_bytes_per_layer: 0,
+        dtype: Some(StateDtype::F32),
+    };
+    let sched = Scheduler::new(params, clock)
+        .with_state_layout(state)
+        .with_gate(gate);
+    (sched, ledger, controller)
+}
+
+/// P7 S-1 (`hybrid_reservation_includes_state`): a request's worst-case reservation is its KV
+/// pages plus its per-sequence state — 4 pages of 1 MiB and 3 MiB of state reserve exactly
+/// 7 MiB (4 MiB of pages in the ledger, 3 MiB in the state allocation) — a pool too small for
+/// the pages refuses it with the existing KV-capacity reason, and finishing or cancelling returns the ledger to 0. Breaks if the
+/// state is left out of the reservation, the admission check or the release.
+#[test]
+fn hybrid_reservation_includes_state() {
+    use smallvec::smallvec;
+    use turbine_core::request::FinishReason;
+    use turbine_reliability::budget::PoolKind;
+    use turbine_scheduler::{
+        CancelReason, IterationOutcome, RejectionReason, SchedRequest, SeqId, SubmitError,
+    };
+
+    let held = |l: &turbine_reliability::ledger::Ledger| {
+        let u = l.usage(DeviceId(0), PoolKind::Kv);
+        u.used + u.reserved
+    };
+    let req = |n: u64| SchedRequest::new(rid(u128::from(n)), smallvec![SeqId(n)], 32, 32, 16);
+
+    let (mut s, ledger, _c) = gated_with_state(64, 3 << 20);
+    let mut pool = BlockPool::new(
+        BlockPoolConfig {
+            layout: format().layout,
+            num_blocks: 64,
+        },
+        HostMemory::new(DeviceId(0), 64 * block_bytes()) as Arc<dyn DeviceMemory>,
+    )
+    .unwrap();
+    s.submit(req(1), 64).unwrap();
+    assert_eq!(
+        held(&ledger),
+        4 << 20,
+        "4 pages; the state is charged apart"
+    );
+    let res = s.reservation(rid(1)).expect("admitted with a reservation");
+    assert_eq!(res.bytes(), 4 << 20);
+    assert_eq!(res.state_bytes(), 3 << 20);
+    // Finishing releases KV and state.
+    let plan = s.plan(&mut pool, &IterationLimits::default());
+    assert_eq!(plan.items.len(), 1);
+    s.complete(
+        &mut pool,
+        IterationOutcome {
+            iteration: plan.iteration,
+            finished: vec![(SeqId(1), FinishReason::Stop)],
+            appended: vec![(SeqId(1), 1)],
+            rolled_back: Vec::new(),
+            failed: None,
+        },
+    );
+    assert_eq!(held(&ledger), 0, "finish releases the state");
+    // Cancelling releases it too.
+    s.submit(req(2), 64).unwrap();
+    assert_eq!(held(&ledger), 4 << 20);
+    s.cancel(rid(2), CancelReason::ClientDisconnect);
+    let _ = s.plan(&mut pool, &IterationLimits::default());
+    assert_eq!(held(&ledger), 0, "cancel releases the state");
+
+    // 3 pages of KV do not hold the request's 4 pages.
+    let (mut small, ledger, _c) = gated_with_state(3, 3 << 20);
+    match small.submit(req(3), 64) {
+        Err(SubmitError::Rejected { reason, .. }) => {
+            assert_eq!(reason, RejectionReason::ContextExceedsKvCapacity)
+        }
+        other => panic!("expected a KV-capacity rejection, got {other:?}"),
+    }
+    assert_eq!(held(&ledger), 0);
+}
+
+/// P7 review fix 2: the ledger's `kv` capacity is the physical KV pool, and the per-sequence
+/// state is charged against its own fixed allocation (`max_running × state`), not against the
+/// KV pool. A 16-page pool with 3 MiB of state a sequence and 4 running slots: two 8-page
+/// requests fill the pool exactly (16 MiB held, 6 MiB of state), the third waits for pages.
+/// Breaks if admission counts the state against the KV pool (the pool then holds one request).
+#[test]
+fn state_is_charged_beside_the_kv_pool() {
+    use smallvec::smallvec;
+    use turbine_reliability::budget::PoolKind;
+    use turbine_scheduler::{SchedRequest, SeqId};
+
+    let (mut s, ledger, _c) = gated_with_state(16, 3 << 20);
+    let req = |n: u64| SchedRequest::new(rid(u128::from(n)), smallvec![SeqId(n)], 64, 64, 16);
+    for n in 1..=3 {
+        s.submit(req(n), 16).unwrap();
+    }
+    let u = ledger.usage(DeviceId(0), PoolKind::Kv);
+    assert_eq!(u.used + u.reserved, 16 << 20, "KV pages only");
+    assert!(s.reservation(rid(1)).is_some());
+    assert!(
+        s.reservation(rid(2)).is_some(),
+        "the pool holds two requests"
+    );
+    assert!(s.reservation(rid(3)).is_none(), "the third waits for pages");
+    assert_eq!(s.gate().unwrap().queue_len(), 1);
+    assert_eq!(s.reservation(rid(1)).unwrap().bytes(), 8 << 20);
+    assert_eq!(s.reservation(rid(1)).unwrap().state_bytes(), 3 << 20);
+}
+
+/// P7 review fix 3: a request's state covers every sequence (`n` choices); the allocation holds
+/// `max_running_requests` (4) sequences. n = 4 takes all 12 MiB, n = 5 is refused at submit with
+/// `state_exceeds_capacity`, and a request that only lacks free state waits and starts once the
+/// state is back. Breaks if the estimate charges one sequence's state for `n` choices.
+#[test]
+fn state_covers_every_sequence() {
+    use turbine_scheduler::{CancelReason, SchedRequest, SeqId, SubmitError};
+
+    let (mut s, _ledger, _c) = gated_with_state(64, 3 << 20);
+    let mut pool = BlockPool::new(
+        BlockPoolConfig {
+            layout: format().layout,
+            num_blocks: 64,
+        },
+        HostMemory::new(DeviceId(0), 64 * block_bytes()) as Arc<dyn DeviceMemory>,
+    )
+    .unwrap();
+    let req = |id: u64, n: u64| {
+        let seqs = (0..n).map(|i| SeqId(id * 10 + i)).collect();
+        SchedRequest::new(rid(u128::from(id)), seqs, 16, 16, 16)
+    };
+    assert_eq!(
+        s.submit(req(9, 5), 64),
+        Err(SubmitError::StateExceedsCapacity)
+    );
+    s.submit(req(1, 4), 64).unwrap();
+    assert_eq!(s.reservation(rid(1)).unwrap().state_bytes(), 12 << 20);
+    s.submit(req(2, 1), 64).unwrap();
+    assert!(s.reservation(rid(2)).is_none(), "no free state: it waits");
+    s.cancel(rid(1), CancelReason::ClientDisconnect);
+    let _ = s.plan(&mut pool, &IterationLimits::default());
+    let _ = s.plan(&mut pool, &IterationLimits::default());
+    assert_eq!(s.reservation(rid(2)).unwrap().state_bytes(), 3 << 20);
 }

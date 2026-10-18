@@ -40,9 +40,13 @@ pub fn read_architecture(model_dir: &Path) -> Option<String> {
             .as_str()
             .map(str::to_string)
     };
-    // A wrapper checkpoint names its text model in `text_config`: the registry resolved it there.
-    if let Ok((_, obj)) = turbine_model::families::resolve(&top) {
-        return first(obj);
+    // A wrapper checkpoint names its text model in `text_config`: the registry resolved it there
+    // (a registered top-level name keeps the top level's, P7 S-1).
+    if let Ok((family, obj)) = turbine_model::families::resolve(&top) {
+        return [&top, obj]
+            .into_iter()
+            .filter_map(first)
+            .find(|name| family.hf_architectures().contains(&name.as_str()));
     }
     first(&top)
 }
@@ -103,6 +107,81 @@ pub fn before_discovery(cfg: &Config) -> Result<SupportDecision, ConfigError> {
     tier_formats(cfg)?;
     let (weight, kv) = format_columns(cfg);
     support::check(key_before_discovery(cfg, weight, kv))
+}
+
+/// Model features no executor implements, refused before discovery (P7 S-1): a
+/// `config.json` whose sliding window would limit attention (`use_sliding_window: true`, or a
+/// `sliding_window` below `max_position_embeddings`) is a configuration error (exit 2,
+/// before any port is bound, also under `--check-config`) whose reason starts with
+/// `sliding_window_unsupported:` and names the key and value. Every other outcome of reading
+/// the model config is left to the later stages that report it today (a missing or
+/// unregistered model passes here).
+pub fn model_feature_refusal(model_dir: &Path) -> Result<(), ConfigError> {
+    match turbine_model::config::load_model_config(model_dir) {
+        Err(e) if e.reason_code() == Some(turbine_model::config::SLIDING_WINDOW_UNSUPPORTED) => {
+            Err(invalid("model.path", e.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The verified jump-forward (`structured_output.jump_forward`) for the configured model (P7
+/// S-12, Task 32). A family with per-sequence state (a hybrid) has no stateless attention model
+/// for the forced-token run to verify against, so jump-forward is off for it: the returned
+/// value is `false`. An **explicit** `structured_output.jump_forward: true` — in the YAML file
+/// or a `--set` override — is a configuration error (exit 2, also under `--check-config`) whose
+/// reason starts with `jump_forward_hybrid`. Attention-only families keep the configured value.
+/// `hybrid` reports whether the model keeps state, so a caller logs the startup WARN once.
+pub fn hybrid_jump_forward(
+    cfg: &Config,
+    config_path: Option<&Path>,
+    overrides: &[turbine_core::config::Override],
+) -> Result<(bool, bool), ConfigError> {
+    let hybrid = turbine_model::config::load_model_config(&cfg.model.path)
+        .is_ok_and(|arch| !arch.state.is_empty());
+    if !hybrid || !cfg.structured_output.jump_forward {
+        return Ok((cfg.structured_output.jump_forward, hybrid));
+    }
+    if jump_forward_explicit(config_path, overrides) {
+        return Err(invalid(
+            "structured_output.jump_forward",
+            "jump_forward_hybrid: jump-forward is not supported by a family with per-sequence \
+             state (a hybrid); remove the key or set it false"
+                .into(),
+        ));
+    }
+    Ok((false, hybrid))
+}
+
+/// Whether `structured_output.jump_forward` is present as `true` in the YAML file `path` or in
+/// an override — the marker that distinguishes an explicit `true` (refused for a hybrid) from
+/// the configuration default.
+fn jump_forward_explicit(
+    path: Option<&Path>,
+    overrides: &[turbine_core::config::Override],
+) -> bool {
+    let set_true = overrides
+        .iter()
+        .any(|o| o.key == "structured_output.jump_forward" && o.value.as_bool() == Some(true));
+    set_true
+        || path.is_some_and(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .is_some_and(|text| yaml_jump_forward_true(&text))
+        })
+}
+
+/// Whether the YAML `text` sets `structured_output.jump_forward` to `true`.
+fn yaml_jump_forward_true(text: &str) -> bool {
+    let Ok(v) = serde_norway::from_str::<serde_norway::Value>(text) else {
+        return false;
+    };
+    let Some(so) = v.get("structured_output") else {
+        return false;
+    };
+    so.get("jump_forward")
+        .and_then(serde_norway::Value::as_bool)
+        == Some(true)
 }
 
 /// The lower-tier KV formats in use, `(key, format)`: `kv.cpu.format` and `kv.nvme.format` of
@@ -363,6 +442,9 @@ mod tests {
     use turbine_core::support::{VENDORS, WILDCARD};
     use turbine_core::types::{DeviceId, MemoryKind, Vendor};
     use turbine_device::{DeviceInfo, DeviceMemoryInfo};
+
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
 
     /// A per-test directory under the system temp dir, removed on drop.
     struct TempDir(PathBuf);
@@ -662,9 +744,9 @@ mod tests {
             assert_eq!(err.code, "kv_tq_unavailable", "{err:?}");
             assert!(err.message.contains("ABI v2.11"), "{err:?}");
             // The model's arch is not known before discovery: the partial row is the best any
-            // arch could give; gfx1201 Llama is experimental, gfx942 refused.
+            // arch could give; gfx1201 Llama is supported (Task 37b), gfx942 refused.
             let first = before_discovery(&hip).unwrap();
-            assert_eq!(first.status, SupportStatus::Experimental, "{}", first.key);
+            assert_eq!(first.status, SupportStatus::Supported, "{}", first.key);
         }
     }
 
@@ -707,15 +789,29 @@ mod tests {
         assert_eq!(d.status, SupportStatus::Experimental);
         assert_eq!(after_discovery(&cpu, &none, d.clone()).unwrap(), d);
 
-        // A Phase 7 family is refused on the GPU vendor before discovery, served on the host.
+        // Qwen3 BF16 is supported since its gate closed (Task 11, 2026-10-08), before
+        // discovery too; another Phase 7 family is still experimental on the GPU vendor
+        // (S-13), naming its pending gate; both are served on the host.
         let qwen = model_dir(
             "qwen",
             serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}),
         );
-        let err = before_discovery(&config("hip", qwen.path())).unwrap_err();
-        assert_eq!(err.key(), Some("execution.backend"));
-        assert!(err.to_string().contains("phase-7-model-families"), "{err}");
+        let d = before_discovery(&config("hip", qwen.path())).unwrap();
+        assert_eq!(d.status, SupportStatus::Supported);
         assert!(before_discovery(&config("cpu", qwen.path())).is_ok());
+        let moe = model_dir(
+            "qwen-moe",
+            serde_json::json!({"architectures": ["Qwen3MoeForCausalLM"]}),
+        );
+        let d = before_discovery(&config("hip", moe.path())).unwrap();
+        assert_eq!(d.status, SupportStatus::Experimental);
+        assert!(
+            d.view()
+                .reason
+                .is_some_and(|r| r.contains("phase-7-model-families")),
+            "{d:?}"
+        );
+        assert!(before_discovery(&config("cpu", moe.path())).is_ok());
 
         // No config.json: the architecture is unknown.
         let empty = TempDir::new("empty");
@@ -794,11 +890,131 @@ mod tests {
         );
         let unknown = model_dir(
             "unknown",
-            serde_json::json!({"architectures": ["GptOssForCausalLM"]}),
+            serde_json::json!({"architectures": [UNREGISTERED_ARCH]}),
         );
         assert_eq!(
             read_architecture(unknown.path()).as_deref(),
-            Some("GptOssForCausalLM")
+            Some(UNREGISTERED_ARCH)
         );
+    }
+
+    /// P7 S-1: a real sliding window is refused before discovery with its reason code and
+    /// the key it came from (a configuration error, exit 2); `sliding_window: null` passes.
+    #[test]
+    fn sliding_window_refused() {
+        let fixture = |slug: &str| -> serde_json::Value {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../turbine-model/tests/fixtures")
+                .join(slug)
+                .join("config.json");
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let mut qwen3 = fixture("qwen3-0.6b");
+        qwen3["use_sliding_window"] = serde_json::json!(true);
+        let mut mistral = fixture("mistral-7b-instruct-v0.3");
+        mistral["sliding_window"] = serde_json::json!(4096);
+        for (name, edited, key) in [
+            ("sw-qwen3", qwen3, "use_sliding_window"),
+            ("sw-mistral", mistral, "sliding_window"),
+        ] {
+            let dir = model_dir(name, edited);
+            let err = model_feature_refusal(dir.path()).unwrap_err();
+            assert_eq!(err.key(), Some("model.path"), "{err}");
+            let ConfigError::Invalid { reason, .. } = &err else {
+                panic!("expected Invalid, got {err:?}");
+            };
+            let code = reason.split(':').next().unwrap();
+            assert_eq!(code, "sliding_window_unsupported", "{err}");
+            assert!(reason.contains(key), "{err}");
+        }
+        let unedited = model_dir("sw-none", fixture("mistral-7b-instruct-v0.3"));
+        assert!(model_feature_refusal(unedited.path()).is_ok());
+    }
+
+    /// P7 S-7: a placement whose gate failed is refused before any port is bound (a
+    /// configuration error, exit 2) with its `PARALLEL_REFUSALS` reason code: a synthetic
+    /// Mixtral row inserted through the test-only [`turbine_core::support::
+    /// with_parallel_refusals`] seam makes `parallel::check_executable` refuse
+    /// `MixtralForCausalLM` at tp 2 (which its hooks otherwise split), and without the seam
+    /// the plan passes. The committed table's Mixtral entries, if any, carry a `mixtral_`
+    /// code (Task 22 records a failing placement here). Breaks if the tensor-parallel path
+    /// skips `parallel_refusal` or the seam leaks past its guard.
+    #[test]
+    fn mixtral_placement_refusal() {
+        use turbine_core::support::{PARALLEL_REFUSALS, ParallelRefusal, with_parallel_refusals};
+        use turbine_distributed::plan::{ParallelPlan, RankSlot, ReplicaGroup};
+
+        let dir = TempDir::new("mixtral-placement");
+        let spec = turbine_model::testing::tiny::write_tiny_family(dir.path(), "mixtral", 3);
+        assert_eq!(spec.config.family.0.name(), "mixtral");
+        let mut cfg = config("cpu", dir.path());
+        cfg.parallel.tensor_parallel_size = turbine_core::config::SizeOrAuto::Size(2);
+        let plan = |tp: u32| ParallelPlan {
+            tp,
+            dp: 1,
+            pp: 1,
+            ep: 1,
+            backend: "host",
+            mode: turbine_core::config::RankMode::Local,
+            vendor: None,
+            excluded_devices: Vec::new(),
+            groups: vec![ReplicaGroup {
+                replica: turbine_core::types::ReplicaId(0),
+                ranks: (0..tp)
+                    .map(|rank| RankSlot {
+                        rank,
+                        device: turbine_core::types::DeviceId(rank),
+                        host: "local".into(),
+                    })
+                    .collect(),
+            }],
+            reasons: Vec::new(),
+            experts: None,
+            stages: Vec::new(),
+        };
+
+        // Without the refusal the tiny Mixtral splits at tp 2 (its hooks are tensor-parallel).
+        let mut ok = plan(2);
+        assert!(
+            crate::parallel::check_executable(&mut ok, &cfg).is_ok(),
+            "tiny Mixtral tp 2 must pass without a refusal"
+        );
+
+        static MIXTRAL_TP2: [ParallelRefusal; 1] = [ParallelRefusal {
+            architecture: "MixtralForCausalLM",
+            modes: "tp",
+            reason: "mixtral_tp2_gate: test refusal (synthetic row)",
+        }];
+        let _guard = with_parallel_refusals(&MIXTRAL_TP2);
+        let mut refused = plan(2);
+        let err = crate::parallel::check_executable(&mut refused, &cfg)
+            .expect_err("the synthetic refusal fires");
+        let crate::parallel::PlanFailure::Config(message) = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(message.contains("mixtral_tp2_gate"), "{message}");
+        assert!(message.contains("MixtralForCausalLM"), "{message}");
+        // And it does not refuse another architecture or tp 1.
+        assert!(
+            crate::parallel::check_executable(&mut plan(1), &cfg).is_ok(),
+            "tp 1 is never refused"
+        );
+        drop(_guard);
+        assert!(
+            crate::parallel::check_executable(&mut plan(2), &cfg).is_ok(),
+            "the seam's guard cleared its rows"
+        );
+
+        // The real table's Mixtral entries, if any, carry a `mixtral_` code.
+        for r in PARALLEL_REFUSALS
+            .iter()
+            .filter(|r| r.architecture == "MixtralForCausalLM")
+        {
+            assert!(
+                r.reason.starts_with("mixtral_"),
+                "Mixtral refusal {} must name its mixtral_ code",
+                r.reason
+            );
+        }
     }
 }

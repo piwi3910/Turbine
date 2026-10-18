@@ -1,0 +1,26 @@
+{
+  "note": "P7 Task 37 re-gate: the unchanged Task 13 shared-prefix GSM8K recipe (c16, 32 fillers, kv.gpu.max_bytes=4GiB, kv.cpu.max_bytes=4GiB, kv.cpu.format=l0, kv.dtype=tq4) wedges on the Phase 7 tree at 8be49852. The candidate served 34/200 requests (2 items + 32 fillers) then stopped making progress; no eval report was produced.",
+  "server": "scripts/lab-serve.sh novanas scripts/lab/phase6-novanas-llama.yaml --set kv.gpu.max_bytes=4GiB --set kv.cpu.max_bytes=4GiB --set kv.cpu.format=l0 --set kv.dtype=tq4",
+  "run_id": "1017151259-0541b8b7",
+  "requests_served": 34,
+  "requests_total": 200,
+  "server_log": "event=\"decode_deferred\" seq=35.. reason=\"kv_exhausted\" \"decode waits for a KV block (no preemption below SURVIVAL)\" repeated indefinitely",
+  "kv_document_at_wedge": {
+    "l0": {
+      "dtype": "tq4",
+      "block_bytes": 4128768,
+      "blocks_total": 773,
+      "blocks_used": 773,
+      "blocks_free": 0,
+      "referenced_blocks": 114,
+      "formats": {"bf16": {"blocks": 89}, "l0": {"blocks": 629}},
+      "partial_entries": 34
+    },
+    "l1": {"dtype": "tq4", "blocks_total": 1024, "blocks_used": 23, "blocks_free": 1001}
+  },
+  "metrics": {
+    "turbine_kv_evictions_total{tier=\"l0\",reason=\"capacity\"}": 121,
+    "turbine_pressure_signal{signal=\"allocation_failure\"}": 0.0
+  },
+  "mechanism": "BlockPool::next_reclaimable reclaims only base pages and allocate_in(<class>) grows a page class only from a fully-free (convertible) base slab; with kv.recent_window_blocks=1 (default) every live sequence needs a fresh BF16 window page, so a base pool with no fully-free slab starves the class and decodes defer forever. Task 13 predates the window (Task 17)."
+}

@@ -49,6 +49,8 @@ pub enum ErrorCode {
     QueueFull,
     QueueTimeout,
     ContextExceedsKvCapacity,
+    /// `n` sequences of a family with per-sequence state exceed the state allocation (400).
+    StateExceedsCapacity,
     InvalidJsonSchema,
     ToolsNotSupported,
     UnknownTool,
@@ -95,6 +97,7 @@ impl ErrorCode {
             ErrorCode::QueueFull => "queue_full",
             ErrorCode::QueueTimeout => "queue_timeout",
             ErrorCode::ContextExceedsKvCapacity => "context_exceeds_kv_capacity",
+            ErrorCode::StateExceedsCapacity => "state_exceeds_capacity",
             ErrorCode::InvalidJsonSchema => "invalid_json_schema",
             ErrorCode::ToolsNotSupported => "tools_not_supported",
             ErrorCode::UnknownTool => "unknown_tool",
@@ -266,6 +269,11 @@ pub struct ResourceEstimate {
     pub max_output_tokens: u32,
     /// KV blocks the request holds at completion.
     pub projected_kv_blocks: u32,
+    /// The model's per-sequence state the request holds while it runs
+    /// ([`crate::types::StateLayout::bytes_per_sequence`], P7 S-1): reserved beside its KV
+    /// blocks. 0 for attention-only families.
+    #[serde(default)]
+    pub state_bytes: u64,
     pub workspace_bytes: u64,
     pub est_prefill_seconds: f64,
     pub est_decode_seconds: f64,
@@ -285,6 +293,7 @@ impl ResourceEstimate {
             new_prefill_tokens: prompt,
             max_output_tokens: max_output,
             projected_kv_blocks: u32::try_from(blocks).unwrap_or(u32::MAX),
+            state_bytes: 0,
             workspace_bytes: 0,
             est_prefill_seconds: 0.0,
             est_decode_seconds: 0.0,
@@ -321,6 +330,13 @@ pub enum GenerationEvent {
         token_id: u32,
         logprob: Option<f32>,
         top_logprobs: Vec<(u32, f32)>,
+    },
+    /// Reasoning text of a choice (Phase 7 S-10, `reasoning_content`): what the model's
+    /// reasoning parser split off the output, sent before the `Token` event of the token that
+    /// produced it; that token's `text` carries only content.
+    Reasoning {
+        choice: u32,
+        text: String,
     },
     /// The choice's output parsed into tool calls (Phase 2); followed by `Finished`.
     ToolCalls {

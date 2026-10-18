@@ -256,8 +256,59 @@ int32_t launch_moe_scatter(turbine_ctx *ctx, const void *down,
                            const int32_t *pos, const float *topk_weights,
                            int32_t num_tokens, int32_t hidden, int32_t top_k,
                            void *out);
+// Quantized experts (moe_quant.hip, run by moe.cpp run_quant). Rows [0, rows)
+// are the gathered rows of the local experts; first is the first one's index
+// in sorted_rows and [lo, hi) the local expert range, offsets the device
+// expert_offsets.
+// out[i, :] = e4m3(x[i, :] / scales[expert(i) - lo]) over cols columns.
+int32_t launch_moe_quant_static(turbine_ctx *ctx, const void *x, void *out,
+                                int64_t rows, int32_t cols,
+                                const int32_t *offsets, int32_t first,
+                                int32_t lo, int32_t hi, const float *scales);
+// act[i, :] from gu[i, 2 * inter] (gate columns then up columns, or
+// interleaved pairs) with the optional [local, n] biases; clamp selects the
+// gpt-oss activation with limit.
+int32_t launch_moe_quant_act(turbine_ctx *ctx, const void *gu, void *act,
+                             int64_t rows, int32_t inter, bool interleaved,
+                             bool clamp, float limit, const void *b_gate,
+                             const void *b_up, const int32_t *offsets,
+                             int32_t first, int32_t lo, int32_t hi);
+// y[i, :] += bias[expert(i), :] (BF16, rounded).
+int32_t launch_moe_quant_bias(turbine_ctx *ctx, void *y, int64_t rows,
+                              int32_t cols, const void *bias,
+                              const int32_t *offsets, int32_t first, int32_t lo,
+                              int32_t hi);
+// out[t] = round(out[t] + round(y[t] * scale_t)) per token, scale_t =
+// sigmoid(x[t] . gate_w) or 1 (gate_w NULL).
+int32_t launch_moe_shared_combine(turbine_ctx *ctx, const void *x,
+                                  const void *y, const void *gate_w, void *out,
+                                  int32_t tokens, int32_t hidden);
 // Largest num_experts / top_k the Turbine MoE kernels handle.
 constexpr int32_t kMoeMaxExperts = 256;
+// The grouped quantized-expert GEMM (moe_quant_grouped.hip,
+// turbine_moe_quant_grouped): out[pos - first, n] = a[pos - first, :] .
+// dequant(w)[n, :] for every row pos of the local experts, columns [0, n[0])
+// from w[0] and [n[0], n_total) from w[1]. a is BF16 (FP8 block, MXFP4) or
+// e4m3 codes (FP8 tensor, W8A8, with a_scale per expert or per row).
+struct MoeQuantGrouped {
+  const uint8_t *a;
+  int64_t lda; // elements
+  const uint8_t *w[2];
+  const uint8_t *s[2];
+  int32_t n[2];
+  int64_t code_stride[2], scale_stride[2]; // bytes per expert
+  const float *a_scale;
+  int32_t a_scale_vec;
+  const int32_t *offsets;
+  int32_t expert_begin, num_local, first;
+  int32_t k, n_total;
+  int64_t ldc;
+  void *out;
+};
+// n_total and k multiples of 64; wide: 128-row tiles (else 64).
+int32_t launch_moe_quant_grouped(turbine_ctx *ctx, int32_t weight_dtype,
+                                 const MoeQuantGrouped &p, int64_t rows,
+                                 bool wide);
 constexpr int32_t kMoeMaxTopK = 32;
 // The small-m path over d's rows: fills pos ([num_tokens * top_k]), act
 // ([num_tokens * top_k, inter] BF16) and down ([num_tokens * top_k, hidden]
@@ -408,8 +459,9 @@ bool paged_supports(const turbine_attention_paged_desc *d, PagedPath path);
 int32_t paged_run(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                   const char *entry, PagedPath path);
 // paged_attention_splitkv.cpp: what CK fmha_fwd_splitkv adds to the paged
-// checks (one query per sequence, grouped query heads), and its call (after
-// the append). kv_layer's page layout as for fmha_fwd_pagedkv.
+// checks (head_dim 128: one query per sequence, grouped query heads; head_dim
+// 64 / 256: every call, prefill included), and its call (after the append).
+// kv_layer's page layout as for fmha_fwd_pagedkv.
 bool ck_splitkv_serves(const turbine_attention_paged_desc *d);
 int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                        const std::string &entry);
@@ -419,8 +471,19 @@ int32_t run_ck_splitkv(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
 bool b1_serves(const turbine_attention_paged_desc *d);
 int32_t run_b1_decode(turbine_ctx *ctx, const turbine_attention_paged_desc *d,
                       const std::string &entry);
-// moe.cpp: the five moe_experts paths.
-enum class MoePath { SmallM, WmmaPrefill, Wmma, Grouped, PerExpert };
+// moe.cpp: the six moe_experts paths (Quant: the v2.16 quantized experts).
+// QuantLoop / QuantGrouped force one path of the quantized experts (Quant
+// picks by routed rows and the formats the grouped kernel wins on).
+enum class MoePath {
+  SmallM,
+  WmmaPrefill,
+  Wmma,
+  Grouped,
+  PerExpert,
+  Quant,
+  QuantLoop,
+  QuantGrouped
+};
 // The implementation name of path (impl_table.cpp's).
 const char *moe_path_name(MoePath path);
 bool moe_experts_supports(const turbine_moe_experts_desc *d, MoePath path);

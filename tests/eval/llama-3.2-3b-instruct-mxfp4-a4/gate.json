@@ -1,0 +1,18 @@
+{
+  "format": "mxfp4_a4",
+  "checkpoint": "matmelis/Llama_3.2_3B_w_mxfp4_a_mxfp4_gptq@91925ffda6977d097354a99718a20e035f8af80a",
+  "tasks": "tests/eval/gsm8k-200.jsonl",
+  "concurrency": 16,
+  "baseline": "../llama-3.2-3b-instruct/turbine-bf16-c16.json",
+  "baseline_engine": "turbine, BF16 Llama-3.2-3B-Instruct (unsloth @ 006f5dcd1393c3add266de40994ba96225e9689d), GSM8K-200 at concurrency 16",
+  "baseline_accuracy": 0.795,
+  "candidate": "turbine.json",
+  "candidate_accuracy": 0.015,
+  "max_drop": 0.04,
+  "drop": 0.78,
+  "result": "FAIL",
+  "decided": "Phase 7 spec, decision \"mxfp4_a4\" (B) (2026-10-08): supported if GSM8K holds the 6a 4-bit drop (<= 0.04) and golden passes a tolerance derived from transformers' self-spread",
+  "reason": "The checkpoint is the BASE Llama-3.2-3B, not Instruct: config.json eos_token_id 128001 (<|end_of_text|>; the Instruct 3B is 128009 <|eot_id|>), the tokenizer ships no chat_template, and a manual Llama chat prompt is echoed rather than answered (raw `Q: ...` completions do work). A base model does not follow the GSM8K chat prompt, so this comparison does not measure the checkpoint's quantized accuracy. Recorded for the report; the row stays experimental.",
+  "eval_compare": "turbine-golden eval-compare --baseline tests/eval/llama-3.2-3b-instruct/turbine-bf16-c16.json --candidate tests/eval/llama-3.2-3b-instruct-mxfp4-a4/turbine.json --max-drop 0.04 -> rc 2 (refused): \"baseline was measured with 0 filler requests of 0 words but candidate with 0 of 2000\" (the committed BF16 c16 baseline predates the eval filler fields)",
+  "golden": "tests/golden/llama-3.2-3b-instruct-mxfp4-a4/ - c1 FAIL 10/16 (need 11), c16 FAIL 10/16; see .procoder/perf-log.md \"P7 mxfp4_a4 gate\""
+}

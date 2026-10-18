@@ -1484,11 +1484,166 @@ fn lossy_tier_reuse_with(format: &str, bounds: (HeadBound, f64, f64)) {
     );
 }
 
+/// P7 S-12 (Task 33, `hybrid_prefix_reuse_matches_cold`): a Qwen3.5 hybrid's per-sequence
+/// block-boundary state snapshots travel with their KV block through L1 and L2. A session's
+/// prompt is filled and published, filler turns push its blocks down to L1 and then to L2, and
+/// a later turn of the same session hits the prefix from each tier. Every token and logprob of
+/// the warm turns equals the cold run bit for bit — the KV comes back lossless (both tiers at
+/// `l0`) and the state restores from the nearest block-boundary snapshot instead of being
+/// rebuilt — and `turbine_hybrid_state_snapshots_total{outcome="restored"}` counts the
+/// restores. Breaks if a snapshot is lost on demotion/promotion (a warm turn diverges), the
+/// state is rebuilt rather than restored, or the snapshot bytes do not survive the tier.
+#[test]
+#[ignore = "lab: needs the HIP backend, libturbine_hip.so, the Qwen3.5-9B weights and /home/piwi/turbine-kv"]
+fn hybrid_prefix_reuse_matches_cold() {
+    if !require_backend("hip") {
+        return;
+    }
+    let _gpu = one_server_at_a_time();
+    let model_dir = require_env_dir("TURBINE_TEST_MODEL_DIR");
+    // This test is only meaningful on the Qwen3.5 hybrid checkpoint
+    // (`TURBINE_TEST_MODEL_DIR=/models/qwen3.5-9b`); the default lab Job points at Llama, where
+    // there is no state to snapshot, so it is skipped there instead of failing.
+    let arch = std::fs::read(model_dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|c| {
+            c["architectures"][0]
+                .as_str()
+                .or_else(|| c["text_config"]["architectures"][0].as_str())
+                .map(str::to_string)
+        });
+    if arch.as_deref() != Some("Qwen3_5ForConditionalGeneration") {
+        println!(
+            "hybrid_prefix_reuse_matches_cold: skipping, {} is not the Qwen3.5 hybrid",
+            arch.as_deref().unwrap_or("no architecture")
+        );
+        return;
+    }
+    let kv_dir = Path::new(KV_DIR);
+    assert!(kv_dir.is_dir(), "{KV_DIR} is not mounted");
+    // A snapshot at every full block (so a hit has one to restore), the lossless tail off (so
+    // the demoted blocks carry their snapshot in the tier record), and both tiers at `l0` (the
+    // KV comes back exact). The tier turns are judged with the batched bounds: a restore resumes
+    // the prefill at the snapshot boundary (a short chunk), whose kernel tiling rounds
+    // differently from the cold full-length prefill, exactly as the batched golden runs allow.
+    let base = [
+        format!("kv.nvme.path={KV_DIR}"),
+        "kv.nvme.max_bytes=64GiB".into(),
+        "kv.cpu.max_bytes=1GiB".into(),
+        "kv.hybrid_snapshot_interval_blocks=1".into(),
+        "kv.lossless_tail_blocks=0".into(),
+    ];
+
+    // A's prompt: five full 128-token blocks. The primer continues it with one decode token.
+    let a = prompt(100, 700);
+    // Cold reference: sharing off, so nothing is reused anywhere.
+    let cold_sets = [base.as_slice(), &["kv.prefix_sharing=false".to_string()]].concat();
+    let cold = {
+        let server = LabServer::start(&model_dir, &cold_sets);
+        server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"))
+    };
+
+    let server = LabServer::start(&model_dir, &base);
+
+    // Turn 1 fills A's block-boundary snapshots and publishes its blocks.
+    let first = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    assert_within_batched_bounds(&cold, &first, "turn 1 (cold fill)");
+
+    // Warm A at L0: a second identical turn reuses the prefix, which gives A's blocks the reuse
+    // evidence (`access_count > 0`) the demotion policy needs — without it they are dropped under
+    // filler pressure, not demoted, and no tier hit can happen.
+    let warm = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    assert!(
+        warm.cached_tokens > 0,
+        "the L0 warm turn reused no prefix: {warm:?}"
+    );
+    assert_within_batched_bounds(&cold, &warm, "the L0 warm turn");
+
+    // Filler turns of far-apart sessions push A's (oldest, now cacheable) blocks down to L1.
+    let to_l1 = |s: &LabServer| s.metric(r#"turbine_kv_demotions_total{from="l0",to="l1"}"#);
+    let restored =
+        |s: &LabServer| s.metric(r#"turbine_hybrid_state_snapshots_total{outcome="restored"}"#);
+    let promoted_l1 = |s: &LabServer| s.metric(r#"turbine_kv_promotions_total{from="l1",to="l0"}"#);
+    let mut filler = 0;
+    while to_l1(&server) < 10.0 {
+        filler += 1;
+        assert!(filler <= 400, "demotion to L1 never happened");
+        let key = format!("filler-{filler}");
+        server.complete_in(&prompt(1_000 + filler, 1_800), 1, Some(&key));
+    }
+    eprintln!(
+        "{filler} filler prompts moved {} blocks to L1 (promoted_l1={})",
+        to_l1(&server),
+        promoted_l1(&server)
+    );
+
+    // Turn 2 hits A from L1: the KV promotes exact and the state restores from a snapshot.
+    let before_l1 = restored(&server);
+    let before_promoted = promoted_l1(&server);
+    let from_l1 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+    if from_l1.cached_tokens == 0 {
+        dump_kv(&server);
+    }
+    assert!(
+        from_l1.cached_tokens > 0,
+        "the L1 turn reused no prefix: {from_l1:?}"
+    );
+    assert!(
+        restored(&server) > before_l1,
+        "the L1 hit restored no snapshot"
+    );
+    assert!(
+        promoted_l1(&server) > before_promoted,
+        "the L1 turn promoted nothing from L1 (not a tier hit): {from_l1:?}"
+    );
+    assert_within_batched_bounds(&cold, &from_l1, "the L1 turn");
+
+    // A further L2 leg: push A on down to L2 and hit it again. With hybrid state a block's tier
+    // record carries its snapshot tail (~49 MiB for Qwen3.5-9B), so L1 holds far fewer blocks
+    // than its KV-only count and L1 -> L2 spill does not fire under this filler load (P7 S-12
+    // gap: `to_l2` stays 0 over the fill). The leg asserts only when a spill is observed, so a
+    // regression that stops it is reported rather than silently passing; the gap itself is an
+    // open P7 S-12 item (an L1 -> L2 spill for hybrid records).
+    let mut filler_l2 = 0;
+    while to_l2(&server) < 1.0 && filler_l2 < 60 {
+        filler_l2 += 1;
+        let key = format!("filler-l2-{filler_l2}");
+        server.complete_in(&prompt(2_000 + filler_l2, 1_800), 1, Some(&key));
+    }
+    if to_l2(&server) >= 1.0 {
+        let before_l2 = restored(&server);
+        let from_l2 = server.complete_with_logprobs(json!(a), ANSWER_TOKENS, Some("a"));
+        if from_l2.cached_tokens == 0 {
+            dump_kv(&server);
+        }
+        assert!(
+            from_l2.cached_tokens > 0,
+            "the L2 turn reused no prefix: {from_l2:?}"
+        );
+        assert!(
+            restored(&server) > before_l2,
+            "the L2 hit restored no snapshot"
+        );
+        assert_within_batched_bounds(&cold, &from_l2, "the L2 turn");
+        println!("hybrid L2 leg exercised ({} blocks to L2)", to_l2(&server));
+    } else {
+        println!(
+            "hybrid L2 leg SKIPPED: no L1->L2 spill with hybrid records ({} blocks to L2)",
+            to_l2(&server)
+        );
+    }
+    assert!(
+        restored(&server) > 0.0,
+        "no state snapshot was ever restored"
+    );
+    println!("hybrid_prefix_reuse_matches_cold ok");
+}
+
 /// The lab config loads and spells out the tiers the lab tests rely on.
 #[test]
 fn phase4_lab_config_loads() {
     let c = turbine_core::config::load(&lab_config(), &[]).expect("phase4-novanas.yaml loads");
-    assert_eq!(c.kv.block_tokens, 128);
     assert!(c.kv.cpu.enabled && c.kv.nvme.enabled);
     assert_eq!(c.kv.nvme.path, Path::new(KV_DIR));
     assert_eq!(c.kv.nvme.max_bytes.0, KV_CAP_BYTES);

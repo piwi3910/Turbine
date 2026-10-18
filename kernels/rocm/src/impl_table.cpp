@@ -18,14 +18,18 @@
 //                                  ck_tile_fmha_pagedkv_mixed_staged [ck]
 //                                  (multiple of 128), 5
 //                                  turbine_hip_mixed_staged, 6
-//                                  turbine_hip_mixed
+//                                  turbine_hip_mixed; head_dim 64 / 256
+//                                  (v2.17): 7 ck_tile_fmha_splitkv [ck]
+//                                  (pages of a multiple of 128 tokens)
 //   attention_decode_paged       0 turbine_hip_b1_decode [turbine_hip]
 //                                  (decode of grouped query heads, group
 //                                  <= 8, BF16 flat pages, any page size;
 //                                  from 4 sequences it runs CK splitkv
 //                                  when CK serves the page size),
 //                                  1 ck_tile_fmha_splitkv [ck] (grouped query
-//                                  heads, pages of a multiple of 128 tokens),
+//                                  heads at head_dim 128, every head layout
+//                                  at 64 / 256; pages of a multiple of 128
+//                                  tokens),
 //                                  2 ck_tile_fmha_pagedkv [ck], 3 turbine_hip
 //                                  (BF16 pages); FP8 pages: 4
 //                                  turbine_hip_fp8_decode, 5 turbine_hip_fp8;
@@ -38,11 +42,20 @@
 //                                  of 256), 2 turbine_hip_moe_wmma
 //                                  (multiples of 64), 3 hipblaslt_grouped
 //                                  (only when hipBLASLt has a grouped
-//                                  solution), 4 hipblaslt_per_expert; 3 and 4
-//                                  read host_expert_offsets
+//                                  solution), 4 hipblaslt_per_expert, 5
+//                                  turbine_hip_moe_quant (the v2.16 quantized
+//                                  experts: per-expert qgemm loop below 64
+//                                  routed rows and for the formats the grouped
+//                                  kernel does not win on, else the grouped
+//                                  prefill kernel), 6
+//                                  turbine_hip_moe_quant_loop (the loop alone),
+//                                  7 turbine_hip_moe_quant_grouped (the grouped
+//                                  kernel alone); 3, 4, 5, 6 and 7 read
+//                                  host_expert_offsets
 //   rope, silu_mul, embedding,   0 turbine_hip [turbine_hip]
 //   add, moe_route, logits_reduce,
 //   row_sumsq, rmsnorm_sharded (v2.6)
+//   sigmoid_mul (v2.19)          0 turbine_hip [turbine_hip]
 //   qgemm (v2.9)                 0 hipblaslt_fp8 [hipblaslt] (FP8_TENSOR /
 //                                  FP8_CHANNEL weights, FP8_TENSOR /
 //                                  FP8_TOKEN activations)
@@ -63,8 +76,14 @@
 //                                  codec, BF16 pages), 1 turbine_hip_tq
 //                                  [turbine_hip] (TurboQuant tq4 / tq2,
 //                                  BF16 pages, head_dim 128)
+//   gdn_prefill, gdn_decode      0 llama_cpp_gated_delta_net [llama_cpp]
+//   (v2.18)                        (BF16, k_dim == v_dim in {32, 64, 128})
+//   conv1d_prefill (v2.18)       0 aiter_causal_conv1d_split_qkv [aiter]
+//   conv1d_update (v2.18)        0 llama_cpp_ssm_conv [llama_cpp] (BF16,
+//                                  window 4)
 #include <string>
 
+#include "gdn.hpp"
 #include "kv_transcode.hpp"
 #include "qgemm_fp8_block.hpp"
 #include "qgemm_impls.hpp"
@@ -210,6 +229,10 @@ const ImplEntry kSiluMul[] = {
     whole<turbine_silu_mul_desc, turbine_silu_mul_supported, turbine_silu_mul>(
         "turbine_hip", kTurbine),
 };
+const ImplEntry kSigmoidMul[] = {
+    whole<turbine_sigmoid_mul_desc, turbine_sigmoid_mul_supported,
+          turbine_sigmoid_mul>("turbine_hip", kTurbine),
+};
 const ImplEntry kEmbedding[] = {
     whole<turbine_embedding_desc, turbine_embedding_supported,
           turbine_embedding>("turbine_hip", kTurbine),
@@ -232,6 +255,10 @@ const ImplEntry kPrefillPagedImpls[] = {
         "turbine_hip_mixed_staged", kTurbine),
     entry<Paged<kPrefillPaged, PagedPath::TurbineMixed>>("turbine_hip_mixed",
                                                          kTurbine),
+    // Last, so every earlier index keeps its implementation: it serves only
+    // the head dims fmha_fwd_pagedkv has no gfx12 instance of (ABI v2.17).
+    entry<Paged<kPrefillPaged, PagedPath::CkSplitkv>>(
+        "ck_tile_fmha_splitkv", kCk, 0, page_multiple_allows),
 };
 const ImplEntry kDecodePagedImpls[] = {
     entry<Paged<kDecodePaged, PagedPath::TurbineB1>>("turbine_hip_b1_decode",
@@ -266,6 +293,15 @@ const ImplEntry kMoeExperts[] = {
                                      TURBINE_IMPL_NEEDS_HOST_OFFSETS),
     entry<Experts<MoePath::PerExpert>>("hipblaslt_per_expert", kHipblaslt,
                                        TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    entry<Experts<MoePath::Quant>>("turbine_hip_moe_quant", kTurbine,
+                                   TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    // The two paths of turbine_hip_moe_quant, each alone (tests, the harness):
+    // the per-expert qgemm loop and the grouped prefill kernel.
+    entry<Experts<MoePath::QuantLoop>>("turbine_hip_moe_quant_loop", kTurbine,
+                                       TURBINE_IMPL_NEEDS_HOST_OFFSETS),
+    entry<Experts<MoePath::QuantGrouped>>("turbine_hip_moe_quant_grouped",
+                                          kTurbine,
+                                          TURBINE_IMPL_NEEDS_HOST_OFFSETS),
 };
 const ImplEntry kAddRmsnorm[] = {
     entry<AddNorm<true>>("ck_tile_rmsnorm2d", kCk),
@@ -322,6 +358,35 @@ const ImplEntry kKvTranscode[] = {
                kv_transcode_tq_run>>("turbine_hip_tq", kTurbine),
 };
 
+// A conv1d implementation: its supports / run pair for one mode.
+template <int32_t (*Run)(turbine_ctx *, const turbine_conv1d_desc *)>
+struct Conv {
+  static bool supports(const void *d) {
+    return conv1d_supports(static_cast<const turbine_conv1d_desc *>(d));
+  }
+  static int32_t run(turbine_ctx *ctx, const void *d) {
+    return Run(ctx, static_cast<const turbine_conv1d_desc *>(d));
+  }
+};
+
+constexpr const char *kLlamaCpp = "llama_cpp";
+constexpr const char *kAiter = "aiter";
+
+const ImplEntry kGdnPrefill[] = {
+    entry<Impl<turbine_gdn_desc, gdn_supports, gdn_prefill_run>>(
+        "llama_cpp_gated_delta_net", kLlamaCpp),
+};
+const ImplEntry kGdnDecode[] = {
+    entry<Impl<turbine_gdn_desc, gdn_supports, gdn_decode_run>>(
+        "llama_cpp_gated_delta_net", kLlamaCpp),
+};
+const ImplEntry kConv1dPrefill[] = {
+    entry<Conv<conv1d_prefill_run>>("aiter_causal_conv1d_split_qkv", kAiter),
+};
+const ImplEntry kConv1dUpdate[] = {
+    entry<Conv<conv1d_update_run>>("llama_cpp_ssm_conv", kLlamaCpp),
+};
+
 struct OpImpls {
   const ImplEntry *entries;
   int32_t count;
@@ -353,14 +418,19 @@ const OpImpls kOps[] = {
     of(kQGemm),
     of(kQuantizeAct),
     of(kKvTranscode),
+    of(kGdnPrefill),
+    of(kGdnDecode),
+    of(kConv1dPrefill),
+    of(kConv1dUpdate),
+    of(kSigmoidMul),
 };
-static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_KV_TRANSCODE + 1,
+static_assert(sizeof(kOps) / sizeof(kOps[0]) == TURBINE_OP_SIGMOID_MUL + 1,
               "one implementation list per TURBINE_OP_* code");
 
 } // namespace
 
 const ImplEntry *impl_entries(int32_t op, int32_t *count) {
-  if (op < 0 || op > TURBINE_OP_KV_TRANSCODE) {
+  if (op < 0 || op > TURBINE_OP_SIGMOID_MUL) {
     *count = 0;
     return nullptr;
   }

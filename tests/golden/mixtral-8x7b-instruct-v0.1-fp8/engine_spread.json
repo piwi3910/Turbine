@@ -1,0 +1,591 @@
+{
+  "captures": "tol3",
+  "slug": "mixtral-8x7b-instruct-v0.1-fp8",
+  "variants": [
+    "c1-cold",
+    "mg-ep2-c1",
+    "mg-ep2-c16-00",
+    "mg-ep2-c16-01",
+    "mg-ep2-c16-02",
+    "mg-ep2-c16-03",
+    "mg-ep2-c16-04",
+    "mg-ep2-c16-05",
+    "mg-ep2-c16-06",
+    "mg-ep2-c16-07",
+    "mg-ep2-c16-08",
+    "mg-ep2-c16-09",
+    "mg-ep2-c16-10",
+    "mg-ep2-c16-11",
+    "mg-ep2-c16-12",
+    "mg-ep2-c16-13",
+    "mg-ep2-c16-14",
+    "mg-ep2-c16-15",
+    "mg-tp2-c16-00",
+    "mg-tp2-c16-01",
+    "mg-tp2-c16-02",
+    "mg-tp2-c16-03",
+    "mg-tp2-c16-04",
+    "mg-tp2-c16-05",
+    "mg-tp2-c16-06",
+    "mg-tp2-c16-07",
+    "mg-tp2-c16-08",
+    "mg-tp2-c16-09",
+    "mg-tp2-c16-10",
+    "mg-tp2-c16-11",
+    "mg-tp2-c16-12",
+    "mg-tp2-c16-13",
+    "mg-tp2-c16-14",
+    "mg-tp2-c16-15"
+  ],
+  "old": {
+    "likely": 3.35,
+    "tail": 7.05,
+    "likely_batched": 3.35,
+    "tail_batched": 7.05,
+    "likely_multi_gpu": 3.35,
+    "tail_multi_gpu": 7.05
+  },
+  "noise": {
+    "likely": 0.0,
+    "tail": 0.0
+  },
+  "noise_worst": {
+    "likely": [0.0, "-", -1],
+    "tail": [0.0, "-", -1]
+  },
+  "noise_multi_gpu": {
+    "likely": 5.569134,
+    "tail": 8.3831714,
+    "worst": {
+      "likely": [5.569134, "p14", 5],
+      "tail": [8.3831714, "p14", 6]
+    }
+  },
+  "bounds": {
+    "likely": {
+      "observed": 1.32,
+      "triangle": 3.35,
+      "proposed": 3.35,
+      "over_cap": false
+    },
+    "tail": {
+      "observed": 4.93,
+      "triangle": 7.05,
+      "proposed": 7.05,
+      "over_cap": false
+    },
+    "likely_batched": {
+      "observed": 1.32,
+      "triangle": 3.35,
+      "proposed": 3.35,
+      "over_cap": false
+    },
+    "tail_batched": {
+      "observed": 4.93,
+      "triangle": 7.05,
+      "proposed": 7.05,
+      "over_cap": false
+    },
+    "likely_multi_gpu": {
+      "observed": 5.5,
+      "triangle": 8.92,
+      "proposed": 5.5,
+      "over_cap": false
+    },
+    "tail_multi_gpu": {
+      "observed": 10.89,
+      "triangle": 15.44,
+      "proposed": 10.89,
+      "over_cap": false
+    }
+  },
+  "noise_distribution": {
+    "likely": {
+      "0.5": 0.0,
+      "0.9": 0.0,
+      "0.99": 0.0,
+      "1.0": 0.0,
+      "n": 0
+    },
+    "tail": {
+      "0.5": 0.0,
+      "0.9": 0.0,
+      "0.99": 0.0,
+      "1.0": 0.0,
+      "n": 0
+    }
+  },
+  "noise_by_variant": {
+    "mg-ep2-c1": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [6.449625, "p14"],
+      "tail": [7.775744500000001, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-00": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [3.0170993999999998, "p14"],
+      "tail": [6.283556000000001, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-01": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [3.9094659999999997, "p14"],
+      "tail": [6.389182999999999, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-02": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [3.51123825, "p10"],
+      "tail": [6.283556000000001, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-03": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [4.092277600000001, "p14"],
+      "tail": [7.383318399999999, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-04": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [4.092277600000001, "p14"],
+      "tail": [7.383318399999999, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-05": {
+      "prefix_ok": 15,
+      "prompts": 16,
+      "likely": [4.092277600000001, "p14"],
+      "tail": [7.383318399999999, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-06": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [4.0327777000000005, "p14"],
+      "tail": [7.93165966, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-07": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [4.0327777000000005, "p14"],
+      "tail": [7.93165966, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-08": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [4.0327777000000005, "p14"],
+      "tail": [7.93165966, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-09": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [4.0327777000000005, "p14"],
+      "tail": [7.93165966, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-10": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [4.0327777000000005, "p14"],
+      "tail": [7.93165966, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-11": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [4.817034, "p14"],
+      "tail": [8.266818, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-12": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [4.817034, "p14"],
+      "tail": [8.266818, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-13": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [4.817034, "p14"],
+      "tail": [8.266818, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-14": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [3.0170993999999998, "p14"],
+      "tail": [6.283556000000001, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-15": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [3.0170993999999998, "p14"],
+      "tail": [6.283556000000001, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-00": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-01": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-02": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 2
+    },
+    "mg-tp2-c16-03": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-04": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [0.7940826000000001, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 2
+    },
+    "mg-tp2-c16-05": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-06": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [0.7366199, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-07": {
+      "prefix_ok": 15,
+      "prompts": 16,
+      "likely": [0.7940826000000001, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 2
+    },
+    "mg-tp2-c16-08": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [0.8821421, "p05"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-09": {
+      "prefix_ok": 14,
+      "prompts": 16,
+      "likely": [0.7366199, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-10": {
+      "prefix_ok": 15,
+      "prompts": 16,
+      "likely": [0.8116169000000001, "p11"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-11": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-12": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [0.7366199, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 2
+    },
+    "mg-tp2-c16-13": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [0.7940826000000001, "p15"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-14": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    },
+    "mg-tp2-c16-15": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.51951985, "p10"],
+      "tail": [5.600418000000001, "p12"],
+      "missing": 1
+    }
+  },
+  "vs_reference": {
+    "c1-cold": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [1.310447191546631, "p10"],
+      "tail": [4.928801011474608, "p12"],
+      "missing": 0
+    },
+    "mg-ep2-c1": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [5.493343553833008, "p14"],
+      "tail": [8.387948901855468, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-00": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.9413089538330075, "p14"],
+      "tail": [10.889286288574219, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-01": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [3.8336755538330074, "p14"],
+      "tail": [10.261112017456053, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-02": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [2.9413089538330075, "p14"],
+      "tail": [10.889286288574219, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-03": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [4.016487153833008, "p14"],
+      "tail": [8.644037017456053, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-04": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [4.016487153833008, "p14"],
+      "tail": [8.644037017456053, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-05": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [4.016487153833008, "p14"],
+      "tail": [8.644037017456053, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-06": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.971643553833008, "p14"],
+      "tail": [7.212409722412108, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-07": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [2.971643553833008, "p14"],
+      "tail": [7.212409722412108, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-08": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.971643553833008, "p14"],
+      "tail": [7.212409722412108, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-09": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.971643553833008, "p14"],
+      "tail": [7.212409722412108, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-10": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.971643553833008, "p14"],
+      "tail": [7.212409722412108, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-11": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [4.741243553833008, "p14"],
+      "tail": [9.983516288574219, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-12": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [4.741243553833008, "p14"],
+      "tail": [9.983516288574219, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-13": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [4.741243553833008, "p14"],
+      "tail": [9.983516288574219, "p14"],
+      "missing": 1
+    },
+    "mg-ep2-c16-14": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [2.9413089538330075, "p14"],
+      "tail": [10.889286288574219, "p14"],
+      "missing": 0
+    },
+    "mg-ep2-c16-15": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [2.9413089538330075, "p14"],
+      "tail": [10.889286288574219, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-00": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-01": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-02": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-03": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-04": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [2.0443117729888916, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-05": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.801901288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-06": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [1.0530254852325438, "p11"],
+      "tail": [4.801901288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-07": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [1.0381540915466307, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-08": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [1.589190991546631, "p10"],
+      "tail": [4.84731672241211, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-09": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.915320991546631, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-10": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [1.9592852915466308, "p10"],
+      "tail": [4.801901288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-11": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.801901288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-12": {
+      "prefix_ok": 12,
+      "prompts": 16,
+      "likely": [1.915320991546631, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-13": {
+      "prefix_ok": 13,
+      "prompts": 16,
+      "likely": [1.915320991546631, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-14": {
+      "prefix_ok": 11,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    },
+    "mg-tp2-c16-15": {
+      "prefix_ok": 10,
+      "prompts": 16,
+      "likely": [1.9369165729888915, "p10"],
+      "tail": [4.942367288574218, "p14"],
+      "missing": 0
+    }
+  }
+}

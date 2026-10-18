@@ -49,6 +49,12 @@ usage() {
 # tests: > ~60 s each on novanas (nextest's "has been running for over 60 seconds" warning in
 # scripts/lab-test.sh full runs, e.g. target/lab-perf and lab-test logs from 2026-09-26/27).
 # One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
+# Lab tests against a model already served by `scripts/lab-serve.sh` (they read TURBINE_LAB_URL
+# and run through `scripts/remote-cargo.sh`): always skipped here.
+SERVED_TESTS=(
+	# crates/turbine-server/tests/lab_openai.rs (P7 Task 19)
+	mistral_tool_call_round_trip
+)
 # Lab tests that open two GPUs (Phase 5): skipped (libtest `--skip`, by substring) in a
 # one-GPU Job, where they would fail on the missing device; run them with `--gpus 2`.
 # (tiny_model's hip_tp2_matches_tp1 / hip_ep2_matches_ep1 / hip_pp2_matches_pp1 open their
@@ -64,6 +70,10 @@ TWO_GPU_TESTS=(
 	tp2_collective_failure_recovers_on_gpu
 	# crates/turbine-model/tests/perf.rs (P5 Task 32)
 	tp_forward_profile
+	# crates/turbine-model/tests/olmoe_ep_tp_lab.rs (P7 Task 12)
+	olmoe_routing_trace_ep2_tp2
+	# crates/turbine-model/tests/golden.rs (P7 Task 17)
+	hip_trace_vs_cpu_qwen3moe
 )
 
 # Lab tests whose expectation follows the Job's R9700 count (TURBINE_EXPECT_AMD = --gpus): they
@@ -223,6 +233,11 @@ build_test_command() {
 	# The golden references are committed; the Hugging Face transformers CPU reference is only
 	# needed to regenerate them.
 	[[ $HF_REFERENCE -eq 1 ]] || TEST_CMD+=(--skip hf_reference_matches_cpu)
+	# Lab tests against an already served model (TURBINE_LAB_URL; a lab-serve.sh session runs
+	# them through remote-cargo.sh): never in a lab-test Job.
+	for t in "${SERVED_TESTS[@]}"; do
+		TEST_CMD+=(--skip "$t")
+	done
 	# A one-GPU Job cannot run the two-GPU tests (TWO_GPU_TESTS above); `--gpus 2` runs them.
 	# Without an explicit selection (`-- …`) the two-GPU leg runs only those and GPU_COUNT_TESTS
 	# (bare filter args, which libtest ORs by substring): every other test is the one-GPU leg's.
@@ -372,12 +387,18 @@ on_interrupt() {
 
 # render_job build|test: the template as the GPU-less build Job or the GPU test Job.
 render_job() {
-	local gpus="$GPUS" rename=()
+	local gpus="$GPUS" rename=() model_env=()
 	if [[ $1 == build ]]; then
 		gpus=0
 		rename=(-e "s/turbine-lab-test-__RUN_ID__/${BUILD_JOB}/" -e "s/turbine-lab-role: test/turbine-lab-role: build/")
 	fi
-	sed "${rename[@]+"${rename[@]}"}" -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
+	# A caller-set TURBINE_TEST_MODEL_DIR overrides the Job's default (`-- <cargo args>` runs one
+	# model's tests, e.g. Qwen3.5's HIP-vs-CPU trace).
+	if [[ -n "${TURBINE_TEST_MODEL_DIR:-}" ]]; then
+		model_env=(-e "s#value: /models/llama-3.2-3b-instruct#value: ${TURBINE_TEST_MODEL_DIR}#")
+	fi
+	sed "${rename[@]+"${rename[@]}"}" "${model_env[@]+"${model_env[@]}"}" \
+		-e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
 		-e "s/__PHASE__/$1/g" "${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
 }
 

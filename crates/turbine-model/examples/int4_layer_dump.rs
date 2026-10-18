@@ -56,6 +56,7 @@ fn main() {
         shape: vec![n, k],
         stack: None,
         source: None,
+        float32_stored: false,
     };
     let mut stored = Vec::new();
     for slot in fmt.slots(&base) {

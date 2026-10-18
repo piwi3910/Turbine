@@ -167,7 +167,9 @@ fn sharded_norms(
 /// in place, as `[tokens · heads, head_dim]` rows. The norm op takes one row stride, and in the
 /// fused Q/K/V layout a token's heads are strided by the fused width, so this hook keeps the
 /// projections dense ([`AttentionHook::fuses_qkv`] false: one GEMM per projection); rows never
-/// mix tokens, so ragged batches stay independent.
+/// mix tokens, so ragged batches stay independent. Every provider runs it as its plain
+/// `rmsnorm` (on HIP the library's `turbine_rmsnorm`). A tensor-parallel rank holds whole heads,
+/// so it norms its own rows with the replicated `[head_dim]` weights and no collective.
 pub struct QkNormPerHead;
 
 /// The [`QkNormPerHead`] hook.

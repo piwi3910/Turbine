@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_olmoe};
+use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_qwen3_5};
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
@@ -194,6 +194,33 @@ fn invalid_config_exits_2_before_bind() {
     );
 }
 
+/// P7 S-12 (Task 32): a family with per-sequence state (a hybrid) refuses an explicit
+/// `structured_output.jump_forward: true` — exit 2 naming `jump_forward_hybrid`, before any
+/// port binds and under `--check-config` too. Breaks if a hybrid silently accepts jump-forward.
+#[test]
+fn jump_forward_on_hybrid_exits_2() {
+    let model = TempDir::new("turbine-server-jf-hybrid");
+    let spec = write_tiny_qwen3_5(model.path(), 3);
+    let cfg = TempConfig::new(
+        "jump-forward-hybrid",
+        &format!("model:\n  path: {}\n", spec.dir.display()),
+    );
+    let out = wait_with_timeout(
+        spawn_server(
+            &[
+                "--check-config",
+                "--set",
+                "structured_output.jump_forward=true",
+            ],
+            &cfg.path,
+        ),
+        Duration::from_secs(20),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
+    assert!(stderr.contains("jump_forward_hybrid"), "stderr: {stderr}");
+}
+
 /// Phase 2m: a module key naming no registered module is a configuration error — exit 2 before
 /// device discovery and before the port is bound, the same under `--check-config`.
 #[test]
@@ -348,39 +375,6 @@ fn ep_on_dense_model_exits_2() {
         );
         TcpListener::bind(addr).expect("the configured port must still be free");
     }
-}
-
-/// P5 exit (user decision 2026-09-28, `turbine_core::support::PARALLEL_REFUSALS`): OLMoE with
-/// expert and tensor parallelism together is refused before bind: the tiny OLMoE with
-/// `expert_parallel_size: 2` and `tensor_parallel_size: 2` exits 2 naming
-/// `parallel.expert_parallel_size` and the reason code `olmoe_ep_tp_drift`, and the port stays
-/// free; ep 2 alone still starts (tiny_server `ep2_serves_like_ep1`). Breaks if the refusal is
-/// lost or moves after the port is bound.
-#[test]
-fn olmoe_ep_tp_exits_2() {
-    let port = free_port();
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let dir = TempDir::new("turbine-server-cli-olmoe");
-    write_tiny_olmoe(dir.path(), 7);
-    let yaml = format!(
-        "model:\n  path: {}\n  served_name: m\n  max_seq_len: 64\nserver:\n  listen: {addr}\n\
-         execution:\n  backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\n\
-         parallel:\n  expert_parallel_size: 2\n  tensor_parallel_size: 2\n  \
-         collective_backend: host\n",
-        dir.path().display()
-    );
-    let cfg = TempConfig::new("olmoe-ep-tp", &yaml);
-    let out = wait_with_timeout(spawn_server(&[], &cfg.path), Duration::from_secs(30));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
-    assert!(
-        stderr.contains(
-            "turbine-server: invalid parallel plan: parallel.expert_parallel_size: \
-             olmoe_ep_tp_drift"
-        ),
-        "stderr: {stderr}"
-    );
-    TcpListener::bind(addr).expect("the configured port must still be free");
 }
 
 /// P5 S-12 (plan Task 22): pipeline parallelism combined with tensor parallelism is refused
@@ -876,39 +870,37 @@ fn support_matrix_output() {
                 .is_some_and(|r| r.contains("phase-2b-nvidia"))),
         "{v}"
     );
+    // Phase 7 families (S-13): experimental on amd until their gate closes, naming it.
     for architecture in [
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "MistralForCausalLM",
         "MixtralForCausalLM",
+        "GptOssForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
     ] {
-        assert!(has("amd", "*", architecture, "unsupported"), "{v}");
-    }
-    assert!(has("cpu", "*", "*", "experimental"), "{v}");
-    // P5 exit (user decision 2026-09-28): OLMoE with expert × tensor parallelism is refused.
-    let refusals = v["parallel_refusals"]
-        .as_array()
-        .expect("parallel_refusals");
-    assert!(
-        refusals
-            .iter()
-            .any(|r| r["architecture"] == "OlmoeForCausalLM"
-                && r["modes"] == "ep+tp"
+        assert!(
+            rows.iter().any(|r| r["vendor"] == "amd"
+                && r["arch"] == "*"
+                && r["architecture"] == architecture
+                && r["status"] == "experimental"
                 && r["reason"]
                     .as_str()
-                    .is_some_and(|s| s.starts_with("olmoe_ep_tp_drift"))),
-        "{v}"
-    );
+                    .is_some_and(|s| s.contains("phase-7-model-families"))),
+            "{architecture}: {v}"
+        );
+    }
+    assert!(has("cpu", "*", "*", "experimental"), "{v}");
+    // No parallel-mode refusal remains (Phase 7 Task 13).
+    assert_eq!(v["parallel_refusals"], serde_json::json!([]), "{v}");
 
     let out = run(&["--support-matrix"]);
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("vendor "), "{text}");
-    assert_eq!(
-        text.lines().count(),
-        rows.len() + 1 + deferred.len() + refusals.len(),
-        "{text}"
-    );
+    let expected = rows.len() + 1 + deferred.len();
+    assert_eq!(text.lines().count(), expected, "{text}");
 
     // --support-matrix takes no configuration; --output needs --support-matrix.
     let out = run(&["--support-matrix", "--config", "/nonexistent.yaml"]);
@@ -968,13 +960,16 @@ fn check_config_reports_support_row() {
         Some("support: supported (amd/*/*/bf16/bf16/none)")
     );
 
-    // An unsupported row is a configuration error under --check-config too.
-    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    // An unsupported row is a configuration error under --check-config too (an architecture
+    // with no row on amd).
+    set_architecture(dir.path(), UNREGISTERED_ARCH);
     let out = check(&[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("support matrix: amd/*/Qwen3ForCausalLM/bf16/bf16/none is unsupported"),
+        stderr.contains(
+            "support matrix: amd/*/ExampleUnregisteredForCausalLM/bf16/bf16/none is unsupported"
+        ),
         "{stderr}"
     );
     assert!(!String::from_utf8_lossy(&out.stdout).contains("config ok"));
@@ -988,14 +983,17 @@ fn set_architecture(model_dir: &Path, architecture: &str) {
     std::fs::write(&path, v.to_string()).unwrap();
 }
 
+/// An architecture no family registers and no support-matrix row names.
+const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
 /// Phase 2m S-11: a model whose architecture has an `unsupported` row on the configured
 /// backend's vendor is a configuration error — exit 2 before device discovery and before the
-/// port is bound (Phase 8 families stay refused on GPU vendors until their track closes).
+/// port is bound (an architecture with no row on the GPU vendor).
 #[test]
 fn unsupported_row_exits_2_before_bind() {
     let dir = TempDir::new("turbine-server-unsupported-row");
     write_tiny_llama(dir.path(), 5);
-    set_architecture(dir.path(), "Qwen3ForCausalLM");
+    set_architecture(dir.path(), UNREGISTERED_ARCH);
     let port = free_port();
     let cfg = TempConfig::new(
         "unsupported-row",
@@ -1009,11 +1007,8 @@ fn unsupported_row_exits_2_before_bind() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     assert!(stderr.contains("support matrix"), "stderr: {stderr}");
-    assert!(stderr.contains("Qwen3ForCausalLM"), "stderr: {stderr}");
-    assert!(
-        stderr.contains("phase-7-model-families"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(UNREGISTERED_ARCH), "stderr: {stderr}");
+    assert!(stderr.contains("no support-matrix row"), "stderr: {stderr}");
     let logs = format!("{stdout}\n{stderr}");
     assert!(
         !logs.contains("device_discovery"),
@@ -1063,6 +1058,41 @@ fn kv_dtype_tq2_exits_2_before_bind() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(0), "{kv}: stderr: {stderr}");
+    }
+}
+
+/// P7 S-1: a model whose `config.json` sets a real sliding window (Mistral-7B v0.3 with
+/// `sliding_window: 4096`) is refused before the port is bound: exit 2 printing the reason
+/// code `sliding_window_unsupported`, under `--check-config` too. Breaks if the refusal
+/// waits for the model load (exit 1) or loses its reason code.
+#[test]
+fn sliding_window_config_exits_2_before_bind() {
+    let dir = TempDir::new("turbine-server-sliding-window");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../turbine-model/tests/fixtures/mistral-7b-instruct-v0.3/config.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+    v["sliding_window"] = serde_json::json!(4096);
+    std::fs::write(dir.path().join("config.json"), v.to_string()).unwrap();
+    let port = free_port();
+    let cfg = TempConfig::new(
+        "sliding-window",
+        &format!("server:\n  listen: 127.0.0.1:{port}\nexecution:\n  backend: cpu\n"),
+    );
+    let model = format!("model.path={}", dir.path().display());
+    for check in [true, false] {
+        let mut args = vec!["--set", model.as_str()];
+        if check {
+            args.insert(0, "--check-config");
+        }
+        let out = wait_with_timeout(spawn_server(&args, &cfg.path), Duration::from_secs(20));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: stderr: {stderr}");
+        assert!(
+            stderr.contains("sliding_window_unsupported"),
+            "{args:?}: stderr: {stderr}"
+        );
+        TcpListener::bind(("127.0.0.1", port)).expect("the configured port must still be free");
     }
 }
 
@@ -1139,7 +1169,7 @@ fn hermes_config_loads() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
-        stderr.contains("(registered: llama3_json, hermes, mistral)"),
+        stderr.contains("(registered: llama3_json, hermes, mistral, harmony, qwen3_xml)"),
         "{stderr}"
     );
 }

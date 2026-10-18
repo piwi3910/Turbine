@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use turbine_core::registry::{Module, Registry};
+use turbine_core::types::StateLayout;
 use turbine_kernels::{KernelRegistry, OpRequirement};
 use turbine_tensor::DeviceMemory;
 
@@ -20,18 +21,24 @@ use crate::executor::{DecoderSpec, ExecutorLimits, ExecutorOptions, ModelExecuto
 use crate::loader::{LoadedWeights, WeightSlot};
 use crate::testing::tiny::TinySpec;
 
+pub mod gpt_oss;
 pub mod llama;
 pub mod mistral;
 pub mod mixtral;
 pub mod olmoe;
 pub mod qwen3;
+pub mod qwen3_5;
+pub mod qwen3_5_moe;
 pub mod qwen3_moe;
 
+pub use gpt_oss::GptOss;
 pub use llama::{Llama, llama_slots};
 pub use mistral::Mistral;
 pub use mixtral::{Mixtral, mixtral_slots};
 pub use olmoe::{Olmoe, olmoe_slots};
 pub use qwen3::Qwen3;
+pub use qwen3_5::Qwen3_5;
+pub use qwen3_5_moe::Qwen3_5Moe;
 pub use qwen3_moe::Qwen3Moe;
 
 /// One decoder family.
@@ -56,6 +63,11 @@ pub trait ModelFamily: Module {
     /// The tool-call format a null `model.tool_call_parser` resolves to (when the chat template
     /// renders tools).
     fn default_tool_format(&self) -> Option<&'static str>;
+    /// The reasoning parser `model.reasoning_parser: auto` resolves to (Phase 7 S-10); `None`
+    /// for a family without marked reasoning.
+    fn default_reasoning_parser(&self) -> Option<&'static str> {
+        None
+    }
     /// The family's executor over `weights` for batches within `limits`; `registry` must have
     /// been built from [`ModelFamily::requirements`] of the same `cfg`, block size and `opts`.
     fn build_executor(
@@ -74,11 +86,58 @@ pub trait ModelFamily: Module {
     fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
         None
     }
+    /// A chat template (`(name, Jinja source)`) the family substitutes when the checkpoint's own
+    /// template renders neither `tools` nor an assistant turn's `tool_calls` and the operator
+    /// set no `model.chat_template` ([`crate::ChatTemplate::resolve_for`]); `None` (the default):
+    /// the checkpoint's template is always used.
+    fn chat_template_override(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
     /// Writes a tiny synthetic checkpoint of this family into `dir` (weights from a ChaCha8
     /// stream seeded by `seed`; the tiny tokenizer): the checkpoint the family's conformance
     /// suite ([`crate::conformance::families_suite`]) runs on the CPU provider. A test
     /// utility: panics on I/O errors.
     fn write_tiny(&self, dir: &Path, seed: u64) -> TinySpec;
+    /// One kind per layer of `cfg` (P7 S-1). The default: every layer full attention.
+    fn layer_kinds(&self, cfg: &ModelArchConfig) -> Vec<LayerKind> {
+        vec![LayerKind::FullAttention; cfg.num_layers as usize]
+    }
+    /// Whether the family's checkpoints carry Q/K/V/O projection biases (`attention_bias:
+    /// true` in `config.json`): the shared config parser refuses `attention_bias: true` for a
+    /// family that does not (P7 S-8: gpt-oss does). The default: no.
+    fn attention_bias(&self) -> bool {
+        false
+    }
+    /// The per-sequence state `cfg` keeps beside its paged KV (P7 S-1). The default: none.
+    fn state_layout(&self, cfg: &ModelArchConfig) -> StateLayout {
+        let _ = cfg;
+        StateLayout::default()
+    }
+    /// Checkpoint tensor prefixes this family's executor does not load but that the checkpoint
+    /// legitimately ships (e.g. a vision tower or an MTP head the text path ignores): the loader
+    /// counts the tensors and bytes under each prefix and logs one `event="weights_skipped"`
+    /// each, instead of warning `unexpected_tensor` per tensor. The default: none.
+    fn skipped_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// The checkpoint prefix of the text model's parameters (`model`, or Qwen3.5's
+    /// `model.language_model` under the multimodal wrapper): the executor builds the embedding,
+    /// per-layer and final-norm names from it. Slots stacks the family names itself
+    /// ([`ModelFamily::weight_slots`]) are unaffected. The default: `model`.
+    fn text_prefix(&self) -> &'static str {
+        "model"
+    }
+}
+
+/// How one decoder layer mixes tokens (P7 S-1): full causal attention, attention over the last
+/// `window` positions, or a linear-attention (recurrent) layer with per-sequence state and no
+/// paged KV.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum LayerKind {
+    FullAttention,
+    SlidingWindow { window: u32 },
+    LinearAttention,
 }
 
 impl std::fmt::Debug for dyn ModelFamily {
@@ -96,6 +155,24 @@ pub struct FamilyConfig {
     pub qk_norm: bool,
     /// RMSNorm over each Q and K head before RoPE (Qwen3, Qwen3-MoE).
     pub qk_norm_per_head: bool,
+    /// The window of the family's sliding-attention layers ([`LayerKind::SlidingWindow`]):
+    /// `sliding_window` of `config.json`, read by a family whose layers alternate it with full
+    /// attention (gpt-oss); `None` for every other family.
+    pub sliding_window: Option<u32>,
+    /// The Gated DeltaNet dimensions of the family's linear-attention layers
+    /// ([`LayerKind::LinearAttention`], P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<crate::config::GdnDims>,
+    /// Every full-attention layer has a per-head output gate (Qwen3.5, P7 S-11).
+    pub attn_output_gate: bool,
+    /// A fraction of `head_dim` the RoPE rotates (`partial_rotary_factor`, Qwen3.5's 0.25);
+    /// `None` rotates the whole head.
+    pub partial_rotary_factor: Option<f32>,
+    /// The family's RMSNorm weights follow transformers' `output · (1 + weight)` form (Qwen3.5).
+    pub unit_offset_norms: bool,
+    /// A hybrid family's full-attention interval (Qwen3.5's `full_attention_interval`): every
+    /// `n`-th layer is [`LayerKind::FullAttention`] (1-indexed: layers `n − 1`, `2n − 1`, …),
+    /// the rest [`LayerKind::LinearAttention`]. `None` for every attention-only family.
+    pub full_attention_interval: Option<u32>,
 }
 
 /// A registered family as a value of `ModelArchConfig`: equal by name, printed as its name.
@@ -118,7 +195,17 @@ impl std::fmt::Debug for FamilyRef {
 
 static FAMILIES: Registry<dyn ModelFamily> = Registry::new(
     "model_family",
-    &[&Llama, &Olmoe, &Qwen3, &Qwen3Moe, &Mistral, &Mixtral],
+    &[
+        &Llama,
+        &Olmoe,
+        &Qwen3,
+        &Qwen3Moe,
+        &Mistral,
+        &Mixtral,
+        &GptOss,
+        &Qwen3_5,
+        &Qwen3_5Moe,
+    ],
 );
 
 /// Every model family, in the order error messages list them.
@@ -164,6 +251,7 @@ pub(crate) fn experts(
         experts_per_token,
         expert_intermediate,
         norm_topk_prob,
+        shared_inter: None,
     })
 }
 
@@ -206,19 +294,21 @@ fn family_for(name: &str) -> Result<Option<&'static dyn ModelFamily>, ModelError
 }
 
 /// The family of a parsed top-level `config.json` and the object its text-model keys are read
-/// from: `architectures[0]` of the top level (the object is the top level), else of a wrapper's
-/// `text_config` (the object is `text_config`). No registered family, or two claiming the name,
+/// from: `architectures[0]` of the top level, else of a wrapper's `text_config`; the object is
+/// `text_config` whenever the top level has one (P7 S-1), else the top level. No registered
+/// family, or two claiming the name,
 /// is [`ModelError::Unsupported`] naming the top-level `architectures` and the registered
 /// families.
 pub fn resolve(
     top: &serde_json::Value,
 ) -> Result<(&'static dyn ModelFamily, &serde_json::Value), ModelError> {
+    let text_config = top.get("text_config").filter(|t| t.is_object());
     if let Some(name) = single_architecture(top)
         && let Some(family) = family_for(name)?
     {
-        return Ok((family, top));
+        return Ok((family, text_config.unwrap_or(top)));
     }
-    if let Some(text) = top.get("text_config").filter(|t| t.is_object())
+    if let Some(text) = text_config
         && let Some(name) = single_architecture(text)
         && let Some(family) = family_for(name)?
     {
@@ -245,6 +335,9 @@ mod tests {
     use crate::loader::WeightSlot;
     use crate::testing::TempDir;
     use crate::testing::tiny::{write_tiny_llama, write_tiny_olmoe};
+
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
 
     fn config_json(dir: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap()
@@ -287,6 +380,9 @@ mod tests {
             ("qwen3_moe", "Qwen3MoeForCausalLM"),
             ("mistral", "MistralForCausalLM"),
             ("mixtral", "MixtralForCausalLM"),
+            ("gpt_oss", "GptOssForCausalLM"),
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ] {
             assert_eq!(
                 resolve(&json!({"architectures": [hf]})).unwrap().0.name(),
@@ -296,23 +392,147 @@ mod tests {
             assert_eq!(resolve(&nested).unwrap().0.name(), name);
         }
 
-        let err = resolve(&json!({"architectures": ["GptOssForCausalLM"]}))
+        let err = resolve(&json!({"architectures": [UNREGISTERED_ARCH]}))
             .unwrap_err()
             .to_string();
         assert!(
             err.contains(
                 "registered families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 \
                  (Qwen3ForCausalLM), qwen3_moe (Qwen3MoeForCausalLM), mistral \
-                 (MistralForCausalLM), mixtral (MixtralForCausalLM)"
+                 (MistralForCausalLM), mixtral (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), \
+                 qwen3_5 (Qwen3_5ForConditionalGeneration), qwen3_5_moe \
+                 (Qwen3_5MoeForConditionalGeneration)"
             ),
             "{err}"
         );
-        assert!(err.contains("GptOssForCausalLM"), "{err}");
+        assert!(err.contains(UNREGISTERED_ARCH), "{err}");
         let err = resolve(&json!({})).unwrap_err().to_string();
         assert!(
             err.starts_with("unsupported architectures = <missing>;"),
             "{err}"
         );
+    }
+
+    /// The layer kinds and per-sequence state of a raw `config.json`, derived independently of
+    /// the families: `layer_types` when present, else `full_attention_interval` (every n-th layer
+    /// full, the rest linear), else one window (`sliding_window`, unless `use_sliding_window` is
+    /// false) or full attention for every layer. Families without linear layers carry no state.
+    fn expected_kinds_and_state(
+        family: &str,
+        config: &serde_json::Value,
+    ) -> (Vec<LayerKind>, StateLayout) {
+        let text = config
+            .get("text_config")
+            .filter(|t| t.is_object())
+            .unwrap_or(config);
+        let layers = text["num_hidden_layers"].as_u64().unwrap() as usize;
+        let window = text
+            .get("sliding_window")
+            .and_then(|w| w.as_u64())
+            .filter(|_| text.get("use_sliding_window") != Some(&json!(false)))
+            .map(|w| w as u32);
+        let kinds: Vec<LayerKind> = if let Some(types) = text["layer_types"].as_array() {
+            types
+                .iter()
+                .map(|t| match t.as_str().unwrap() {
+                    "full_attention" => LayerKind::FullAttention,
+                    "sliding_attention" => LayerKind::SlidingWindow {
+                        window: window.expect("sliding_attention needs sliding_window"),
+                    },
+                    "linear_attention" => LayerKind::LinearAttention,
+                    other => panic!("{family}: unknown layer type {other}"),
+                })
+                .collect()
+        } else if let Some(n) = text["full_attention_interval"].as_u64() {
+            (0..layers)
+                .map(|i| {
+                    if (i as u64 + 1).is_multiple_of(n) {
+                        LayerKind::FullAttention
+                    } else {
+                        LayerKind::LinearAttention
+                    }
+                })
+                .collect()
+        } else if let Some(window) = window {
+            vec![LayerKind::SlidingWindow { window }; layers]
+        } else {
+            vec![LayerKind::FullAttention; layers]
+        };
+        let linear = kinds
+            .iter()
+            .filter(|k| **k == LayerKind::LinearAttention)
+            .count();
+        let state = if linear == 0 {
+            StateLayout::default()
+        } else {
+            // The Gated DeltaNet state of a hybrid family: the linear layers' dimensions come
+            // from the raw config, the state bytes from them.
+            let k_heads = text["linear_num_key_heads"].as_u64().unwrap();
+            let v_heads = text["linear_num_value_heads"].as_u64().unwrap();
+            let k_dim = text["linear_key_head_dim"].as_u64().unwrap();
+            let v_dim = text["linear_value_head_dim"].as_u64().unwrap();
+            let conv_kernel = text["linear_conv_kernel_dim"].as_u64().unwrap();
+            let conv_dim = 2 * k_heads * k_dim + v_heads * v_dim;
+            StateLayout {
+                linear_layers: linear as u32,
+                recurrent_bytes_per_layer: v_heads * v_dim * k_dim * 4,
+                conv_bytes_per_layer: conv_dim * (conv_kernel - 1) * 2,
+                dtype: Some(turbine_core::types::StateDtype::F32),
+            }
+        };
+        (kinds, state)
+    }
+
+    #[test]
+    fn layer_kinds_and_state_layout() {
+        let tmp = TempDir::new("families-layer-kinds");
+        for family in registry().iter() {
+            let dir = tmp.path().join(family.name());
+            let spec = family.write_tiny(&dir, 7);
+            let cfg = crate::config::load_model_config(&dir).unwrap();
+            assert_eq!(cfg, spec.config, "{}", family.name());
+            let expect = expected_kinds_and_state(family.name(), &config_json(&dir));
+            assert_eq!(cfg.layer_kinds, expect.0, "{}", family.name());
+            assert_eq!(cfg.state, expect.1, "{}", family.name());
+            assert_eq!(
+                cfg.kv_layout(128).num_layers,
+                cfg.attention_layers(),
+                "{}",
+                family.name()
+            );
+            let mut next = 0;
+            for layer in 0..cfg.num_layers {
+                let slot = cfg.kv_layer_index(layer);
+                if cfg.layer_kinds[layer as usize] == LayerKind::LinearAttention {
+                    assert_eq!(slot, None, "{} layer {layer}", family.name());
+                } else {
+                    assert_eq!(slot, Some(next), "{} layer {layer}", family.name());
+                    next += 1;
+                }
+            }
+        }
+
+        // A `text_config`-wrapped copy of the tiny Qwen3 config (`architectures` stays at the
+        // top level) parses to the same `ModelArchConfig`.
+        let dir = tmp.path().join("qwen3");
+        let plain = crate::config::load_model_config(&dir).unwrap();
+        let mut text = config_json(&dir);
+        let architectures = text
+            .as_object_mut()
+            .unwrap()
+            .remove("architectures")
+            .unwrap();
+        let wrapped = json!({
+            "architectures": architectures,
+            "model_type": "qwen3_wrapper",
+            "text_config": text,
+        });
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec_pretty(&wrapped).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(crate::config::load_model_config(&dir).unwrap(), plain);
     }
 
     /// One line per slot: name, shape and, for a slice of a stacked parameter, the stack's name,

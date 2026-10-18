@@ -1,7 +1,8 @@
 //! Hugging Face `config.json` / `generation_config.json` parsing and the allowlist (P1 S-3):
 //! `architectures[0]` must name a registered model family (`crate::families::resolve`, Phase 2m
 //! S-2), whose own keys it parses; the keys every decoder shares are parsed here (and
-//! `attention_bias: true`, which no executor implements, is refused for every family). Anything
+//! `attention_bias: true`, which only gpt-oss's executor implements, is refused for every other
+//! family). Anything
 //! else is refused with the offending field named and the supported set listed.
 //!
 //! The weight-format part of the allowlist is the checkpoint's [`crate::weights::WeightFormat`] (Phase 2m S-10,
@@ -13,11 +14,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use turbine_core::types::{KvLayout, ModelShape};
+use turbine_core::types::{KvLayout, ModelShape, StateLayout};
 
 use crate::ModelError;
 use crate::executor::rope::yarn_attention_factor;
-use crate::families::{FamilyRef, resolve};
+use crate::families::{FamilyRef, LayerKind, resolve};
 use crate::safetensors::SafetensorsIndex;
 use crate::weights::{WeightFormatRef, detect};
 
@@ -89,11 +90,38 @@ pub struct ModelArchConfig {
     /// RMSNorm over each Q and K head (`q_norm` / `k_norm` of `[head_dim]`) before RoPE
     /// (Qwen3, Qwen3-MoE); never together with `qk_norm`.
     pub qk_norm_per_head: bool,
+    /// The window of the sliding-attention layers ([`LayerKind::SlidingWindow`]), for a family
+    /// that alternates them with full attention (gpt-oss, P7 S-8); `None` otherwise.
+    pub sliding_window: Option<u32>,
+    /// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers
+    /// ([`LayerKind::LinearAttention`], P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<GdnDims>,
+    /// Every full-attention layer computes a per-head output gate that multiplies the attention
+    /// output before the O projection (Qwen3.5's `attn_output_gate`, P7 S-11).
+    pub attn_output_gate: bool,
+    /// The rotary dimension: `head_dim`, or a fraction of it for a partial-rotary family
+    /// (`partial_rotary_factor`, Qwen3.5's `head_dim / 4`). The rope op rotates only the first
+    /// `rotary_dim` elements of each head.
+    pub rotary_dim: u32,
+    /// The family's RMSNorm weights follow transformers' `output · (1 + weight)` form (Qwen3.5's
+    /// `Qwen3_5RMSNorm`): the loader adds 1 to them, so the plain `rmsnorm` op applies it
+    /// (`families::ModelFamily::unit_offset_norms`).
+    pub unit_offset_norms: bool,
+    /// A hybrid family's full-attention interval (Qwen3.5): every `n`-th layer is
+    /// [`crate::families::LayerKind::FullAttention`], the rest linear; `None` otherwise. The
+    /// family's [`crate::families::ModelFamily::layer_kinds`] reads it.
+    pub full_attention_interval: Option<u32>,
     /// How the weights are stored and which dtypes weights and activations use.
     pub weight_format: WeightFormatRef,
     /// How the paged KV pool stores K and V (`kv.dtype`, Phase 6a S-13): BF16 as parsed; the
     /// server sets FP8 and its per-layer scales before the executor is built.
     pub kv_cache: crate::kv_scales::KvCache,
+    /// One kind per layer ([`crate::families::ModelFamily::layer_kinds`], P7 S-1): only the
+    /// attention layers (every kind but `LinearAttention`) have a slot in the paged KV.
+    pub layer_kinds: Vec<LayerKind>,
+    /// The per-sequence state beside the paged KV
+    /// ([`crate::families::ModelFamily::state_layout`]); empty for every attention-only family.
+    pub state: StateLayout,
 }
 
 /// Per-layer mixture of experts: a router picks `experts_per_token` of `num_experts` SwiGLU
@@ -106,6 +134,51 @@ pub struct MoeConfig {
     pub expert_intermediate: u32,
     /// Renormalise the selected top-k softmax weights to sum to 1 (`false` for OLMoE).
     pub norm_topk_prob: bool,
+    /// Width of the shared expert added to every token (`shared_expert_intermediate_size`,
+    /// Qwen3.5/3.6 MoE, P7 S-11); `None` for a family without one.
+    pub shared_inter: Option<u32>,
+}
+
+/// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers (P7 S-11):
+/// `k_heads` key heads of `k_dim` and `v_heads` value heads of `v_dim` (each value head reads
+/// key head `h / (v_heads / k_heads)`), and a causal depthwise convolution of the concatenated
+/// `q | k | v` channels with window `conv_kernel` (`TURBINE_ABI` supports 4).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GdnDims {
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    pub conv_kernel: u32,
+}
+
+impl GdnDims {
+    /// Elements of the key projection (`k_heads · k_dim`), and of the `q` and `k` blocks of the
+    /// convolution.
+    pub fn key_dim(&self) -> usize {
+        self.k_heads as usize * self.k_dim as usize
+    }
+
+    /// Elements of the value projection (`v_heads · v_dim`), and of the `v` block.
+    pub fn value_dim(&self) -> usize {
+        self.v_heads as usize * self.v_dim as usize
+    }
+
+    /// The convolution's channels: `2 · key_dim + value_dim` (`q | k | v`).
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+
+    /// F32 bytes of one sequence's recurrent state (`v_heads · v_dim · k_dim`).
+    pub fn recurrent_bytes(&self) -> u64 {
+        (self.v_heads as u64) * (self.v_dim as u64) * (self.k_dim as u64) * 4
+    }
+
+    /// Bytes of one sequence's convolution state (`conv_dim · (conv_kernel − 1)`, activation
+    /// dtype: 2 bytes BF16).
+    pub fn conv_bytes(&self) -> u64 {
+        (self.conv_dim() as u64) * (self.conv_kernel.saturating_sub(1) as u64) * 2
+    }
 }
 
 /// `generation_config.json`: EOS ids, BOS and the model's suggested sampling defaults.
@@ -126,6 +199,7 @@ const TRANSFORMERS_DEFAULT_THETA: &[(&str, f64)] = &[
     ("llama", 10_000.0),
     ("mistral", 10_000.0),
     ("mixtral", 1_000_000.0),
+    ("gpt_oss", 150_000.0),
     ("olmoe", 10_000.0),
     ("qwen3", 10_000.0),
     ("qwen3_moe", 10_000.0),
@@ -267,11 +341,33 @@ impl ModelArchConfig {
         canonical_json(&value)
     }
 
-    /// Per-token K and V of every layer in the [`ModelArchConfig::kv_cache`] dtype (BF16, or
-    /// FP8 e4m3 under `kv.dtype: fp8_e4m3`), in blocks of `block_tokens` tokens.
+    /// The layers with a slot in the paged KV: every layer kind but `LinearAttention`.
+    pub fn attention_layers(&self) -> u32 {
+        self.layer_kinds
+            .iter()
+            .filter(|k| **k != LayerKind::LinearAttention)
+            .count() as u32
+    }
+
+    /// The paged-KV slot of `layer`: its index among the attention layers; `None` for a
+    /// linear-attention layer (or a layer past the model's last).
+    pub fn kv_layer_index(&self, layer: u32) -> Option<u32> {
+        let kinds = self.layer_kinds.get(..=layer as usize)?;
+        let (last, before) = kinds.split_last()?;
+        (*last != LayerKind::LinearAttention).then(|| {
+            before
+                .iter()
+                .filter(|k| **k != LayerKind::LinearAttention)
+                .count() as u32
+        })
+    }
+
+    /// Per-token K and V of every attention layer ([`ModelArchConfig::attention_layers`]) in the
+    /// [`ModelArchConfig::kv_cache`] dtype (BF16, or FP8 e4m3 under `kv.dtype: fp8_e4m3`), in
+    /// blocks of `block_tokens` tokens.
     pub fn kv_layout(&self, block_tokens: u32) -> KvLayout {
         KvLayout {
-            num_layers: self.num_layers,
+            num_layers: self.attention_layers(),
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
             dtype: self.kv_cache.dtype,
@@ -309,6 +405,12 @@ impl ModelArchConfig {
         for base in &self.family.0.weight_slots(self) {
             for slot in format.slots(base) {
                 if let Some(entry) = index.get(&slot.name) {
+                    // A `float32_stored` slot (Qwen3.5's `linear_attn.norm.weight`, `A_log`,
+                    // `dt_bias`) may be F32 instead of the format's dtype; the loader converts
+                    // it on load ([`crate::loader`]), so it is not a dtype violation here either.
+                    if slot.float32_stored && entry.dtype == crate::safetensors::Dtype::F32 {
+                        continue;
+                    }
                     format.check_tensor(entry)?;
                 }
             }
@@ -366,7 +468,10 @@ struct RawConfig {
     num_key_value_heads: Option<u32>,
     #[serde(default)]
     head_dim: Option<u32>,
-    intermediate_size: u32,
+    /// The dense MLP's width. A mixture of experts may omit it (Qwen3.6 MoE carries only
+    /// `moe_intermediate_size`); the family's expert width is then the model's.
+    #[serde(default)]
+    intermediate_size: Option<u32>,
     rms_norm_eps: f32,
     #[serde(default)]
     rope_theta: Option<f64>,
@@ -382,7 +487,8 @@ struct RawConfig {
     max_position_embeddings: u32,
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
-    /// Biased Q/K/V/O projections; no executor implements them (refused for every family).
+    /// Biased Q/K/V/O projections; refused unless the family adds them
+    /// ([`crate::families::ModelFamily::attention_bias`]).
     #[serde(default)]
     attention_bias: Option<bool>,
 }
@@ -407,6 +513,21 @@ struct RawLlama3Scaling {
     low_freq_factor: f64,
     high_freq_factor: f64,
     original_max_position_embeddings: u32,
+}
+
+/// The reason code of a refused sliding window (P7 S-1).
+pub const SLIDING_WINDOW_UNSUPPORTED: &str = "sliding_window_unsupported";
+
+/// The reason code of a [`ModelError::Unsupported`] refusal of `field`, when it has one: the
+/// sliding-window keys (`sliding_window`, `use_sliding_window`) carry
+/// [`SLIDING_WINDOW_UNSUPPORTED`].
+pub(crate) fn reason_code(field: &str) -> Option<&'static str> {
+    matches!(field, "sliding_window" | "use_sliding_window").then_some(SLIDING_WINDOW_UNSUPPORTED)
+}
+
+/// `"<code>: "` for a refusal with a reason code, else empty (the head of its message).
+pub(crate) fn reason_prefix(field: &str) -> String {
+    reason_code(field).map_or_else(String::new, |code| format!("{code}: "))
 }
 
 pub(crate) fn unsupported(field: &str, value: impl Into<String>, supported: &str) -> ModelError {
@@ -459,10 +580,14 @@ pub fn load_model_config_with(
         detail,
     };
 
+    // `text` is `text_config` when the top level has one (P7 S-1); `architectures[0]` is the
+    // top level's when it names the family, else `text_config`'s.
     let (family, text) = resolve(&top)?;
-    let hf_architecture = text["architectures"][0]
-        .as_str()
-        .expect("resolve matched a string")
+    let hf_architecture = [&top, text]
+        .into_iter()
+        .filter_map(|v| v["architectures"][0].as_str())
+        .find(|name| family.hf_architectures().contains(name))
+        .expect("resolve matched a registered name")
         .to_string();
     let raw = RawConfig::deserialize(text).map_err(|e| invalid(format!("invalid JSON: {e}")))?;
     let weight_format = WeightFormatRef(detect(&top)?);
@@ -489,7 +614,9 @@ pub fn load_model_config_with(
         ("num_hidden_layers", raw.num_hidden_layers),
         ("hidden_size", raw.hidden_size),
         ("head_dim", head_dim),
-        ("intermediate_size", raw.intermediate_size),
+        // A mixture of experts may omit `intermediate_size` (Qwen3.6 MoE carries only
+        // `moe_intermediate_size`); its value is resolved from the family below.
+        ("intermediate_size", raw.intermediate_size.unwrap_or(1)),
         ("vocab_size", raw.vocab_size),
         ("max_position_embeddings", raw.max_position_embeddings),
     ] {
@@ -539,7 +666,8 @@ pub fn load_model_config_with(
         )));
     }
 
-    if raw.attention_bias == Some(true) {
+    // Biased Q/K/V/O projections: only a family whose executor adds them (gpt-oss) takes them.
+    if raw.attention_bias == Some(true) && !family.attention_bias() {
         return Err(unsupported("attention_bias", "true", "false"));
     }
 
@@ -551,9 +679,12 @@ pub fn load_model_config_with(
 
     // A mixture of experts reports its experts' width as the model's intermediate size
     // (Qwen3-MoE's dense `intermediate_size` is unused; OLMoE's and Mixtral's are the experts').
-    let intermediate = family_cfg
-        .moe
-        .map_or(raw.intermediate_size, |m| m.expert_intermediate);
+    // Qwen3.6 MoE omits `intermediate_size` entirely: the family's expert width is the model's.
+    let intermediate = match (family_cfg.moe, raw.intermediate_size) {
+        (Some(m), _) => m.expert_intermediate,
+        (None, Some(dense)) => dense,
+        (None, None) => return Err(invalid("missing field `intermediate_size`".to_string())),
+    };
     // Every weight size and offset (slots, stacks, buffers, the total in `shape`) is computed in
     // `usize` from these dimensions: refuse a config whose weights could not be addressed at 4
     // bytes per element (an upper bound on every model's parameters, so nothing below can wrap).
@@ -603,7 +734,27 @@ pub fn load_model_config_with(
     };
     let eos_token_ids = load_eos(dir, raw.eos_token_id, &config_path)?;
 
-    Ok(ModelArchConfig {
+    // Part Rotary: `rotary_dim` is `head_dim` unless the family names a `partial_rotary_factor`.
+    let rotary_dim = match family_cfg.partial_rotary_factor {
+        None => head_dim,
+        Some(f) => {
+            if !(f.is_finite() && f > 0.0 && f <= 1.0) {
+                return Err(invalid(format!(
+                    "partial_rotary_factor {f} must be in (0, 1]"
+                )));
+            }
+            let d = (f64::from(head_dim) * f64::from(f)).round() as u32;
+            if d == 0 || !d.is_multiple_of(2) || d > head_dim {
+                return Err(invalid(format!(
+                    "partial_rotary_factor {f} of head_dim {head_dim} gives an invalid \
+                     rotary_dim {d} (positive, even, at most head_dim)"
+                )));
+            }
+            d
+        }
+    };
+
+    let mut cfg = ModelArchConfig {
         family: FamilyRef(family),
         hf_architecture,
         num_layers: raw.num_hidden_layers,
@@ -622,9 +773,28 @@ pub fn load_model_config_with(
         moe: family_cfg.moe,
         qk_norm: family_cfg.qk_norm,
         qk_norm_per_head: family_cfg.qk_norm_per_head,
+        sliding_window: family_cfg.sliding_window,
+        gdn: family_cfg.gdn,
+        attn_output_gate: family_cfg.attn_output_gate,
+        rotary_dim,
+        unit_offset_norms: family_cfg.unit_offset_norms,
+        full_attention_interval: family_cfg.full_attention_interval,
         weight_format,
         kv_cache: crate::kv_scales::KvCache::bf16(),
-    })
+        layer_kinds: Vec::new(),
+        state: StateLayout::default(),
+    };
+    cfg.layer_kinds = family.layer_kinds(&cfg);
+    if cfg.layer_kinds.len() != cfg.num_layers as usize {
+        return Err(invalid(format!(
+            "family {} reports {} layer kinds for num_hidden_layers {}",
+            family.name(),
+            cfg.layer_kinds.len(),
+            cfg.num_layers
+        )));
+    }
+    cfg.state = family.state_layout(&cfg);
+    Ok(cfg)
 }
 
 /// transformers 5's `rope_parameters` split into its `rope_theta` and its scaling entry: the
@@ -862,6 +1032,9 @@ mod tests {
     use crate::testing::TempDir;
     use crate::testing::tiny::write_tiny_llama;
 
+    /// An architecture no family registers.
+    const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
+
     fn fixture_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llama-3.2-3b-instruct")
     }
@@ -975,6 +1148,7 @@ mod tests {
                 experts_per_token: 8,
                 expert_intermediate: 1024,
                 norm_topk_prob: false,
+                shared_inter: None,
             })
         );
         assert!(cfg.qk_norm);
@@ -1215,18 +1389,57 @@ mod tests {
         ::safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
     }
 
+    /// Rewrites the BF16 tensor `name` of `dir`'s `model.safetensors` as F32 (each BF16 value
+    /// widened), the shape unchanged.
+    fn rewrite_as_f32(dir: &Path, index: &SafetensorsIndex, name: &str) {
+        use ::safetensors::Dtype;
+        use ::safetensors::tensor::TensorView;
+        let file = fs::read(dir.join("model.safetensors")).unwrap();
+        let tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = index
+            .entries()
+            .map(|e| {
+                let bytes = &file[e.range.start as usize..e.range.end as usize];
+                if e.name == name {
+                    let f32_bytes: Vec<u8> = bytes
+                        .chunks_exact(2)
+                        .flat_map(|b| {
+                            half::bf16::from_le_bytes([b[0], b[1]])
+                                .to_f32()
+                                .to_le_bytes()
+                        })
+                        .collect();
+                    (e.name.clone(), Dtype::F32, e.shape.clone(), f32_bytes)
+                } else {
+                    (e.name.clone(), e.dtype, e.shape.clone(), bytes.to_vec())
+                }
+            })
+            .collect();
+        let views: Vec<(String, TensorView<'_>)> = tensors
+            .iter()
+            .map(|(n, dtype, shape, data)| {
+                (
+                    n.clone(),
+                    TensorView::new(*dtype, shape.clone(), data).unwrap(),
+                )
+            })
+            .collect();
+        ::safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+    }
+
     #[test]
     fn rejects_unsupported() {
-        let dir = edited_config("gpt-oss", |v| {
-            v["architectures"] = serde_json::json!(["GptOssForCausalLM"]);
+        let dir = edited_config("unregistered", |v| {
+            v["architectures"] = serde_json::json!([UNREGISTERED_ARCH]);
         });
         let err = load_model_config(&dir).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unsupported architectures = GptOssForCausalLM; supported: registered families: \
-             llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
+            "unsupported architectures = ExampleUnregisteredForCausalLM; supported: registered \
+             families: llama (LlamaForCausalLM), olmoe (OlmoeForCausalLM), qwen3 (Qwen3ForCausalLM), \
              qwen3_moe (Qwen3MoeForCausalLM), mistral (MistralForCausalLM), mixtral \
-             (MixtralForCausalLM)"
+             (MixtralForCausalLM), gpt_oss (GptOssForCausalLM), qwen3_5 \
+             (Qwen3_5ForConditionalGeneration), qwen3_5_moe \
+             (Qwen3_5MoeForConditionalGeneration)"
         );
         fs::remove_dir_all(dir).unwrap();
 
@@ -1290,6 +1503,42 @@ mod tests {
             ("rope_scaling.rope_type", "dynamic", "default, llama3, yarn")
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Phase 7 Task 35: a `float32_stored` slot (Qwen3.5's Gated DeltaNet `linear_attn.norm.weight`,
+    /// `A_log`, `dt_bias`) may be F32 in the released checkpoint — transformers casts it to the
+    /// model dtype, and the loader converts it on load — so `check_supported_weights` accepts F32
+    /// there while a plain BF16 layer still rejects it. Breaks if the exemption is dropped from
+    /// the startup check (the real Qwen3.5-9B checkpoint then refuses with
+    /// `unsupported tensor dtype = F32 (…linear_attn.norm.weight)`).
+    #[test]
+    fn float32_stored_slots_accept_f32() {
+        let tiny = TempDir::new("config-f32-norm");
+        let spec = crate::testing::tiny::write_tiny_qwen3_5(tiny.path(), 5);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        spec.config.check_supported_weights(&index).unwrap();
+        let name_of = |suffix: &str| {
+            index
+                .entries()
+                .map(|e| e.name.clone())
+                .find(|n| n.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no tensor ending in {suffix}"))
+        };
+        let norm = name_of(".linear_attn.norm.weight");
+        rewrite_as_f32(tiny.path(), &index, &norm);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        assert_eq!(index.get(&norm).unwrap().dtype, ::safetensors::Dtype::F32);
+        spec.config
+            .check_supported_weights(&index)
+            .expect("an F32 Gated DeltaNet norm weight is converted on load");
+
+        // A non-`float32_stored` layer stays BF16-only.
+        let proj = name_of(".linear_attn.in_proj_z.weight");
+        rewrite_as_f32(tiny.path(), &index, &proj);
+        let index = SafetensorsIndex::open(tiny.path()).unwrap();
+        let err = spec.config.check_supported_weights(&index).unwrap_err();
+        assert!(err.to_string().contains(&proj), "{err}");
+        assert_eq!(unsupported(err).0, "tensor dtype");
     }
 
     /// The committed transformers values (`tests/fixtures/yarn_params.json`, written by
@@ -1897,6 +2146,7 @@ mod tests {
                 experts_per_token: 8,
                 expert_intermediate: 768,
                 norm_topk_prob: true,
+                shared_inter: None,
             })
         );
         // The experts' width, not the unused dense intermediate_size (6144).
@@ -1925,6 +2175,7 @@ mod tests {
                 experts_per_token: 2,
                 expert_intermediate: 14_336,
                 norm_topk_prob: true,
+                shared_inter: None,
             })
         );
         assert!(!mixtral.qk_norm_per_head && !mixtral.qk_norm);
@@ -1933,10 +2184,56 @@ mod tests {
             mixtral.kv_layout(128).block_bytes(),
             128 * 2 * 8 * 128 * 2 * 32
         );
+
+        // The Phase 7 Qwen3.6 MoE hybrid (S-11): the dense Qwen3.5 layer stack (Gated DeltaNet
+        // + gated full attention, `full_attention_interval` 4) with a 256-expert MoE and a
+        // shared expert, from the pinned FP8 checkpoint's real `config.json`.
+        let qwen35moe = load_model_config(&family_fixture("qwen3.6-35b-a3b-fp8")).unwrap();
+        assert_eq!(qwen35moe.family.0.name(), "qwen3_5_moe");
+        assert_eq!(
+            qwen35moe.hf_architecture,
+            "Qwen3_5MoeForConditionalGeneration"
+        );
+        assert_eq!((qwen35moe.num_layers, qwen35moe.hidden), (40, 2048));
+        assert_eq!(
+            (
+                qwen35moe.num_attention_heads,
+                qwen35moe.num_kv_heads,
+                qwen35moe.head_dim
+            ),
+            (16, 2, 256)
+        );
+        assert_eq!(
+            qwen35moe.moe,
+            Some(MoeConfig {
+                num_experts: 256,
+                experts_per_token: 8,
+                expert_intermediate: 512,
+                norm_topk_prob: true,
+                shared_inter: Some(512),
+            })
+        );
+        assert_eq!(
+            qwen35moe.gdn,
+            Some(crate::config::GdnDims {
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+            })
+        );
+        assert_eq!(qwen35moe.full_attention_interval, Some(4));
+        assert!(qwen35moe.attn_output_gate && qwen35moe.unit_offset_norms);
+        assert!(qwen35moe.qk_norm_per_head && !qwen35moe.qk_norm);
+        assert!(!qwen35moe.tie_word_embeddings);
+        assert_eq!(qwen35moe.vocab_size, 248_320);
+        assert_eq!(qwen35moe.rope_theta, 10_000_000.0);
+        assert_eq!(qwen35moe.rotary_dim, 64);
     }
 
-    /// Features no executor implements are refused naming the key (open Phase 8 decisions,
-    /// kept as the run-ahead has them): sliding windows (Mistral, Mixtral, Qwen3), partially
+    /// Features no executor implements are refused naming the key (kept as the run-ahead
+    /// has them): sliding windows (Mistral, Mixtral, Qwen3), partially
     /// dense Qwen3-MoE layers; missing expert keys are malformed.
     #[test]
     fn rejects_unsupported_family_features() {

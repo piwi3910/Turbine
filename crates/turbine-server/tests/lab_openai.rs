@@ -796,6 +796,284 @@ fn tools_and_json_schema() {
     );
 }
 
+/// The `host:port` of `TURBINE_LAB_URL` (`http://<host>:<port>`, an already running lab
+/// server); panics when it is unset or not of that shape (a lab test never skips).
+fn lab_url_addr() -> SocketAddr {
+    let url = std::env::var("TURBINE_LAB_URL").unwrap_or_else(|_| {
+        panic!("TURBINE_LAB_URL is not set; point it at the served model, e.g. http://192.168.10.203:18000")
+    });
+    let rest = url
+        .strip_prefix("http://")
+        .unwrap_or_else(|| panic!("TURBINE_LAB_URL={url}: only http:// URLs"));
+    rest.trim_end_matches('/')
+        .parse()
+        .unwrap_or_else(|e| panic!("TURBINE_LAB_URL={url}: not http://<ip>:<port> ({e})"))
+}
+
+/// One chat completion against `addr`; the response JSON (panics on a non-200 answer).
+fn lab_chat(addr: SocketAddr, body: &Value) -> Value {
+    let (status, text) = request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&body.to_string()),
+    );
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("response is not JSON ({e}): {text}"))
+}
+
+/// P7 S-6: the `mistral` tool round trip on a served Mistral-7B-Instruct-v0.3
+/// (`scripts/lab-serve.sh novanas scripts/lab/phase7-novanas-mistral-7b.yaml`, then
+/// `TURBINE_LAB_URL=http://192.168.10.203:18000 scripts/remote-cargo.sh test -p turbine-server
+/// --test lab_openai mistral_tool_call_round_trip -- --ignored`). A `tools` request with
+/// `tool_choice: "required"` returns exactly one call, `get_weather`, whose arguments are a JSON
+/// object with a `location`; sending that call back as the assistant turn plus a `tool` result
+/// (the call's id: the v0.3 template refuses any id that is not 9 characters) yields a
+/// non-empty assistant `content`. Breaks if the format's grammar, parser or call ids, or the
+/// rendering of `tool_calls` and `tool` messages through Mistral's template, are wrong.
+#[test]
+#[ignore = "lab: needs a served Mistral-7B-Instruct-v0.3 at TURBINE_LAB_URL"]
+fn mistral_tool_call_round_trip() {
+    let addr = lab_url_addr();
+    let (status, models) = request(addr, "GET", "/v1/models", None);
+    assert_eq!(status, 200, "{models}");
+    let models: Value = serde_json::from_str(&models).expect("models JSON");
+    let model = models["data"][0]["id"]
+        .as_str()
+        .expect("a served model")
+        .to_string();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city, e.g. Paris"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["location"]
+            }
+        }
+    }]);
+    let user = json!({"role": "user", "content": "What is the weather like in Paris today?"});
+    let first = lab_chat(
+        addr,
+        &json!({
+            "model": model, "messages": [user], "tools": tools, "tool_choice": "required",
+            "temperature": 0.0, "max_tokens": 128
+        }),
+    );
+    println!("first: {first}");
+    let choice = &first["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{first}");
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool_calls: {first}"));
+    assert_eq!(calls.len(), 1, "{first}");
+    let call = &calls[0];
+    assert_eq!(call["type"], "function", "{call}");
+    assert_eq!(call["function"]["name"], "get_weather", "{call}");
+    let arguments: Value = serde_json::from_str(
+        call["function"]["arguments"]
+            .as_str()
+            .expect("arguments string"),
+    )
+    .unwrap_or_else(|e| panic!("arguments are not JSON ({e}): {call}"));
+    assert!(
+        arguments["location"]
+            .as_str()
+            .is_some_and(|l| !l.is_empty()),
+        "arguments without a location: {arguments}"
+    );
+    let id = call["id"].as_str().expect("call id");
+
+    let second = lab_chat(
+        addr,
+        &json!({
+            "model": model,
+            "messages": [
+                user,
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": id,
+                 "content": "{\"temperature\": 18, \"unit\": \"celsius\", \"sky\": \"sunny\"}"}
+            ],
+            "tools": tools, "temperature": 0.0, "max_tokens": 128
+        }),
+    );
+    println!("second: {second}");
+    let message = &second["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or("");
+    assert!(
+        !content.trim().is_empty(),
+        "no assistant content after the tool result: {second}"
+    );
+    assert!(
+        message["tool_calls"]
+            .as_array()
+            .is_none_or(|c| c.is_empty()),
+        "{second}"
+    );
+}
+
+/// P7 S-9: the Harmony channels against a served gpt-oss (`scripts/lab-serve.sh novanas
+/// scripts/lab/phase7-novanas-gpt-oss-20b.yaml`, then `TURBINE_LAB_URL=http://192.168.10.203:18000
+/// scripts/remote-cargo.sh test -p turbine-server --test lab_openai harmony_channels -- --ignored`).
+/// A plain question yields non-empty `reasoning_content` and `content`; a `tool_choice:
+/// "required"` request yields one `get_weather` call with JSON arguments; with the same seed
+/// and `temperature: 0` the streamed `reasoning_content` / `content` deltas concatenate to the
+/// non-streamed text; an `n: 2` stream carries each choice's own channels; and
+/// `reasoning_effort: "extreme"` is a 400 naming the field. Breaks if the marker emission
+/// (P7 decision "Harmony marker visibility"), the channel parser, the tool parser or the
+/// `reasoning_content` plumbing is wrong. Runs in Task 26.
+#[test]
+#[ignore = "lab: needs a served gpt-oss at TURBINE_LAB_URL"]
+fn harmony_channels() {
+    let addr = lab_url_addr();
+    let (status, models) = request(addr, "GET", "/v1/models", None);
+    assert_eq!(status, 200, "{models}");
+    let models: Value = serde_json::from_str(&models).expect("models JSON");
+    let model = models["data"][0]["id"]
+        .as_str()
+        .expect("a served model")
+        .to_string();
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a given location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "The city, e.g. Paris"}
+                },
+                "required": ["location"]
+            }
+        }
+    }]);
+    let user = json!({"role": "user", "content": "What is the capital of France? Answer briefly."});
+
+    // A plain question: both channels non-empty.
+    let base = json!({
+        "model": model, "messages": [user.clone()], "temperature": 0.0, "seed": 7,
+        "max_tokens": 256
+    });
+    let answer = lab_chat(addr, &base);
+    let message = &answer["choices"][0]["message"];
+    let reasoning = message["reasoning_content"].as_str().unwrap_or_default();
+    let content = message["content"].as_str().unwrap_or_default();
+    assert!(!reasoning.trim().is_empty(), "no reasoning: {answer}");
+    assert!(!content.trim().is_empty(), "no content: {answer}");
+    assert!(
+        !content.contains("<|channel|>"),
+        "channel markers leaked into content: {answer}"
+    );
+
+    // The same request streamed: the deltas concatenate to the non-streamed text.
+    let mut streamed_body = base.clone();
+    streamed_body["stream"] = json!(true);
+    let (_, sse) = request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&streamed_body.to_string()),
+    );
+    let mut streamed_reasoning = String::new();
+    let mut streamed_content = String::new();
+    for line in sse.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(text) = delta["reasoning_content"].as_str() {
+            streamed_reasoning.push_str(text);
+        }
+        if let Some(text) = delta["content"].as_str() {
+            streamed_content.push_str(text);
+        }
+    }
+    assert_eq!(streamed_reasoning, reasoning, "streamed reasoning differs");
+    assert_eq!(streamed_content, content, "streamed content differs");
+
+    // `tool_choice: "required"`: one get_weather call with JSON arguments.
+    let call_body = json!({
+        "model": model,
+        "messages": [json!({"role": "user",
+                            "content": "What is the weather like in Paris today?"})],
+        "tools": tools, "tool_choice": "required", "temperature": 0.0, "max_tokens": 256
+    });
+    let called = lab_chat(addr, &call_body);
+    let choice = &called["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{called}");
+    let calls = choice["message"]["tool_calls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool_calls: {called}"));
+    assert_eq!(calls.len(), 1, "{called}");
+    assert_eq!(calls[0]["function"]["name"], "get_weather", "{called}");
+    serde_json::from_str::<Value>(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments string"),
+    )
+    .unwrap_or_else(|e| panic!("arguments are not JSON ({e}): {called}"));
+
+    // `n: 2`: both choices stream their own channels.
+    let mut both = base.clone();
+    both["n"] = json!(2);
+    both["stream"] = json!(true);
+    let (_, sse) = request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&both.to_string()),
+    );
+    let mut channels: BTreeMap<u32, (String, String)> = BTreeMap::new();
+    for line in sse.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(choice) = chunk["choices"][0]["index"].as_u64() else {
+            continue;
+        };
+        let entry = channels
+            .entry(u32::try_from(choice).expect("u32 choice"))
+            .or_default();
+        if let Some(text) = chunk["choices"][0]["delta"]["reasoning_content"].as_str() {
+            entry.0.push_str(text);
+        }
+        if let Some(text) = chunk["choices"][0]["delta"]["content"].as_str() {
+            entry.1.push_str(text);
+        }
+    }
+    assert_eq!(channels.len(), 2, "expected both choices: {channels:?}");
+    for (choice, (reasoning, content)) in &channels {
+        assert!(
+            !reasoning.trim().is_empty(),
+            "choice {choice}: no reasoning"
+        );
+        assert!(!content.trim().is_empty(), "choice {choice}: no content");
+    }
+
+    // `reasoning_effort: "extreme"` is a 400 naming the field.
+    let mut extreme = base.clone();
+    extreme["reasoning_effort"] = json!("extreme");
+    let (status, text) = request(
+        addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&extreme.to_string()),
+    );
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("reasoning_effort"), "{text}");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Always-run checks of the fixture and of the response checks.
 

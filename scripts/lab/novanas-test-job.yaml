@@ -200,6 +200,24 @@ spec:
             # OLMoE-1B-7B weights for the Phase 2 MoE tests.
             - name: TURBINE_TEST_MOE_MODEL_DIR
               value: /models/olmoe-1b-7b-0125-instruct
+            # Qwen3-4B-Instruct-2507 weights for the Phase 7 Qwen3 trace (golden
+            # hip_trace_vs_cpu_qwen3, a release-build test).
+            - name: TURBINE_TEST_QWEN3_MODEL_DIR
+              value: /models/qwen3-4b-instruct-2507
+            # gpt-oss-20b weights for the Phase 7 gpt-oss trace (golden
+            # hip_trace_vs_cpu_gpt_oss, a release-build test).
+            - name: TURBINE_TEST_GPT_OSS_MODEL_DIR
+              value: /models/gpt-oss-20b
+            # Qwen3-30B-A3B-Instruct-2507-FP8 weights for the Phase 7 Qwen3-MoE trace
+            # (golden hip_trace_vs_cpu_qwen3moe, a two-GPU release-build test).
+            - name: TURBINE_TEST_QWEN3MOE_MODEL_DIR
+              value: /models/qwen3-30b-a3b-instruct-2507-fp8
+            # MXFP4-A16 8B weights and the committed p05 transformers trace for the Phase 7 Task 28
+            # diagnostic (golden mxfp4_cpu_vs_transformers_p05, a release-build test).
+            - name: TURBINE_TEST_MXFP4_MODEL_DIR
+              value: /models/llama-3.1-8b-instruct-mxfp4a16
+            - name: TURBINE_P05_TRACE
+              value: tests/golden/llama-3.1-8b-instruct-mxfp4a16/p05-trace.json
             - name: UV_VERSION
               value: 0.11.2
             - name: UV_INSTALL_DIR

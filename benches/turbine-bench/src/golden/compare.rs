@@ -193,7 +193,9 @@ impl CompareReport {
             self.prompts_passing,
             self.prompts_total,
             self.tolerance.min_prompts_passing,
-            if self.logprob_bounds.batched {
+            if self.logprob_bounds.multi_gpu {
+                "multi-GPU"
+            } else if self.logprob_bounds.batched {
                 "batched"
             } else {
                 "strict"
@@ -224,6 +226,8 @@ mod tests {
             margin_nats: 0.5,
             max_abs_logprob_diff_likely_batched: None,
             max_abs_logprob_diff_tail_batched: None,
+            max_abs_logprob_diff_likely_multi_gpu: None,
+            max_abs_logprob_diff_tail_multi_gpu: None,
         }
     }
 

@@ -72,6 +72,7 @@ impl StreamState {
                 logprob,
                 top_logprobs,
             }) => self.token(choice, text, token_id, logprob, top_logprobs),
+            Some(GenerationEvent::Reasoning { choice, text }) => self.reasoning(choice, text),
             Some(GenerationEvent::ToolCalls { choice, calls }) => self.tool_calls(choice, calls),
             Some(GenerationEvent::Finished {
                 choice,
@@ -126,6 +127,19 @@ impl StreamState {
             Value::String(text)
         };
         Ok(vec![self.chunk(i, content, None)])
+    }
+
+    /// Chat: one `delta.reasoning_content` chunk (P7 S-10). Completions have no reasoning.
+    fn reasoning(&mut self, choice: u32, text: String) -> Result<Vec<Event>, ApiError> {
+        let i = self.index(choice)?;
+        if !self.ctx.chat() || text.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![self.chunk(
+            i,
+            json!({ "reasoning_content": text }),
+            None,
+        )])
     }
 
     /// Chat: one chunk per call, in call order. Completions have no tool calls.

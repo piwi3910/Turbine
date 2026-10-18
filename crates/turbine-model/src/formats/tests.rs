@@ -11,6 +11,7 @@ use turbine_core::registry::Module;
 use super::*;
 use crate::structured::GrammarLimits;
 use crate::structured::tests::feed_text;
+use crate::structured::{TokenMask, step_mask};
 use crate::testing::TempDir;
 use crate::testing::tiny::{PYTHON_TAG as TINY_PYTHON_TAG, TINY_EOS, write_tiny_llama};
 use crate::tools::{ToolCallOut, ToolCallParser, ToolChoice, ToolParse, tool_call_grammar};
@@ -38,7 +39,10 @@ fn weather_tools() -> Vec<Value> {
                 "required": ["location"]
             }
         }}),
-        json!({"type": "function", "function": {"name": "get_time"}}),
+        // The description keeps gpt-oss's real template (which renders `tool.description`)
+        // able to render the fixture.
+        json!({"type": "function", "function": {"name": "get_time",
+            "description": "Get the current time."}}),
     ]
 }
 
@@ -73,7 +77,14 @@ fn names_and_args(parse: ToolParse) -> Vec<(String, String)> {
                     i,
                 )| {
                     assert_eq!(index, i);
-                    assert!(id.starts_with("call_") && id.len() == 29, "{id}");
+                    // `call_` + 24 alphanumerics, or the 9 of the `mistral` format.
+                    let alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+                    assert!(
+                        id.strip_prefix("call_")
+                            .is_some_and(|rest| rest.len() == 24 && alnum(rest))
+                            || (id.len() == 9 && alnum(&id)),
+                        "{id}"
+                    );
                     (name, arguments)
                 },
             )
@@ -416,6 +427,20 @@ fn enveloped_conformance(name: &str, s: &Samples<'_>) {
     // above; a broken schema, an unlisted tool or a second call where one is allowed is
     // refused.
     let (_dir, tokenizer) = tiny_tokenizer(&format!("turbine-formats-{name}"));
+    // The format's marker atoms must exist as special tokens for the compile (the conformance
+    // suite does the same for every registered format).
+    let mut tokenizer = Arc::unwrap_or_clone(tokenizer);
+    tokenizer
+        .add_special_tokens(
+            &format
+                .special_tokens()
+                .iter()
+                .map(|t| t.text)
+                .filter(|t| envelope::is_marker_atom(t))
+                .collect::<Vec<_>>(),
+        )
+        .expect("add markers");
+    let tokenizer = Arc::new(tokenizer);
     let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).expect("token trie");
     let ok = |choice: &ToolChoice, parallel, text: &str| {
         accepts(
@@ -512,6 +537,56 @@ fn mistral_conformance() {
         "[1, 2]",
     );
     assert!(array.is_err(), "{array:?}");
+}
+
+/// P7 S-18 (part 2): the `qwen3_xml` format's own cases, the XML form the Qwen3.5 template
+/// renders. The checks every format must pass are `conformance::formats_suite`
+/// (`registry_conformance::tool_formats`); these pin the grammar's enum handling, the parser's
+/// decoding of the template's raw scalars, and that the tags are optional special tokens.
+#[test]
+fn qwen3_xml_conformance() {
+    let one = "<tool_call>\n<function=get_weather>\n<parameter=location>\n\"Oslo\"</parameter>\n<parameter=unit>\n\"celsius\"</parameter>\n</function>\n</tool_call>";
+    let time = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+    let two = format!("{one}\n{time}");
+    enveloped_conformance(
+        "qwen3_xml",
+        &Samples {
+            one,
+            two: &two,
+            time,
+            bad: "<tool_call>\n<function=get_weather>\n<parameter=location>\n\"Oslo\"</parameter>\n<parameter=unit>\n\"kelvin\"</parameter>\n</function>\n</tool_call>",
+            unknown: "<tool_call>\n<function=get_stock>\n<parameter=location>\n\"Oslo\"</parameter>\n</function>\n</tool_call>",
+            texts: &[
+                "The sea is calm.",
+                "Thinking about it.",
+                "<",
+                "  <b>bold</b>",
+            ],
+        },
+    );
+    // The parser also reads the template's raw form (unquoted scalar values, a `\n` before
+    // `</parameter>`).
+    let parser = registry().get("qwen3_xml").unwrap().parser();
+    assert_eq!(
+        names_and_args(parser.parse(
+            "<tool_call>\n<function=get_weather>\n<parameter=location>\nOslo\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>"
+        )),
+        [(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )]
+    );
+    // A mapping argument is decoded from its JSON, as the template writes it.
+    assert_eq!(
+        names_and_args(parser.parse(
+            "<tool_call>\n<function=f>\n<parameter=opts>\n{\"a\": 1, \"b\": [2]}\n</parameter>\n</function>\n</tool_call>"
+        )),
+        [("f".to_string(), r#"{"opts":{"a":1,"b":[2]}}"#.to_string())]
+    );
+    // The special tokens are optional: qwen3_xml binds on the tiny tokenizer, which lacks them.
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-qwen3-xml-bind");
+    let bound = bind(&Qwen3Xml, &tokenizer).expect("bind");
+    assert_eq!(bound.tokens.id("<tool_call>"), None);
 }
 
 /// The run-ahead's grammar cases on the real Llama-3.2 tokenizer (multi-byte tokens across the
@@ -617,4 +692,388 @@ fn openings_of_hermes_and_mistral() {
             "mistral {text:?} first={first:?}"
         );
     }
+}
+
+/// The chat-template fixture (`tests/fixtures/<dir>/tokenizer_config.json`, the checkpoint's
+/// own template) of a family whose default tool format is checked against its real template;
+/// `None` for Llama and OLMoE (covered by Phase 2's tool tests).
+fn family_template_fixture(family: &str) -> Option<&'static str> {
+    match family {
+        "qwen3" => Some("qwen3-0.6b"),
+        // The template of the pinned Qwen3-30B-A3B-Instruct-2507-FP8 revision
+        // (`scripts/lab/phase7-checkpoints.tsv`).
+        "qwen3_moe" => Some("qwen3-30b-a3b"),
+        "mistral" => Some("mistral-7b-instruct-v0.3"),
+        "mixtral" => Some("mixtral-8x7b-instruct-v0.1"),
+        "gpt_oss" => Some("gpt-oss-20b"),
+        _ => None,
+    }
+}
+
+/// Each family's default tool format, and the special tokens of its tokenizer that decode to
+/// no text (skipped by the detokenizer, so a parser never sees them).
+fn family_tool_expectations(family: &str) -> (Option<&'static str>, &'static [&'static str]) {
+    match family {
+        "llama" => (Some(llama3_json::LLAMA3_JSON), &[]),
+        "olmoe" => (None, &[]),
+        "qwen3" | "qwen3_moe" => (Some(hermes::HERMES), &["<|im_end|>"]),
+        "mistral" | "mixtral" => (Some(mistral::MISTRAL), &[mistral::TOOL_CALLS, "</s>"]),
+        // The seven Harmony markers are declared `required: false` like Hermes's and Mistral's:
+        // the conformance suite binds every format to the tiny tokenizer, which defines none of
+        // them. The served gpt-oss tokenizer defines all seven, and (P7 decision "Harmony marker
+        // visibility") the detokenizer emits them, so the parser sees them all.
+        "gpt_oss" => (Some(harmony::HARMONY), &[]),
+        "qwen3_5" => (Some(qwen3_xml::QWEN3_XML), &[]),
+        "qwen3_5_moe" => (Some(qwen3_xml::QWEN3_XML), &[]),
+        other => panic!("family {other} has no expected default tool format"),
+    }
+}
+
+/// S-18 (part 1): an assistant turn carrying one `get_weather` call, rendered by the family's
+/// real chat template, parses back through the family's default format into that call. The
+/// assistant text is what the template renders after the generation prompt, with the
+/// tokenizer's no-text special tokens removed and the family's reasoning split off first, as
+/// the server does.
+#[test]
+fn family_default_tool_calls_round_trip() {
+    let arguments = json!({"location": "Oslo", "unit": "celsius"});
+    let tools = weather_tools();
+    let user = json!({"role": "user", "content": "What is the weather in Oslo?"});
+    let assistant = json!({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "a1B2c3D4e",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": arguments.clone()}
+    }]});
+    let mut checked = 0;
+    for family in crate::families::registry().iter() {
+        let (default, no_text) = family_tool_expectations(family.name());
+        assert_eq!(
+            family.default_tool_format(),
+            default,
+            "family {} default tool format",
+            family.name()
+        );
+        let Some(dir) = family_template_fixture(family.name()) else {
+            continue;
+        };
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(dir);
+        // As the server resolves it: the checkpoint's own template (`resolve` prefers a
+        // `chat_template.jinja` beside the tokenizer config, gpt-oss's layout; the others carry
+        // it in the config), or the family's tool-aware replacement when that renders neither
+        // `tools` nor `tool_calls` (Mixtral's does not).
+        let template = crate::ChatTemplate::resolve_for(&fixture, None, family)
+            .unwrap_or_else(|e| panic!("{}: {dir} template: {e}", family.name()));
+        let kwargs = serde_json::Map::new();
+        let prompt = template
+            .render(std::slice::from_ref(&user), Some(&tools), true, &kwargs)
+            .unwrap_or_else(|e| panic!("{}: prompt: {e}", family.name()));
+        let turn = template
+            .render(
+                &[user.clone(), assistant.clone()],
+                Some(&tools),
+                false,
+                &kwargs,
+            )
+            .unwrap_or_else(|e| panic!("{}: assistant turn: {e}", family.name()));
+        let mut text = turn
+            .strip_prefix(&prompt)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: the assistant turn does not extend the generation prompt:\n{prompt:?}\n{turn:?}",
+                    family.name()
+                )
+            })
+            .to_string();
+        for token in no_text {
+            text = text.replace(token, "");
+        }
+        if let Some(name) = family.default_reasoning_parser() {
+            let parser = crate::reasoning::registry()
+                .get(name)
+                .unwrap_or_else(|| panic!("reasoning parser {name}"));
+            let mut stream = parser.start(&prompt);
+            let mut split = stream.push(&text);
+            split.append(stream.finish());
+            assert_eq!(split.reasoning.trim(), "", "{}: {text:?}", family.name());
+            text = split.content;
+        }
+        let format = registry()
+            .get(default.expect("a family with a template fixture has a default format"))
+            .expect("registered default format");
+        let calls = names_and_args(format.parser().parse(&text));
+        assert_eq!(calls.len(), 1, "{}: {text:?}", family.name());
+        assert_eq!(calls[0].0, "get_weather", "{}: {text:?}", family.name());
+        let parsed: Value = serde_json::from_str(&calls[0].1).expect("arguments are JSON");
+        assert_eq!(parsed, arguments, "{}: {text:?}", family.name());
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 5,
+        "qwen3, qwen3_moe, mistral, mixtral and gpt_oss have template fixtures"
+    );
+}
+
+/// The tool calls of `parse`, or `None` when it returned content.
+fn maybe_calls(parse: ToolParse) -> Option<Vec<(String, String)>> {
+    match parse {
+        ToolParse::Calls(calls) => Some(calls.into_iter().map(|c| (c.name, c.arguments)).collect()),
+        ToolParse::Content(_) => None,
+    }
+}
+
+/// The Harmony call forms: `one`/`time`/`two` are the generation form (commentary channel,
+/// recipient after it), `turn` is what gpt-oss's template renders for a call in the history
+/// (recipient before the channel, no `<|constrain|>`), `truncated` a call cut off mid-output.
+// The generation form of a harmony call: the generation prompt ends with `<|start|>assistant`,
+// so the constrained model writes the call from the channel on (the parser also accepts the
+// `<|start|>assistant`-prefixed form; HARMONY_TURN below is the template's assistant-turn form).
+const HARMONY_ONE: &str = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
+const HARMONY_TIME: &str =
+    "<|channel|>commentary to=functions.get_time <|constrain|>json<|message|>{}<|call|>";
+const HARMONY_TURN: &str = "<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"location\": \"Oslo\", \"unit\": \"celsius\"}<|call|>";
+
+/// S-9 (part 1): the `harmony` format's own cases over the generation-form calls, plus the
+/// template's assistant-turn form. The checks every format must pass are
+/// `conformance::formats_suite` (`registry_conformance::tool_formats`).
+#[test]
+fn harmony_conformance() {
+    let two = format!("{HARMONY_ONE}{HARMONY_TIME}");
+    enveloped_conformance(
+        "harmony",
+        &Samples {
+            one: HARMONY_ONE,
+            two: &two,
+            time: HARMONY_TIME,
+            bad: "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"unit\": \"kelvin\"}<|call|>",
+            unknown: "<|channel|>commentary to=functions.get_stock <|constrain|>json<|message|>{}<|call|>",
+            texts: &["The weather in Oslo is sunny.", "<"],
+        },
+    );
+    let parser = registry().get("harmony").expect("registered").parser();
+    // The template's assistant-turn form (recipient before the channel, no `<|constrain|>`)
+    // parses back into the same call.
+    assert_eq!(
+        maybe_calls(parser.parse(HARMONY_TURN)),
+        Some(vec![(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )])
+    );
+    // A call cut off before `<|call|>` stays content (a partial form parses as nothing).
+    let truncated = &HARMONY_ONE[..HARMONY_ONE.len() - harmony::CALL.len()];
+    assert_eq!(maybe_calls(parser.parse(truncated)), None);
+}
+
+/// The harmony `<|call|>` is an EOS id of gpt-oss AND the literal terminator the required
+/// grammar forces after the arguments. The constraint's mask must keep allowing it there —
+/// stripping an EOS id whose grammar still needs it dead-ended the served `required` call
+/// with "the constraint allows no token" exactly when the arguments were complete — and
+/// committing it completes the constraint. Mid-grammar, an EOS id still ends nothing.
+#[test]
+fn harmony_call_terminator_is_an_eos_id() {
+    let format = registry().get("harmony").expect("registered");
+    let (_dir, tokenizer) = tiny_tokenizer("turbine-formats-harmony-eos");
+    let mut tokenizer = Arc::unwrap_or_clone(tokenizer);
+    // The format's marker atoms as special tokens (the conformance suite does the same); the
+    // terminator then has an id of its own.
+    tokenizer
+        .add_special_tokens(
+            &format
+                .special_tokens()
+                .iter()
+                .map(|t| t.text)
+                .filter(|t| envelope::is_marker_atom(t))
+                .collect::<Vec<_>>(),
+        )
+        .expect("add markers");
+    let tokenizer = Arc::new(tokenizer);
+    let call_id = tokenizer
+        .token_to_id(harmony::CALL)
+        .expect("<|call|> gets an id");
+    // gpt-oss's checkpoint lists `<|call|>` among its EOS tokens.
+    let eos = [TINY_EOS.as_slice(), &[call_id]].concat();
+    let compiler = GrammarCompiler::new(&tokenizer, &eos).expect("token trie");
+
+    // The model's own call goes through the required grammar, terminator included.
+    let ok = |text: &str| {
+        accepts(
+            &compiler,
+            &tokenizer,
+            &eos,
+            format,
+            &ToolChoice::Required,
+            false,
+            text,
+        )
+    };
+    assert_eq!(ok(HARMONY_ONE), Ok(true), "the complete call is accepted");
+
+    // Mid-grammar (the arguments incomplete) the terminator and the other EOS ids are still
+    // refused: the mask keeps EOS ids out where the grammar does not literally need them.
+    let limits = GrammarLimits {
+        max_schema_bytes: 64 * 1024,
+    };
+    let spec = format
+        .grammar(&weather_tools(), &ToolChoice::Required, false)
+        .expect("grammar");
+    let mut matcher = compiler.compile(&spec, &limits).expect("compile");
+    let partial = &HARMONY_ONE[..HARMONY_ONE.len() - harmony::CALL.len() - 1];
+    feed_text(matcher.as_mut(), &tokenizer, &eos, partial).expect("the partial call walks");
+    let mut mask = TokenMask::new_none(tokenizer.vocab_size() as usize);
+    step_mask(matcher.as_mut(), &eos, &mut mask).expect("the mask is not empty mid-call");
+    assert!(
+        !mask.is_allowed(call_id),
+        "the terminator must stay disallowed while the arguments are incomplete"
+    );
+}
+
+/// S-9 (part 2): a Harmony output splits into the analysis reasoning and the final content, a
+/// commentary tool call is withheld for the tool parser, markers split across pushes change
+/// nothing, and `reasoning_effort` reaches the gpt-oss template context (default `medium`).
+#[test]
+fn harmony_round_trip() {
+    let split_of = |pieces: &[&str]| {
+        use crate::reasoning::ReasoningDelta;
+        let parser = crate::reasoning::registry()
+            .get("harmony")
+            .expect("registered");
+        let mut stream = parser.start("<|start|>assistant");
+        let mut split = ReasoningDelta::default();
+        for piece in pieces {
+            split.append(stream.push(piece));
+        }
+        split.append(stream.finish());
+        split
+    };
+    let parse = |text: &str| {
+        registry()
+            .get("harmony")
+            .expect("registered")
+            .parser()
+            .parse(text)
+    };
+
+    // (1) analysis reasoning, then a commentary-channel call: the reasoning is `reasoning`,
+    // the withheld call text is released at the finish for the tool parser.
+    let call_output = format!("<|channel|>analysis<|message|>think<|end|>{HARMONY_ONE}");
+    let split = split_of(&[&call_output]);
+    assert_eq!(split.reasoning, "think");
+    assert_eq!(
+        maybe_calls(parse(&split.content)),
+        Some(vec![(
+            "get_weather".to_string(),
+            r#"{"location":"Oslo","unit":"celsius"}"#.to_string()
+        )])
+    );
+    // The plain call text parses the same (what the engine's tool parser holds).
+    assert_eq!(
+        maybe_calls(parse(HARMONY_ONE)),
+        maybe_calls(parse(&split.content))
+    );
+
+    // (2) analysis then final: reasoning `a`, content `b`.
+    let answer = "<|channel|>analysis<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>b<|return|>";
+    let split = split_of(&[answer]);
+    assert_eq!(
+        (split.reasoning.as_str(), split.content.as_str()),
+        ("a", "b"),
+        "{answer}"
+    );
+
+    // (3) the same output one char per push, and split inside `<|chan` / `nel|>`.
+    let chars: Vec<String> = answer.chars().map(String::from).collect();
+    let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+    let per_char = split_of(&pieces);
+    assert_eq!(
+        (per_char.reasoning.as_str(), per_char.content.as_str()),
+        ("a", "b"),
+        "one char per push"
+    );
+    let at = answer.find("<|channel|>").expect("channel marker") + "<|chan".len();
+    let mid_marker = split_of(&[&answer[..at], &answer[at..]]);
+    assert_eq!(
+        (mid_marker.reasoning.as_str(), mid_marker.content.as_str()),
+        ("a", "b"),
+        "split inside the channel marker"
+    );
+
+    // (4) `reasoning_effort` reaches the gpt-oss template context; without it the template
+    // sees `medium` (the checkpoint's own default, also the render's).
+    let template = crate::ChatTemplate::resolve(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gpt-oss-20b"),
+        None,
+    )
+    .expect("gpt-oss template");
+    let messages = [json!({"role": "user", "content": "What is the weather in Oslo?"})];
+    let mut kwargs = serde_json::Map::new();
+    kwargs.insert("reasoning_effort".into(), json!("high"));
+    let high = template
+        .render(&messages, None, true, &kwargs)
+        .expect("render high");
+    assert!(high.contains("Reasoning: high"), "{high}");
+    let medium = template
+        .render(&messages, None, true, &serde_json::Map::new())
+        .expect("render medium");
+    assert!(medium.contains("Reasoning: medium"), "{medium}");
+}
+
+/// P7 S-6: the `mistral` parser's call ids are 9 alphanumerics, so a parsed call sent back as
+/// an assistant `tool_calls` turn plus its `tool` result renders through Mistral-7B-Instruct-
+/// v0.3's real template (which raises on any other id length) with the call and the result in
+/// the prompt. Breaks if the format draws `call_` + 24 ids (the template refuses the turn).
+#[test]
+fn mistral_call_ids_render_through_the_v03_template() {
+    let parser = mistral::MistralParser::seeded(7);
+    let text = r#"[{"name": "get_weather", "arguments": {"location": "Oslo"}}, {"name": "get_time", "arguments": {}}]"#;
+    let ToolParse::Calls(calls) = parser.parse(text) else {
+        panic!("expected calls");
+    };
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert!(
+            call.id.len() == crate::tools::MISTRAL_CALL_ID_LEN
+                && call.id.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "{}",
+            call.id
+        );
+    }
+    assert_ne!(calls[0].id, calls[1].id);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mistral-7b-instruct-v0.3/tokenizer_config.json");
+    let template = crate::ChatTemplate::load(&path).expect("mistral template");
+    let call = &calls[0];
+    let arguments: Value = serde_json::from_str(&call.arguments).expect("arguments JSON");
+    let messages = [
+        json!({"role": "user", "content": "What is the weather in Oslo?"}),
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": call.id, "type": "function",
+            "function": {"name": call.name, "arguments": arguments}
+        }]}),
+        json!({"role": "tool", "tool_call_id": call.id, "content": "{\"temperature\": 7}"}),
+    ];
+    let tools = weather_tools();
+    let kwargs = serde_json::Map::new();
+    let prompt = template
+        .render(&messages, Some(&tools), true, &kwargs)
+        .expect("the v0.3 template accepts the format's ids");
+    assert!(
+        prompt.contains(&format!("\"id\": \"{}\"", call.id)),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("\"call_id\": \"{}\"", call.id)),
+        "{prompt}"
+    );
+
+    let long =
+        json!({"role": "tool", "tool_call_id": "call_0123456789abcdefghijklmn", "content": "x"});
+    let refused = template.render(
+        &[messages[0].clone(), messages[1].clone(), long],
+        Some(&tools),
+        true,
+        &kwargs,
+    );
+    assert!(refused.is_err(), "the template refuses a call_ + 24 id");
 }

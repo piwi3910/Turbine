@@ -48,28 +48,40 @@ impl ShardedL1Tier {
         }
     }
 
-    /// `bytes` cut into the shards' parts, in shard order.
+    /// `bytes` cut into the shards' parts, in shard order; the last shard takes the remainder
+    /// (a hybrid block's snapshot tail rides after the KV bytes, P7 S-12 Task 33).
     fn parts<'a>(&self, mut bytes: &'a [u8]) -> Vec<&'a [u8]> {
+        let last = self.shard_bytes.len() - 1;
         self.shard_bytes
             .iter()
-            .map(|&n| {
-                let (part, rest) = bytes.split_at(n);
-                bytes = rest;
-                part
+            .enumerate()
+            .map(|(i, &n)| {
+                if i == last {
+                    bytes
+                } else {
+                    let (part, rest) = bytes.split_at(n);
+                    bytes = rest;
+                    part
+                }
             })
             .collect()
     }
 
     /// [`Self::parts`] of a mutable block.
     fn parts_mut<'a>(&self, mut bytes: &'a mut [u8]) -> Vec<&'a mut [u8]> {
-        self.shard_bytes
-            .iter()
-            .map(|&n| {
-                let (part, rest) = std::mem::take(&mut bytes).split_at_mut(n);
-                bytes = rest;
-                part
-            })
-            .collect()
+        let last = self.shard_bytes.len() - 1;
+        let mut out = Vec::with_capacity(self.shard_bytes.len());
+        for (i, &n) in self.shard_bytes.iter().enumerate() {
+            if i == last {
+                out.push(bytes);
+                break;
+            }
+            let taken = std::mem::take(&mut bytes);
+            let (part, rest) = taken.split_at_mut(n);
+            out.push(part);
+            bytes = rest;
+        }
+        out
     }
 
     /// The rank tiers, in rank order.
@@ -158,12 +170,15 @@ impl ShardedL1Tier {
     }
 
     fn check_len(&self, len: usize) -> Result<(), TierError> {
-        let want: usize = self.shard_bytes.iter().sum();
-        if len == want {
+        // P7 S-12 (Task 33): the record is the shards' KV bytes plus, on the last shard, a
+        // hybrid block's snapshot tail (`0` for an attention-only block).
+        let kv: u64 = self.shard_bytes.iter().map(|&b| b as u64).sum();
+        let want: u64 = self.shards.iter().map(|s| s.max_record_bytes()).sum();
+        if len as u64 >= kv && len as u64 <= want {
             Ok(())
         } else {
             Err(TierError::Io(format!(
-                "block is {len} bytes, sharded L1 slot {want}"
+                "block is {len} bytes, sharded L1 slot {kv}..{want}"
             )))
         }
     }
@@ -176,6 +191,16 @@ impl KvTier for ShardedL1Tier {
 
     fn enabled(&self) -> bool {
         self.shards.iter().all(|s| s.enabled())
+    }
+
+    /// P7 S-12 (Task 33): a hybrid block's snapshot tail rides in the last shard's record
+    /// ([`Self::parts`]), so only its tier takes the extra bytes. Multi-shard hybrid snapshot
+    /// tiers are untested (the hybrid families' gates are single-card); the single-shard
+    /// ([`Self::parts`]'s `[one]` fast path) and last-shard paths are what is covered.
+    fn set_snapshot_bytes(&self, bytes: u64) {
+        if let Some(last) = self.shards.last() {
+            last.set_snapshot_bytes(bytes);
+        }
     }
 
     fn capacity_bytes(&self) -> u64 {

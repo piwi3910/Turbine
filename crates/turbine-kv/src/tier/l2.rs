@@ -15,6 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -26,8 +27,10 @@ use crate::identity::{KvKey, NamespaceKey};
 use crate::metrics::{EvictReason, KvMetrics};
 
 pub const SLAB_MAGIC: &[u8; 8] = b"TKVSLAB1";
-const SLAB_VERSION: u32 = 2;
-/// Bytes of the codec name in a version 2 header.
+/// Bumped from 2 by P7 Task 33: a hybrid block's slot holds `[kv in the tier format][snapshot
+/// exact]`, so a slot's bytes are the record's, not just the KV codec's.
+const SLAB_VERSION: u32 = 3;
+/// Bytes of the codec name in a version 2+ header.
 const FORMAT_NAME_BYTES: usize = 16;
 /// Slot and header alignment (the `O_DIRECT` requirement on the lab NVMe drives).
 const ALIGN: usize = 4096;
@@ -121,6 +124,10 @@ pub struct L2NvmeTier {
     state: Mutex<L2State>,
     /// In-flight I/O count, bounded by `max_queue_depth`.
     queue: (Mutex<u32>, Condvar),
+    /// P7 S-12 (Task 33): the exact snapshot tail a hybrid block's record appends to
+    /// `block_bytes` (0 for an attention-only model). Set once, when the engine marks the model
+    /// hybrid ([`KvTier::set_snapshot_bytes`]); a slot is sized to the record it stores.
+    snapshot_bytes: AtomicU64,
 }
 
 /// A zeroed heap buffer whose window starts on a 4 KiB boundary (`O_DIRECT`), without `unsafe`.
@@ -225,6 +232,7 @@ impl L2NvmeTier {
                 room_epoch: 0,
             }),
             queue: (Mutex::new(0), Condvar::new()),
+            snapshot_bytes: AtomicU64::new(0),
             cfg,
         })
     }
@@ -448,13 +456,31 @@ impl L2NvmeTier {
         u64::from_le_bytes(b)
     }
 
+    /// P7 S-12 (Task 33): the largest record a slot holds (`slot_bytes` plus a hybrid block's
+    /// snapshot tail). A slot is sized to the record it stores.
+    fn max_record_bytes(&self) -> usize {
+        self.slot_bytes
+            .saturating_add(self.snapshot_bytes.load(Ordering::Relaxed) as usize)
+    }
+
+    /// The slot size for a record of `len` bytes in codec `format`: the fixed `slot_bytes` for
+    /// an L0-format block that fits it, else the record's own size rounded up (a hybrid block's
+    /// record, or a lossy codec's).
+    fn slot_bytes_for(&self, format: &'static str, len: usize) -> usize {
+        if format == crate::tier::L0_FORMAT && len <= self.slot_bytes {
+            self.slot_bytes
+        } else {
+            len.div_ceil(ALIGN) * ALIGN
+        }
+    }
+
     /// Stores `bytes` under `key` in a slot of codec `format`.
     fn store(&self, key: KvKey, format: &'static str, bytes: &[u8]) -> Result<TierSlot, TierError> {
-        if bytes.is_empty() || bytes.len() > self.slot_bytes {
+        if bytes.is_empty() || bytes.len() > self.max_record_bytes() {
             return Err(TierError::Io(format!(
                 "block of {} bytes does not fit the {}-byte slot",
                 bytes.len(),
-                self.slot_bytes
+                self.max_record_bytes()
             )));
         }
         let (slab, slot, slot_bytes, file) = {
@@ -480,11 +506,7 @@ impl L2NvmeTier {
                 None => match self.pop_free(&mut s, format, bytes.len()) {
                     Some(free) => free,
                     None => {
-                        let slot_bytes = if format == crate::tier::L0_FORMAT {
-                            self.slot_bytes
-                        } else {
-                            bytes.len().div_ceil(ALIGN) * ALIGN
-                        };
+                        let slot_bytes = self.slot_bytes_for(format, bytes.len());
                         let idx = if s.slabs.len() < self.max_slabs {
                             s.slabs.len()
                         } else {
@@ -591,6 +613,11 @@ impl KvTier for L2NvmeTier {
 
     fn enabled(&self) -> bool {
         true
+    }
+
+    /// P7 S-12 (Task 33): a hybrid block's record is `block_bytes + snapshot_bytes`.
+    fn set_snapshot_bytes(&self, bytes: u64) {
+        self.snapshot_bytes.store(bytes, Ordering::Relaxed);
     }
 
     fn capacity_bytes(&self) -> u64 {
@@ -719,18 +746,14 @@ impl KvTier for L2NvmeTier {
     /// slab below the slab limit, or at the limit an empty slab of another format.
     fn free_slots(&self, format: &'static str, bytes: u64) -> u64 {
         let len = bytes as usize;
-        if len == 0 || len > self.slot_bytes {
+        if len == 0 || len > self.max_record_bytes() {
             return 0;
         }
         let s = self.lock();
         if s.health.is_degraded() {
             return 0;
         }
-        let slot = if format == crate::tier::L0_FORMAT {
-            self.slot_bytes
-        } else {
-            len.div_ceil(ALIGN) * ALIGN
-        };
+        let slot = self.slot_bytes_for(format, len);
         let per_slab = (self.slots_per_slab * self.slot_bytes) / slot;
         let mut n = s.free.get(format).map_or(0, |f| {
             f.iter()

@@ -10,6 +10,7 @@ use minijinja::value::{Kwargs, Value, ValueKind};
 use minijinja::{AutoEscape, Environment, Error, ErrorKind, State, UndefinedBehavior};
 
 use crate::ModelError;
+use crate::families::ModelFamily;
 
 /// A compiled chat template plus the special-token strings it may reference.
 pub struct ChatTemplate {
@@ -18,6 +19,7 @@ pub struct ChatTemplate {
     bos_token: Option<String>,
     eos_token: Option<String>,
     renders_tools: bool,
+    renders_tool_calls: bool,
 }
 
 impl std::fmt::Debug for ChatTemplate {
@@ -27,6 +29,7 @@ impl std::fmt::Debug for ChatTemplate {
             .field("bos_token", &self.bos_token)
             .field("eos_token", &self.eos_token)
             .field("renders_tools", &self.renders_tools)
+            .field("renders_tool_calls", &self.renders_tool_calls)
             .finish()
     }
 }
@@ -101,6 +104,31 @@ impl ChatTemplate {
         }
     }
 
+    /// [`ChatTemplate::resolve`], then the family's tool-aware replacement
+    /// ([`ModelFamily::chat_template_override`]) when the template the checkpoint ships renders
+    /// neither `tools` nor an assistant turn's `tool_calls` and no explicit template was set:
+    /// the replacement keeps the checkpoint's special tokens. An explicit `model.chat_template`
+    /// is the operator's choice and always wins.
+    pub fn resolve_for(
+        model_dir: &Path,
+        explicit: Option<&Path>,
+        family: &dyn ModelFamily,
+    ) -> Result<ChatTemplate, ModelError> {
+        let shipped = Self::resolve(model_dir, explicit)?;
+        let Some((name, source)) = family.chat_template_override() else {
+            return Ok(shipped);
+        };
+        if explicit.is_some() || shipped.renders_tools || shipped.renders_tool_calls {
+            return Ok(shipped);
+        }
+        Self::compile(
+            Path::new(name),
+            source.to_string(),
+            shipped.bos_token,
+            shipped.eos_token,
+        )
+    }
+
     fn compile(
         path: &Path,
         source: String,
@@ -108,6 +136,7 @@ impl ChatTemplate {
         eos_token: Option<String>,
     ) -> Result<ChatTemplate, ModelError> {
         let name = path.display().to_string();
+        let renders_tool_calls = source.contains("tool_calls");
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -132,6 +161,7 @@ impl ChatTemplate {
             bos_token,
             eos_token,
             renders_tools,
+            renders_tool_calls,
         })
     }
 
@@ -156,6 +186,10 @@ impl ChatTemplate {
         for (k, v) in kwargs {
             ctx.insert(k.clone(), v.clone());
         }
+        // P7 S-9: the reasoning effort defaults to `medium` when neither the request's
+        // `reasoning_effort` nor `chat_template_kwargs` carries one.
+        ctx.entry("reasoning_effort")
+            .or_insert(serde_json::Value::String("medium".into()));
         ctx.insert("messages".into(), messages.to_vec().into());
         match tools {
             Some(tools) => {
@@ -178,6 +212,16 @@ impl ChatTemplate {
     /// True when the template source references the `tools` variable.
     pub fn renders_tools(&self) -> bool {
         self.renders_tools
+    }
+
+    /// Where the template came from: a file path, or the family override's name.
+    pub fn source_name(&self) -> &str {
+        &self.name
+    }
+
+    /// True when the template source mentions an assistant turn's `tool_calls`.
+    pub fn renders_tool_calls(&self) -> bool {
+        self.renders_tool_calls
     }
 }
 

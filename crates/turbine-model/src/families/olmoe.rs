@@ -71,6 +71,7 @@ impl ModelFamily for Olmoe {
             moe: Some(moe),
             qk_norm: true,
             qk_norm_per_head: false,
+            ..FamilyConfig::default()
         })
     }
 
@@ -186,6 +187,7 @@ pub(crate) fn moe_slots(
         (m.num_experts as usize, m.expert_intermediate as usize)
     });
     let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: false,
         name,
         shape,
         stack: None,
@@ -228,6 +230,7 @@ pub(crate) fn moe_slots(
                 offset: e * shape.iter().product::<usize>(),
             };
             WeightSlot {
+                float32_stored: false,
                 name: format!("{p}.{}.{e}.{proj}.weight", names.experts),
                 shape,
                 stack: Some(place),

@@ -33,9 +33,9 @@ use turbine_kernels::cpu::quant::{dequantize, fp8_e4m3_round, fp8_e4m3_value};
 use turbine_kernels::quant::{ActQuantDesc, QuantSchemeDesc};
 
 use super::common::{
-    Follows, Owned, bf16_bytes, bf16_values, f32_bytes, matches_ignore, module_of, pow2_at_least,
-    quantization_config, read_owned, scheme_unsupported, shard_like, shard_misaligned,
-    write_fixture,
+    Follows, Owned, bf16_bytes, bf16_values, f32_bytes, is_shared_expert, matches_ignore,
+    module_of, pow2_at_least, quantization_config, read_owned, scheme_unsupported, shard_like,
+    shard_misaligned, write_fixture,
 };
 use super::{ActivationQuant, LinearSlot, QuantScheme, WeightFormat};
 use crate::ModelError;
@@ -153,7 +153,11 @@ impl Fp8Layout {
                 Some(p) if p.shape.len() == 2 => (p.name.clone(), [p.shape[0], p.shape[1]]),
                 _ => (slot.name.clone(), [n, k]),
             };
-            let reason = if !self.derive(slot).1 {
+            let reason = if is_shared_expert(&slot.name) {
+                // The Qwen3.5/3.6 shared expert is added by the BF16 MoE path, never run as its
+                // own qgemm: decode its block-scaled FP8 to BF16 at load (P7 Task 34).
+                Some("shared_expert_bf16")
+            } else if !self.derive(slot).1 {
                 Some("shard_misaligned")
             } else if !(supports(&qgemm(n, k)) && supports(&qgemm(whole[0], whole[1]))) {
                 Some("kernel_unsupported")
@@ -271,6 +275,7 @@ impl Fp8Layout {
         let matrix = self.scale_shape(rows, k);
         let per_row = matrix.get(1).copied().unwrap_or(1);
         out.push(WeightSlot {
+            float32_stored: false,
             name: format!("{module}.{}", self.scale_suffix),
             shape: self.scale_shape(n, k),
             stack: Some(StackPlace {
@@ -282,6 +287,7 @@ impl Fp8Layout {
         });
         if self.act == ActivationQuant::Fp8PerTensorStatic {
             out.push(WeightSlot {
+                float32_stored: false,
                 name: format!("{module}.input_scale"),
                 shape: vec![n],
                 stack: Some(StackPlace {
@@ -498,6 +504,7 @@ fn check_slot(name: &str) -> WeightSlot {
         shape: vec![0],
         stack: None,
         source: None,
+        float32_stored: false,
     }
 }
 
@@ -695,7 +702,7 @@ pub fn check_block(field: &str, block: (u32, u32)) -> Result<Fp8Weights, ModelEr
 /// The static activation scale the tiny writer gives layer `module` (BF16-exact, different per
 /// projection so a fused projection's largest-part rule is exercised).
 fn tiny_input_scale(module: &str) -> f32 {
-    const BY_PROJ: [(&str, f32); 7] = [
+    const BY_PROJ: [(&str, f32); 10] = [
         ("q_proj", 0.031_25),
         ("k_proj", 0.062_5),
         ("v_proj", 0.093_75),
@@ -703,6 +710,10 @@ fn tiny_input_scale(module: &str) -> f32 {
         ("gate_proj", 0.062_5),
         ("up_proj", 0.031_25),
         ("down_proj", 0.078_125),
+        // Mixtral's experts: `w1` gate, `w3` up, `w2` down.
+        ("w1", 0.062_5),
+        ("w3", 0.031_25),
+        ("w2", 0.078_125),
     ];
     BY_PROJ
         .iter()
@@ -823,6 +834,7 @@ mod tests {
             shape,
             stack: None,
             source: None,
+            float32_stored: false,
         }
     }
 

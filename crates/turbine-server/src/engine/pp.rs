@@ -130,6 +130,8 @@ impl OwnedBatch {
         self.seqs
             .iter()
             .map(|s| SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: s.seq,
                 q_start: s.q_start,
                 q_len: s.q_len,
@@ -1262,6 +1264,8 @@ mod tests {
                     let tokens = next[s].clone();
                     let positions: Vec<u32> = (lens[s]..lens[s] + tokens.len() as u32).collect();
                     let slice = SeqSlice {
+                        state_slot: None,
+                        snapshot_blocks: &[],
                         seq: SeqId(s as u64 + 1),
                         q_start: 0,
                         q_len: tokens.len() as u32,
@@ -1347,6 +1351,8 @@ mod tests {
             let started = Instant::now();
             let batch = |s: usize| {
                 [SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(s as u64),
                     q_start: 0,
                     q_len: 2,

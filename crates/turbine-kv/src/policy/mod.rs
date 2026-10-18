@@ -400,6 +400,7 @@ pub(crate) mod tests {
             tier: TierId::L1,
             slot: 0,
             format: crate::tier::L0_FORMAT,
+            snapshot_bytes: 0,
         };
         dir.add_location(&k2, l1);
         dir.remove_location(&k2, TierId::L0);

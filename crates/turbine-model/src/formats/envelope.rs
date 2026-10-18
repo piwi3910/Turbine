@@ -77,11 +77,41 @@ pub(crate) fn text_not_starting_with(prefix: &str) -> String {
     format!("{}({})", ws(0), alternatives.join("|"))
 }
 
+/// One envelope piece as a Lark rule-body fragment: `<|...|>`-shaped runs become bare atoms
+/// (llguidance reads them as the tokenizer's special tokens — a quoted literal is plain text
+/// and can never match a special token, whose trie bytes carry the special-token marker), the
+/// rest stays one quoted literal. [`is_marker_atom`] names the shapes this applies to.
+pub(crate) fn is_marker_atom(text: &str) -> bool {
+    text.starts_with("<|") && text.ends_with("|>")
+}
+
+pub(crate) fn lark_envelope(piece: &str) -> String {
+    let mut out = String::new();
+    let mut rest = piece;
+    while let Some(open) = rest.find("<|") {
+        let (head, tail) = rest.split_at(open);
+        let Some(close) = tail.find("|>").map(|n| n + 2) else {
+            break;
+        };
+        let marker = &tail[..close];
+        if !head.is_empty() {
+            out.push_str(&format!("\"{head}\" "));
+        }
+        out.push_str(marker);
+        out.push(' ');
+        rest = &tail[close..];
+    }
+    if !rest.is_empty() {
+        out.push_str(&format!("\"{rest}\""));
+    }
+    out.trim_end().to_string()
+}
+
 /// The `call` alternatives and `call_<i>` / `params_<i>` rules of `allowed`, each call being
-/// `before` + the tool's name + `middle` + its parameters + `after` (Lark string bodies, JSON
-/// quotes already escaped). The parameters take the tool's JSON schema with the bounded
-/// natural JSON whitespace ([`with_json_options`]); a tool without `parameters` takes any
-/// object.
+/// `before` + the tool's name + `middle` + its parameters + `after`, with `<|...|>`-shaped
+/// runs of each piece as special-token atoms ([`lark_envelope`]). The parameters take the
+/// tool's JSON schema with the bounded natural JSON whitespace ([`with_json_options`]); a
+/// tool without `parameters` takes any object.
 pub(crate) fn call_rules(
     allowed: &[FunctionTool<'_>],
     before: &str,
@@ -93,8 +123,11 @@ pub(crate) fn call_rules(
     for (i, tool) in allowed.iter().enumerate() {
         // Names are [A-Za-z0-9_-] only (`function_tools`), so they need no escaping.
         rules.push_str(&format!(
-            "call_{i}: \"{before}{}{middle}\" params_{i} \"{after}\"\n",
-            tool.name
+            "call_{i}: {}\"{}\"{} params_{i} {}\n",
+            lark_envelope(before),
+            tool.name,
+            lark_envelope(middle),
+            lark_envelope(after)
         ));
         let schema = tool.parameters.cloned().unwrap_or_else(|| {
             let mut any_object = Map::new();
@@ -135,30 +168,45 @@ pub(crate) fn named_call(
     Some((name, arguments.to_string()))
 }
 
-/// A parser's source of call ids.
-pub(crate) struct CallIds(Mutex<ChaCha8Rng>);
+/// A parser's source of call ids: a random stream and the id shape drawn from it
+/// ([`new_call_id`] unless [`CallIds::with_shape`] says otherwise).
+pub(crate) struct CallIds {
+    rng: Mutex<ChaCha8Rng>,
+    shape: fn(&mut ChaCha8Rng) -> String,
+}
 
 impl CallIds {
     /// OS-seeded.
     pub(crate) fn new() -> CallIds {
-        CallIds(Mutex::new(ChaCha8Rng::from_os_rng()))
+        CallIds {
+            rng: Mutex::new(ChaCha8Rng::from_os_rng()),
+            shape: new_call_id,
+        }
     }
 
     /// Reproducible (tests, simulations).
     pub(crate) fn seeded(seed: u64) -> CallIds {
-        CallIds(Mutex::new(ChaCha8Rng::seed_from_u64(seed)))
+        CallIds {
+            rng: Mutex::new(ChaCha8Rng::seed_from_u64(seed)),
+            shape: new_call_id,
+        }
+    }
+
+    /// The same stream drawing ids of another shape (a format whose template constrains ids).
+    pub(crate) fn with_shape(self, shape: fn(&mut ChaCha8Rng) -> String) -> CallIds {
+        CallIds { shape, ..self }
     }
 
     /// `found` calls as [`ToolCallOut`]s indexed in order, with fresh ids.
     pub(crate) fn assign(&self, found: Vec<(String, String)>) -> Vec<ToolCallOut> {
         // A poisoned lock only means another parse panicked mid-draw; the stream is still valid.
-        let mut rng = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut rng = self.rng.lock().unwrap_or_else(|p| p.into_inner());
         found
             .into_iter()
             .zip(0u32..)
             .map(|((name, arguments), index)| ToolCallOut {
                 index,
-                id: new_call_id(&mut *rng),
+                id: (self.shape)(&mut rng),
                 name,
                 arguments,
             })

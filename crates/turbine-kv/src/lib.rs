@@ -12,14 +12,19 @@ pub mod policy;
 pub mod pool;
 pub mod reclaim;
 pub mod session;
+pub mod state;
 pub mod table;
 pub mod tier;
 pub mod transfer;
 
-pub use document::{KvDocument, KvTierDocument};
+pub use document::{KvDocument, KvRankDocument, KvTierDocument};
 pub use metrics::KvMetrics;
 pub use pool::{BlockPool, BlockPoolConfig, PoolError};
 pub use reclaim::L0Reclaimer;
+pub use state::{
+    KvError, MemSnapshotStore, SnapshotPool, SnapshotRef, SnapshotStore, StateCopy, StateLoc,
+    StateSlot, StateSlotPool,
+};
 pub use table::{BlockTable, blocks_for_tokens};
 
 #[cfg(test)]

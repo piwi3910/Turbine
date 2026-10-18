@@ -1033,6 +1033,7 @@ void free_dev(Dev &d) {
 turbine_attention_paged_desc paged_desc(const Case &c, const Dev &d, void *pool,
                                         int dtype) {
   turbine_attention_paged_desc p{};
+  p.window_left = -1; // ABI v2.17: no sliding window
   p.q = d.q;
   p.k_new = d.k_new;
   p.v_new = d.v_new;

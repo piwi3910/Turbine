@@ -4,8 +4,10 @@
 //! width (the dense `intermediate_size` is unused), `norm_topk_prob` (default false, as
 //! transformers' `Qwen3MoeConfig`); every layer must be sparse (`decoder_sparse_step` 1, no
 //! `mlp_only_layers`), and `use_sliding_window` must not be true. Checkpoint names are OLMoE's
-//! (`mlp.gate`, `mlp.experts.<e>.{gate,up,down}_proj`). Tool calls default to `hermes`. CPU
-//! backend only: the support matrix refuses it on GPU vendors until its Phase 8 track closes.
+//! (`mlp.gate`, `mlp.experts.<e>.{gate,up,down}_proj`). Tool calls default to `hermes`. Tensor
+//! and expert parallelism run the same hooks ([`ModelFamily::tp_decoder_spec`], P7 S-5); on GPU
+//! vendors the support matrix keeps it refused until its row closes in Phase 7 model families
+//! (track phase-7-model-families).
 
 use std::sync::Arc;
 
@@ -84,6 +86,7 @@ impl ModelFamily for Qwen3Moe {
             moe: Some(moe),
             qk_norm: false,
             qk_norm_per_head: true,
+            ..FamilyConfig::default()
         })
     }
 
@@ -106,8 +109,20 @@ impl ModelFamily for Qwen3Moe {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
     }
 
+    /// Tensor and expert parallelism (P7 S-5): the same hooks on the rank's shard. Heads and KV
+    /// heads split by `crate::tp` (Qwen3-30B-A3B: 32 / 4 over 2 ranks), every expert's gate/up
+    /// rows and down columns split under tp (768 -> 384, three whole FP8 blocks), whole experts
+    /// per rank under ep; the router is replicated and runs on the all-reduced hidden row.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
+    }
+
     fn default_tool_format(&self) -> Option<&'static str> {
         Some(HERMES)
+    }
+
+    fn default_reasoning_parser(&self) -> Option<&'static str> {
+        Some("qwen_think")
     }
 
     /// The family's tiny checkpoint (`testing::tiny`).

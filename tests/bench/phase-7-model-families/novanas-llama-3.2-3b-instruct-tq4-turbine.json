@@ -1,0 +1,28 @@
+{
+  "requests_ok": 200,
+  "requests_failed": 0,
+  "wall_seconds": 60.899781767,
+  "request_throughput": 3.284084017988629,
+  "output_token_throughput": 840.725508605089,
+  "ttft_ms": {
+    "p50": 228.820915,
+    "p95": 606.2890319999999,
+    "p99": 3943.3616970000003
+  },
+  "itl_ms": {
+    "p50": 15.389604,
+    "p95": 15.973605,
+    "p99": 114.006001
+  },
+  "e2e_ms": {
+    "p50": 4732.1584139999995,
+    "p95": 5032.891525,
+    "p99": 8406.282424
+  },
+  "by_status": {
+    "200": 200
+  },
+  "by_error_code": {},
+  "client_dropped": 0,
+  "streams_incomplete": 0
+}

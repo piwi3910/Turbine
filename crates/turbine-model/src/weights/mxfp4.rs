@@ -13,7 +13,10 @@
 //! compressed-tensors `mxfp4-pack-quantized` as `X.weight_packed` / `X.weight_scale`, AMD Quark
 //! `fp4` as `X.weight` / `X.weight_scale` (its `pack_method: reorder` does not reorder fp4), and
 //! OpenAI's `quant_method: mxfp4` as `X.weight_blocks` `[n, k/32, 16]` / `X.weight_scales`
-//! `[n, k/32]` (the same bytes, grouped by block).
+//! `[n, k/32]` (the same bytes, grouped by block). gpt-oss stores each layer's experts fused, as
+//! `mlp.experts.gate_up_proj_blocks` `[E, 2·inter, k/32, 16]` and `_scales` `[E, 2·inter, k/32]`
+//! (`down_proj_*` alike; [`fused_expert_tensor`]): those are U8 slots copied as stored, with the
+//! checkpoint's shapes, and the gpt-oss MoE hook reads them as `[E, n, k/2]` and `[E, n, k/32]`.
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -89,7 +92,20 @@ pub fn glob_ignore(glob: &str) -> String {
 enum Part {
     Data,
     Scales,
+    /// An OpenAI fused-expert tensor (`…experts.<proj>_blocks` / `_scales`): U8, copied as
+    /// stored.
+    Fused,
     Plain,
+}
+
+/// Whether `name` is one of gpt-oss's fused expert tensors: `…mlp.experts.<proj>_blocks` or
+/// `<proj>_scales` (the per-layer `weight_blocks` / `weight_scales` of a linear layer are not).
+pub fn fused_expert_tensor(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or("");
+    name.contains(".experts.")
+        && last != "weight_blocks"
+        && last != "weight_scales"
+        && (last.ends_with("_blocks") || last.ends_with("_scales"))
 }
 
 impl Mxfp4Layout {
@@ -126,7 +142,9 @@ impl Mxfp4Layout {
     fn part(&self, slot: &WeightSlot) -> Part {
         let (data, scales) = self.kind.names();
         let suffix = slot.name.rsplit('.').next().unwrap_or("");
-        if suffix == scales && slot.name.contains('.') {
+        if self.kind == Mxfp4Kind::OpenAi && fused_expert_tensor(&slot.name) {
+            Part::Fused
+        } else if suffix == scales && slot.name.contains('.') {
             Part::Scales
         } else if suffix == data
             && (self.kind != Mxfp4Kind::Quark || self.quantizes(&slot.name, &slot.shape))
@@ -177,6 +195,7 @@ impl Mxfp4Layout {
             let mut shape = lead.clone();
             shape.extend([rows, cols]);
             WeightSlot {
+                float32_stored: false,
                 name: format!("{module}.{suffix}"),
                 shape: vec![n, cols],
                 stack: Some(StackPlace {
@@ -211,7 +230,7 @@ impl Mxfp4Layout {
 
     pub fn slot_dtype(&self, slot: &WeightSlot) -> DType {
         match self.part(slot) {
-            Part::Data | Part::Scales => DType::U8,
+            Part::Data | Part::Scales | Part::Fused => DType::U8,
             Part::Plain => super::Bf16::DTYPE,
         }
     }
@@ -222,8 +241,9 @@ impl Mxfp4Layout {
         // The data is packed U8 whenever its name is its own (compressed-tensors
         // `weight_packed`, OpenAI `weight_blocks`); only Quark's data shares the name `weight`
         // with an unquantized BF16 layer, so there the dtype tells them apart (review r13 C3).
-        let packed =
-            suffix == scales || (suffix == data && (data != "weight" || entry.dtype == Dtype::U8));
+        let packed = suffix == scales
+            || (suffix == data && (data != "weight" || entry.dtype == Dtype::U8))
+            || (self.kind == Mxfp4Kind::OpenAi && fused_expert_tensor(&entry.name));
         let ok = if packed {
             entry.dtype == Dtype::U8
         } else {

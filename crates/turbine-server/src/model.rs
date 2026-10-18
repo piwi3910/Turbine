@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +37,7 @@ use turbine_model::formats::{self, BoundToolFormat, ToolFormat};
 use turbine_model::kv_scales::KvCache;
 use turbine_model::loader::LoadedWeights;
 use turbine_model::pp;
+use turbine_model::reasoning::ReasoningParser;
 use turbine_model::tp::{self, ShardSpec};
 use turbine_model::{
     ChatTemplate, GenerationConfig, GrammarCompiler, MAX_STAGING_BYTES, ModelArchConfig,
@@ -82,7 +83,31 @@ pub(crate) fn model_error(context: &str, e: ModelError) -> StartupError {
     StartupError::new(format!("{context}: {e}"))
 }
 
+/// A kernel selection failure. A requirement no provider supports is `kernel_op_unavailable`
+/// (P7 S-4, the spec failure mode "kernel library without an op the family needs"): logged as
+/// the `kernel_capability` event and named by the ABI entry point and the config, e.g.
+/// `turbine_moe_experts (hidden=2880 … weight_dtype=mxfp4)`, so a library below the needed ABI
+/// minor is told apart from a broken one.
 fn kernel_error(context: &str, e: KernelError) -> StartupError {
+    if let KernelError::NoProvider { op, config, detail } = &e {
+        tracing::error!(
+            event = "kernel_capability",
+            reason = "kernel_op_unavailable",
+            op = %op,
+            config = %config,
+            detail = %detail,
+            "no kernel provider runs a configuration the model needs"
+        );
+        return StartupError::new(format!(
+            "kernel_op_unavailable: {context}: turbine_{op} ({config}) is not supported by any \
+             kernel provider{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({detail})")
+            }
+        ));
+    }
     StartupError::new(format!("{context}: {e}"))
 }
 
@@ -505,6 +530,8 @@ pub struct PreparedModel {
     /// The resolved `model.tool_call_parser`: a registered tool format bound to the tokenizer,
     /// or `None` (off).
     pub tool_format: Option<Arc<BoundToolFormat>>,
+    /// The resolved `model.reasoning_parser` (P7 S-10), or `None` (off).
+    pub reasoning_parser: Option<&'static dyn ReasoningParser>,
     /// The module picked at each extension point (`/turbine/v1/status` `modules`).
     pub modules: ModuleChoices,
     pub served_name: String,
@@ -546,6 +573,11 @@ pub struct PreparedModel {
     pub stage: Option<PpStage>,
     /// Bytes of the weights this rank loads: its shard, or the whole model.
     pub weight_bytes: u64,
+    /// P7 S-12 (Task 32): the model keeps per-sequence state (a hybrid family); its L0 pool
+    /// budget then charges `ceil(state bytes / interval)` per block for block-boundary snapshots.
+    pub hybrid: bool,
+    /// `kv.hybrid_snapshot_interval_blocks` (`≥ 1`): full blocks between snapshots.
+    pub hybrid_snapshot_interval_blocks: u32,
 }
 
 /// The model's identity (P4 §Data namespace key): BLAKE3 of `config.json` and of the
@@ -609,12 +641,23 @@ pub fn prepare_replica(
     prepare_with(config, inventory, &base.kernel_metrics, Some(base), part)
 }
 
-/// The device bytes `slots` take (BF16, the only weight dtype tensor parallelism serves; a
-/// stacked slot is its part of the stack; a padded vocabulary shard counts its padding rows).
-fn slot_bytes(slots: &[turbine_model::WeightSlot]) -> u64 {
+/// The device bytes `slots` take in `format` (a stacked slot is its part of the stack; a padded
+/// vocabulary shard counts its padding rows): each slot expanded through
+/// [`turbine_model::weights::WeightFormat::slots`] — a quantized layer's packed data, scales,
+/// zero points and activation scales — at its shape and
+/// [`turbine_model::weights::WeightFormat::slot_dtype`], exactly the bytes the loader uploads
+/// (the sharded counterpart of `ModelArchConfig::shape().weight_bytes`).
+fn slot_bytes(
+    format: &dyn turbine_model::weights::WeightFormat,
+    slots: &[turbine_model::WeightSlot],
+) -> u64 {
     slots
         .iter()
-        .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+        .flat_map(|s| format.slots(s))
+        .map(|s| {
+            s.shape.iter().map(|&d| d as u64).product::<u64>()
+                * format.slot_dtype(&s).size_bytes() as u64
+        })
         .sum()
 }
 
@@ -655,9 +698,21 @@ fn prepare_with(
         .unwrap_or_else(|| dir.join("tokenizer.json"));
     let tokenizer =
         Arc::new(Tokenizer::from_file(&tokenizer_path).map_err(|e| model_error("tokenizer", e))?);
-    let template = ChatTemplate::resolve(dir, config.model.chat_template.as_deref())
-        .map(Arc::new)
-        .map_err(|e| model_error("chat template", e))?;
+    let template =
+        ChatTemplate::resolve_for(dir, config.model.chat_template.as_deref(), arch.family.0)
+            .map(Arc::new)
+            .map_err(|e| model_error("chat template", e))?;
+    if let Some((name, _)) = arch.family.0.chat_template_override()
+        && template.source_name() == name
+    {
+        tracing::info!(
+            event = "chat_template_override",
+            template = name,
+            family = arch.family.0.name(),
+            "the checkpoint's chat template renders neither tools nor tool_calls; using the \
+             family's tool-aware template"
+        );
+    }
     let max_seq_len = resolve_max_seq_len(
         config.model.max_seq_len,
         arch.max_position_embeddings,
@@ -707,6 +762,9 @@ fn prepare_with(
         (None, Some(s)) => tp::weight_slots(&arch, s).map_err(tp_error)?,
     };
     turbine_model::weights::resolve_for_providers(&mut arch, &device_slots, &ordered);
+    // The rank's weight bytes in the format the selected kernels serve (a block-scaled FP8 layer
+    // none runs counts its BF16 decode): the budget's weight term for every sharded placement.
+    let weight_bytes = slot_bytes(arch.weight_format.get(), &device_slots);
     // One device: the family's ops, workspace, KV layout and weights. A tensor-parallel rank
     // (P5 S-6): its shard's (its heads, KV heads, intermediate and vocabulary columns). An
     // expert-parallel rank (S-11): its experts' (one `moe_experts` config per run of them) and
@@ -725,7 +783,7 @@ fn prepare_with(
                 .map_err(pp_error)?,
                 pp::workspace_bytes(&arch, s, limits).map_err(pp_error)?,
                 pp::kv_layout(&arch, &s.layers, block_tokens).map_err(pp_error)?,
-                slot_bytes(&pp::weight_slots(&arch, s).map_err(pp_error)?),
+                weight_bytes,
             )
         }
         (Some(e), _) => (
@@ -740,7 +798,7 @@ fn prepare_with(
             .map_err(ep_error)?,
             ep::workspace_bytes(&arch, e.shard, &e.placement, limits).map_err(ep_error)?,
             ep::kv_layout(&arch, e.shard, block_tokens).map_err(ep_error)?,
-            slot_bytes(&ep::weight_slots(&arch, e.shard, &e.placement).map_err(ep_error)?),
+            weight_bytes,
         ),
         (None, None) => (
             executor::available_requirements(&arch, block_tokens, executor_options, &ordered),
@@ -758,7 +816,7 @@ fn prepare_with(
                 .map_err(tp_error)?,
             tp::workspace_bytes(&arch, s, limits).map_err(tp_error)?,
             tp::kv_layout(&arch, s, block_tokens).map_err(tp_error)?,
-            slot_bytes(&tp::weight_slots(&arch, s).map_err(tp_error)?),
+            weight_bytes,
         ),
     };
     // Device-side logits reduction (P2c S-4) is optional: only when enabled and a provider
@@ -882,6 +940,10 @@ fn prepare_with(
         &reliability,
         config.kv.gpu.max_bytes,
         0,
+        state_allocation(
+            scheduler.max_running_requests,
+            arch.state.bytes_per_sequence(),
+        ),
     )?;
     let pool = kv_pool_config(
         layout,
@@ -925,9 +987,14 @@ fn prepare_with(
         tool_call_parser = tool_format_name.unwrap_or("none"),
         "structured output ready"
     );
+    let reasoning_parser = crate::modules::resolve_reasoning_parser(
+        config.model.reasoning_parser.as_str(),
+        arch.family.0,
+    );
     let modules = ModuleChoices {
         family: arch.family.0.name().to_string(),
         tool_format: tool_format_name.map(str::to_string),
+        reasoning_parser: reasoning_parser.map(|p| p.name().to_string()),
         weight_format: arch.weight_format.0.name().to_string(),
         backend: config.execution.backend.to_string(),
         card_profile: provider.opened.card.map(|card| card.name.to_string()),
@@ -951,6 +1018,7 @@ fn prepare_with(
     // The resolved RoPE parameters scope the prefix namespace (P6a S-16): a `model.rope_scaling`
     // override leaves config.json, hence its hash, unchanged.
     let identity = model_identity(dir)?.with_rope(&arch.rope_identity());
+    let hybrid = !arch.state.is_empty();
     Ok(PreparedModel {
         provider,
         arch,
@@ -971,6 +1039,7 @@ fn prepare_with(
         grammar,
         structured_output: config.structured_output.clone(),
         tool_format,
+        reasoning_parser,
         modules,
         served_name,
         budget,
@@ -990,6 +1059,8 @@ fn prepare_with(
         expert,
         stage,
         weight_bytes: weights,
+        hybrid,
+        hybrid_snapshot_interval_blocks: config.kv.hybrid_snapshot_interval_blocks,
     })
 }
 
@@ -1030,6 +1101,10 @@ impl PreparedModel {
             &self.reliability,
             self.kv_cap,
             0,
+            state_allocation(
+                self.scheduler.max_running_requests,
+                self.arch.state.bytes_per_sequence(),
+            ),
         )?;
         self.pool = kv_pool_config(
             layout,
@@ -1080,9 +1155,10 @@ pub(crate) fn measure_budget(
     reliability: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
     collective: u64,
+    state_allocation: u64,
 ) -> Result<DeviceBudget, StartupError> {
     let host = read_host(&FsProc::default()).sample.mem_available_bytes;
-    compute_budget(
+    let mut budget = compute_budget(
         &BudgetInputs {
             device,
             memory_kind,
@@ -1098,7 +1174,13 @@ pub(crate) fn measure_budget(
         reliability,
         kv_cap,
     )
-    .map_err(|e| StartupError::new(format!("startup: {e}")))
+    .map_err(|e| StartupError::new(format!("startup: {e}")))?;
+    // The state allocation (`max_running × state`, P7 review fix) is set aside inside the
+    // `kv` pool: the pool left is the physical KV block pool, the ledger's `kv` capacity.
+    if let Some((_, kv)) = budget.pools.iter_mut().find(|(k, _)| *k == PoolKind::Kv) {
+        *kv = kv.saturating_sub(state_allocation);
+    }
+    Ok(budget)
 }
 
 /// Logs a backend's note on the kernel selections at INFO: `event=<note.event>`, `block_tokens`
@@ -1118,9 +1200,16 @@ fn log_backend_note(note: &BackendNote, block_tokens: u32) {
     );
 }
 
+/// The fixed state allocation: the state of `max_running` sequences (P7 review fix; admission
+/// charges each request's `n × state` against it, apart from the KV pool).
+pub(crate) fn state_allocation(max_running: u32, state_bytes: u64) -> u64 {
+    u64::from(max_running).saturating_mul(state_bytes)
+}
+
 /// The L0 pool: as many blocks as the budget's `kv` pool (`bytes`: the budget remainder after
-/// weights, workspace, runtime overhead and the emergency reserve, capped by
-/// `kv.gpu.max_bytes`) holds. At least one block per running request.
+/// weights, workspace, runtime overhead, the emergency reserve and the state allocation,
+/// capped by `kv.gpu.max_bytes` — [`measure_budget`] — so the physical block pool the ledger's
+/// `kv` capacity stands for) holds. At least one block per running request.
 pub(crate) fn kv_pool_config(
     layout: KvLayout,
     bytes: u64,
@@ -1129,8 +1218,9 @@ pub(crate) fn kv_pool_config(
     let pool = BlockPoolConfig::for_bytes(layout, bytes);
     if pool.num_blocks < max_running {
         return Err(StartupError::new(format!(
-            "the kv pool of {bytes} B holds {} KV blocks of {} B; at least one block per \
-             running request (scheduler.max_running_requests = {max_running}) is required",
+            "the kv pool of {bytes} B (after the state of {max_running} running sequences) holds \
+             {} KV blocks of {} B; at least one block per running request \
+             (scheduler.max_running_requests = {max_running}) is required",
             pool.num_blocks,
             pool.layout.block_bytes()
         )));
@@ -1208,6 +1298,157 @@ pub(crate) fn install_decode_graphs(prepared: &PreparedModel, executor: &mut dyn
             turbine_model::executor::decoder::PREFILL_OVERLAP_MIN_TOKENS,
         ));
     }
+}
+
+/// Where calibrated KV scales are cached: `$TURBINE_CACHE_DIR`, else `$XDG_CACHE_HOME/turbine`,
+/// else `$HOME/.cache/turbine`; `None` when none of them is set (no cache, calibration reruns).
+fn kv_scales_cache_dir() -> Option<PathBuf> {
+    let var = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    var("TURBINE_CACHE_DIR")
+        .or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("turbine")))
+        .or_else(|| var("HOME").map(|d| d.join(".cache").join("turbine")))
+}
+
+/// The cache file of `prepared`'s scale set: the checkpoint's identity (config, safetensors
+/// index, RoPE), the calibration prompts, the page layout, and the format revision.
+fn kv_scales_cache_file(prepared: &PreparedModel) -> Option<PathBuf> {
+    let id = &prepared.identity;
+    let hex = |h: &[u8; 32]| blake3::Hash::from_bytes(*h).to_hex().to_string()[..16].to_owned();
+    let mut prompts = blake3::Hasher::new();
+    for p in turbine_model::kv_scales::calibration_prompts() {
+        prompts.update(&(p.len() as u64).to_le_bytes());
+        prompts.update(p.as_bytes());
+    }
+    let prompts = prompts.finalize().to_hex().to_string();
+    Some(kv_scales_cache_dir()?.join(format!(
+        "kv-scales-v1-{}-{}-{}-{}.json",
+        hex(&id.config_hash),
+        hex(&id.weights_index_hash),
+        hex(&id.rope_hash),
+        &prompts[..16]
+    )))
+}
+
+fn read_kv_scales_cache(path: &Path, layers: usize) -> Option<turbine_model::kv_scales::KvScales> {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let bits = |key: &str| -> Option<Vec<f32>> {
+        let v: Option<Vec<f32>> = doc[key]
+            .as_array()?
+            .iter()
+            .map(|b| Some(f32::from_bits(u32::try_from(b.as_u64()?).ok()?)))
+            .collect();
+        v.filter(|v| v.len() == layers && v.iter().all(|s| s.is_finite() && *s > 0.0))
+    };
+    Some(turbine_model::kv_scales::KvScales {
+        k: bits("k_bits")?,
+        v: bits("v_bits")?,
+    })
+}
+
+fn write_kv_scales_cache(path: &Path, scales: &turbine_model::kv_scales::KvScales) {
+    let doc = serde_json::json!({
+        "layers": scales.k.len(),
+        "k": scales.k,
+        "v": scales.v,
+        "k_bits": scales.k.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+        "v_bits": scales.v.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+    });
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, doc.to_string()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            event = "kv_scales_cache",
+            path = %path.display(),
+            error = %e,
+            "calibrated KV scales not cached"
+        );
+    }
+}
+
+/// P7 S-15: `kv.dtype: fp8_e4m3` on a checkpoint that stores no K/V scales runs with scales
+/// measured over the fixed calibration prompts (`absmax / 448` per layer) instead of 1.0
+/// (user decision 2026-09-28 Q10 kept for checkpoints that have scales). Replaces the unit
+/// scales of `prepared.arch.kv_cache` before anything reads them (the KV namespace hashes them);
+/// a cached set (see [`kv_scales_cache_file`]) skips the pass, which otherwise loads the weights
+/// once more, prefills the prompts on the FP8 executor with unit scales and frees both. One
+/// device only: a tensor, expert or pipeline rank keeps the unit scales.
+pub fn calibrate_kv_scales(prepared: &mut PreparedModel) -> Result<(), StartupError> {
+    let arch = &prepared.arch;
+    if !arch.kv_cache.is_fp8()
+        || prepared.shard.is_some()
+        || prepared.expert.is_some()
+        || prepared.stage.is_some()
+        || turbine_model::kv_scales::checkpoint_has_scales(&prepared.index, arch.num_layers)
+    {
+        return Ok(());
+    }
+    let layers = arch.num_layers as usize;
+    let file = kv_scales_cache_file(prepared);
+    let started = Instant::now();
+    let cached = file
+        .as_deref()
+        .and_then(|f| read_kv_scales_cache(f, layers));
+    let (scales, from_cache) = match cached {
+        Some(s) => (s, true),
+        None => {
+            let limit = turbine_model::kv_scales::CALIBRATION_MAX_TOKENS
+                .min(prepared.scheduler.max_batch_tokens as usize);
+            let prompts = turbine_model::kv_scales::calibration_prompts()
+                .iter()
+                .map(|text| {
+                    let mut ids = prepared
+                        .tokenizer
+                        .encode(text, true)
+                        .map_err(|e| model_error("kv scale calibration prompt", e))?;
+                    ids.truncate(limit);
+                    Ok(ids)
+                })
+                .collect::<Result<Vec<_>, StartupError>>()?;
+            let mem = Arc::clone(&prepared.provider.opened.mem);
+            let weights = load_weights(prepared)?;
+            let mut executor = build_executor(
+                &prepared.arch,
+                weights,
+                Arc::clone(&prepared.registry),
+                Arc::clone(&mem),
+                prepared.block_tokens,
+                prepared.scheduler.max_batch_tokens,
+                prepared.scheduler.max_running_requests,
+                prepared.executor_options,
+            )
+            .map_err(|e| model_error("kv scale calibration", e))?;
+            let scales = turbine_model::kv_scales::calibrate(executor.as_mut(), &mem, &prompts)
+                .map_err(|e| model_error("kv scale calibration", e))?;
+            drop(executor);
+            if let Some(f) = &file {
+                write_kv_scales_cache(f, &scales);
+            }
+            (scales, false)
+        }
+    };
+    let old = &prepared.arch.kv_cache;
+    prepared.arch.kv_cache = KvCache {
+        k_scales: Arc::from(scales.k),
+        v_scales: Arc::from(scales.v),
+        ..old.clone()
+    };
+    tracing::info!(
+        event = "kv_scales_calibrated",
+        layers,
+        cached = from_cache,
+        seconds = started.elapsed().as_secs_f64(),
+        "FP8 KV scales calibrated for a checkpoint without K/V scales"
+    );
+    Ok(())
 }
 
 /// Steps 8–10: upload the weights; re-measure the memory budget (P3 S-2: dedicated memory
@@ -1318,12 +1559,14 @@ pub(crate) fn load_weights(prepared: &PreparedModel) -> Result<LoadedWeights, St
         }
     };
     // Other expert ranks' and stages' tensors are skipped quietly (counted), not warned one
-    // by one.
-    WeightLoader::load_part(
+    // by one; a family's deliberately unused sub-modules (e.g. a vision tower) are counted per
+    // prefix too (one `weights_skipped` event each).
+    WeightLoader::load_part_skipping(
         arch.weight_format.get(),
         &prepared.index,
         &slots,
         &arch.family.0.weight_slots(arch),
+        arch.family.0.skipped_prefixes(),
         &prepared.provider.opened.mem,
         MAX_STAGING_BYTES,
     )
@@ -1375,6 +1618,10 @@ pub(crate) fn post_load_budget(
         &prepared.reliability,
         prepared.kv_cap,
         collective,
+        state_allocation(
+            prepared.scheduler.max_running_requests,
+            prepared.arch.state.bytes_per_sequence(),
+        ),
     )?;
     let ledger = Ledger::new(&budget);
     ledger.set_metrics(reliability.clone());
@@ -1449,9 +1696,27 @@ pub(crate) fn pool_blocks(
     prepared: &PreparedModel,
     budget: &DeviceBudget,
 ) -> Result<u32, StartupError> {
+    // P7 S-12 (Task 32): a hybrid family also holds a block-boundary snapshot for the block, and
+    // the budget charges the amortized `ceil(state bytes / interval)` beside the block's own
+    // bytes. Size the L0 pool from that effective per-block cost (the live-state reservation is
+    // already taken out of `budget.pool(PoolKind::Kv)`).
+    let layout = prepared.pool.layout;
+    let block = layout.block_bytes().max(1);
+    let snapshot = if prepared.hybrid {
+        prepared
+            .arch
+            .state
+            .bytes_per_sequence()
+            .div_ceil(u64::from(prepared.hybrid_snapshot_interval_blocks.max(1)))
+    } else {
+        0
+    };
+    let per_block = block.saturating_add(snapshot).max(1);
+    let kv_bytes = budget.pool(PoolKind::Kv);
+    let blocks = (kv_bytes / per_block) as u32;
     let measured = kv_pool_config(
-        prepared.pool.layout,
-        budget.pool(PoolKind::Kv),
+        layout,
+        u64::from(blocks).saturating_mul(block),
         prepared.scheduler.max_running_requests,
     )?;
     Ok(measured.num_blocks.min(prepared.pool.num_blocks))
@@ -1545,6 +1810,8 @@ pub(crate) fn warm_up(
             .map(|b| pool.format_code(*b))
             .collect::<Vec<u8>>()];
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(0),
             q_start: 0,
             q_len: 1,
@@ -1657,6 +1924,115 @@ mod tests {
         assert!(check_rope_attn_factor(m, &requirements, &both).is_err());
     }
 
+    /// A provider whose MoE ops run only the BF16 SwiGLU experts of kernel ABI v2, like a
+    /// library below minor 16.
+    struct OldMoe;
+
+    impl turbine_kernels::MoeKernel for OldMoe {
+        fn supports_route(&self, cfg: &turbine_kernels::MoeRouteConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn supports_experts(&self, cfg: &turbine_kernels::MoeExpertsConfig) -> bool {
+            !cfg.needs_v2_16()
+        }
+        fn implementation_route(&self, _cfg: &turbine_kernels::MoeRouteConfig) -> String {
+            "old_moe_route".into()
+        }
+        fn implementation_experts(&self, _cfg: &turbine_kernels::MoeExpertsConfig) -> String {
+            "old_moe_experts".into()
+        }
+        fn route(
+            &self,
+            _ctx: &mut turbine_kernels::MoeRouteContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+        fn experts(
+            &self,
+            _ctx: &mut turbine_kernels::MoeExpertsContext<'_>,
+        ) -> Result<(), KernelError> {
+            Ok(())
+        }
+    }
+
+    impl KernelProvider for OldMoe {
+        fn id(&self) -> turbine_kernels::ProviderId {
+            turbine_kernels::ProviderId("old-moe")
+        }
+        fn gemm(&self) -> Option<&dyn turbine_kernels::GemmKernel> {
+            None
+        }
+        fn attention(&self) -> Option<&dyn turbine_kernels::AttentionKernel> {
+            None
+        }
+        fn norm(&self) -> Option<&dyn turbine_kernels::NormKernel> {
+            None
+        }
+        fn rope(&self) -> Option<&dyn turbine_kernels::RopeKernel> {
+            None
+        }
+        fn activation(&self) -> Option<&dyn turbine_kernels::ActivationKernel> {
+            None
+        }
+        fn embedding(&self) -> Option<&dyn turbine_kernels::EmbeddingKernel> {
+            None
+        }
+        fn elementwise(&self) -> Option<&dyn turbine_kernels::ElementwiseKernel> {
+            None
+        }
+        fn kv_copy(&self) -> Option<&dyn turbine_kernels::KvCopyKernel> {
+            None
+        }
+        fn moe(&self) -> Option<&dyn turbine_kernels::MoeKernel> {
+            Some(self)
+        }
+    }
+
+    /// P7 Task 15: a registry that cannot run `MoeExpertsConfig { weight_dtype: Mxfp4, .. }`
+    /// fails kernel selection as `kernel_op_unavailable`, naming `turbine_moe_experts` and the
+    /// config; the same experts in BF16 select fine. Breaks if a library below ABI minor 16
+    /// would be reported as a generic selection failure (or, worse, selected).
+    #[test]
+    fn kernel_op_unavailable_names_the_abi_entry_point() {
+        let experts = |weight_dtype| {
+            OpRequirement::from(OpConfig::MoeExperts(turbine_kernels::MoeExpertsConfig {
+                hidden: 2880,
+                inter: 2880,
+                num_experts: 32,
+                top_k: 4,
+                expert_begin: 0,
+                expert_end: 32,
+                dtype: DType::BF16,
+                weight_dtype,
+                ..Default::default()
+            }))
+        };
+        let providers: Vec<Arc<dyn KernelProvider>> = vec![Arc::new(OldMoe)];
+        let order = [turbine_kernels::ProviderId("old-moe")];
+        let metrics = KernelMetrics::register(&MetricsRegistry::new());
+        KernelRegistry::build(
+            providers.clone(),
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Bf16)],
+            &metrics,
+            None,
+        )
+        .expect("BF16 experts are supported");
+        let e = KernelRegistry::build(
+            providers,
+            &order,
+            &[experts(turbine_kernels::ExpertDtype::Mxfp4)],
+            &metrics,
+            None,
+        )
+        .err()
+        .expect("MXFP4 experts are refused");
+        let err = kernel_error("kernel selection", e).to_string();
+        assert!(err.starts_with("kernel_op_unavailable"), "{err}");
+        assert!(err.contains("turbine_moe_experts"), "{err}");
+        assert!(err.contains("weight_dtype=mxfp4"), "{err}");
+    }
+
     #[test]
     fn served_name_from_hf_snapshot_or_last_component() {
         assert_eq!(
@@ -1675,6 +2051,26 @@ mod tests {
         );
         // Not a cache layout: `snapshots` without the `models--<org>--<name>` parent.
         assert_eq!(default_served_name(Path::new("/x/snapshots/abc")), "abc");
+    }
+
+    /// A cached scale set reads back bit for bit; one of another layer count, or a corrupt or
+    /// non-positive one, is ignored (recomputed). Breaks if the cache returns stale scales.
+    #[test]
+    fn kv_scales_cache_round_trips_bit_exact() {
+        let dir = std::env::temp_dir().join(format!("turbine-kv-scales-{}", std::process::id()));
+        let path = dir.join("nested").join("scales.json");
+        let scales = turbine_model::kv_scales::KvScales {
+            k: vec![0.123_456_79, 1.0 / 3.0],
+            v: vec![f32::MIN_POSITIVE, 7.5e-3],
+        };
+        write_kv_scales_cache(&path, &scales);
+        assert_eq!(read_kv_scales_cache(&path, 2), Some(scales));
+        assert_eq!(read_kv_scales_cache(&path, 3), None);
+        std::fs::write(&path, b"{\"k_bits\":[0,0],\"v_bits\":[1,1]}").unwrap();
+        assert_eq!(read_kv_scales_cache(&path, 2), None);
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(read_kv_scales_cache(&path, 2), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A single-file checkpoint whose header is shorter than its length prefix is refused, not
@@ -1755,5 +2151,102 @@ mod tests {
         assert_eq!(resolve_tool_call_parser(None, &Qwen3, false), OFF);
         assert_eq!(resolve_tool_call_parser(hermes, &Llama, true), hermes);
         assert_eq!(resolve_tool_call_parser(mistral, &Qwen3, true), mistral);
+    }
+
+    /// P7: the sharded budget counts a quantized rank's stored bytes — the weight format's
+    /// packed data, scales, zero points and activation scales at their dtypes — not BF16's two
+    /// bytes per element. Qwen3-30B-A3B FP8 at tp 2 was refused at startup at about twice its
+    /// per-rank stored size (`weights=… bytes`). The tiny FP8-block Qwen3-MoE (whole 128 blocks
+    /// per rank) and the tiny Mixtral FP8 (per-tensor scales, static activations) budget below
+    /// the BF16 count the old code returned and above the 1-byte-per-element data floor (the
+    /// scales are real device bytes), and the BF16 twin still budgets two bytes per element.
+    #[test]
+    fn sharded_budget_counts_quantized_weight_bytes() {
+        let old_bf16 = |slots: &[turbine_model::WeightSlot]| -> u64 {
+            slots
+                .iter()
+                .map(|s| s.shape.iter().product::<usize>() as u64 * 2)
+                .sum()
+        };
+        // HF `quant_method: fp8`, block scales of 128 × 128 (Qwen3-30B-A3B-FP8's packaging);
+        // the tiny Qwen3-MoE at expert width 256 so a tp rank holds whole blocks.
+        let tmp = turbine_model::testing::TempDir::new("budget-fp8-block-shards");
+        let q = serde_json::json!({"quant_method": "fp8", "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128], "modules_to_not_convert": ["mlp.gate"]});
+        let fixture = turbine_model::testing::tiny::write_tiny_qwen3moe_quantized(
+            tmp.path(),
+            12,
+            &q,
+            128,
+            256,
+        );
+        let spec = fixture.quantized;
+        let slots = tp::weight_slots(&spec.config, ShardSpec { rank: 0, world: 2 })
+            .expect("qwen3_moe tp slots");
+        let format = spec.config.weight_format.get();
+        let quantized = slot_bytes(format, &slots);
+        let bf16 = old_bf16(&slots);
+        assert!(
+            quantized < bf16,
+            "fp8-block budget {quantized} not below the BF16 count {bf16}"
+        );
+        assert!(
+            quantized > bf16 / 2,
+            "fp8-block budget {quantized} not above the 1-byte data floor of {bf16}"
+        );
+        // The expansion stores e4m3 data and F32 scales — the budget priced them, not the
+        // family slots alone.
+        let expanded: Vec<turbine_model::WeightSlot> =
+            slots.iter().flat_map(|s| format.slots(s)).collect();
+        assert!(
+            expanded
+                .iter()
+                .any(|s| format.slot_dtype(s) == DType::F8E4M3)
+        );
+        assert!(expanded.iter().any(|s| format.slot_dtype(s) == DType::F32));
+
+        // The BF16 twin: the budget is unchanged, two bytes per element.
+        let twin = fixture.twin;
+        let twin_slots = tp::weight_slots(&twin.config, ShardSpec { rank: 0, world: 2 })
+            .expect("bf16 twin tp slots");
+        assert_eq!(
+            slot_bytes(twin.config.weight_format.get(), &twin_slots),
+            old_bf16(&twin_slots)
+        );
+
+        // Compressed-tensors `float-quantized`, per-tensor weight scales and static input
+        // scales (RedHatAI's FP8 Mixtral packaging).
+        let tmp = turbine_model::testing::TempDir::new("budget-fp8-tensor-shards");
+        let q = serde_json::json!({
+            "quant_method": "compressed-tensors", "format": "float-quantized",
+            "ignore": [
+                "model.layers.0.block_sparse_moe.gate",
+                "model.layers.1.block_sparse_moe.gate", "lm_head",
+            ],
+            "config_groups": {"group_0": {"targets": ["Linear"],
+                "input_activations": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                                      "dynamic": false, "symmetric": true},
+                "weights": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                            "dynamic": false, "symmetric": true}}}});
+        let fixture = turbine_model::testing::tiny::write_tiny_family_quantized(
+            tmp.path(),
+            "mixtral",
+            22,
+            &q,
+        );
+        let spec = fixture.quantized;
+        let slots = tp::weight_slots(&spec.config, ShardSpec { rank: 0, world: 2 })
+            .expect("mixtral tp slots");
+        let format = spec.config.weight_format.get();
+        let quantized = slot_bytes(format, &slots);
+        let bf16 = old_bf16(&slots);
+        assert!(
+            quantized < bf16,
+            "fp8-tensor budget {quantized} not below the BF16 count {bf16}"
+        );
+        assert!(
+            quantized > bf16 / 2,
+            "fp8-tensor budget {quantized} not above the 1-byte data floor of {bf16}"
+        );
     }
 }

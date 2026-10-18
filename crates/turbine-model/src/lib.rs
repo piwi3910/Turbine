@@ -19,6 +19,7 @@ pub mod kv_scales;
 pub mod loader;
 pub mod metrics;
 pub mod pp;
+pub mod reasoning;
 pub mod registries;
 pub mod safetensors;
 pub mod sampling;
@@ -54,7 +55,9 @@ pub use structured::{
     json_options, step_mask,
 };
 pub use tokenizer::{IncrementalDetokenizer, Tokenizer};
-pub use tools::{ToolCallParser, ToolChoice, ToolParse, new_call_id, tool_call_grammar};
+pub use tools::{
+    ToolCallParser, ToolChoice, ToolParse, new_call_id, new_mistral_call_id, tool_call_grammar,
+};
 pub use tp::TpContext;
 
 /// Every failure of the model layer (contract §10). Messages name the offending file, field or
@@ -66,7 +69,12 @@ pub enum ModelError {
     Io { path: PathBuf, detail: String },
     #[error("{}: pickle formats are not supported", path.display())]
     Pickle { path: PathBuf },
-    #[error("unsupported {field} = {value}; supported: {supported}")]
+    /// A configuration value no executor implements; a refusal with a reason code
+    /// ([`ModelError::reason_code`]) starts its text with `<code>: `.
+    #[error(
+        "{}unsupported {field} = {value}; supported: {supported}",
+        config::reason_prefix(.field)
+    )]
     Unsupported {
         field: String,
         value: String,
@@ -96,6 +104,17 @@ pub enum ModelError {
     /// afterwards.
     #[error("collective: {0}")]
     Collective(#[from] turbine_distributed::collective::CollectiveError),
+}
+
+impl ModelError {
+    /// The reason code of a refusal that has one (P7 S-1: `sliding_window_unsupported` for a
+    /// `sliding_window` / `use_sliding_window` value no executor implements).
+    pub fn reason_code(&self) -> Option<&'static str> {
+        match self {
+            ModelError::Unsupported { field, .. } => config::reason_code(field),
+            _ => None,
+        }
+    }
 }
 
 impl From<MemoryError> for ModelError {

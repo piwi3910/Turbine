@@ -43,6 +43,8 @@ olmoe-1b-7b-0125-instruct-fp8kv|olmoe-1b-7b-0125-instruct|scripts/lab/phase6-nov
 llama-3.2-3b-instruct-yarn16|llama-3.2-3b-instruct|scripts/lab/phase6-novanas-llama-yarn16.yaml|tests/golden/llama-3.2-3b-instruct-yarn16/prompts.jsonl
 llama-3.1-8b-instruct|llama-3.1-8b-instruct|scripts/lab/phase6-novanas-llama8b.yaml|
 llama-3.1-8b-instruct-mxfp4a16|llama-3.1-8b-instruct-mxfp4a16|scripts/lab/phase6-novanas-llama8b-mxfp4.yaml|
+gpt-oss-20b|gpt-oss-20b|scripts/lab/phase7-novanas-gpt-oss-20b.yaml|tests/golden/gpt-oss-20b/prompts.jsonl
+qwen3.5-9b|qwen3.5-9b|scripts/lab/phase7-novanas-qwen3.5-9b.yaml|tests/golden/qwen3.5-9b/prompts.jsonl
 "
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
 ci=/home/piwi/turbine-ci

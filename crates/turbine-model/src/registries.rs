@@ -70,7 +70,17 @@ mod registry_conformance {
         names_are(
             reg,
             "model_family",
-            &["llama", "olmoe", "qwen3", "qwen3_moe", "mistral", "mixtral"],
+            &[
+                "llama",
+                "olmoe",
+                "qwen3",
+                "qwen3_moe",
+                "mistral",
+                "mixtral",
+                "gpt_oss",
+                "qwen3_5",
+                "qwen3_5_moe",
+            ],
         );
         passes(families_suite(reg));
     }
@@ -80,7 +90,11 @@ mod registry_conformance {
     #[test]
     fn tool_formats() {
         let reg = crate::formats::registry();
-        names_are(reg, "tool_format", &["llama3_json", "hermes", "mistral"]);
+        names_are(
+            reg,
+            "tool_format",
+            &["llama3_json", "hermes", "mistral", "harmony", "qwen3_xml"],
+        );
         passes(formats_suite(reg));
     }
 

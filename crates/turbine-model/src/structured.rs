@@ -1,8 +1,9 @@
 //! Constrained decoding (P2 S-17, S-18): the allowed-token bitmask, the matcher trait the engine
 //! drives each decode step, and the llguidance-backed [`GrammarCompiler`].
 //!
-//! Per step the engine calls [`step_mask`] (the matcher fills the mask; EOS stays disallowed
-//! until the matcher accepts), passes the mask to `Sampler::sample`, then commits the sampled
+//! Per step the engine calls [`step_mask`] (the matcher fills the mask; the matcher's EOS bits
+//! say when the output may end — [`TokenMatcher::step_mask_gates_eos`] decides whether
+//! `step_mask` may strip them), passes the mask to `Sampler::sample`, then commits the sampled
 //! token to the matcher. Compilation is bounded ([`GrammarLimits`]) and runs off the engine
 //! thread; llguidance's per-step parser limits stay at their defaults, and a step that exceeds
 //! them fails with [`ModelError::Constraint`] for that request only.
@@ -135,18 +136,28 @@ pub trait TokenMatcher: Send {
         let _ = max;
         Vec::new()
     }
+    /// Whether [`step_mask`] must keep every id of `eos_token_ids` out of the mask until this
+    /// matcher accepts (the default). A matcher whose mask already says exactly when the output
+    /// may end — and whose grammar can require an EOS id as a literal continuation (the
+    /// harmony `<|call|>`, which gpt-oss's checkpoint also lists as an EOS token) — returns
+    /// false: stripping the id there dead-ends the constraint ("the constraint allows no
+    /// token") exactly when the call is complete.
+    fn step_mask_gates_eos(&self) -> bool {
+        true
+    }
 }
 
 /// Fills `mask` for the next step of `matcher`: its allowed ids, with every id of
-/// `eos_token_ids` disallowed until the matcher accepts. A mask that allows nothing is an error
-/// (the constraint is stuck).
+/// `eos_token_ids` disallowed until the matcher accepts — unless the matcher keeps its own EOS
+/// bits ([`TokenMatcher::step_mask_gates_eos`]). A mask that allows nothing is an error (the
+/// constraint is stuck).
 pub fn step_mask(
     matcher: &mut dyn TokenMatcher,
     eos_token_ids: &[u32],
     mask: &mut TokenMask,
 ) -> Result<(), ModelError> {
     matcher.allowed(mask)?;
-    if !matcher.accepts_eos() {
+    if matcher.step_mask_gates_eos() && !matcher.accepts_eos() {
         for &id in eos_token_ids {
             mask.disallow(id);
         }
@@ -338,17 +349,14 @@ impl TokenMatcher for LlguidanceMatcher {
             .compute_mask_or_eos()
             .map_err(constraint_error)?;
         mask.copy_from(&vob);
-        // llguidance marks EOS in its mask when the output may end; mirror that onto every
-        // EOS id of the model.
-        let eos_allowed = self
-            .eos_token_ids
-            .iter()
-            .any(|&id| (id as usize) < vob.len() && vob.is_allowed(id));
-        for &id in &self.eos_token_ids {
-            if eos_allowed {
+        // llguidance's mask carries the EOS ids when the output may end (it knows the ids: the
+        // compiler builds the trie with them), and a literal EOS-token continuation of the
+        // grammar — the harmony `<|call|>`, which gpt-oss also lists as an EOS token — exactly
+        // when the grammar forces it. Keep that as the truth, and mirror an accepting state
+        // onto every EOS id of the model.
+        if self.accepting {
+            for &id in &self.eos_token_ids {
                 mask.allow(id);
-            } else {
-                mask.disallow(id);
             }
         }
         if let Some(metrics) = &self.metrics {
@@ -358,15 +366,13 @@ impl TokenMatcher for LlguidanceMatcher {
     }
 
     fn commit(&mut self, token: u32) -> Result<(), ModelError> {
-        if self.eos_token_ids.contains(&token) {
-            return if self.accepting {
-                Ok(())
-            } else {
-                Err(ModelError::Constraint(format!(
-                    "EOS {token} before the constraint is complete"
-                )))
-            };
+        if self.accepting && self.eos_token_ids.contains(&token) {
+            // The output ends here; nothing left to advance.
+            return Ok(());
         }
+        // An EOS id while the constraint is not complete is a literal continuation of the
+        // grammar (harmony's `<|call|>`): llguidance applies it as the token it is and the
+        // grammar completes.
         self.matcher
             .consume_token(token)
             .map_err(constraint_error)?;
@@ -376,6 +382,13 @@ impl TokenMatcher for LlguidanceMatcher {
 
     fn accepts_eos(&self) -> bool {
         self.accepting
+    }
+
+    fn step_mask_gates_eos(&self) -> bool {
+        // llguidance's mask already says exactly when the output may end (see `allowed`), so
+        // `step_mask` must not strip its EOS bits: the literal `<|call|>` continuation dies
+        // there.
+        false
     }
 
     fn forced_tokens(&mut self, max: usize) -> Vec<u32> {

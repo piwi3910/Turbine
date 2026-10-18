@@ -176,7 +176,26 @@ pub fn check_executable(plan: &mut ParallelPlan, config: &Config) -> Result<(), 
             "parallel.tensor_parallel_size: {} ranks cannot split {}: {e}",
             plan.tp, arch.hf_architecture
         ))
-    })
+    })?;
+    // Combinations the support matrix refuses for this architecture (`PARALLEL_REFUSALS`),
+    // like the expert-parallel path below.
+    if let Some(r) =
+        turbine_core::support::parallel_refusal(&arch.hf_architecture, plan.tp, plan.ep)
+    {
+        let code = r.reason.split(':').next().unwrap_or(r.reason);
+        tracing::error!(
+            event = "parallel_plan_failed",
+            reason = code,
+            tp = plan.tp,
+            error = %r.reason,
+            "the placement is refused by the support matrix"
+        );
+        return Err(PlanFailure::Config(format!(
+            "parallel.tensor_parallel_size: {} (tensor_parallel_size {} on {})",
+            r.reason, plan.tp, arch.hf_architecture
+        )));
+    }
+    Ok(())
 }
 
 /// [`check_executable`] of an expert-parallel plan.
@@ -204,8 +223,7 @@ fn check_expert_parallel(plan: &mut ParallelPlan, config: &Config) -> Result<(),
             ),
         ));
     };
-    // Combinations the support matrix refuses for this architecture (P5 exit: OLMoE with
-    // expert × tensor parallelism, `olmoe_ep_tp_drift`).
+    // Combinations the support matrix refuses for this architecture (`PARALLEL_REFUSALS`).
     if let Some(r) =
         turbine_core::support::parallel_refusal(&arch.hf_architecture, plan.tp, plan.ep)
     {
@@ -894,15 +912,9 @@ mod tests {
         turbine_model::testing::tiny::write_tiny_olmoe(dir.path(), 1);
         let mut config = Config::default();
         config.model.path = dir.path().to_path_buf();
-        // P5 exit (user decision 2026-09-28): OLMoE at ep 2 × tp 2 is refused with
-        // `olmoe_ep_tp_drift` naming `parallel.expert_parallel_size`.
-        match check_executable(&mut ep_plan(2, 2), &config) {
-            Err(PlanFailure::Config(m)) => assert!(
-                m.starts_with("parallel.expert_parallel_size: olmoe_ep_tp_drift"),
-                "{m}"
-            ),
-            other => panic!("ep 2 tp 2: {other:?}"),
-        }
+        // OLMoE at ep 2 × tp 2 is planned (Phase 7 Task 13: the refusal was replaced by a
+        // calibrated multi-GPU golden bound).
+        check_executable(&mut ep_plan(2, 2), &config).expect("ep 2 tp 2 is planned");
         {
             let tp = 1;
             let mut p = ep_plan(tp, 2);

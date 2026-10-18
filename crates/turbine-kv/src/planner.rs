@@ -11,6 +11,7 @@
 
 use turbine_core::types::PressureState;
 
+use crate::state::SnapshotRef;
 use crate::tier::TierId;
 
 /// Why a plan chose its cutoff (P4 §Plan decision); label of `turbine_kv_plans_total{reason}`.
@@ -58,6 +59,16 @@ pub struct KvPlan {
     /// block at `cutoff_blocks()` (a matched full block, or the directory's partial match
     /// when the cutoff keeps every matched block).
     pub partial_tokens: u32,
+    /// P7 S-12 (hybrid families): the snapshot a prefix hit restores, when the model keeps
+    /// per-sequence state and the hit reached a block that carries one. `None` for
+    /// attention-only families and for a hit with no snapshot at or before its cutoff.
+    pub state_snapshot: Option<SnapshotRef>,
+    /// P7 S-12: how many matched blocks the restored state already covers — the state recompute
+    /// starts at the token `state_recompute_from × kv.block_tokens` of the prompt (the tokens
+    /// after the restored snapshot are re-driven through the recurrent layers). `None` for
+    /// attention-only families. A hybrid plan's `recompute_tokens` starts here, not at the
+    /// cutoff (KV blocks between the snapshot and the cutoff are re-written in place).
+    pub state_recompute_from: Option<u32>,
 }
 
 impl KvPlan {
@@ -110,6 +121,27 @@ pub struct PlanInputs<'a> {
     /// comparison of the last block, [`crate::directory::PrefixMatch::partial`]); 0 when the
     /// comparison found nothing.
     pub partial_tokens: u32,
+    /// P7 S-12: the model keeps per-sequence state (a hybrid family). A hybrid hit reuses whole
+    /// blocks only — no tail copy — and restores the nearest snapshot at or before its cutoff.
+    pub hybrid: bool,
+    /// P7 S-12: snapshot each matched block carries, parallel to `matched` (`None` for a block
+    /// without one, and for attention-only families). A hybrid hit's cutoff still counts the
+    /// matched blocks; the state recompute starts at the nearest snapshot's boundary.
+    pub snapshots: &'a [Option<SnapshotRef>],
+}
+
+/// The nearest snapshot at or before matched-block index `at` (the largest `i <= at` with a
+/// snapshot), with its index. `None` when no matched block at or before `at` carries one.
+pub fn nearest_snapshot(
+    snapshots: &[Option<SnapshotRef>],
+    at: usize,
+) -> Option<(usize, SnapshotRef)> {
+    snapshots
+        .iter()
+        .take(at + 1)
+        .enumerate()
+        .rev()
+        .find_map(|(i, s)| s.map(|r| (i, r)))
 }
 
 impl PlanInputs<'_> {
@@ -211,6 +243,31 @@ impl PlanInputs<'_> {
         plan.recompute_tokens -= p;
     }
 
+    /// The plan's final form: the tail-copy extension for attention-only families, or the
+    /// hybrid (P7 S-12) rule — whole-block reuse only (no tail copy) and the state recompute
+    /// starting at the nearest snapshot at or before the cutoff. With no such snapshot the
+    /// prefix's state cannot be restored, so the state is recomputed from zero.
+    fn finalize(&self, mut plan: KvPlan) -> KvPlan {
+        if !self.hybrid {
+            self.extend_partial(&mut plan);
+            return plan;
+        }
+        plan.partial_tokens = 0;
+        let at = plan.cutoff_blocks().saturating_sub(1) as usize;
+        match nearest_snapshot(self.snapshots, at) {
+            Some((i, snapshot)) => {
+                plan.state_snapshot = Some(snapshot);
+                plan.state_recompute_from = Some(i as u32 + 1);
+                plan.recompute_tokens = self.prompt_tokens - (i as u32 + 1) * self.block_tokens;
+            }
+            None => {
+                plan.state_recompute_from = Some(0);
+                plan.recompute_tokens = self.prompt_tokens;
+            }
+        }
+        plan
+    }
+
     fn plan(&self, k: usize, reason: PlanReason) -> KvPlan {
         let mut reuse_l0 = 0;
         let mut promote: Vec<(TierId, u32)> = Vec::new();
@@ -229,6 +286,8 @@ impl PlanInputs<'_> {
             recompute_tokens: self.prompt_tokens - k as u32 * self.block_tokens,
             reason,
             partial_tokens: 0,
+            state_snapshot: None,
+            state_recompute_from: self.hybrid.then_some(0),
         }
     }
 }
@@ -277,9 +336,7 @@ pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
         .min(exact);
     let matched = &inp.matched[..cap];
     if matched.is_empty() {
-        let mut plan = inp.plan(0, PlanReason::NoMatch);
-        inp.extend_partial(&mut plan);
-        return plan;
+        return inp.finalize(inp.plan(0, PlanReason::NoMatch));
     }
     let l0_prefix = matched.iter().take_while(|t| **t == TierId::L0).count();
     let usable = matched
@@ -288,10 +345,10 @@ pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
         .unwrap_or(matched.len());
     let best = inp.argmin(usable);
     if inp.l0_state >= PressureState::Red && best > l0_prefix {
-        return inp.plan(inp.argmin(l0_prefix), PlanReason::L0Pressure);
+        return inp.finalize(inp.plan(inp.argmin(l0_prefix), PlanReason::L0Pressure));
     }
     if usable < matched.len() && inp.argmin(matched.len()) > usable {
-        return inp.plan(best, PlanReason::TierDegraded);
+        return inp.finalize(inp.plan(best, PlanReason::TierDegraded));
     }
     let reason = if best > l0_prefix {
         PlanReason::RetrieveCheaper
@@ -300,9 +357,7 @@ pub fn plan_prefix(inp: &PlanInputs<'_>) -> KvPlan {
     } else {
         PlanReason::AllL0
     };
-    let mut plan = inp.plan(best, reason);
-    inp.extend_partial(&mut plan);
-    plan
+    inp.finalize(inp.plan(best, reason))
 }
 
 #[cfg(test)]
@@ -332,6 +387,15 @@ mod tests {
             lossy_penalty: &[],
             allow_lossy: true,
             partial_tokens: 0,
+            hybrid: false,
+            snapshots: &[],
+        }
+    }
+
+    fn snap(block: u32) -> SnapshotRef {
+        SnapshotRef {
+            block: turbine_core::types::BlockId(block),
+            entry: block,
         }
     }
 
@@ -639,5 +703,83 @@ mod tests {
         inp.partial_tokens = 2;
         let p = plan_prefix(&inp);
         assert_eq!((p.cutoff_blocks(), p.partial_tokens), (1, 0));
+    }
+
+    /// P7 S-12 (Task 32): a hybrid family's hit ends at the last full block carrying a snapshot
+    /// and reuses whole blocks only — a 3.5-block match reuses 3 blocks, restores the block-3
+    /// snapshot and recomputes the half block (no tail copy). Breaks if a hybrid plan splits a
+    /// block, or restores a snapshot it did not reach.
+    #[test]
+    fn hybrid_hit_stops_at_last_snapshot() {
+        let matched = [TierId::L0; 3];
+        let snaps = [Some(snap(1)), Some(snap(2)), Some(snap(3))];
+        let mut inp = inputs(&matched, 3 * 32 + 16);
+        inp.block_tokens = 32;
+        inp.block_bytes = 16 * 32;
+        inp.partial_tokens = 16; // the directory matched half of a fourth block
+        inp.hybrid = true;
+        inp.snapshots = &snaps;
+        let p = plan_prefix(&inp);
+        assert_eq!(p.cutoff_blocks(), 3, "three whole blocks are reused");
+        assert_eq!(p.partial_tokens, 0, "a hybrid never splits a block");
+        assert_eq!(p.state_snapshot, Some(snap(3)));
+        assert_eq!(p.state_recompute_from, Some(3));
+        assert_eq!(
+            p.recompute_tokens, 16,
+            "the state recompute starts at block 3's boundary, so only the half block remains"
+        );
+        // No snapshot at or before the cutoff: the state cannot be restored, so it is
+        // recomputed from zero even though the KV blocks are cached.
+        let mut none = inputs(&matched, 3 * 32 + 16);
+        none.block_tokens = 32;
+        none.hybrid = true;
+        none.snapshots = &[None, None, None];
+        let p = plan_prefix(&none);
+        assert_eq!(p.state_snapshot, None);
+        assert_eq!(p.state_recompute_from, Some(0));
+        assert_eq!(p.recompute_tokens, none.prompt_tokens);
+    }
+
+    /// P7 S-12 (`nearest_snapshot`): with `kv.hybrid_snapshot_interval_blocks` 2 over a 5-block
+    /// chain with snapshots at blocks 2, 4 and 5, a 3-block match restores block 2 and recomputes
+    /// block 3 onward; a full 5-block match restores block 5. Breaks if the planner restores a
+    /// snapshot after the match, or ignores the nearest one before it.
+    #[test]
+    fn hybrid_hit_uses_nearest_snapshot() {
+        // Interval 2: matched blocks 1 and 3 carry no snapshot, block 2 does.
+        let matched = [TierId::L0; 3];
+        let snaps = [None, Some(snap(2)), None];
+        assert_eq!(nearest_snapshot(&snaps, 2), Some((1, snap(2))));
+        assert_eq!(nearest_snapshot(&snaps, 0), None);
+        let mut inp = inputs(&matched, 3 * 32 + 4);
+        inp.block_tokens = 32;
+        inp.hybrid = true;
+        inp.snapshots = &snaps;
+        let p = plan_prefix(&inp);
+        assert_eq!(
+            p.cutoff_blocks(),
+            3,
+            "the KV blocks are reused to the match"
+        );
+        assert_eq!(p.state_snapshot, Some(snap(2)));
+        assert_eq!(p.state_recompute_from, Some(2));
+        assert_eq!(
+            p.recompute_tokens,
+            inp.prompt_tokens - 2 * 32,
+            "block 3's tokens are recomputed"
+        );
+
+        // A prompt matching all 5 blocks restores the finished sequence's last block (5).
+        let all5 = [TierId::L0; 5];
+        let chain = [None, Some(snap(2)), None, Some(snap(4)), Some(snap(5))];
+        let mut full = inputs(&all5, 5 * 32 + 4);
+        full.block_tokens = 32;
+        full.hybrid = true;
+        full.snapshots = &chain;
+        let p = plan_prefix(&full);
+        assert_eq!(p.cutoff_blocks(), 5);
+        assert_eq!(p.state_snapshot, Some(snap(5)));
+        assert_eq!(p.state_recompute_from, Some(5));
+        assert_eq!(p.recompute_tokens, 4);
     }
 }

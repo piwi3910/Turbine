@@ -43,6 +43,8 @@ use turbine_observability::MetricsRegistry;
 use turbine_tensor::DeviceMemory;
 use turbine_tensor::host::HostMemory;
 
+/// An architecture no family registers.
+const UNREGISTERED_ARCH: &str = "ExampleUnregisteredForCausalLM";
 const POLL: Duration = Duration::from_millis(20);
 const READY_LIMIT: Duration = Duration::from_secs(60);
 /// Launches of one test server before a lost port race fails the test.
@@ -135,6 +137,9 @@ struct Setup<'a> {
     capture_logs: bool,
     /// Serve the tiny OLMoE (8 experts top-2, `tiny-olmoe`) instead of the tiny Llama.
     olmoe: bool,
+    /// Serve the tiny `Qwen3_5ForConditionalGeneration` hybrid (per-sequence state snapshots,
+    /// `tiny-qwen3_5`) instead of the tiny Llama.
+    qwen3_5: bool,
     /// More environment variables for the server.
     env: &'a [(&'a str, String)],
     /// Rewrite the tiny Llama into the weight format this `quantization_config` declares
@@ -158,6 +163,7 @@ impl Default for Setup<'_> {
             template_with_tools: true,
             capture_logs: false,
             olmoe: false,
+            qwen3_5: false,
             env: &[],
             quantization: None,
             kv_extra: "",
@@ -220,13 +226,17 @@ impl TinyServer {
 
     fn launch(setup: &Setup<'_>) -> TinyServer {
         let dir = TempDir::new("turbine-tiny-server");
-        let model = if setup.olmoe {
+        let model = if setup.qwen3_5 {
+            "tiny-qwen3_5"
+        } else if setup.olmoe {
             "tiny-olmoe"
         } else {
             "tiny-llama"
         };
         let model_dir = dir.path().join(model);
-        if setup.olmoe {
+        if setup.qwen3_5 {
+            turbine_model::testing::tiny::write_tiny_qwen3_5(&model_dir, 7);
+        } else if setup.olmoe {
             write_tiny_olmoe(&model_dir, 7);
         } else {
             write_tiny_llama_with(
@@ -866,7 +876,8 @@ fn status_reports_modules_and_kernels() {
     let status = server.get("/turbine/v1/status").json();
     assert_eq!(
         status["modules"],
-        json!({"family": "llama", "tool_format": "llama3_json", "weight_format": "bf16",
+        json!({"family": "llama", "tool_format": "llama3_json", "reasoning_parser": null,
+               "weight_format": "bf16",
                "backend": "cpu", "card_profile": null, "scheduling_policy": "default",
                "eviction_policy": "cost_aware"}),
         "{status}"
@@ -1669,6 +1680,51 @@ fn diagnostics_shapes() {
     drop(held);
     drop(waiting);
 }
+
+/// P7 S-12 (Task 33): `/turbine/v1/kv` reports `state_bytes` on every tier, and a hybrid
+/// family's live block-boundary snapshots show up in L0. A tiny `Qwen3_5ForConditionalGeneration`
+/// (cpu backend) with `kv.hybrid_snapshot_interval_blocks: 1` snapshots the state at every full
+/// block; after a completion that fills full blocks, L0's `state_bytes` is positive, echoed on
+/// the `l0` tier, while the lower tiers (nothing is demoted here) report none. Breaks if the
+/// field is missing, an attention-only model reports state bytes, or a stored snapshot's entry
+/// is not counted.
+#[test]
+fn kv_document_reports_state_bytes() {
+    // An attention-only model reports none everywhere.
+    let llama = TinyServer::start("");
+    let doc = llama.get("/turbine/v1/kv").json();
+    for i in 0..3 {
+        assert_eq!(
+            doc["tiers"][i]["state_bytes"].as_u64().unwrap_or(0),
+            0,
+            "attention-only tier {i}: {doc}"
+        );
+    }
+
+    let server = TinyServer::launch(&Setup {
+        qwen3_5: true,
+        kv_extra: "  hybrid_snapshot_interval_blocks: 1\n",
+        ..Setup::default()
+    });
+    let resp = server.post(
+        "/v1/completions",
+        &json!({"model": server.model, "prompt": "Hello", "max_tokens": 300,
+                "ignore_eos": true, "temperature": 0}),
+    );
+    assert_eq!(resp.status, 200, "{}", resp.body);
+    let state = |tier: &Value| tier["state_bytes"].as_u64().unwrap_or(0);
+    // The engine publishes its documents each iteration; wait for the snapshot to be counted.
+    wait_for(Duration::from_secs(10), "L0 reports state bytes", || {
+        state(&server.kv_tier()) > 0
+    });
+    let l0 = server.kv_tier();
+    assert!(state(&l0) > 0, "{l0}");
+    let doc = server.get("/turbine/v1/kv").json();
+    assert_eq!(state(&doc["tiers"][0]), state(&l0), "{doc}");
+    assert_eq!(state(&doc["tiers"][1]), 0, "{doc}");
+    assert_eq!(state(&doc["tiers"][2]), 0, "{doc}");
+}
+
 #[test]
 fn request_validation() {
     let server = TinyServer::start("");
@@ -1982,14 +2038,14 @@ fn startup_failures_exit_1() {
     assert_exit_1(&config_yaml(&pickle, addr, ""), addr, "pickle");
 
     // Unsupported architecture (no registered family).
-    let unknown = dir.path().join("gpt-oss");
+    let unknown = dir.path().join("unregistered");
     write_tiny_llama(&unknown, 7);
     let mut cfg: Value =
         serde_json::from_slice(&std::fs::read(unknown.join("config.json")).unwrap()).unwrap();
-    cfg["architectures"] = json!(["GptOssForCausalLM"]);
+    cfg["architectures"] = json!([UNREGISTERED_ARCH]);
     std::fs::write(unknown.join("config.json"), cfg.to_string()).unwrap();
     let addr = free_addr();
-    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, "GptOssForCausalLM");
+    assert_exit_1(&config_yaml(&unknown, addr, ""), addr, UNREGISTERED_ARCH);
 
     // hip with a kernel library that does not exist.
     let tiny = dir.path().join("tiny");
@@ -3701,6 +3757,139 @@ fn qwen3_tiny_generates_on_cpu() {
     panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
 }
 
+/// A Qwen3-style test template: the generation prompt opens `<think>\n` unless
+/// `enable_thinking` is false, which renders the empty `<think>\n\n</think>\n\n` block.
+const THINKING_TEMPLATE: &str = "{%- for message in messages %}<|im_start|>{{ message.role }}\n\
+{{ message.content }}<|im_end|>\n{% endfor %}{%- if add_generation_prompt %}<|im_start|>assistant\n\
+{% if enable_thinking is defined and not enable_thinking %}<think>\n\n</think>\n\n{% else %}<think>\n\
+{% endif %}{%- endif %}";
+
+/// The chat text of choice 0: `content` and `reasoning_content` concatenated over the stream's
+/// deltas (`None` for a field no delta carried).
+fn streamed_fields(chunks: &[Value]) -> (String, Option<String>) {
+    let mut content = String::new();
+    let mut reasoning: Option<String> = None;
+    for chunk in chunks {
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            content.push_str(text);
+        }
+        if let Some(text) = delta["reasoning_content"].as_str() {
+            reasoning.get_or_insert_with(String::new).push_str(text);
+        }
+    }
+    (content, reasoning)
+}
+
+/// Phase 7 S-10: the tiny Qwen3 resolves `model.reasoning_parser: auto` to `qwen_think`
+/// (`/turbine/v1/status` `modules.reasoning_parser`). With thinking on (the generation prompt
+/// ends `<think>\n`) a greedy 8-token answer is all reasoning: non-empty
+/// `message.reasoning_content`, `turbine_reasoning_tokens_total` 8, and the streamed
+/// `delta.reasoning_content` concatenates to the same text. With
+/// `chat_template_kwargs: {"enable_thinking": false}` the field is absent and `content` holds
+/// the text. Breaks if the parser is not wired, the prompt tail is not passed, the kwargs do not
+/// reach the template or the stream and the full body disagree.
+#[test]
+fn reasoning_content_follows_enable_thinking() {
+    let dir = TempDir::new("turbine-tiny-qwen3-reasoning");
+    let model_dir = dir.path().join("tiny-qwen3");
+    write_tiny_family(&model_dir, "qwen3", 3);
+    std::fs::write(model_dir.join("chat_template.jinja"), THINKING_TEMPLATE).unwrap();
+
+    let config = dir.path().join("config.yaml");
+    for _ in 0..LAUNCH_ATTEMPTS {
+        let addr = free_addr();
+        std::fs::write(&config, config_yaml(&model_dir, addr, "")).unwrap();
+        let mut child = spawn(&config);
+        let logs = drain_stderr(&mut child);
+        match wait_until_ready(&mut child, addr, &logs) {
+            Ready::PortTaken => continue,
+            Ready::Serving => {}
+        }
+        let status = request(addr, "GET", "/turbine/v1/status", None).json();
+        assert_eq!(
+            status["modules"]["reasoning_parser"], "qwen_think",
+            "{status}"
+        );
+
+        let body = json!({"model": "tiny-qwen3", "max_tokens": 8, "temperature": 0,
+                          "ignore_eos": true,
+                          "messages": [{"role": "user", "content": "Hello"}]});
+        let resp = request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&body.to_string()),
+        );
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let message = resp.json()["choices"][0]["message"].clone();
+        let reasoning = message["reasoning_content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no reasoning_content: {message}"))
+            .to_string();
+        assert!(!reasoning.is_empty(), "{message}");
+        let metrics = request(addr, "GET", "/metrics", None).body;
+        assert_eq!(
+            sample(&metrics, "turbine_reasoning_tokens_total"),
+            Some(8.0),
+            "{metrics}"
+        );
+
+        let mut streaming = body.clone();
+        streaming["stream"] = json!(true);
+        let resp = request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            Some(&streaming.to_string()),
+        );
+        let (content, streamed) = streamed_fields(&stream_chunks(&resp));
+        assert_eq!(streamed.as_deref(), Some(reasoning.as_str()));
+        assert_eq!(content, message["content"].as_str().unwrap_or(""));
+
+        let mut off = body.clone();
+        off["chat_template_kwargs"] = json!({"enable_thinking": false});
+        let resp = request(addr, "POST", "/v1/chat/completions", Some(&off.to_string()));
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let message = &resp.json()["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none(), "{message}");
+        assert!(
+            !message["content"].as_str().unwrap_or("").is_empty(),
+            "{message}"
+        );
+        return;
+    }
+    panic!("turbine-server lost its port {LAUNCH_ATTEMPTS} times in a row");
+}
+
+/// P7 S-9: `reasoning_effort` accepts only `low` / `medium` / `high`; any other value is a
+/// 400 naming the field (before any model work). Breaks if the request deserialization stops
+/// naming it.
+#[test]
+fn reasoning_effort_rejects_unknown() {
+    let server = TinyServer::start("");
+    let body = json!({
+        "model": server.model,
+        "max_tokens": 4,
+        "reasoning_effort": "extreme",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let resp = request(
+        server.addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&body.to_string()),
+    );
+    assert_eq!(resp.status, 400, "{}", resp.body);
+    assert!(
+        resp.body.contains("reasoning_effort"),
+        "the 400 does not name reasoning_effort: {}",
+        resp.body
+    );
+}
+
 /// P5 S-7: two data-parallel replicas of the tiny model share the cpu "device"
 /// (`allow_device_sharing`, each with half the device budget); 32 concurrent requests all
 /// succeed, the router sends work to both replicas (`turbine_dp_routed_total` non-zero for
@@ -3871,6 +4060,40 @@ fn tp2_serves_tp1_tokens() {
     wait_for(Duration::from_secs(10), "every block free", || {
         two.blocks_used() == 0
     });
+}
+
+/// P7 S-7: the KV document reports every rank's headroom — `ranks` with one entry per rank of
+/// the placement (`rank`, `device`, `headroom_bytes`), each `headroom_bytes` > 0 and at most
+/// the L0 pool the engine runs (`blocks_total × block_bytes`; every rank of a group holds a
+/// pool of the same block count, so the group's headroom is one pool's). Breaks if the engine
+/// publishes no per-rank headroom, names the wrong rank or device, or reports a headroom above
+/// its pool.
+#[test]
+fn kv_document_reports_rank_headroom() {
+    let one = TinyServer::start("");
+    let kv = one.get("/turbine/v1/kv").json();
+    let ranks = kv["ranks"].as_array().expect("ranks in the KV document");
+    assert_eq!(ranks.len(), 1, "{kv}");
+    assert_eq!(ranks[0]["rank"], 0, "{kv}");
+    assert_eq!(ranks[0]["device"], 0, "{kv}");
+    assert!(ranks[0]["headroom_bytes"].as_u64().unwrap() > 0, "{kv}");
+
+    let two = TinyServer::start(TP2);
+    let kv = two.get("/turbine/v1/kv").json();
+    let ranks = kv["ranks"].as_array().expect("ranks at tp 2");
+    assert_eq!(ranks.len(), 2, "{kv}");
+    let tier = two.kv_tier();
+    let pool_bytes = tier["blocks_total"].as_u64().unwrap() * tier["block_bytes"].as_u64().unwrap();
+    for (rank, r) in ranks.iter().enumerate() {
+        assert_eq!(r["rank"], rank, "{kv}");
+        assert_eq!(r["device"], rank, "{kv}");
+        let headroom = r["headroom_bytes"].as_u64().unwrap();
+        assert!(headroom > 0, "ranks[{rank}]: {kv}");
+        assert!(
+            headroom <= pool_bytes,
+            "ranks[{rank}] headroom {headroom} over pool {pool_bytes}"
+        );
+    }
 }
 
 /// P5 S-6 edge case "cancellation mid-step in a TP group": at tp 2, dropping held streams
@@ -4132,8 +4355,7 @@ fn dp2_of_tp2_groups_serve() {
 /// holding half the tiny OLMoE's experts (P5 S-11).
 const EP2: &str = "parallel:\n  expert_parallel_size: 2\n  collective_backend: host\n";
 
-/// P5 S-11, S-12: the tiny OLMoE served at ep 2 with replicated attention (tp 1; OLMoE at
-/// ep 2 × tp 2 is refused, `olmoe_ep_tp_drift`) completes greedy prompts with exactly ep 1's tokens, alone and 8 at a time;
+/// P5 S-11, S-12: the tiny OLMoE served at ep 2 with replicated attention (tp 1) completes greedy prompts with exactly ep 1's tokens, alone and 8 at a time;
 /// `/turbine/v1/status` shows `ep` 2, the plan's reason codes and the contiguous placement
 /// (experts 0–3 on rank 0, 4–7 on rank 1), `/turbine/v1/scheduler` has the `expert` section
 /// with non-zero token counts for both ranks, and `turbine_expert_rank_tokens_total` counts
@@ -4164,8 +4386,7 @@ fn ep2_serves_like_ep1() {
         "1 2 3 4",
     ];
     let want: Vec<Vec<u32>> = prompts.iter().map(|p| greedy(&one, p)).collect();
-    // OLMoE at ep 2 × tp 2 is refused (P5 exit, `olmoe_ep_tp_drift`; server_cli
-    // `olmoe_ep_tp_exits_2`), so only replicated attention is served here.
+    // Only replicated attention is served here; ep 2 × tp 2 is gated by the lab golden.
     {
         let (what, extra) = ("ep 2 tp 1", EP2);
         let two = olmoe(extra);

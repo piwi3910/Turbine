@@ -47,10 +47,7 @@ use crate::config::{ModelArchConfig, unsupported};
 use crate::executor::{
     DecoderExecutor, DecoderSpec, ExecutorLimits, ExecutorOptions, ModelExecutor,
 };
-use crate::loader::{LM_HEAD, LoadedWeights, SlotSource, WeightSlot};
-
-/// The embedding's checkpoint name (vocabulary-sharded with the LM head).
-const EMBED: &str = "model.embed_tokens.weight";
+use crate::loader::{LM_HEAD, LoadedWeights, SlotPart, SlotSource, WeightSlot};
 
 /// One rank of a tensor-parallel group, as its executor sees it (contract §10): its position,
 /// the group's communicator and the stream the collectives are ordered on (the rank's compute
@@ -88,8 +85,9 @@ fn refuse(cfg: &ModelArchConfig, s: ShardSpec, why: String) -> ModelError {
         "parallel.tensor_parallel_size",
         format!("{} ({} {why})", s.world, cfg.family.0.name()),
         "a size dividing the attention heads, the KV heads (or a multiple of them), the \
-         intermediate size and every expert's, for a family with tensor-parallel hooks (llama, \
-         olmoe)",
+         intermediate size, every expert's and the Gated DeltaNet heads, for a family with \
+         tensor-parallel hooks (llama, mistral, mixtral, olmoe, qwen3, qwen3_moe, qwen3_5, \
+         qwen3_5_moe)",
     )
 }
 
@@ -136,7 +134,23 @@ pub fn check(cfg: &ModelArchConfig, s: ShardSpec) -> Result<(), ModelError> {
             format!("intermediate size {}", cfg.intermediate),
         )),
         _ => Ok(()),
+    }?;
+    // A hybrid family's Gated DeltaNet layers shard by value head (and the key heads they read):
+    // every rank takes `k_heads / world` key heads and `v_heads / world` value heads (P7
+    // Task 34).
+    if let Some(g) = cfg.gdn
+        && (!g.k_heads.is_multiple_of(s.world) || !g.v_heads.is_multiple_of(s.world))
+    {
+        return Err(refuse(
+            cfg,
+            s,
+            format!(
+                "Gated DeltaNet {} key / {} value heads",
+                g.k_heads, g.v_heads
+            ),
+        ));
     }
+    Ok(())
 }
 
 /// `cfg` as rank `s` runs it: its attention heads, its KV heads (one when they are replicated),
@@ -153,6 +167,12 @@ pub fn rank_config(cfg: &ModelArchConfig, s: ShardSpec) -> Result<ModelArchConfi
     if let Some(m) = rank.moe.as_mut() {
         m.expert_intermediate /= s.world;
     }
+    // The Gated DeltaNet heads shard by value head: each rank reads its key heads and computes
+    // its value heads (P7 Task 34).
+    if let Some(g) = rank.gdn.as_mut() {
+        g.k_heads /= s.world;
+        g.v_heads /= s.world;
+    }
     Ok(rank)
 }
 
@@ -164,6 +184,64 @@ pub fn kv_layout(
     block_tokens: u32,
 ) -> Result<KvLayout, ModelError> {
     Ok(rank_config(cfg, s)?.kv_layout(block_tokens))
+}
+
+/// The embedding's checkpoint name of the tiny checkpoints the tests use (text prefix `model`).
+#[cfg(test)]
+const EMBED: &str = "model.embed_tokens.weight";
+
+/// Whether `slot` is one of a gated family's per-head Q/K/V slots (stacked into
+/// `self_attn.q_gate_kv_proj.weight`): a rank holds only its heads' slots, so the pairing with
+/// the unsharded list skips them and assigns their sources by head geometry.
+fn is_gated_qkv(slot: &WeightSlot) -> bool {
+    slot.stack
+        .as_ref()
+        .is_some_and(|p| p.name.ends_with(".self_attn.q_gate_kv_proj.weight"))
+}
+
+/// Whether `name` is a Gated DeltaNet weight whose rank slice is a multi-part concatenation of
+/// its `[q | k | v]` rows (Qwen3.5/3.6 `linear_attn.in_proj_qkv` and its `conv1d`): the key-head
+/// and value-head regions take different row slices, which one `(axis, start, len)` cannot
+/// express.
+fn gdn_multipart(name: &str) -> bool {
+    name.ends_with(".linear_attn.in_proj_qkv.weight")
+        || name.ends_with(".linear_attn.conv1d.weight")
+}
+
+/// The [`SlotSource`] of rank `s` for a Gated DeltaNet `[q | k | v]` weight of checkpoint
+/// `shape`: the rank's q rows, k rows and v rows of the model's key and value heads.
+fn gdn_source(
+    cfg: &ModelArchConfig,
+    shape: &[usize],
+    s: ShardSpec,
+) -> Result<SlotSource, ModelError> {
+    let g = cfg
+        .gdn
+        .ok_or_else(|| unsupported("gdn", "absent", "a family with Gated DeltaNet dims"))?;
+    let (world, r) = (s.world as usize, s.rank as usize);
+    let key = g.k_heads as usize * g.k_dim as usize;
+    let value = g.v_heads as usize * g.v_dim as usize;
+    let (kp, vp) = (key / world, value / world);
+    Ok(SlotSource {
+        shape: shape.to_vec(),
+        parts: vec![
+            SlotPart {
+                axis: 0,
+                start: r * kp,
+                len: kp,
+            },
+            SlotPart {
+                axis: 0,
+                start: key + r * kp,
+                len: kp,
+            },
+            SlotPart {
+                axis: 0,
+                start: 2 * key + r * vp,
+                len: vp,
+            },
+        ],
+    })
 }
 
 /// Rank `s`'s weight slots: the family's slots of [`rank_config`] (so the fused Q/K/V and
@@ -182,57 +260,108 @@ pub fn weight_slots(cfg: &ModelArchConfig, s: ShardSpec) -> Result<Vec<WeightSlo
             message: format!("tensor-parallel slots of {}: {what}", family.name()),
         })
     };
-    if slots.len() != full.len() {
-        return Err(mismatch(format!(
-            "{} slots at rank width, {} unsharded",
-            slots.len(),
-            full.len()
-        )));
-    }
     let head_dim = cfg.head_dim as usize;
     let kv_start = kv_head_range(cfg.num_kv_heads, s).start as usize * head_dim;
     let (v_offset, v_rows, v_padded) = vocab_shard(cfg.vocab_size, s);
-    for (slot, whole) in slots.iter_mut().zip(&full) {
+    let embed = format!("{}.embed_tokens.weight", cfg.family.0.text_prefix());
+    // Every non-gated slot pairs one to one with the unsharded slot of the same index; a gated
+    // family's per-head Q/K/V stack expands into `2 · heads + 2` slots, so a rank holds fewer
+    // (`self_attn.q_gate_kv_proj.weight`) and those are handled below.
+    let gated: Vec<bool> = slots.iter().map(is_gated_qkv).collect();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < slots.len() || j < full.len() {
+        if i < slots.len() && gated[i] {
+            i += 1;
+            continue;
+        }
+        if j < full.len() && is_gated_qkv(&full[j]) {
+            j += 1;
+            continue;
+        }
+        if i >= slots.len() || j >= full.len() {
+            return Err(mismatch(if i >= slots.len() {
+                format!("{} without a rank slot", full[j].name)
+            } else {
+                format!("{} without an unsharded slot", slots[i].name)
+            }));
+        }
+        let slot = &mut slots[i];
+        let whole = &full[j];
         if slot.name != whole.name {
             return Err(mismatch(format!("{} against {}", slot.name, whole.name)));
         }
-        if slot.name == EMBED || slot.name == LM_HEAD {
+        if slot.name == embed || slot.name == LM_HEAD {
             slot.shape = vec![v_padded as usize, cfg.hidden as usize];
-            slot.source = Some(SlotSource {
-                shape: whole.shape.clone(),
-                axis: 0,
-                start: v_offset as usize,
-                len: v_rows as usize,
+            slot.source = Some(SlotSource::one(
+                whole.shape.clone(),
+                0,
+                v_offset as usize,
+                v_rows as usize,
+            ));
+        } else if slot.shape != whole.shape {
+            // A Gated DeltaNet layer's `in_proj_qkv` (`[q | k | v]`) and its `conv1d`: the
+            // key-head and value-head row regions take different slices, so the rank's rows are
+            // the concatenation of three parts (P7 Task 34, decision "P7 Task 34 TP/EP
+            // sharding").
+            if gdn_multipart(slot.name.as_str()) {
+                slot.source = Some(gdn_source(cfg, &whole.shape, s)?);
+            } else {
+                let differ: Vec<usize> = (0..slot.shape.len().min(whole.shape.len()))
+                    .filter(|&d| slot.shape[d] != whole.shape[d])
+                    .collect();
+                let [axis] = differ[..] else {
+                    return Err(mismatch(format!(
+                        "{} is {:?} at rank width, {:?} unsharded",
+                        slot.name, slot.shape, whole.shape
+                    )));
+                };
+                let len = slot.shape[axis];
+                let kv_part = ["k_proj.weight", "v_proj.weight", "k_norm.weight"]
+                    .iter()
+                    .any(|suffix| slot.name.ends_with(suffix));
+                let start = if kv_part {
+                    kv_start
+                } else {
+                    s.rank as usize * len
+                };
+                slot.source = Some(SlotSource::one(whole.shape.clone(), axis, start, len));
+            }
+        }
+        i += 1;
+        j += 1;
+    }
+    // A gated family's Q/K/V slots: each rank slot reads the (global) head's rows of the
+    // checkpoint's interleaved `q_proj` / `k_proj` / `v_proj`, the rank stack being
+    // `[q_all | gate_all | k | v]` at the rank's widths (P7 S-11).
+    if cfg.attn_output_gate {
+        let q_dim = cfg.num_attention_heads as usize * head_dim;
+        let kv_dim = cfg.num_kv_heads as usize * head_dim;
+        let rank_heads = rank.num_attention_heads as usize;
+        let rank_q = rank_heads * head_dim;
+        let rank_kv = rank.num_kv_heads as usize * head_dim;
+        let per_head = head_dim * cfg.hidden as usize;
+        let hidden = cfg.hidden as usize;
+        for k in 0..slots.len() {
+            if !gated[k] {
+                continue;
+            }
+            let offset = slots[k].stack.as_ref().expect("a gated slot").offset;
+            slots[k].source = Some(if offset < rank_q * hidden {
+                let global = s.rank as usize * rank_heads + offset / per_head;
+                SlotSource::one(vec![2 * q_dim, hidden], 0, 2 * global * head_dim, head_dim)
+            } else if offset < 2 * rank_q * hidden {
+                let local = (offset - rank_q * hidden) / per_head;
+                let global = s.rank as usize * rank_heads + local;
+                SlotSource::one(
+                    vec![2 * q_dim, hidden],
+                    0,
+                    (2 * global + 1) * head_dim,
+                    head_dim,
+                )
+            } else {
+                SlotSource::one(vec![kv_dim, hidden], 0, kv_start, rank_kv)
             });
-            continue;
         }
-        if slot.shape == whole.shape {
-            continue;
-        }
-        let differ: Vec<usize> = (0..slot.shape.len().min(whole.shape.len()))
-            .filter(|&d| slot.shape[d] != whole.shape[d])
-            .collect();
-        let [axis] = differ[..] else {
-            return Err(mismatch(format!(
-                "{} is {:?} at rank width, {:?} unsharded",
-                slot.name, slot.shape, whole.shape
-            )));
-        };
-        let len = slot.shape[axis];
-        let kv_part = ["k_proj.weight", "v_proj.weight", "k_norm.weight"]
-            .iter()
-            .any(|suffix| slot.name.ends_with(suffix));
-        let start = if kv_part {
-            kv_start
-        } else {
-            s.rank as usize * len
-        };
-        slot.source = Some(SlotSource {
-            shape: whole.shape.clone(),
-            axis,
-            start,
-            len,
-        });
     }
     Ok(slots)
 }

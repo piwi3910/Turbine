@@ -4,8 +4,8 @@
 //! A call is an optional `[TOOL_CALLS]` control token, then one JSON array of
 //! `{"name": …, "arguments": {…}}` objects (an `id` string key is accepted and ignored).
 //! `[TOOL_CALLS]` is a special token that decodes to no text; the grammar leaves it out, so it
-//! compiles on any tokenizer, and the parser accepts calls without it (an open Phase 8 decision,
-//! kept as the run-ahead has it). In `auto` mode an output opens like a call when its first
+//! compiles on any tokenizer, and the parser accepts calls without it (kept as the run-ahead
+//! has it). In `auto` mode an output opens like a call when its first
 //! token is `[TOOL_CALLS]` or its first non-whitespace character is `[`.
 use serde_json::Value;
 use turbine_core::registry::Module;
@@ -13,7 +13,7 @@ use turbine_core::registry::Module;
 use super::envelope::{CallIds, allowed_tools, call_rules, named_call, text_not_starting_with, ws};
 use super::{BoundTokens, ConstraintSpec, Opening, SpecialToken, ToolFormat};
 use crate::ModelError;
-use crate::tools::{ToolCallParser, ToolChoice, ToolParse};
+use crate::tools::{ToolCallParser, ToolChoice, ToolParse, new_mistral_call_id};
 
 /// The format's registry name (and the `parser` label of `turbine_tool_calls_total`).
 pub const MISTRAL: &str = "mistral";
@@ -126,14 +126,14 @@ impl MistralParser {
     /// A parser whose call ids come from an OS-seeded stream.
     pub fn new() -> MistralParser {
         MistralParser {
-            ids: CallIds::new(),
+            ids: CallIds::new().with_shape(new_mistral_call_id),
         }
     }
 
     /// A parser with reproducible call ids (tests, simulations).
     pub fn seeded(seed: u64) -> MistralParser {
         MistralParser {
-            ids: CallIds::seeded(seed),
+            ids: CallIds::seeded(seed).with_shape(new_mistral_call_id),
         }
     }
 }

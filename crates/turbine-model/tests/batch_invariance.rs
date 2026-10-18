@@ -162,6 +162,8 @@ impl Harness {
             tokens.extend_from_slice(&p.tokens);
             positions.extend(p.start..p.start + p.tokens.len() as u32);
             seqs.push(SeqSlice {
+                state_slot: None,
+                snapshot_blocks: &[],
                 seq: SeqId(u64::from(p.seq) + 1),
                 q_start,
                 q_len: p.tokens.len() as u32,

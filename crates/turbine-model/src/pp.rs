@@ -101,7 +101,7 @@ fn stage_spec(cfg: &ModelArchConfig) -> Result<DecoderSpec, ModelError> {
                 "> 1 ({} has no decoder hooks for pipeline stages)",
                 cfg.family.0.name()
             ),
-            "a family on the shared decoder skeleton (llama, olmoe)",
+            "a family on the shared decoder skeleton (llama, mistral, olmoe, qwen3)",
         )
     })
 }
@@ -180,8 +180,9 @@ pub fn check(cfg: &ModelArchConfig, stages: &[StageSpec]) -> Result<(), ModelErr
     Ok(())
 }
 
-/// `cfg` as a stage over `layers` runs it: `num_layers` is the stage's layer count (its KV
-/// layout, shape and budget terms are the stage's); everything else stays the model's.
+/// `cfg` as a stage over `layers` runs it: `num_layers` is the stage's layer count, its layer
+/// kinds and linear-layer state count the stage's layers (its KV layout, shape and budget terms
+/// are the stage's); everything else stays the model's.
 pub fn stage_config(
     cfg: &ModelArchConfig,
     layers: &Range<u32>,
@@ -189,6 +190,8 @@ pub fn stage_config(
     check_layers(cfg, layers)?;
     let mut stage = cfg.clone();
     stage.num_layers = layers.len() as u32;
+    stage.layer_kinds = cfg.layer_kinds[layers.start as usize..layers.end as usize].to_vec();
+    stage.state.linear_layers = stage.num_layers - stage.attention_layers();
     Ok(stage)
 }
 

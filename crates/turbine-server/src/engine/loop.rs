@@ -103,7 +103,7 @@ use turbine_kv::BlockPool;
 use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
-    TokenFeed,
+    SnapshotRef, StateLoc, StateSnapshots, TokenFeed,
 };
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_reliability::budget::PoolKind;
@@ -115,6 +115,7 @@ use turbine_scheduler::{
     BatchKind, CancelReason, IterationFailure, IterationLimits, IterationOutcome, IterationPlan,
     LastIteration, SchedRequest, Scheduler, SubmitError,
 };
+use turbine_tensor::{DType, Tensor};
 
 use super::deadlines::{Deadlines, Timeouts};
 use super::pp::PipelineStats;
@@ -123,7 +124,7 @@ use super::stages::{IterationStages, Stage, StageClock};
 use super::{
     EVENT_CHANNEL_CAPACITY, EngineCommand, EngineDocs, EngineMetrics, EngineShared, SubmitAck,
 };
-use crate::kv_orchestrator::{CopyMark, KvOrchestrator};
+use crate::kv_orchestrator::{CopyMark, DeviceSnapshotStore, KvOrchestrator};
 use crate::metrics::{Outcome, ReasonLabels, TokenKind};
 use crate::reliability::EngineReliability;
 
@@ -165,6 +166,8 @@ pub(crate) struct EngineParts {
     pub jump_forward: bool,
     /// `structured_output.jump_forward_max_tokens`: the longest forced run fed in one step.
     pub jump_forward_max_tokens: u32,
+    /// Every rank's KV headroom, published in the KV document (P7 S-7).
+    pub ranks: Vec<turbine_kv::KvRankDocument>,
 }
 
 /// The message of the `slow_client` error event.
@@ -303,6 +306,15 @@ pub(crate) struct EngineLoop {
     jump_forward: bool,
     /// `structured_output.jump_forward_max_tokens`.
     jump_forward_max_tokens: u32,
+    /// [`EngineParts::ranks`].
+    ranks: Vec<turbine_kv::KvRankDocument>,
+    /// P7 S-12 (Task 32): the snapshot entries this turn's plan reserved (block → entry),
+    /// recorded on the directory once the iteration commits, released when it fails. Cleared
+    /// every turn.
+    snapshot_pending: HashMap<BlockId, turbine_model::executor::SnapshotRef>,
+    /// P7 S-12 (Task 32): `kv.hybrid_snapshot_interval_blocks` when the model keeps hybrid
+    /// state, else `None` (no snapshots).
+    hybrid_interval: Option<u32>,
 }
 
 /// A micro-batch launched into the pipeline's stages before the last, waiting for its last
@@ -369,6 +381,9 @@ struct Built {
     formats: Vec<Vec<u8>>,
     rows: Vec<RowInfo>,
     feeds: Vec<TokenFeed>,
+    /// P7 S-12 (Task 32): per row, the block-boundary snapshots the step must fill, `(token
+    /// offset within the step, entry)`. Empty for an attention-only model.
+    snapshots: Vec<SmallVec<[(u32, SnapshotRef); 2]>>,
 }
 
 enum Build {
@@ -408,7 +423,45 @@ struct InFlight {
 
 impl EngineLoop {
     /// The engine over `p`; its diagnostics documents are published at once.
-    pub fn new(p: EngineParts) -> EngineLoop {
+    pub fn new(mut p: EngineParts) -> EngineLoop {
+        // P7 S-12 (Task 32): a hybrid family keeps per-sequence state. The engine allocates the
+        // KV-owned snapshot byte buffer over the L0 pool's memory (one entry per L0 block, the
+        // budget's conservative bound), hands it to the executor, and marks the KV hierarchy as
+        // hybrid so a prefix hit restores the nearest snapshot.
+        let mut hybrid_state_bytes = 0u64;
+        let mut hybrid_interval = None;
+        if let Some(layout) = p.executor.state_layout() {
+            let entries = u64::from(p.pool.total_blocks());
+            let entry_bytes = layout.bytes_per_sequence();
+            if entries > 0 && entry_bytes > 0 {
+                let mem = Arc::clone(p.pool.view().storage.memory());
+                let words = usize::try_from(entries.saturating_mul(entry_bytes)).unwrap_or(0);
+                match Tensor::empty(&mem, &[words], DType::U8) {
+                    Ok(buffer) => {
+                        // P7 S-12 (Task 33): the same buffer backs the device-path snapshot
+                        // store, so a demoted block's snapshot travels with it through L1/L2.
+                        let snap_mem = Arc::clone(buffer.storage.memory());
+                        let snap_base = buffer.storage.ptr();
+                        p.executor
+                            .set_state_snapshots(StateSnapshots { buffer, layout });
+                        p.kv.set_hybrid_state(layout, p.pool.total_blocks());
+                        p.kv.set_snapshot_store(Arc::new(DeviceSnapshotStore::new(
+                            snap_mem,
+                            snap_base,
+                            p.pool.total_blocks(),
+                            entry_bytes,
+                        )));
+                        hybrid_interval = Some(p.kv.snapshot_interval());
+                        hybrid_state_bytes = entries.saturating_mul(entry_bytes);
+                    }
+                    Err(e) => tracing::warn!(
+                        event = "hybrid_state_snapshots_unavailable",
+                        error = %e,
+                        "no snapshot buffer; hybrid prefix reuse is off"
+                    ),
+                }
+            }
+        }
         let overlap = p.overlap && p.executor.overlaps() && p.executor.reduces_logits();
         tracing::info!(
             event = "overlap_scheduling",
@@ -480,7 +533,14 @@ impl EngineLoop {
             last_collect: None,
             jump_forward: p.jump_forward,
             jump_forward_max_tokens: p.jump_forward_max_tokens,
+            ranks: p.ranks,
+            snapshot_pending: HashMap::new(),
+            hybrid_interval,
         };
+        engine
+            .metrics
+            .server
+            .set_hybrid_state_bytes(hybrid_state_bytes);
         engine.publish(false);
         engine.publish_stats();
         engine
@@ -575,6 +635,7 @@ impl EngineLoop {
         let failed = outcome.failed.is_some();
         if failed {
             self.pending_publishes.clear();
+            self.release_snapshots();
         }
         if !failed {
             // Only KV the forward pass wrote successfully enters the cache; the tables are
@@ -583,6 +644,9 @@ impl EngineLoop {
             for (id, blocks, tokens) in self.kv_commits(&plan) {
                 self.kv.commit(&mut self.pool, id, &blocks, &tokens);
             }
+            // P7 S-12: the step's block-boundary snapshots land on their directory entries (the
+            // blocks just committed).
+            self.record_snapshots();
             // The finished requests' partial tails publish before the tables release.
             for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
                 self.kv.publish_tail(&mut self.pool, id, block, &tokens);
@@ -703,6 +767,7 @@ impl EngineLoop {
     /// [`EngineLoop::launch_pipe`]'s device work: `None` when the plan has only forks.
     fn try_launch(&mut self, plan: &IterationPlan) -> Result<Option<Built>, IterationError> {
         self.fork_copies(plan)?;
+        self.state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -718,7 +783,7 @@ impl EngineLoop {
                 ));
             }
         };
-        let slices = seq_slices(plan, &built);
+        let slices = seq_slices(plan, &built, &self.sched);
         let view = self.pool.view();
         self.exec
             .launch(
@@ -739,7 +804,7 @@ impl EngineLoop {
         self.iteration_requests = f.requests.clone();
         let phase = phase_of(&f.plan);
         let result = {
-            let slices = seq_slices(&f.plan, &f.built);
+            let slices = seq_slices(&f.plan, &f.built, &self.sched);
             let view = self.pool.view();
             self.exec.forward(&BatchInput {
                 tokens: &f.built.tokens,
@@ -778,6 +843,7 @@ impl EngineLoop {
                 for (id, blocks, tokens) in self.kv_commits(&f.plan) {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
                 }
+                self.record_snapshots();
                 // The finished requests' partial tails publish before the tables release.
                 for (id, block, tokens) in std::mem::take(&mut self.pending_publishes) {
                     self.kv.publish_tail(&mut self.pool, id, block, &tokens);
@@ -796,6 +862,7 @@ impl EngineLoop {
             }
             Err(error) => {
                 self.pending_publishes.clear();
+                self.release_snapshots();
                 let outcome = self.pipe_failure(f.plan.iteration, error);
                 self.sched.complete(&mut self.pool, outcome);
             }
@@ -1762,6 +1829,7 @@ impl EngineLoop {
         plan: &IterationPlan,
     ) -> Result<Option<(Vec<RowInfo>, Logits)>, IterationError> {
         self.fork_copies(plan)?;
+        self.state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -1810,6 +1878,42 @@ impl EngineLoop {
         self.exec
             .copy_blocks(&self.pool.view(), &src, &dst)
             .map_err(|e| IterationError::model("copy_blocks failed", e))
+    }
+
+    /// P7 S-12 (Task 32): the hybrid state copies of `plan`, ordered after the block copies and
+    /// before the step (a prefix hit restores a snapshot into the sequence's live slot; an
+    /// `n > 1` fork copies the parent's slot into the child's). Counts the restores.
+    fn state_copies(&mut self, plan: &IterationPlan) -> Result<(), IterationError> {
+        if plan.state_copies.is_empty() {
+            return Ok(());
+        }
+        self.exec
+            .copy_state(&plan.state_copies)
+            .map_err(|e| IterationError::model("copy_state failed", e))?;
+        for c in &plan.state_copies {
+            if matches!((c.src, c.dst), (StateLoc::Snapshot(_), StateLoc::Slot(_))) {
+                self.metrics.server.hybrid_state_snapshot("restored");
+            }
+        }
+        Ok(())
+    }
+
+    /// P7 S-12 (Task 32): records this turn's reserved snapshot entries on their directory
+    /// entries (the step committed their blocks). A block with no committed key is dropped: its
+    /// entry stays reserved but unused (freed with the block).
+    fn record_snapshots(&mut self) {
+        for (block, ref_) in self.snapshot_pending.drain() {
+            self.kv.snapshot_record(block, ref_);
+            self.metrics.server.hybrid_state_snapshot("stored");
+        }
+    }
+
+    /// P7 S-12 (Task 32): releases this turn's reserved snapshot entries after a failed step, so
+    /// a reserved-but-unwritten entry is not left holding a block that never committed.
+    fn release_snapshots(&mut self) {
+        for (block, _) in self.snapshot_pending.drain() {
+            self.kv.snapshot_release(block);
+        }
     }
 
     /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
@@ -1943,6 +2047,7 @@ impl EngineLoop {
             formats: Vec::with_capacity(items.len()),
             rows: Vec::with_capacity(items.len()),
             feeds: Vec::new(),
+            snapshots: Vec::with_capacity(items.len()),
         };
         let reduces = self.exec.reduces_logits();
         for it in items {
@@ -1997,6 +2102,39 @@ impl EngineLoop {
             let feedable =
                 reduce.is_some_and(|q| q.temperature <= 0.0 || (q.uniform.is_some() && !seeded));
             built.slices.push((it.index, q_start, it.len, it.kv_len));
+            // P7 S-12 (Task 32/33): reserve a snapshot entry for each full block this item
+            // completes that the interval rule wants (every `kv.hybrid_snapshot_interval_blocks`-th
+            // full block, 1-based) and for the sequence's last full block inside the chunk. A
+            // single-chunk prefill does not end on a block boundary, so the interior boundaries
+            // are captured too: the executor fills them from the kernel's per-block boundary rows
+            // (the kernel writes one per `kv.block_tokens` from the chunk's start), so the engine
+            // only asks for an interior boundary when the chunk itself starts on a block boundary.
+            let mut row_snaps: SmallVec<[(u32, SnapshotRef); 2]> = SmallVec::new();
+            if let Some(interval) = self.hybrid_interval {
+                let bt = self.pool.layout().block_tokens.max(1);
+                let chunk_start = it.kv_len.saturating_sub(it.len);
+                let first = chunk_start / bt + 1;
+                let last = it.kv_len / bt;
+                let table = &plan.items[it.index].block_table.blocks;
+                for m in first..=last {
+                    let interior = m * bt < it.kv_len;
+                    // An interior boundary maps to a kernel row only when the chunk starts on a
+                    // block boundary (the row is counted from the chunk start).
+                    if interior && chunk_start % bt != 0 {
+                        continue;
+                    }
+                    if !u64::from(m).is_multiple_of(u64::from(interval)) && m != last {
+                        continue;
+                    }
+                    if let Some(&block) = table.get(m as usize - 1)
+                        && let Some(ref_) = self.kv.snapshot_alloc(block)
+                    {
+                        row_snaps.push((m * bt - chunk_start, ref_));
+                        self.snapshot_pending.insert(block, ref_);
+                    }
+                }
+            }
+            built.snapshots.push(row_snaps);
             built.formats.push(if self.pool.page_classes_active() {
                 plan.items[it.index]
                     .block_table
@@ -2022,7 +2160,7 @@ impl EngineLoop {
 
     /// Runs the forward pass over `built` (one ragged batch of `plan`'s items).
     fn forward(&mut self, plan: &IterationPlan, built: &Built) -> Result<Logits, IterationError> {
-        let slices = seq_slices(plan, built);
+        let slices = seq_slices(plan, built, &self.sched);
         let phase = phase_of(plan);
         let started = Instant::now();
         let view = self.pool.view();
@@ -2495,6 +2633,9 @@ impl EngineLoop {
         if let Err(error) = self.fork_copies(&next.plan) {
             return self.launch_failed(next, prev, error);
         }
+        if let Err(error) = self.state_copies(&next.plan) {
+            return self.launch_failed(next, prev, error);
+        }
         // The tail copies of this plan will have run once the iteration completes (overlap
         // scheduling completes it next turn).
         self.tail_done.extend(
@@ -2533,7 +2674,7 @@ impl EngineLoop {
             }
         }
         let (launched, launch_time) = {
-            let slices = seq_slices(&next.plan, &built);
+            let slices = seq_slices(&next.plan, &built, &self.sched);
             let view = self.pool.view();
             let started = Instant::now();
             let launched = self.exec.launch(
@@ -3262,7 +3403,8 @@ impl EngineLoop {
         if let Some(p) = &self.pipeline {
             scheduler.pipeline = Some(p.snapshot(self.pipe.len() as u32));
         }
-        let kv = self.kv.document(&self.pool);
+        let mut kv = self.kv.document(&self.pool);
+        kv.ranks.clone_from(&self.ranks);
         self.metrics.kv.record(&self.pool);
         self.stages.mark(Stage::Complete);
         let stages = std::mem::replace(&mut self.stages, StageClock::start()).finish();
@@ -3295,18 +3437,27 @@ impl EngineLoop {
             })
             .sum();
         self.shared.set_outstanding(pending);
+        self.shared
+            .set_state_slots_free(self.sched.state_slots().map(|p| p.free()));
     }
 }
 
 /// The [`SeqSlice`] of each row of `built`, a batch of `plan`.
-fn seq_slices<'a>(plan: &'a IterationPlan, built: &'a Built) -> Vec<SeqSlice<'a>> {
+fn seq_slices<'a>(
+    plan: &'a IterationPlan,
+    built: &'a Built,
+    sched: &Scheduler,
+) -> Vec<SeqSlice<'a>> {
     built
         .slices
         .iter()
         .zip(&built.rows)
         .zip(&built.formats)
+        .zip(&built.snapshots)
         .map(
-            |((&(index, q_start, q_len, kv_len), row), formats)| SeqSlice {
+            |(((&(index, q_start, q_len, kv_len), row), formats), snapshots)| SeqSlice {
+                state_slot: sched.state_slot_of(row.seq).map(|s| s.0),
+                snapshot_blocks: snapshots.as_slice(),
                 seq: row.seq,
                 q_start,
                 q_len,
@@ -3549,6 +3700,78 @@ mod tests {
         .expect("executor")
     }
 
+    /// The tiny Qwen3.5 (a hybrid: Gated DeltaNet layers keep per-sequence state, P7 S-12).
+    fn hybrid_tiny() -> (TempDir, TinySpec, Arc<Tokenizer>) {
+        let dir = TempDir::new("turbine-engine-loop-hybrid");
+        let spec = turbine_model::testing::tiny::write_tiny_qwen3_5(dir.path(), 8);
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        (dir, spec, tokenizer)
+    }
+
+    /// The tiny Qwen3.5 on the cpu reference provider, for batches of `max_seqs` sequences.
+    fn hybrid_executor(spec: &TinySpec, max_seqs: u32) -> Box<dyn ModelExecutor> {
+        let cfg = &spec.config;
+        let mem = mem();
+        let index = SafetensorsIndex::open(&spec.dir).unwrap();
+        let weights = WeightLoader::load(
+            &index,
+            &cfg.family.0.weight_slots(cfg),
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load");
+        let provider = cpu_reference_provider();
+        let order = [provider.id()];
+        let registry = KernelRegistry::build(
+            vec![provider],
+            &order,
+            &executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default()),
+            &KernelMetrics::register(&MetricsRegistry::new()),
+            None,
+        )
+        .unwrap();
+        executor::build_executor(
+            cfg,
+            weights,
+            Arc::new(registry),
+            mem,
+            BLOCK_TOKENS,
+            64,
+            max_seqs,
+            ExecutorOptions::default(),
+        )
+        .expect("executor")
+    }
+
+    /// A greedy request asking for one logprob alternative per token (P7 S-12).
+    fn hybrid_request(prompt: &[u32], max_tokens: u32) -> GenerationRequest {
+        let mut r = request(prompt, max_tokens);
+        r.sampling.logprobs = Some(1);
+        r
+    }
+
+    /// `(token id, logprob)` of one request run to completion.
+    fn run_logprobs(
+        tx: &mpsc::Sender<EngineCommand>,
+        req: GenerationRequest,
+    ) -> (Vec<(u32, Option<f32>)>, u32) {
+        let (mut rx, admitted) = submit(tx, req);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut tokens = Vec::new();
+        loop {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token {
+                    token_id, logprob, ..
+                } => tokens.push((token_id, logprob)),
+                GenerationEvent::Finished { usage, .. } => {
+                    return (tokens, usage.expect("usage").cached_tokens);
+                }
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+    }
+
     fn request(prompt: &[u32], max_tokens: u32) -> GenerationRequest {
         GenerationRequest {
             id: RequestId::new_v4(),
@@ -3729,10 +3952,14 @@ mod tests {
             replica: 0,
             group: Vec::new(),
         });
-        let scheduler = Scheduler::new(params, Arc::clone(&clock))
+        let mut scheduler = Scheduler::new(params, Arc::clone(&clock))
             .with_metrics(metrics.scheduler.clone())
             .with_gate(parts.gate)
             .with_micro_batches(pipeline.as_ref().map_or(1, |p| p.micro_batches));
+        // P7 S-12 (Task 32): a hybrid family's scheduler allocates one state slot per sequence.
+        if let Some(layout) = exec.state_layout() {
+            scheduler = scheduler.with_state_layout(layout);
+        }
         let controller = parts.engine.handle.clone();
         let pressure = Arc::clone(&parts.controller);
         let test_clock = Arc::clone(&clock);
@@ -3758,6 +3985,7 @@ mod tests {
             pipeline,
             jump_forward: true,
             jump_forward_max_tokens: 32,
+            ranks: Vec::new(),
         });
         TestEngine {
             engine,
@@ -3865,6 +4093,157 @@ mod tests {
             drop(tx);
             handle.join().unwrap().unwrap();
         }
+    }
+
+    /// P7 S-12 (Task 32, `hybrid_prefix_reuse_matches_cold`): a hybrid model (tiny Qwen3.5 on the
+    /// cpu backend, `kv.block_tokens` 16) stores a state snapshot at every full-block boundary
+    /// (`kv.hybrid_snapshot_interval_blocks` 1) and restores the nearest one at or before a hit's
+    /// cutoff instead of rebuilding the state from scratch. A conversation that sends growing
+    /// prefixes hits at 1, 2 and 3 full blocks and once mid-block; each turn's greedy tokens and
+    /// logprobs are bit-equal to the same prompt run cold (a salt shares nothing). An `n: 2`
+    /// request equals two separate requests, and `turbine_hybrid_state_snapshots_total{outcome=
+    /// "restored"}` counts the restores. Breaks if a snapshot is not stored, not restored, or
+    /// changes an output. (The state-slot pool ends where it started on finish, cancel and
+    /// preemption, asserted deterministically in the scheduler's `state_slots_alloc_and_release`
+    /// and `preemption_returns_the_state_slot`; the engine's published free count lags a turn
+    /// behind a request's finish, so it is not compared here.)
+    #[test]
+    fn hybrid_prefix_reuse_matches_cold() {
+        let (_dir, spec, tokenizer) = hybrid_tiny();
+        let exec = hybrid_executor(&spec, 4);
+        let kv = KvConfig {
+            hybrid_snapshot_interval_blocks: 1,
+            ..KvConfig::default()
+        };
+        let t = engine_with_kv(
+            exec,
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv,
+            |_, _, _| None,
+        );
+        let TestEngine {
+            engine,
+            tx,
+            shared,
+            reg,
+            ..
+        } = t;
+        let handle = std::thread::spawn(move || engine.run());
+
+        // A 64-token base sequence; every prompt is one of its prefixes. Prompts are sent in
+        // growing order so each turn hits at one more full block.
+        let base: Vec<u32> = std::iter::once(256).chain(97..160).collect();
+        assert_eq!(base.len(), 64);
+        let prefix = |n: usize| base[..n].to_vec();
+        // A cold run of `n` tokens: a per-length salt shares nothing with any other request.
+        let cold = |n: usize, max_tokens: u32| {
+            let mut r = hybrid_request(&prefix(n), max_tokens);
+            r.cache_salt = Some(format!("cold-{n}"));
+            run_logprobs(&tx, r)
+        };
+
+        let lengths = [16usize, 32, 48, 64];
+        let colds: Vec<_> = lengths.iter().map(|&n| cold(n, 8)).collect();
+        let mut warm = Vec::new();
+        for &n in &lengths {
+            warm.push(run_logprobs(&tx, hybrid_request(&prefix(n), 8)));
+        }
+        // Turn 1 is cold; turns 2..4 hit at 1, 2 and 3 full blocks and match their cold run.
+        assert_eq!(warm[0].1, 0, "the first turn caches nothing");
+        assert_eq!(warm[1].1, 16, "turn 2 hits at 1 full block");
+        assert_eq!(warm[2].1, 32, "turn 3 hits at 2 full blocks");
+        assert_eq!(warm[3].1, 48, "turn 4 hits at 3 full blocks");
+        for (i, &n) in lengths.iter().enumerate() {
+            assert_eq!(
+                warm[i].0, colds[i].0,
+                "turn {n} matches its cold run (tokens and logprobs)"
+            );
+        }
+
+        // A mid-block hit: 56 tokens is 3 full blocks plus a partial 8-token tail; the match
+        // ends at 48, the snapshot there restores, and the tail recomputes.
+        let mid_cold = cold(56, 8);
+        let mid = run_logprobs(&tx, hybrid_request(&prefix(56), 8));
+        assert_eq!(mid.1, 48, "the mid-block turn reuses 3 full blocks");
+        assert_eq!(mid.0, mid_cold.0, "the mid-block turn matches its cold run");
+
+        // P7 S-12: the snapshots were stored and at least one restore ran.
+        assert!(
+            metric(
+                &reg,
+                "turbine_hybrid_state_snapshots_total{outcome=\"stored\"}"
+            ) >= 4.0,
+            "block-boundary snapshots stored"
+        );
+        assert!(
+            metric(
+                &reg,
+                "turbine_hybrid_state_snapshots_total{outcome=\"restored\"}"
+            ) > 0.0,
+            "a hit restored a snapshot"
+        );
+        assert!(metric(&reg, "turbine_hybrid_state_bytes") > 0.0);
+
+        // A request cancelled mid-decode returns its state slot (the scheduler's slot pool ends
+        // where it started — asserted deterministically in `turbine-scheduler`'s
+        // `state_slots_alloc_and_release` and `preemption_returns_the_state_slot`). Here the
+        // engine keeps serving afterwards: a fresh prefix hit still matches and the pool is
+        // still reported.
+        let (mut rx, admitted) = submit(&tx, hybrid_request(&prefix(64), 64));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut seen = 0;
+        while seen < 2 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token { .. } => seen += 1,
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        drop(rx);
+        let after = run_logprobs(&tx, hybrid_request(&prefix(32), 8));
+        assert!(
+            after.1 > 0,
+            "a cached prefix still hits after the cancellation"
+        );
+        assert!(
+            shared.state_slots_free().is_some(),
+            "a hybrid engine reports its state-slot pool"
+        );
+
+        // An `n: 2` request equals two separate requests of the same prompt (both hit at 1 block).
+        let solo = run_logprobs(&tx, hybrid_request(&prefix(32), 8));
+        let mut dual = hybrid_request(&prefix(32), 8);
+        dual.n = 2;
+        let (mut rx, admitted) = submit(&tx, dual);
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut choices: Vec<Vec<(u32, Option<f32>)>> = vec![Vec::new(), Vec::new()];
+        let mut finished = 0u32;
+        while finished < 2 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token {
+                    choice,
+                    token_id,
+                    logprob,
+                    ..
+                } => choices[choice as usize].push((token_id, logprob)),
+                GenerationEvent::Finished { .. } => finished += 1,
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            choices[0], solo.0,
+            "the fork's first choice matches a solo run"
+        );
+        assert_eq!(
+            choices[1], solo.0,
+            "the fork's second choice matches a solo run"
+        );
+
+        drop(tx);
+        handle.join().unwrap().unwrap();
     }
 
     /// P5p S-5 (`partial_prefix_reuse_matches_cold`): a finished request publishes its partial
@@ -4417,8 +4796,16 @@ mod tests {
         let cfg = &spec.config;
         let mem = mem();
         let index = SafetensorsIndex::open(&spec.dir).unwrap();
-        let weights =
-            WeightLoader::load(&index, &llama_slots(cfg), &mem, MAX_STAGING_BYTES).expect("load");
+        // The family's own slots (the tiny Llama's are `llama_slots`).
+        let slots = cfg.family.0.weight_slots(cfg);
+        let weights = WeightLoader::load_format(
+            cfg.weight_format.get(),
+            &index,
+            &slots,
+            &mem,
+            MAX_STAGING_BYTES,
+        )
+        .expect("load");
         let provider = cpu_reference_provider();
         let order = [provider.id()];
         let mut reqs = executor::requirements(cfg, BLOCK_TOKENS, ExecutorOptions::default());
@@ -4677,8 +5064,9 @@ mod tests {
         finish: Option<(FinishReason, u32)>,
     }
 
-    /// Runs `requests` (all queued before the engine starts) on a fresh engine over the tiny
-    /// Llama with the device reduction, with overlap scheduling on or off, and returns every
+    /// Runs `requests` (all queued before the engine starts) on a fresh engine over `spec`'s
+    /// tiny checkpoint (the tiny Llama unless a family test passes another) with the device
+    /// reduction, with overlap scheduling on or off, and returns every
     /// request's choices and how many iterations launched ahead of one in flight.
     fn run_streams(
         spec: &TinySpec,
@@ -4686,14 +5074,14 @@ mod tests {
         requests: &[GenerationRequest],
         overlap: bool,
     ) -> (Vec<Vec<ChoiceStream>>, u64) {
-        let t = engine_with(
-            tiny_reducing_executor(spec, 8),
-            Arc::clone(tokenizer),
-            params(4, 8),
-            overlap,
-        );
+        let exec = tiny_reducing_executor(spec, 8);
+        // A hybrid family's executor cannot overlap (its Gated DeltaNet layers read `g`/`beta`
+        // back on the host), so the engine leaves overlap off however it is requested.
+        let can = exec.overlaps() && exec.reduces_logits();
+        let t = engine_with(exec, Arc::clone(tokenizer), params(4, 8), overlap);
         assert_eq!(
-            t.engine.overlap, overlap,
+            t.engine.overlap,
+            overlap && can,
             "the reducing CPU executor can overlap"
         );
         let streams: Vec<_> = requests.iter().map(|r| submit(&t.tx, r.clone())).collect();
@@ -4825,6 +5213,56 @@ mod tests {
         assert!(serial[3][0].logprobs.iter().all(Option::is_some));
         assert_eq!(serial[5].len(), 2);
         assert_eq!(serial[6][0].finish, Some((FinishReason::Length, 1)));
+    }
+
+    /// P7 S-1 constraint: overlap scheduling (the default) stays bit-exact against serial for
+    /// every registered family — on each family's tiny checkpoint on the CPU backend, 4
+    /// concurrent greedy requests with logprobs produce the same token and logprob streams with
+    /// overlap on as with it off, and iterations did launch ahead. Iterates the registry, so a
+    /// family registered later is covered. Breaks if a family's executor feeds a different
+    /// token on the device, or its decode under overlap differs from the serial loop.
+    #[test]
+    fn overlap_matches_serial_every_family() {
+        let prompts: [&[u32]; 4] = [
+            &[256, 72, 101, 108, 108, 111],
+            &[256, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107],
+            &[256, 79],
+            &[256, 1, 2, 3],
+        ];
+        for family in turbine_model::families::registry().iter() {
+            let dir = TempDir::new("turbine-engine-loop-family");
+            let spec = family.write_tiny(dir.path(), 7);
+            let tokenizer =
+                Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+            let requests: Vec<GenerationRequest> = prompts
+                .iter()
+                .zip([10, 7, 12, 5])
+                .map(|(p, max)| {
+                    let mut r = request(p, max);
+                    r.sampling.logprobs = Some(2);
+                    r
+                })
+                .collect();
+            let (serial, none) = run_streams(&spec, &tokenizer, &requests, false);
+            assert_eq!(none, 0, "{}", family.name());
+            let can = {
+                let probe = tiny_reducing_executor(&spec, 8);
+                probe.overlaps() && probe.reduces_logits()
+            };
+            let (overlapped, ahead) = run_streams(&spec, &tokenizer, &requests, true);
+            if can {
+                assert!(ahead > 0, "{}: no iteration launched ahead", family.name());
+            }
+            assert_eq!(overlapped, serial, "{}", family.name());
+            for (choices, max) in serial.iter().zip([10, 7, 12, 5]) {
+                assert_eq!(choices[0].tokens.len(), max, "{}", family.name());
+                assert!(
+                    choices[0].logprobs.iter().all(Option::is_some),
+                    "{}",
+                    family.name()
+                );
+            }
+        }
     }
 
     /// Folds `events` into `stream`; true once it holds the choice's `Finished`.

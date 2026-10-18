@@ -20,6 +20,21 @@ use crate::executor::TraceTensor;
 use crate::executor::rope::inv_freq;
 use crate::safetensors::Dtype;
 
+/// One token's routing at one MoE layer, recorded by
+/// [`DecoderExecutor::set_routing_trace`](crate::executor::DecoderExecutor::set_routing_trace)
+/// (P7 Task 12): the top-k expert ids in the router's order, their gates (the routing weights
+/// the experts' outputs are scaled by) and the margin of the choice — the smallest selected
+/// router logit minus the largest unselected one, on the logits the router selects on (BF16-
+/// rounded for a BF16 model); `+inf` when every expert is selected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutingRow {
+    pub layer: u32,
+    pub position: u32,
+    pub topk_ids: Vec<u32>,
+    pub topk_gates: Vec<f32>,
+    pub margin: f32,
+}
+
 /// Reads the BF16 tensor `name` of a checkpoint as f32 values (a positioned read of its byte
 /// range; no caching). Panics when it is missing, not BF16 or unreadable (a test utility).
 pub fn read_bf16_weight(index: &SafetensorsIndex, name: &str) -> Vec<f32> {
@@ -184,7 +199,8 @@ pub enum AttnProbs {
     Bf16Unnormalised,
 }
 
-/// Recomputes each op of a Llama trace from the trace's own inputs.
+/// Recomputes each op of a Llama or Qwen3 (per-head Q/K norm) trace from the trace's own
+/// inputs.
 pub struct LocalChecker<'a> {
     cfg: &'a ModelArchConfig,
     /// Weight tensor values by checkpoint name (widened to f32).
@@ -348,6 +364,26 @@ impl<'a> LocalChecker<'a> {
             push(l, "q", &bf_linear(attn_norm, "self_attn.q_proj", hidden), q);
             push(l, "k", &bf_linear(attn_norm, "self_attn.k_proj", hidden), k);
             push(l, "v", &bf_linear(attn_norm, "self_attn.v_proj", hidden), v);
+            // Qwen3: RMSNorm over each `head_dim` slice of Q and K, in place before RoPE.
+            let (q, k) = if cfg.qk_norm_per_head {
+                let q_norm = &get(l, "q_norm").data;
+                let k_norm = &get(l, "k_norm").data;
+                push(
+                    l,
+                    "q_norm",
+                    &self.rmsnorm(q, &w("self_attn.q_norm")),
+                    q_norm,
+                );
+                push(
+                    l,
+                    "k_norm",
+                    &self.rmsnorm(k, &w("self_attn.k_norm")),
+                    k_norm,
+                );
+                (q_norm, k_norm)
+            } else {
+                (q, k)
+            };
             let q_rope = &get(l, "q_rope").data;
             let k_rope = &get(l, "k_rope").data;
             push(

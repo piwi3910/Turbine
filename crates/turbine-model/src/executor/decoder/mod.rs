@@ -48,20 +48,21 @@
 //! instead ([`OpProfile`]): each op goes through [`LayerRun::op`] (or the skeleton's own
 //! wrapper), which synchronises the stream after it while profiling and costs one branch
 //! otherwise.
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use turbine_core::types::{BlockId, DType, KvLayout, ModelShape};
+use turbine_core::types::{BlockId, DType, KvLayout, ModelShape, SeqId};
 use turbine_distributed::collective::{Collective, ReduceOp};
 use turbine_distributed::tp::{ShardSpec, vocab_shard};
 use turbine_kernels::{
-    AddRmsnormConfig, AddRmsnormContext, AttentionConfig, AttentionKind, ElementwiseConfig,
-    ElementwiseContext, EmbeddingConfig, EmbeddingContext, FusedRope, GemmConfig, GemmContext,
-    GemmFused, GemmFusion, KernelError, KernelRegistry, NormConfig, NormContext, OpConfig,
-    OpRequirement, PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext,
-    RopeConfig, RopeContext, TqPaged,
+    ActivationConfig, ActivationContext, AddRmsnormConfig, AddRmsnormContext, AttentionConfig,
+    AttentionKind, Conv1dConfig, Conv1dContext, ElementwiseConfig, ElementwiseContext,
+    EmbeddingConfig, EmbeddingContext, FusedRope, GdnConfig, GdnContext, GdnMode, GemmConfig,
+    GemmContext, GemmFused, GemmFusion, KernelError, KernelRegistry, NormConfig, NormContext,
+    OpConfig, OpRequirement, PagedAttentionContext, QGemmConfig, QGemmContext, QuantizeActContext,
+    RopeConfig, RopeContext, SigmoidMulConfig, SigmoidMulContext, TqPaged,
 };
 use turbine_tensor::{DeviceBuffer, DeviceMemory, KvPoolView, StreamRef, Tensor, TensorView};
 
@@ -71,13 +72,15 @@ use super::logits::{self, LogitsHead};
 use super::profile::{self, OpProfile, Profiler};
 use super::{
     BatchInput, ExecutorLimits, ExecutorOptions, ForwardTimings, Logits, ModelExecutor, SeqSlice,
-    Split, TokenFeed, feed_runs, rope,
+    Split, StateCopy, StateLoc, StateSlot, StateSnapshots, TokenFeed, feed_runs, rope,
 };
 use crate::ModelError;
-use crate::config::{ModelArchConfig, MoeConfig};
+use crate::config::{GdnDims, ModelArchConfig, MoeConfig};
 use crate::ep::{EpContext, EpDims};
-use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name};
+use crate::families::LayerKind;
+use crate::loader::{LM_HEAD, LoadedWeights, qkv_proj_name_at};
 use crate::pp::PpContext;
+use crate::testing::trace::RoutingRow;
 use crate::tp::{TpContext, rank_config};
 
 pub mod hooks;
@@ -87,10 +90,13 @@ mod trace;
 
 pub use linear::{Linear, LinearQuant, LinearView, QuantParts, QuantView};
 
-pub use hooks::{MOE, PLAIN_ATTENTION, QK_NORM_FULL, QK_NORM_PER_HEAD, SWIGLU};
+pub use hooks::{
+    ATTENTION_SINKS_WINDOW, MOE, MOE_GPT_OSS, MOE_SHARED, PLAIN_ATTENTION, QK_NORM_FULL,
+    QK_NORM_PER_HEAD, SWIGLU,
+};
 pub use tq_tables::TqDeviceTables;
 pub use trace::TraceTensor;
-use trace::Tracer;
+use trace::{RoutingTracer, Tracer};
 
 pub(crate) fn invalid(message: String) -> ModelError {
     ModelError::Kernel(KernelError::InvalidArgument { message })
@@ -121,6 +127,9 @@ pub struct DecoderDims {
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// The rotary dimension the rope op rotates ([`ModelArchConfig::rotary_dim`]): `head_dim`,
+    /// or a fraction of it for a partial-rotary family (Qwen3.5).
+    pub rotary_dim: usize,
     /// `heads · head_dim`.
     pub q_dim: usize,
     /// `kv_heads · head_dim`.
@@ -157,6 +166,22 @@ pub struct DecoderDims {
     pub quant: Option<LinearQuant>,
     /// Some decoder linear layers stay BF16 (the checkpoint's ignore list, or no quantization).
     pub bf16_linears: bool,
+    /// Per layer, the sliding window of its attention as the kernels take it
+    /// ([`AttentionConfig::window`], `window_left`): `Some(w − 1)` for a layer of
+    /// [`LayerKind::SlidingWindow`] `{ window: w }`, which attends the last `w` positions
+    /// (transformers' mask keeps `q − k < w`), `None` for full attention (P7 S-8).
+    pub window_left: Vec<Option<u32>>,
+    /// The Gated DeltaNet dimensions of a hybrid family's linear-attention layers (Qwen3.5,
+    /// P7 S-11); `None` for every attention-only family.
+    pub gdn: Option<GdnDims>,
+}
+
+/// The `window_left` of a layer kind (`None`: every position `≤ p`).
+fn window_left(kind: LayerKind) -> Option<u32> {
+    match kind {
+        LayerKind::SlidingWindow { window } => Some(window.saturating_sub(1)),
+        _ => None,
+    }
 }
 
 /// What a tensor-parallel rank's dims add ([`DecoderDims::for_shard`]).
@@ -184,6 +209,7 @@ impl DecoderDims {
             heads: cfg.num_attention_heads as usize,
             kv_heads: cfg.num_kv_heads as usize,
             head_dim,
+            rotary_dim: cfg.rotary_dim as usize,
             q_dim: cfg.num_attention_heads as usize * head_dim,
             kv_dim: cfg.num_kv_heads as usize * head_dim,
             inter: cfg.intermediate as usize,
@@ -200,6 +226,8 @@ impl DecoderDims {
             ep: None,
             quant,
             bf16_linears,
+            window_left: cfg.layer_kinds.iter().map(|k| window_left(*k)).collect(),
+            gdn: cfg.gdn,
         }
     }
 
@@ -288,7 +316,38 @@ impl DecoderDims {
             num_q_heads: self.heads as u32,
             num_kv_heads: self.kv_heads as u32,
             head_dim: self.head_dim as u32,
-            rotary_dim: self.head_dim as u32,
+            rotary_dim: self.rotary_dim as u32,
+            dtype: self.act,
+        }
+    }
+
+    /// The Gated DeltaNet config of a linear-attention layer in `mode` (P7 S-11); `None` when
+    /// the model has no linear layers.
+    pub fn gdn_config(&self, mode: GdnMode) -> Option<GdnConfig> {
+        self.gdn.map(|g| GdnConfig {
+            k_heads: g.k_heads,
+            v_heads: g.v_heads,
+            k_dim: g.k_dim,
+            v_dim: g.v_dim,
+            mode,
+            dtype: self.act,
+        })
+    }
+
+    /// The causal conv1d config of a linear-attention layer in `mode`; `None` without GDN.
+    pub fn conv1d_config(&self, mode: GdnMode) -> Option<Conv1dConfig> {
+        self.gdn.map(|g| Conv1dConfig {
+            channels: g.conv_dim() as u32,
+            kernel: g.conv_kernel,
+            mode,
+            dtype: self.act,
+        })
+    }
+
+    /// The sigmoid-multiply config of the gated attention output over `cols` columns.
+    pub fn sigmoid_mul(&self, cols: usize) -> SigmoidMulConfig {
+        SigmoidMulConfig {
+            cols: cols as u64,
             dtype: self.act,
         }
     }
@@ -296,7 +355,14 @@ impl DecoderDims {
     /// Paged causal GQA attention over blocks of `block_tokens` tokens of `kv` pages (the
     /// activation dtype, or F8E4M3 under `kv.dtype: fp8_e4m3`: the config then names the page
     /// dtype, [`AttentionConfig::dtype`]).
-    fn attention(&self, kind: AttentionKind, block_tokens: u32, kv: DType) -> AttentionConfig {
+    fn attention(
+        &self,
+        kind: AttentionKind,
+        block_tokens: u32,
+        kv: DType,
+        window: Option<u32>,
+        sinks: bool,
+    ) -> AttentionConfig {
         // Quantized pages (FP8, TurboQuant) name the page dtype; float pages the activations'.
         let dtype = if kv == DType::F8E4M3 || kv.tq_record_bytes().is_some() {
             kv
@@ -311,7 +377,32 @@ impl DecoderDims {
             dtype,
             block_tokens: Some(block_tokens),
             causal: true,
+            window,
+            sinks,
         }
+    }
+
+    /// Every distinct attention config of `kind` the layers run: one per distinct window.
+    fn attentions(
+        &self,
+        kind: AttentionKind,
+        block_tokens: u32,
+        kv: DType,
+        sinks: bool,
+    ) -> Vec<AttentionConfig> {
+        let mut out: Vec<AttentionConfig> = Vec::new();
+        let windows: &[Option<u32>] = if self.window_left.is_empty() {
+            &[None]
+        } else {
+            &self.window_left
+        };
+        for &w in windows {
+            let cfg = self.attention(kind, block_tokens, kv, w, sinks);
+            if !out.contains(&cfg) {
+                out.push(cfg);
+            }
+        }
+        out
     }
 
     /// Parameter `name` taken from `weights`, checked to be the `shape` matrix (or stack of
@@ -379,6 +470,46 @@ pub trait AttentionHook: Send + Sync {
         q: &TensorView<'_>,
         k: &TensorView<'_>,
     ) -> Result<(), ModelError>;
+    /// Runs on the raw Q/K/V GEMM outputs `q`, `k`, `v` in place, before their trace points
+    /// (projection biases, P7 S-8). Nothing by default.
+    fn after_linear(
+        &self,
+        run: &LayerRun<'_>,
+        w: &HookWeights,
+        q: &TensorView<'_>,
+        k: &TensorView<'_>,
+        v: &TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let _ = (run, w, q, k, v);
+        Ok(())
+    }
+    /// Runs on the O projection's output rows `proj` in place, before its all-reduce (output
+    /// bias, P7 S-8). Nothing by default.
+    fn after_o_proj(
+        &self,
+        run: &LayerRun<'_>,
+        w: &HookWeights,
+        proj: &TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let _ = (run, w, proj);
+        Ok(())
+    }
+    /// Whether the layers' attention takes learned sink logits ([`AttentionConfig::sinks`]);
+    /// [`AttentionHook::sinks`] then returns each layer's. False by default.
+    fn has_sinks(&self) -> bool {
+        false
+    }
+    /// The layer's sink logits: F32 `[heads]` in the scaled-score domain, when
+    /// [`AttentionHook::has_sinks`].
+    fn sinks<'a>(&self, w: &'a HookWeights) -> Option<TensorView<'a>> {
+        let _ = w;
+        None
+    }
+    /// Whether decode may take the fused form (norm and residual add inside the GEMVs): false
+    /// for a hook whose projections carry biases the fused GEMVs do not add. True by default.
+    fn allows_fused_decode(&self) -> bool {
+        true
+    }
 }
 
 /// The FFN variant: the block from the normalised rows ([`LayerRun::normed`]) to its output
@@ -574,6 +705,21 @@ impl LayerRun<'_> {
         self.exec.trace.record(Some(self.layer), name, view)
     }
 
+    /// Records the layer's MoE routing (router logits `[tokens, experts]` F32, top-k ids I32 and
+    /// gates F32 `[tokens, top_k]`) when the routing trace is on
+    /// ([`DecoderExecutor::set_routing_trace`]); `bf16_logits` as the route config.
+    pub fn trace_routing(
+        &self,
+        logits: &TensorView<'_>,
+        ids: &TensorView<'_>,
+        gates: &TensorView<'_>,
+        bf16_logits: bool,
+    ) -> Result<(), ModelError> {
+        self.exec
+            .routing
+            .record(self.layer, self.row0, logits, ids, gates, bf16_logits)
+    }
+
     /// Tensor parallelism: sums the contiguous `view` across the group's ranks in place (its
     /// dtype, BF16 or F32); nothing on one device.
     pub fn all_reduce(&self, view: &TensorView<'_>) -> Result<(), ModelError> {
@@ -686,7 +832,7 @@ pub fn rows(buf: &Tensor, t: usize) -> TensorView<'_> {
 /// Refuses what the decoder cannot run of a quantized weight format (Phase 6a): layers of
 /// different quantized schemes, a stacked parameter (fused Q/K/V, gate/up) whose parts differ
 /// in scheme, block-scaled parts not on block boundaries, a quantized LM head, quantized
-/// experts (`quant_moe_phase7`: mixture-of-experts layers are Phase 7's) and pipeline
+/// experts of a format without a kernel row (`quant_moe_phase7`) and pipeline
 /// parallelism (`pipeline` set: not yet proven with quantized stages). Tensor parallelism is
 /// served (Phase 6a S-12): the loader refuses a shard that cuts a group or block
 /// (`quant_shard_misaligned`).
@@ -703,10 +849,14 @@ fn check_weight_format(cfg: &ModelArchConfig, pipeline: bool) -> Result<(), Mode
         return Ok(());
     };
     let refuse = |why: String| Err(invalid(format!("weight format {}: {why}", format.name())));
-    if cfg.moe.is_some() {
-        return refuse(
-            "quant_moe_phase7: quantized mixture-of-experts models arrive with Phase 7".into(),
-        );
+    // Quantized experts run on the Phase 7 per-expert kernels: FP8 block (W8A16), FP8 tensor
+    // with static activation scales (W8A8) and MXFP4 weights; any other format has no row.
+    if cfg.moe.is_some() && !hooks::experts_served(&quant) {
+        return refuse(format!(
+            "quant_moe_phase7: {} experts for {} have no supported row",
+            format.name(),
+            cfg.hf_architecture
+        ));
     }
     if pipeline {
         return refuse(
@@ -765,15 +915,176 @@ fn batch_limits(cfg: &ModelArchConfig, limits: ExecutorLimits) -> BatchLimits {
     }
 }
 
+/// The linear-attention layers of `cfg` (one GDN state and one conv state each).
+pub(crate) fn linear_layers(cfg: &ModelArchConfig) -> usize {
+    cfg.layer_kinds
+        .iter()
+        .filter(|k| **k == LayerKind::LinearAttention)
+        .count()
+}
+
+/// Device bytes of a hybrid family's Gated DeltaNet buffers (P7 S-11): the per-token
+/// projections, the conv output, the gate/decay inputs and their F32 host round trip, plus
+/// `linear_layers × max_seqs` recurrent (F32) and convolution states, the per-layer slot
+/// table (I32), and the per-block boundary rows a prefill chunk snapshots (P7 S-12 Task 33).
+fn gdn_workspace_bytes(cfg: &ModelArchConfig, d: &DecoderDims, limits: ExecutorLimits) -> u64 {
+    let Some(g) = d.gdn else {
+        return 0;
+    };
+    let es = d.act.size_bytes() as u64;
+    let f32 = DType::F32.size_bytes() as u64;
+    let t = u64::from(limits.max_batch_tokens);
+    let n = u64::from(limits.max_seqs);
+    let layers = linear_layers(cfg) as u64;
+    let per_token = es * (2 * g.conv_dim() + 2 * g.value_dim() + 2 * g.v_heads as usize) as u64
+        + f32 * 2 * u64::from(g.v_heads);
+    // Boundary rows: one per full block of a chunk, `linear_layers · max_batch_tokens /
+    // block_tokens` of them, each a recurrent state (F32) and a conv tail (activation dtype).
+    let rows = (u64::from(limits.max_batch_tokens) / u64::from(limits.block_tokens.max(1))).max(1);
+    let state_elems = u64::from(g.v_heads) * u64::from(g.v_dim) * u64::from(g.k_dim);
+    let conv_elems = g.conv_dim() as u64 * u64::from(g.conv_kernel.saturating_sub(1));
+    let boundary = layers * rows * (f32 * state_elems + es * conv_elems);
+    t * per_token + layers * n * (g.recurrent_bytes() + g.conv_bytes()) + 4 * layers * n + boundary
+}
+
+/// Whether a checkpoint weight is an RMSNorm weight (the `(1 + weight)` offset applies to it):
+/// its name's last-but-one dot-separated component is a norm.
+pub(crate) fn is_norm_weight(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').nth(1),
+        Some("input_layernorm" | "post_attention_layernorm" | "norm" | "q_norm" | "k_norm")
+    )
+}
+
+/// Whether the `(1 + weight)` offset applies to a checkpoint weight: an RMSNorm weight
+/// ([`is_norm_weight`]) of transformers' `Qwen3_5RMSNorm` form. The Gated DeltaNet layers' gated
+/// norm (`linear_attn.norm.weight`) is a plain `Qwen3_5RMSNormGated` weight
+/// (`weight * rms(x) * silu(z)`) and keeps its stored value.
+pub(crate) fn unit_offset_applies(name: &str) -> bool {
+    is_norm_weight(name) && !name.contains(".linear_attn.")
+}
+
+/// Adds 1 to every element of the `[n]` norm tensor `t` (transformers' `output · (1 + weight)`
+/// form, [`ModelArchConfig::unit_offset_norms`]) in place, in the activation dtype.
+fn unit_offset_norm(t: &Tensor) -> Result<(), ModelError> {
+    let bytes = t.storage.whole().read_bytes()?;
+    let out: Vec<u8> = bytes
+        .chunks_exact(2)
+        .flat_map(|b| {
+            half::bf16::from_f32(half::bf16::from_le_bytes([b[0], b[1]]).to_f32() + 1.0)
+                .to_le_bytes()
+        })
+        .collect();
+    t.storage.whole().write_bytes(&out)?;
+    Ok(())
+}
+
+/// Reads a `[n]` activation-dtype tensor to `Vec<f32>` (blocking).
+fn host_f32(t: &Tensor) -> Result<Vec<f32>, ModelError> {
+    let bytes = t.storage.whole().read_bytes()?;
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect())
+}
+
 /// The skeleton's parameters of one layer, and the hooks'.
 struct Layer {
     input_norm: Tensor,
-    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V.
+    post_norm: Tensor,
+    /// Full attention or a Gated DeltaNet linear attention.
+    mixer: Mixer,
+    ffn: HookWeights,
+}
+
+/// The token mixer of a layer (P7 S-11): full attention, or a Gated DeltaNet linear attention.
+enum Mixer {
+    Attention(Box<AttentionLayer>),
+    Gdn(Box<GdnLayer>),
+}
+
+/// A full-attention layer's parameters, and the attention hook's.
+struct AttentionLayer {
+    /// `[q_dim + 2·kv_dim, hidden]`: Q rows, then K, then V (a gated layer's stack is
+    /// `[q_all | gate_all | k | v]`, de-interleaved by the loader).
     w_qkv: Linear,
     wo: Linear,
-    post_norm: Tensor,
     attention: HookWeights,
-    ffn: HookWeights,
+    /// `attn_output_gate`: the attention output is multiplied by `sigmoid(gate)` before the
+    /// O projection (kernel ABI v2.19 `TURBINE_OP_SIGMOID_MUL`).
+    gated: bool,
+}
+
+/// A Gated DeltaNet layer's parameters (Qwen3.5).
+struct GdnLayer {
+    in_qkv: Linear,
+    in_z: Linear,
+    in_a: Linear,
+    in_b: Linear,
+    /// `[conv_dim, 1, kernel]` as stored; read as `[conv_dim, kernel]`.
+    conv_w: Tensor,
+    /// The gated RMSNorm weight over `v_dim`.
+    norm: Tensor,
+    out_proj: Linear,
+    /// F32 host copies of `A_log` and `dt_bias` (`[v_heads]`), the host `g`/`beta` producer.
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    /// The layer's base state slot: `linear_index · max_seqs`.
+    slot_base: usize,
+}
+
+/// Q/K/V in their buffer, with or without the per-head output gate.
+enum QkvSplit {
+    /// `[q | k | v]`.
+    Plain(Split<3>),
+    /// `[q | gate | k | v]` (the gated family's per-head attention gate).
+    Gated(Split<4>),
+}
+
+impl QkvSplit {
+    fn width(&self) -> usize {
+        match self {
+            QkvSplit::Plain(s) => s.width(),
+            QkvSplit::Gated(s) => s.width(),
+        }
+    }
+
+    fn fused(&self) -> bool {
+        match self {
+            QkvSplit::Plain(s) => s.fused,
+            QkvSplit::Gated(s) => s.fused,
+        }
+    }
+
+    fn whole<'a>(&self, buf: &'a Tensor, t: usize) -> TensorView<'a> {
+        match self {
+            QkvSplit::Plain(s) => s.whole(buf, t),
+            QkvSplit::Gated(s) => s.whole(buf, t),
+        }
+    }
+
+    fn part<'a>(&self, buf: &'a Tensor, i: usize, t: usize, inner: &[usize]) -> TensorView<'a> {
+        match self {
+            QkvSplit::Plain(s) => s.part(buf, i, t, inner),
+            QkvSplit::Gated(s) => s.part(buf, i, t, inner),
+        }
+    }
+}
+
+/// A Gated DeltaNet layer's activation buffers, allocated once for `max_batch_tokens` tokens.
+struct GdnBuffers {
+    /// `[t, conv_dim]`: `in_proj_qkv` output, then the conv output.
+    qkv: Tensor,
+    conv: Tensor,
+    /// `[t, value_dim]`: `in_proj_z`, then the recurrence output and its gated norm.
+    z: Tensor,
+    attn: Tensor,
+    /// `[t, v_heads]`: `in_proj_a` and `in_proj_b` outputs.
+    a: Tensor,
+    b: Tensor,
+    /// F32 `[t, v_heads]`: `beta = sigmoid(b)` and `g = −exp(A_log)·softplus(a + dt_bias)`.
+    g: Tensor,
+    beta: Tensor,
 }
 
 /// Activation buffers, allocated once: `[max_batch_tokens, cols]` per token row, `[max_seqs,
@@ -792,6 +1103,8 @@ struct Buffers {
     proj: Tensor,
     /// Final-norm output of each sequence's last row.
     last: Tensor,
+    /// A hybrid family's Gated DeltaNet buffers; `None` without linear layers.
+    gdn: Option<GdnBuffers>,
 }
 
 /// A tensor-parallel rank's extra buffers: the sharded norms' partial sums and the LM head's
@@ -804,6 +1117,10 @@ struct TpBuffers {
     /// F32 `[world · max_seqs, vocab_rows]`: every rank's shard, rank-major.
     gathered: Tensor,
 }
+
+/// The snapshot boundaries one step fills: per sequence, its state slot and the
+/// `(token offset within the step, snapshot entry)` pairs to write after the step (P7 S-12).
+type PendingSnapshots = Vec<(SeqId, u32, Vec<(u32, u32)>)>;
 
 /// The decoder executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
 /// tokens over the paged KV pool, on one device (or as one rank of a tensor-parallel group,
@@ -830,8 +1147,9 @@ pub struct DecoderExecutor {
     mem: Arc<dyn DeviceMemory>,
     /// The op sequence ([`DecoderExecutor::requirements`] of these options).
     opts: ExecutorOptions,
-    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`) in their buffer, fused or not.
-    qkv: Split<3>,
+    /// Q/K/V (`[q_dim, kv_dim, kv_dim]`, or a gated layer's `[q, gate, k, v]`) in their
+    /// buffer, fused or not.
+    qkv: QkvSplit,
     /// Residual adds followed by a norm run as one `add_rmsnorm` (`fused_ops` and a provider
     /// selected for it).
     add_norm: bool,
@@ -857,6 +1175,8 @@ pub struct DecoderExecutor {
     /// Timings of the last collected step ([`ModelExecutor::last_timings`]).
     timings: ForwardTimings,
     trace: Tracer,
+    /// The MoE routing trace ([`DecoderExecutor::set_routing_trace`]).
+    routing: RoutingTracer,
     profiler: Profiler,
     /// The batch being enqueued prefills prompt tokens (not decode-only): its GEMMs ask for
     /// rows independent of the batch ([`GemmContext::prefill`]), so a prefix-reused prefill of a
@@ -870,6 +1190,52 @@ pub struct DecoderExecutor {
     /// The pool grows page classes (P6b S-5/S-7): every forward reads the batch's
     /// `block_formats` table, set by [`DecoderExecutor::set_mixed_blocks`].
     mixed_blocks: bool,
+    /// The Gated DeltaNet state of every linear layer and sequence: F32
+    /// `[linear_layers · max_seqs, v_heads, v_dim, k_dim]`; `None` without linear layers. A
+    /// private per-sequence slot map for now (Task 32 replaces it with
+    /// [`turbine_kv::state::StateSlotPool`]).
+    gdn_state: Option<Tensor>,
+    /// The Gated DeltaNet conv state: `[linear_layers · max_seqs, conv_dim, kernel − 1]` in the
+    /// activation dtype; `None` without linear layers.
+    gdn_conv_state: Option<Tensor>,
+    /// I32 `[linear_layers · max_seqs]`: sequence `s` of layer `l` uses slot `l · max_seqs + s`
+    /// (uploaded per forward).
+    gdn_slots: Option<Tensor>,
+    /// Host `SeqId → slot` map of the private state slots, used only when a caller supplies no
+    /// [`SeqSlice::state_slot`] (P7 S-12; the engine's scheduler owns the real slots).
+    state_slots: HashMap<SeqId, u32>,
+    /// Slot `i`'s owning sequence, `None` when free (the private fallback map).
+    slot_owners: Vec<Option<SeqId>>,
+    /// Free slots (below `slot_owners.len()`), for reuse (the private fallback map).
+    free_slots: Vec<u32>,
+    /// Host copy of the uploaded `gdn_slots` table, so an unchanged table is not re-uploaded
+    /// (which would synchronise the stream) every decode step.
+    gdn_slot_cache: Vec<i32>,
+    /// P7 S-12 (Task 32): the snapshot byte buffer the engine set
+    /// ([`ModelExecutor::set_state_snapshots`]); `None` without hybrid state.
+    snapshots: Option<StateSnapshots>,
+    /// P7 S-12: slots written by [`DecoderExecutor::copy_state`] since the last
+    /// [`DecoderExecutor::resolve_gdn_slots`]; a fresh sequence whose slot is set is not zeroed
+    /// (its state was just restored or forked).
+    state_written: Vec<bool>,
+    /// P7 S-12: the snapshot boundaries this step must fill after the state is final,
+    /// `(sequence, slot, entries)`.
+    pending_snapshots: PendingSnapshots,
+    /// P7 S-12 (Task 33): the per-block boundary states the Gated DeltaNet and conv1d kernels
+    /// write for the full blocks *inside* a prefill chunk, F32
+    /// `[linear_layers · max_rows, v_heads, v_dim, k_dim]`; `None` without linear layers. A
+    /// snapshot request for an interior block boundary reads its row here instead of the live
+    /// slot (whose state is only the step's end).
+    boundary_state: Option<Tensor>,
+    /// The conv window tails at the same boundaries, `[linear_layers · max_rows, conv_dim,
+    /// kernel − 1]` in the activation dtype; `None` without linear layers.
+    boundary_conv: Option<Tensor>,
+    /// Rows the boundary buffers hold (`max_batch_tokens / block_tokens`, at least 1).
+    boundary_max_rows: usize,
+    /// This step captures boundary rows (a prefill with an interior snapshot request).
+    boundary_capture: bool,
+    /// The step's total boundary rows across its sequences.
+    boundary_rows: u32,
 }
 
 impl DecoderExecutor {
@@ -918,27 +1284,54 @@ impl DecoderExecutor {
             OpConfig::Embedding(d.embedding()),
             OpConfig::Rmsnorm(d.norm(d.hidden)),
         ];
-        if opts.fused_projections && spec.attention.fuses_qkv() {
+        // A gated family's full-attention layers project a per-head output gate beside Q
+        // (`attn_output_gate`): the projection is twice as wide and never fused (the per-head
+        // Q/K norm reads dense parts).
+        let gated = cfg.attn_output_gate;
+        if !gated && opts.fused_projections && spec.attention.fuses_qkv() {
             specs.extend(d.linear_ops(d.q_dim + 2 * d.kv_dim, d.hidden));
         } else {
             specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            if gated {
+                specs.extend(d.linear_ops(d.q_dim, d.hidden));
+            }
             specs.extend(d.linear_ops(d.kv_dim, d.hidden));
         }
         specs.extend(spec.attention.requirements(d));
-        specs.extend([
-            OpConfig::Rope(d.rope()),
-            OpConfig::Attention(d.attention(
-                AttentionKind::PrefillPaged,
-                block_tokens,
-                cfg.kv_cache.dtype,
-            )),
-            OpConfig::Attention(d.attention(
-                AttentionKind::DecodePaged,
-                block_tokens,
-                cfg.kv_cache.dtype,
-            )),
-        ]);
+        if gated {
+            specs.push(OpConfig::SigmoidMul(d.sigmoid_mul(d.q_dim)));
+        }
+        specs.extend([OpConfig::Rope(d.rope())]);
+        let sinks = spec.attention.has_sinks();
+        for kind in [AttentionKind::PrefillPaged, AttentionKind::DecodePaged] {
+            specs.extend(
+                d.attentions(kind, block_tokens, cfg.kv_cache.dtype, sinks)
+                    .into_iter()
+                    .map(OpConfig::Attention),
+            );
+        }
         specs.extend(d.linear_ops(d.hidden, d.q_dim));
+        // A hybrid family's Gated DeltaNet layers (P7 S-11): the projections, the causal conv1d,
+        // the recurrence and its gated RMSNorm.
+        if let Some(g) = d.gdn {
+            specs.extend(d.linear_ops(g.conv_dim(), d.hidden));
+            specs.extend(d.linear_ops(g.value_dim(), d.hidden));
+            specs.extend(d.linear_ops(g.v_heads as usize, d.hidden));
+            specs.extend(d.linear_ops(d.hidden, g.value_dim()));
+            specs.push(OpConfig::Rmsnorm(d.norm(g.v_dim as usize)));
+            specs.push(OpConfig::SiluMul(ActivationConfig {
+                cols: g.v_dim as u64,
+                dtype: d.act,
+            }));
+            for mode in [GdnMode::Prefill, GdnMode::Decode] {
+                if let Some(c) = d.gdn_config(mode) {
+                    specs.push(OpConfig::Gdn(c));
+                }
+                if let Some(c) = d.conv1d_config(mode) {
+                    specs.push(OpConfig::Conv1d(c));
+                }
+            }
+        }
         specs.push(OpConfig::Add(d.add()));
         if opts.fused_ops {
             specs.push(OpConfig::AddRmsnorm(d.add_norm()));
@@ -1025,7 +1418,12 @@ impl DecoderExecutor {
     ) -> u64 {
         let es = d.act.size_bytes() as u64;
         let f32 = DType::F32.size_bytes() as u64;
-        let per_token = es * (3 * d.hidden + 2 * d.q_dim + 2 * d.kv_dim) as u64;
+        let qkv_cols = if cfg.attn_output_gate {
+            2 * d.q_dim + 2 * d.kv_dim
+        } else {
+            d.q_dim + 2 * d.kv_dim
+        };
+        let per_token = es * (3 * d.hidden + qkv_cols + d.q_dim) as u64;
         let per_seq = es * d.hidden as u64;
         let t = limits.max_batch_tokens;
         u64::from(t) * per_token
@@ -1033,8 +1431,9 @@ impl DecoderExecutor {
             + spec.ffn.workspace_bytes(d, t as usize)
             + u64::from(limits.max_seqs) * per_seq
             + LogitsHead::bytes(d.vocab, head_rows)
-            + f32 * (d.head_dim / 2) as u64
+            + f32 * (d.rotary_dim / 2) as u64
             + DeviceBatch::bytes(&batch_limits(cfg, limits))
+            + gdn_workspace_bytes(cfg, d, limits)
     }
 
     /// Takes the parameters out of `weights` (Q/K/V fused by the loader; the hooks take
@@ -1228,33 +1627,117 @@ impl DecoderExecutor {
             None => DecoderDims::for_shard(cfg, shard)?,
         };
         spec.ffn.check(&d)?;
-        let qkv = Split {
-            cols: [d.q_dim, d.kv_dim, d.kv_dim],
-            fused: opts.fused_projections && spec.attention.fuses_qkv(),
+        // A gated family's full-attention layers carry a per-head output gate: the Q/K/V
+        // projection is `[q_all | gate_all | k | v]` and never fused (the per-head Q/K norm
+        // reads dense parts). Every other family keeps the plain `[q | k | v]` layout.
+        let qkv = if cfg.attn_output_gate {
+            QkvSplit::Gated(Split {
+                cols: [d.q_dim, d.q_dim, d.kv_dim, d.kv_dim],
+                fused: false,
+            })
+        } else {
+            QkvSplit::Plain(Split {
+                cols: [d.q_dim, d.kv_dim, d.kv_dim],
+                fused: opts.fused_projections && spec.attention.fuses_qkv(),
+            })
         };
+        // transformers' `output · (1 + weight)` RMSNorm form: fold the offset into every norm
+        // weight before the layers read them.
+        if cfg.unit_offset_norms {
+            for (name, t) in weights.tensors.iter() {
+                if name.ends_with(".weight") && unit_offset_applies(name) {
+                    unit_offset_norm(t)?;
+                }
+            }
+        }
+        let text_prefix = cfg.family.0.text_prefix();
         let mut layers = Vec::with_capacity(d.layers);
         // A pipeline stage's layer `local` is the model's layer `first + local`.
         let first = pp.as_ref().map_or(0, |s| s.layers.start);
+        let mut gdn_index = 0usize;
         for local in 0..cfg.num_layers {
             let i = first + local;
-            let p = format!("model.layers.{i}");
-            let w_qkv = d.take_linear(&mut weights, &qkv_proj_name(i), &[qkv.width(), d.hidden])?;
-            let wo = d.take_linear(
-                &mut weights,
-                &format!("{p}.self_attn.o_proj.weight"),
-                &[d.hidden, d.q_dim],
-            )?;
+            let p = format!("{text_prefix}.layers.{i}");
             let mut take = |s: &str| weights.take(&format!("{p}.{s}.weight"));
             let (input_norm, post_norm) =
                 (take("input_layernorm")?, take("post_attention_layernorm")?);
-            let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
+            let mixer = match cfg.layer_kinds[local as usize] {
+                LayerKind::LinearAttention => {
+                    let g = d.gdn.ok_or_else(|| {
+                        invalid(format!(
+                            "linear-attention layer {i} without Gated DeltaNet dims"
+                        ))
+                    })?;
+                    let slot_base = gdn_index * max_seqs as usize;
+                    gdn_index += 1;
+                    let a = format!("{p}.linear_attn");
+                    let in_qkv = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_qkv.weight"),
+                        &[g.conv_dim(), d.hidden],
+                    )?;
+                    let in_z = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_z.weight"),
+                        &[g.value_dim(), d.hidden],
+                    )?;
+                    let in_a = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_a.weight"),
+                        &[g.v_heads as usize, d.hidden],
+                    )?;
+                    let in_b = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.in_proj_b.weight"),
+                        &[g.v_heads as usize, d.hidden],
+                    )?;
+                    let conv_w = weights.take(&format!("{a}.conv1d.weight"))?;
+                    let norm = weights.take(&format!("{a}.norm.weight"))?;
+                    let out_proj = d.take_linear(
+                        &mut weights,
+                        &format!("{a}.out_proj.weight"),
+                        &[d.hidden, g.value_dim()],
+                    )?;
+                    let a_log = host_f32(&weights.take(&format!("{a}.A_log"))?)?;
+                    let dt_bias = host_f32(&weights.take(&format!("{a}.dt_bias"))?)?;
+                    Mixer::Gdn(Box::new(GdnLayer {
+                        in_qkv,
+                        in_z,
+                        in_a,
+                        in_b,
+                        conv_w,
+                        norm,
+                        out_proj,
+                        a_log,
+                        dt_bias,
+                        slot_base,
+                    }))
+                }
+                _ => {
+                    let w_qkv = d.take_linear(
+                        &mut weights,
+                        &qkv_proj_name_at(&p, cfg.attn_output_gate),
+                        &[qkv.width(), d.hidden],
+                    )?;
+                    let wo = d.take_linear(
+                        &mut weights,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        &[d.hidden, d.q_dim],
+                    )?;
+                    let attention = spec.attention.load_layer(&d, &p, &mut weights)?;
+                    Mixer::Attention(Box::new(AttentionLayer {
+                        w_qkv,
+                        wo,
+                        attention,
+                        gated: cfg.attn_output_gate,
+                    }))
+                }
+            };
             let ffn = spec.ffn.load_layer(&d, i, &p, &mut weights, opts)?;
             layers.push(Layer {
                 input_norm,
-                w_qkv,
-                wo,
                 post_norm,
-                attention,
+                mixer,
                 ffn,
             });
         }
@@ -1262,12 +1745,12 @@ impl DecoderExecutor {
             .as_ref()
             .map_or((true, true), |s| (s.is_first(), s.is_last()));
         let embed = if embeds || (heads && d.tied_lm_head) {
-            Some(weights.take("model.embed_tokens.weight")?)
+            Some(weights.take(&format!("{text_prefix}.embed_tokens.weight"))?)
         } else {
             None
         };
         let final_norm = if heads {
-            Some(weights.take("model.norm.weight")?)
+            Some(weights.take(&format!("{text_prefix}.norm.weight"))?)
         } else {
             None
         };
@@ -1282,13 +1765,64 @@ impl DecoderExecutor {
         let t = max_batch_tokens as usize;
         let n = max_seqs as usize;
         let act = |cols: usize| Tensor::empty(&mem, &[t, cols], d.act);
-        let mut inv_freq = Tensor::empty(&mem, &[d.head_dim / 2], DType::F32)?;
-        let freqs = rope::inv_freq(cfg.rope_theta, cfg.head_dim, cfg.rope_scaling.as_ref());
-        let freq_bytes: Vec<u8> = freqs.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut inv_freq = Tensor::empty(&mem, &[d.rotary_dim / 2], DType::F32)?;
+        // `inv_freq[i] = theta^(-2i / rotary_dim)`: the exponent's dimension is the rotary one
+        // (`head_dim * partial_rotary_factor`), not `head_dim` (transformers'
+        // `compute_default_rope_parameters`).
+        let freqs = rope::inv_freq(cfg.rope_theta, cfg.rotary_dim, cfg.rope_scaling.as_ref());
+        let freq_bytes: Vec<u8> = freqs
+            .iter()
+            .take(d.rotary_dim / 2)
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         inv_freq.storage.copy_from_host(0, &freq_bytes)?;
         let ffn_buffers = spec.ffn.alloc(&d, t, &mem)?;
         let act_quant = d.alloc_act_quant(t, &mem)?;
         mem.synchronize()?;
+        let gdn_buffers = match d.gdn {
+            None => None,
+            Some(g) => Some(GdnBuffers {
+                qkv: act(g.conv_dim())?,
+                conv: act(g.conv_dim())?,
+                z: act(g.value_dim())?,
+                attn: act(g.value_dim())?,
+                a: act(g.v_heads as usize)?,
+                b: act(g.v_heads as usize)?,
+                g: Tensor::empty(&mem, &[t, g.v_heads as usize], DType::F32)?,
+                beta: Tensor::empty(&mem, &[t, g.v_heads as usize], DType::F32)?,
+            }),
+        };
+        // P7 S-12 (Task 33): one boundary row per full block of a prefill chunk, per linear
+        // layer. A chunk holds at most `max_batch_tokens / block_tokens` full blocks, and the
+        // layer's rows are contiguous, so a `[layers · max_rows, ...]` buffer views cleanly.
+        let boundary_max_rows = (t / limits.layout.block_tokens.max(1) as usize).max(1);
+        let (boundary_state, boundary_conv) = match d.gdn {
+            None => (None, None),
+            Some(g) => {
+                let layers = linear_layers(cfg);
+                (
+                    Some(Tensor::empty(
+                        &mem,
+                        &[
+                            layers * boundary_max_rows,
+                            g.v_heads as usize,
+                            g.v_dim as usize,
+                            g.k_dim as usize,
+                        ],
+                        DType::F32,
+                    )?),
+                    Some(Tensor::empty(
+                        &mem,
+                        &[
+                            layers * boundary_max_rows,
+                            g.conv_dim(),
+                            (g.conv_kernel - 1) as usize,
+                        ],
+                        d.act,
+                    )?),
+                )
+            }
+        };
         let bufs = Buffers {
             inv_freq,
             x: act(d.hidden)?,
@@ -1297,6 +1831,43 @@ impl DecoderExecutor {
             attn: act(d.q_dim)?,
             proj: act(d.hidden)?,
             last: Tensor::empty(&mem, &[n, d.hidden], d.act)?,
+            gdn: gdn_buffers,
+        };
+        // A hybrid family's per-layer Gated DeltaNet state over `linear_layers × max_seqs`
+        // slots (layer `l`, sequence slot `s` → `l · max_seqs + s`).
+        let gdn_slot_count = linear_layers(cfg) * n;
+        let (gdn_state, gdn_conv_state, gdn_slots) = match d.gdn {
+            None => (None, None, None),
+            Some(g) => {
+                let state = Tensor::empty(
+                    &mem,
+                    &[
+                        gdn_slot_count,
+                        g.v_heads as usize,
+                        g.v_dim as usize,
+                        g.k_dim as usize,
+                    ],
+                    DType::F32,
+                )?;
+                let conv = Tensor::empty(
+                    &mem,
+                    &[gdn_slot_count, g.conv_dim(), (g.conv_kernel - 1) as usize],
+                    d.act,
+                )?;
+                // Start every slot at zero (a fresh sequence reads it before any carry).
+                state
+                    .storage
+                    .whole()
+                    .write_bytes(&vec![0u8; state.storage.whole().len()])?;
+                conv.storage
+                    .whole()
+                    .write_bytes(&vec![0u8; conv.storage.whole().len()])?;
+                (
+                    Some(state),
+                    Some(conv),
+                    Some(Tensor::empty(&mem, &[gdn_slot_count], DType::I32)?),
+                )
+            }
         };
         // A stage before the last never computes logits: one row keeps the head valid.
         let head = LogitsHead::new(cfg, &registry, &mem, if heads { n } else { 1 })?;
@@ -1339,11 +1910,27 @@ impl DecoderExecutor {
             launches: VecDeque::with_capacity(2),
             timings: ForwardTimings::default(),
             trace: Tracer::default(),
+            routing: RoutingTracer::default(),
             profiler: Profiler::default(),
             step_prefill: AtomicBool::new(false),
             overlap: None,
             tq_device: None,
             mixed_blocks: false,
+            gdn_state,
+            gdn_conv_state,
+            gdn_slots,
+            state_slots: HashMap::new(),
+            slot_owners: Vec::new(),
+            free_slots: Vec::new(),
+            gdn_slot_cache: Vec::new(),
+            snapshots: None,
+            state_written: Vec::new(),
+            pending_snapshots: Vec::new(),
+            boundary_state,
+            boundary_conv,
+            boundary_max_rows,
+            boundary_capture: false,
+            boundary_rows: 0,
         })
     }
 
@@ -1397,6 +1984,22 @@ impl DecoderExecutor {
         self.trace.take()
     }
 
+    /// Diagnostics (P7 Task 12): while on, every MoE layer of every forward records, per token,
+    /// its top-k expert ids, their gates and the margin of the router's choice (the smallest
+    /// selected router logit minus the largest unselected one), read back after routing (three
+    /// blocking reads per layer; no decode graphs or split prefills meanwhile). Returned by
+    /// [`DecoderExecutor::take_routing_trace`]; off by default, one branch per MoE layer when
+    /// off.
+    pub fn set_routing_trace(&mut self, on: bool) {
+        self.routing.set(on);
+    }
+
+    /// The routing rows recorded since the trace was enabled or last taken, in execution order
+    /// (per forward: layer by layer, each layer's tokens in batch order); empty when off.
+    pub fn take_routing_trace(&mut self) -> Vec<RoutingRow> {
+        self.routing.take()
+    }
+
     /// Diagnostics: while enabled every op of every forward is followed by a stream
     /// synchronisation and timed into the profile returned by
     /// [`DecoderExecutor::take_profile`]. Disabling drops what was recorded. Off by default.
@@ -1424,16 +2027,18 @@ impl DecoderExecutor {
     /// and k, is off.
     pub fn decode_fuses_rope(&self) -> bool {
         let d = &self.dims;
-        let attn = d.attention(
+        let attns = d.attentions(
             AttentionKind::DecodePaged,
             self.kv_layout.block_tokens,
             self.kv_layout.dtype,
+            self.spec.attention.has_sinks(),
         );
         !self.trace.is_on()
-            && self
-                .registry
-                .attention(&attn)
-                .fuses_decode_rope(&attn, &d.rope())
+            && attns.iter().all(|attn| {
+                self.registry
+                    .attention(attn)
+                    .fuses_decode_rope(attn, &d.rope())
+            })
     }
 
     /// The decode graph key [`ModelExecutor::launch`] would run `batch` with `feeds` under
@@ -1480,6 +2085,7 @@ impl DecoderExecutor {
                 .as_ref()
                 .is_some_and(|o| p.total_q < o.min_tokens.max(2))
             || self.trace.is_on()
+            || self.routing.is_on()
             || self.profiler.is_on()
         {
             return Ok(None);
@@ -1499,6 +2105,8 @@ impl DecoderExecutor {
                 first.push(*s);
             } else if start >= split {
                 second.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_start: s.q_start - split as u32,
                     logits_rows: 1,
                     ..*s
@@ -1506,6 +2114,8 @@ impl DecoderExecutor {
             } else {
                 let head = (split - start) as u32;
                 first.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_len: head,
                     kv_len: s.kv_len - (s.q_len - head),
                     reduce: None,
@@ -1513,6 +2123,8 @@ impl DecoderExecutor {
                     ..*s
                 });
                 second.push(SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     q_start: 0,
                     q_len: s.q_len - head,
                     ..*s
@@ -1756,15 +2368,20 @@ impl DecoderExecutor {
             || self.tp.is_some()
             || self.pp.is_some()
             || !self.add_norm
-            || !self.qkv.fused
+            || !self.qkv.fused()
+            || self.dims.gdn.is_some()
+            || !self.spec.attention.allows_fused_decode()
         {
             return false;
         }
         let Some(l) = self.layers.first() else {
             return false;
         };
-        if l.w_qkv.view().q.is_some()
-            || l.wo.view().q.is_some()
+        let Mixer::Attention(a) = &l.mixer else {
+            return false;
+        };
+        if a.w_qkv.view().q.is_some()
+            || a.wo.view().q.is_some()
             || !self
                 .spec
                 .ffn
@@ -1786,7 +2403,7 @@ impl DecoderExecutor {
             residual: true,
             ..GemmFusion::default()
         };
-        fuses(&l.w_qkv, norm) && fuses(&l.wo, residual)
+        fuses(&a.w_qkv, norm) && fuses(&a.wo, residual)
     }
 
     /// Tensor parallelism: sums the contiguous `view` (BF16 or F32) across the group in place,
@@ -2034,7 +2651,10 @@ impl DecoderExecutor {
             self.ffn_part(i, &w, Some(&self.layers[i].post_norm))?;
             return Ok(());
         }
-        self.attention_part(i, &w, kv, false)?;
+        match &self.layers[i].mixer {
+            Mixer::Gdn(_) => self.gdn_part(i, &w)?,
+            Mixer::Attention(_) => self.attention_part(i, &w, kv, false)?,
+        }
         self.all_reduce(&rows(&b.proj, t))?;
         self.record(li, "o_proj", rows(&b.proj, t))?;
         self.residual_add_norm_at(&w, Some(&self.layers[i].post_norm))?;
@@ -2059,6 +2679,10 @@ impl DecoderExecutor {
         fused: bool,
     ) -> Result<(), ModelError> {
         let l = &self.layers[i];
+        let Mixer::Attention(a) = &l.mixer else {
+            return Err(invalid(format!("layer {i} is not a full-attention layer")));
+        };
+        let (gated, attention) = (a.gated, &a.attention);
         let b = &self.bufs;
         let d = &self.dims;
         let (p, t) = (w.p, w.p.total_q);
@@ -2066,12 +2690,13 @@ impl DecoderExecutor {
         let run = self.layer_run(i, w);
         let at = |buf: &'s Tensor| -> TensorView<'s> { buf.view().rows(w.r0, t) };
         let end = w.r0 + t;
+        // The gated stack is `[q | gate | k | v]`; the plain one `[q | k | v]`.
+        let (qi, ki, vi) = if gated { (0, 2, 3) } else { (0, 1, 2) };
         let part = |i: usize, inner: &[usize]| self.qkv.part(&b.qkv, i, end, inner).rows(w.r0, t);
-        let (q, k, v) = (
-            || part(0, &[d.q_dim]),
-            || part(1, &[d.kv_dim]),
-            || part(2, &[d.kv_dim]),
-        );
+        let q = || part(qi, &[d.q_dim]);
+        let k = || part(ki, &[d.kv_dim]);
+        let v = || part(vi, &[d.kv_dim]);
+        let gate = || part(1, &[d.q_dim]);
 
         self.record(li, "attn_norm", at(&b.h))?;
         if fused {
@@ -2079,38 +2704,51 @@ impl DecoderExecutor {
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.gemm_fused(
                 at(&b.x),
-                l.w_qkv.view(),
+                a.w_qkv.view(),
                 whole,
                 None,
                 Some(&l.input_norm),
                 None,
             )?;
-        } else if self.qkv.fused {
-            let wq = l.w_qkv.view();
+        } else if self.qkv.fused() {
+            let wq = a.w_qkv.view();
             let whole = self.qkv.whole(&b.qkv, end).rows(w.r0, t);
             self.linear(at(&b.h), wq, whole)?;
         } else {
-            let wq = |r, n| l.w_qkv.view().rows(r, n);
+            let wq = |r, n| a.w_qkv.view().rows(r, n);
             self.linear(at(&b.h), wq(0, d.q_dim), q())?;
-            self.linear(at(&b.h), wq(d.q_dim, d.kv_dim), k())?;
-            self.linear(at(&b.h), wq(d.q_dim + d.kv_dim, d.kv_dim), v())?;
+            if gated {
+                self.linear(at(&b.h), wq(d.q_dim, d.q_dim), gate())?;
+            }
+            let koff = if gated { 2 * d.q_dim } else { d.q_dim };
+            self.linear(at(&b.h), wq(koff, d.kv_dim), k())?;
+            self.linear(at(&b.h), wq(koff + d.kv_dim, d.kv_dim), v())?;
         }
+        self.spec
+            .attention
+            .after_linear(&run, attention, &q(), &k(), &v())?;
         self.record(li, "q", q())?;
         self.record(li, "k", k())?;
         self.record(li, "v", v())?;
         self.spec
             .attention
-            .after_projections(&run, &l.attention, &q(), &k())?;
-        let q_heads = || part(0, &[d.heads, d.head_dim]);
-        let k_heads = || part(1, &[d.kv_heads, d.head_dim]);
-        let v_heads = || part(2, &[d.kv_heads, d.head_dim]);
+            .after_projections(&run, attention, &q(), &k())?;
+        let q_heads = || part(qi, &[d.heads, d.head_dim]);
+        let k_heads = || part(ki, &[d.kv_heads, d.head_dim]);
+        let v_heads = || part(vi, &[d.kv_heads, d.head_dim]);
         let rope = d.rope();
         let kind = if p.is_decode() {
             AttentionKind::DecodePaged
         } else {
             AttentionKind::PrefillPaged
         };
-        let attn = d.attention(kind, self.kv_layout.block_tokens, self.kv_layout.dtype);
+        let attn = d.attention(
+            kind,
+            self.kv_layout.block_tokens,
+            self.kv_layout.dtype,
+            d.window_left.get(i).copied().flatten(),
+            self.spec.attention.has_sinks(),
+        );
         // P5p b1 attention II: on decode steps RoPE rides in the attention call when its kernel
         // takes it (kernel ABI v2.12: the same operations, one launch and one boundary fewer),
         // except while tracing, which records the rotated q and k.
@@ -2151,7 +2789,13 @@ impl DecoderExecutor {
                     k_new: k_heads(),
                     v_new: v_heads(),
                     out: out.clone(),
-                    kv_layer: batch::kv_layer(kv, i),
+                    kv_layer: batch::kv_layer(
+                        kv,
+                        self.cfg
+                            .kv_layer_index(i as u32)
+                            .expect("a full-attention layer has a KV slot")
+                            as usize,
+                    ),
                     block_table: w.meta.block_table_view(p),
                     q_indptr: w.meta.q_indptr_view(p),
                     kv_lens: w.meta.kv_lens_view(p),
@@ -2182,21 +2826,551 @@ impl DecoderExecutor {
                         inv_freq: b.inv_freq.view(),
                         attn_factor: d.rope_attn_factor,
                     }),
+                    // Phase 7 S-8: the families with sinks (gpt-oss) pass them here.
+                    sinks: self.spec.attention.sinks(attention),
                 })
         })?;
+        // `attn_output_gate` (P7 S-11): `out = attn · sigmoid(gate)` before the O projection.
+        if gated {
+            let cfg = d.sigmoid_mul(d.q_dim);
+            self.op(OpConfig::SigmoidMul(cfg), || {
+                self.registry
+                    .sigmoid_mul(&cfg)
+                    .execute(&mut SigmoidMulContext {
+                        a: at(&b.attn),
+                        gate: gate(),
+                        out: at(&b.attn),
+                    })
+            })?;
+        }
         self.record(li, "attn", at(&b.attn))?;
         if fused {
             // The fused decode form: the residual add runs in the o_proj GEMV's epilogue.
             return self.gemm_fused(
                 at(&b.attn),
-                l.wo.view(),
+                a.wo.view(),
                 at(&b.x),
                 None,
                 None,
                 Some(at(&b.x)),
             );
         }
-        self.linear(at(&b.attn), l.wo.view(), at(&b.proj))
+        self.linear(at(&b.attn), a.wo.view(), at(&b.proj))?;
+        self.spec
+            .attention
+            .after_o_proj(&run, attention, &at(&b.proj))
+    }
+
+    /// The Gated DeltaNet block of layer `i` on the rows of `w`, from their normalised input in
+    /// `h` to the O projection's (not yet all-reduced) output in `proj` (P7 S-11): `in_proj_qkv`
+    /// → causal depthwise conv1d (silu) → `q | k | v`, `in_proj_z` / `in_proj_a` / `in_proj_b`,
+    /// the delta-rule recurrence with the host-computed `g`/`beta`, the gated RMSNorm and
+    /// `out_proj`.
+    fn gdn_part<'s>(&'s self, i: usize, w: &Part<'_>) -> Result<(), ModelError> {
+        let l = &self.layers[i];
+        let Mixer::Gdn(l) = &l.mixer else {
+            return Err(invalid(format!("layer {i} is not a Gated DeltaNet layer")));
+        };
+        let d = &self.dims;
+        let g = d
+            .gdn
+            .ok_or_else(|| invalid("Gated DeltaNet layer without dims".into()))?;
+        let gb = self
+            .bufs
+            .gdn
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet buffers".into()))?;
+        let state = self
+            .gdn_state
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet state".into()))?;
+        let conv_state = self
+            .gdn_conv_state
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet conv state".into()))?;
+        let slots = self
+            .gdn_slots
+            .as_ref()
+            .ok_or_else(|| invalid("Gated DeltaNet slots".into()))?;
+        let (p, t) = (w.p, w.p.total_q);
+        let li = Some(i);
+        let run = self.layer_run(i, w);
+        let at = |buf: &'s Tensor| -> TensorView<'s> { buf.view().rows(w.r0, t) };
+        let mode = if p.is_decode() {
+            GdnMode::Decode
+        } else {
+            GdnMode::Prefill
+        };
+        let cu = (!p.is_decode()).then(|| w.meta.q_indptr_view(p));
+        // The layer's own slot block, `[seqs]` values `slot_base + sequence slot`.
+        let state_slots = TensorView::contiguous(
+            slots.storage.whole(),
+            l.slot_base,
+            &[p.num_seqs],
+            DType::I32,
+        );
+        // P7 S-12 (Task 33): this layer's boundary rows for the step, when a snapshot request
+        // falls on a full block inside the prefill chunk. The kernel counts boundary rows from
+        // the chunk start, so row `o / block_tokens − 1` holds the state after `o` chunk tokens;
+        // the engine only asks for offsets on a block boundary of a block-aligned chunk.
+        let (boundary_states, boundary_conv_states, boundary_tokens) = if self.boundary_capture {
+            let rows = self.boundary_rows as usize;
+            let max_rows = self.boundary_max_rows;
+            let linear_layer = l.slot_base / self.limits.max_seqs as usize;
+            let state_elems = g.v_heads as usize * g.v_dim as usize * g.k_dim as usize;
+            let conv_elems = g.conv_dim() * (g.conv_kernel as usize - 1);
+            let vh = g.v_heads as usize;
+            let vd = g.v_dim as usize;
+            let kd = g.k_dim as usize;
+            let bs = self.boundary_state.as_ref().map(|buf| {
+                TensorView::contiguous(
+                    buf.storage.whole(),
+                    linear_layer * max_rows * state_elems,
+                    &[rows, vh, vd, kd],
+                    DType::F32,
+                )
+            });
+            let bc = self.boundary_conv.as_ref().map(|buf| {
+                TensorView::contiguous(
+                    buf.storage.whole(),
+                    linear_layer * max_rows * conv_elems,
+                    &[rows, g.conv_dim(), g.conv_kernel as usize - 1],
+                    d.act,
+                )
+            });
+            (bs, bc, self.limits.layout.block_tokens)
+        } else {
+            (None, None, 0)
+        };
+
+        // in_proj_qkv → causal conv1d (silu) → q | k | v.
+        let conv_in = at(&gb.qkv);
+        run.linear(at(&self.bufs.h), l.in_qkv.view(), conv_in.clone())?;
+        self.record(li, "gdn_qkv", conv_in.clone())?;
+        let conv_out = at(&gb.conv);
+        let cw = TensorView::contiguous(
+            l.conv_w.storage.whole(),
+            0,
+            &[g.conv_dim(), g.conv_kernel as usize],
+            d.act,
+        );
+        let ccfg = d.conv1d_config(mode).expect("gdn dims");
+        self.op(OpConfig::Conv1d(ccfg), || {
+            self.registry.conv1d(&ccfg).execute(&mut Conv1dContext {
+                cfg: ccfg,
+                x: conv_in,
+                weight: cw,
+                bias: None,
+                conv_state: conv_state.view(),
+                state_slots: state_slots.clone(),
+                cu_seqlens: cu.clone(),
+                out: conv_out.clone(),
+                boundary_conv_states,
+                boundary_tokens,
+                activation: 1,
+            })
+        })?;
+        // q | k | v are the conv output's column blocks (row stride conv_dim).
+        let split = Split {
+            cols: [g.key_dim(), g.key_dim(), g.value_dim()],
+            fused: true,
+        };
+        let q = split.part(&gb.conv, 0, t, &[g.k_heads as usize, g.k_dim as usize]);
+        let k = split.part(&gb.conv, 1, t, &[g.k_heads as usize, g.k_dim as usize]);
+        let v = split.part(&gb.conv, 2, t, &[g.v_heads as usize, g.v_dim as usize]);
+        self.record(li, "gdn_q", q.clone())?;
+        self.record(li, "gdn_k", k.clone())?;
+        self.record(li, "gdn_v", v.clone())?;
+        // in_proj_z / in_proj_a / in_proj_b.
+        let z = at(&gb.z);
+        run.linear(at(&self.bufs.h), l.in_z.view(), z.clone())?;
+        let a = at(&gb.a);
+        let bb = at(&gb.b);
+        run.linear(at(&self.bufs.h), l.in_a.view(), a.clone())?;
+        run.linear(at(&self.bufs.h), l.in_b.view(), bb.clone())?;
+        // beta = sigmoid(b); g = −exp(A_log)·softplus(a + dt_bias), on the host.
+        self.gdn_g_beta(&run, l, t)?;
+        let gcfg = d.gdn_config(mode).expect("gdn dims");
+        // The kernel takes the recurrence output as `[tokens, v_heads, v_dim]` (the buffer is
+        // `[t, value_dim]`, the same memory).
+        let out = TensorView::contiguous(
+            gb.attn.storage.whole(),
+            0,
+            &[t, g.v_heads as usize, g.v_dim as usize],
+            d.act,
+        );
+        self.op(OpConfig::Gdn(gcfg), || {
+            self.registry.gdn(&gcfg).execute(&mut GdnContext {
+                cfg: gcfg,
+                q,
+                k,
+                v,
+                g: at(&gb.g),
+                beta: at(&gb.beta),
+                state: state.view(),
+                state_slots: state_slots.clone(),
+                cu_seqlens: cu.clone(),
+                out: out.clone(),
+                boundary_states,
+                boundary_tokens,
+            })
+        })?;
+        self.record(li, "gdn_out", out.clone())?;
+        // Gated RMSNorm over v_dim per value head: weight · rms(x) · silu(z).
+        let vrows = t * g.v_heads as usize;
+        let normed = TensorView::contiguous(
+            gb.attn.storage.whole(),
+            0,
+            &[vrows, g.v_dim as usize],
+            d.act,
+        );
+        let zflat =
+            TensorView::contiguous(gb.z.storage.whole(), 0, &[vrows, g.v_dim as usize], d.act);
+        let nv = d.norm(g.v_dim as usize);
+        self.op(OpConfig::Rmsnorm(nv), || {
+            self.registry.norm(&nv).execute(&mut NormContext {
+                x: normed.clone(),
+                weight: l.norm.view(),
+                out: normed.clone(),
+                eps: d.eps,
+            })
+        })?;
+        let sm = ActivationConfig {
+            cols: g.v_dim as u64,
+            dtype: d.act,
+        };
+        self.op(OpConfig::SiluMul(sm), || {
+            self.registry
+                .activation(&sm)
+                .execute(&mut ActivationContext {
+                    gate: zflat,
+                    up: normed.clone(),
+                    out: normed.clone(),
+                })
+        })?;
+        self.record(li, "gdn_normed", normed.clone())?;
+        run.linear(at(&gb.attn), l.out_proj.view(), at(&self.bufs.proj))
+    }
+
+    /// Computes `beta = sigmoid(b)` and `g = −exp(A_log)·softplus(a + dt_bias)` on the host from
+    /// layer `l`'s `in_proj_a` / `in_proj_b` outputs (P7 S-11, decision "P7 GDN `g`/`beta`
+    /// production" A): a device→host→device round trip, acceptable until the ABI computes them
+    /// on device.
+    fn gdn_g_beta(&self, run: &LayerRun<'_>, l: &GdnLayer, t: usize) -> Result<(), ModelError> {
+        let gb = self.bufs.gdn.as_ref().expect("gdn buffers");
+        let vh = self.dims.gdn.expect("gdn dims").v_heads as usize;
+        let a = TensorView::contiguous(gb.a.storage.whole(), 0, &[t, vh], self.dims.act);
+        let b = TensorView::contiguous(gb.b.storage.whole(), 0, &[t, vh], self.dims.act);
+        run.step("gdn_g_beta", "host", || {
+            let read = |v: &TensorView<'_>| -> Result<Vec<f32>, ModelError> {
+                let bytes = v.slice.read_bytes()?;
+                Ok(bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect())
+            };
+            let av = read(&a)?;
+            let bv = read(&b)?;
+            let mut g = Vec::with_capacity(t * vh);
+            let mut beta = Vec::with_capacity(t * vh);
+            for tok in 0..t {
+                for h in 0..vh {
+                    let x = av[tok * vh + h] + l.dt_bias[h];
+                    let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+                    g.push(-l.a_log[h].exp() * sp);
+                    beta.push(1.0 / (1.0 + (-bv[tok * vh + h]).exp()));
+                }
+            }
+            let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            gb.g.storage.whole().write_bytes(&bytes(&g))?;
+            gb.beta.storage.whole().write_bytes(&bytes(&beta))?;
+            Ok(())
+        })
+    }
+
+    /// The hybrid state's `(linear_layers, recurrent bytes per layer, conv bytes per layer)`.
+    fn gdn_state_sizes(&self) -> Option<(usize, usize, usize)> {
+        let g = self.dims.gdn?;
+        let layers = linear_layers(&self.cfg);
+        let rec = (g.v_heads * g.v_dim * g.k_dim) as usize * 4;
+        let conv = g.conv_dim() * (g.conv_kernel as usize - 1) * self.dims.act.size_bytes();
+        Some((layers, rec, conv))
+    }
+
+    /// Resolves each sequence's Gated DeltaNet state slot for `batch` (P7 S-12, Task 32) before it
+    /// is packed: the scheduler's per-sequence slot when the slice carries one
+    /// ([`SeqSlice::state_slot`]), else the private fallback map of a direct caller. A sequence
+    /// that starts fresh (no cached prefix, `kv_len == q_len`) has its recurrent and conv state
+    /// zeroed, unless [`DecoderExecutor::copy_state`] just wrote that slot this turn (a restored
+    /// snapshot or a fork). Records the step's snapshot boundaries from
+    /// [`SeqSlice::snapshot_blocks`]; the upload is skipped when the table is unchanged.
+    fn resolve_gdn_slots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
+        self.boundary_capture = false;
+        self.boundary_rows = 0;
+        if self.gdn_state.is_none() {
+            return Ok(());
+        }
+        let n = self.limits.max_seqs as usize;
+        let layers = self.gdn_state.as_ref().map_or(0, |s| s.shape[0]) / n;
+        let g = self.dims.gdn.expect("gdn dims");
+        let mut host = vec![0i32; layers * n];
+        let mut fresh: Vec<u32> = Vec::new();
+        self.pending_snapshots.clear();
+        for (s, seq) in batch.seqs.iter().enumerate() {
+            let slot = match seq.state_slot {
+                Some(slot) => slot,
+                None => match self.state_slots.get(&seq.seq) {
+                    Some(slot) => *slot,
+                    None => {
+                        let slot = match self.free_slots.pop() {
+                            Some(slot) => slot,
+                            None => {
+                                let slot = self.slot_owners.len() as u32;
+                                if slot as usize >= n {
+                                    return Err(invalid(format!(
+                                        "Gated DeltaNet state slots exhausted: {n} sequences"
+                                    )));
+                                }
+                                self.slot_owners.push(None);
+                                slot
+                            }
+                        };
+                        self.slot_owners[slot as usize] = Some(seq.seq);
+                        self.state_slots.insert(seq.seq, slot);
+                        slot
+                    }
+                },
+            };
+            for l in 0..layers {
+                host[l * n + s] = (l * n + slot as usize) as i32;
+            }
+            let written = self
+                .state_written
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(false);
+            if seq.kv_len == seq.q_len && !written {
+                fresh.push(slot);
+            }
+            if !seq.snapshot_blocks.is_empty() {
+                self.pending_snapshots.push((
+                    seq.seq,
+                    slot,
+                    seq.snapshot_blocks
+                        .iter()
+                        .map(|(offset, r)| (*offset, r.entry))
+                        .collect(),
+                ));
+            }
+        }
+        if !fresh.is_empty() {
+            let rec = (g.v_heads * g.v_dim * g.k_dim) as usize * 4;
+            let conv = g.conv_dim() * (g.conv_kernel as usize - 1) * self.dims.act.size_bytes();
+            let zeros_rec = vec![0u8; rec];
+            let zeros_conv = vec![0u8; conv];
+            let state = self.gdn_state.as_ref().expect("state");
+            let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+            for slot in &fresh {
+                for l in 0..layers {
+                    let idx = l * n + *slot as usize;
+                    state
+                        .storage
+                        .whole()
+                        .sub(idx * rec, rec)
+                        .write_bytes(&zeros_rec)?;
+                    conv_state
+                        .storage
+                        .whole()
+                        .sub(idx * conv, conv)
+                        .write_bytes(&zeros_conv)?;
+                }
+            }
+        }
+        let written_len = self.state_written.len().max(n);
+        self.state_written.resize(written_len, false);
+        self.state_written.iter_mut().for_each(|w| *w = false);
+        if host != self.gdn_slot_cache {
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.gdn_slots
+                .as_ref()
+                .expect("slots")
+                .storage
+                .whole()
+                .write_bytes(&bytes)?;
+            self.gdn_slot_cache = host;
+        }
+        // P7 S-12 (Task 33): a snapshot request on a full block *inside* a prefill chunk needs
+        // the kernel's per-block boundary rows, not the live slot (the step's end state). The
+        // kernel writes a row per block for every sequence, so sized for the whole batch.
+        let bt = self.limits.layout.block_tokens.max(1);
+        self.boundary_capture = self.boundary_state.is_some()
+            && batch.seqs.iter().any(|s| {
+                s.snapshot_blocks
+                    .iter()
+                    .any(|(o, _)| *o > 0 && *o < s.q_len)
+            });
+        self.boundary_rows = if self.boundary_capture {
+            batch.seqs.iter().map(|s| s.q_len / bt).sum()
+        } else {
+            0
+        };
+        Ok(())
+    }
+
+    /// The host bytes of one sequence slot's whole state (its `layers` recurrent then conv parts,
+    /// in layer order), as a [`StateSnapshots`] entry lays them out.
+    fn read_slot_state(&self, slot: u32) -> Result<Vec<u8>, ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(Vec::new());
+        };
+        let n = self.limits.max_seqs as usize;
+        let state = self.gdn_state.as_ref().expect("state");
+        let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+        let mut out = Vec::with_capacity(layers * (rec + conv));
+        for l in 0..layers {
+            let idx = l * n + slot as usize;
+            out.extend_from_slice(&state.storage.whole().sub(idx * rec, rec).read_bytes()?);
+            out.extend_from_slice(
+                &conv_state
+                    .storage
+                    .whole()
+                    .sub(idx * conv, conv)
+                    .read_bytes()?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Writes `bytes` (a [`StateSnapshots`] entry's layout) into sequence slot `slot`.
+    fn write_slot_state(&mut self, slot: u32, bytes: &[u8]) -> Result<(), ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(());
+        };
+        let n = self.limits.max_seqs as usize;
+        let expect = layers * (rec + conv);
+        if bytes.len() != expect {
+            return Err(invalid(format!(
+                "state copy of {} bytes, a slot holds {expect}",
+                bytes.len()
+            )));
+        }
+        let state = self.gdn_state.as_ref().expect("state");
+        let conv_state = self.gdn_conv_state.as_ref().expect("conv state");
+        for l in 0..layers {
+            let idx = l * n + slot as usize;
+            let at = l * (rec + conv);
+            state
+                .storage
+                .whole()
+                .sub(idx * rec, rec)
+                .write_bytes(&bytes[at..at + rec])?;
+            conv_state
+                .storage
+                .whole()
+                .sub(idx * conv, conv)
+                .write_bytes(&bytes[at + rec..at + rec + conv])?;
+        }
+        if self.state_written.len() <= slot as usize {
+            self.state_written.resize(slot as usize + 1, false);
+        }
+        self.state_written[slot as usize] = true;
+        Ok(())
+    }
+
+    /// Fills this step's snapshot boundaries (P7 S-12): for each sequence, the state at the
+    /// requested offset into its entry. An end-of-step boundary (`offset == q_len`) writes the
+    /// live slot's final state; an interior boundary of a chunked prefill (`offset` a full block
+    /// inside the chunk) writes the kernel's corresponding boundary row (P7 S-12 Task 33). Called
+    /// after the layers ran and the stream is synchronised.
+    fn write_pending_snapshots(&mut self, batch: &BatchInput<'_>) -> Result<(), ModelError> {
+        if self.pending_snapshots.is_empty() {
+            return Ok(());
+        }
+        let entry_bytes = self
+            .snapshots
+            .as_ref()
+            .map_or(0, StateSnapshots::entry_bytes) as usize;
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(());
+        };
+        if entry_bytes != layers * (rec + conv) {
+            return Err(invalid(format!(
+                "snapshot entry of {entry_bytes} bytes, the state holds {}",
+                layers * (rec + conv)
+            )));
+        }
+        // Each sequence's first boundary row in the batch's boundary buffers: rows are
+        // chunk-relative, so sequence `s` owns `q_len / block_tokens` rows from its base.
+        let bt = self.limits.layout.block_tokens.max(1);
+        let mut row_base: HashMap<SeqId, u32> = HashMap::new();
+        let mut acc = 0u32;
+        for s in batch.seqs {
+            row_base.insert(s.seq, acc);
+            acc += s.q_len / bt;
+        }
+        let pending = std::mem::take(&mut self.pending_snapshots);
+        for (seq, slot, entries) in pending {
+            let Some(slice) = batch.seqs.iter().find(|s| s.seq == seq) else {
+                continue;
+            };
+            let q_len = slice.q_len;
+            let chunk_start = slice.kv_len.saturating_sub(q_len);
+            let base = row_base.get(&seq).copied().unwrap_or(0);
+            // The live slot's end state is read lazily, only when an end-of-step boundary asks.
+            let mut live: Option<Vec<u8>> = None;
+            for (offset, entry) in entries {
+                let bytes = if offset == q_len && q_len > 0 {
+                    match &live {
+                        Some(b) => b.clone(),
+                        None => {
+                            let b = self.read_slot_state(slot)?;
+                            live = Some(b.clone());
+                            b
+                        }
+                    }
+                } else if offset > 0 && offset < q_len && offset % bt == 0 && chunk_start % bt == 0
+                {
+                    let row = base + offset / bt - 1;
+                    self.read_boundary_state(row as usize)?
+                } else {
+                    continue;
+                };
+                self.snapshots
+                    .as_ref()
+                    .expect("snapshots")
+                    .write(entry, &bytes)
+                    .map_err(ModelError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The host bytes of the state at boundary row `row` of the batch's boundary buffers (P7 S-12
+    /// Task 33): every linear layer's recurrent state (F32) then its conv window tail, in
+    /// [`turbine_core::types::StateLayout`] order, as an entry lays them out.
+    fn read_boundary_state(&self, row: usize) -> Result<Vec<u8>, ModelError> {
+        let Some((layers, rec, conv)) = self.gdn_state_sizes() else {
+            return Ok(Vec::new());
+        };
+        let (Some(bstate), Some(bconv)) =
+            (self.boundary_state.as_ref(), self.boundary_conv.as_ref())
+        else {
+            return Err(invalid(
+                "a boundary snapshot without the boundary buffers".into(),
+            ));
+        };
+        let g = self.dims.gdn.expect("gdn dims");
+        let state_elems = g.v_heads as usize * g.v_dim as usize * g.k_dim as usize;
+        let conv_elems = g.conv_dim() * (g.conv_kernel as usize - 1);
+        let max_rows = self.boundary_max_rows;
+        let mut out = Vec::with_capacity(layers * (rec + conv));
+        for gl in 0..layers {
+            let rec_off = (gl * max_rows + row) * state_elems * 4;
+            out.extend_from_slice(&bstate.storage.whole().sub(rec_off, rec).read_bytes()?);
+            let conv_off = (gl * max_rows + row) * conv_elems * self.dims.act.size_bytes();
+            out.extend_from_slice(&bconv.storage.whole().sub(conv_off, conv).read_bytes()?);
+        }
+        Ok(out)
     }
 
     /// The FFN block of layer `i` on the rows of `w`, from their normalised input in `h` to the
@@ -2464,12 +3638,76 @@ impl ModelExecutor for DecoderExecutor {
             ));
         }
         self.launch(batch, &[])?;
-        self.collect()
+        let logits = self.collect()?;
+        // P7 S-12: fill the step's block-boundary snapshots now the state is final.
+        self.write_pending_snapshots(batch)?;
+        Ok(logits)
     }
 
-    /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch.
+    /// P7 S-12 (Task 32): the KV-owned snapshot byte buffer, set once by the engine.
+    fn set_state_snapshots(&mut self, snapshots: StateSnapshots) {
+        self.snapshots = Some(snapshots);
+    }
+
+    /// P7 S-12: the per-sequence state layout, `None` for an attention-only family. A
+    /// tensor-parallel rank's state is sharded to its value heads (`self.dims.gdn` is the rank's
+    /// configuration, P7 Task 34), not the model's.
+    fn state_layout(&self) -> Option<turbine_core::types::StateLayout> {
+        let g = self.dims.gdn?;
+        Some(turbine_core::types::StateLayout {
+            linear_layers: linear_layers(&self.cfg) as u32,
+            recurrent_bytes_per_layer: g.recurrent_bytes(),
+            conv_bytes_per_layer: g.conv_bytes(),
+            dtype: Some(turbine_core::types::StateDtype::F32),
+        })
+    }
+
+    /// P7 S-12 (Task 32): copies hybrid per-sequence state between live slots and snapshot
+    /// entries (the whole recurrent and conv state of every linear layer, in
+    /// [`turbine_core::types::StateLayout`] order).
+    fn copy_state(&mut self, copies: &[StateCopy]) -> Result<(), ModelError> {
+        if self.gdn_state.is_none() {
+            return if copies.is_empty() {
+                Ok(())
+            } else {
+                Err(ModelError::Kernel(KernelError::Unsupported {
+                    message: "this executor has no hybrid per-sequence state".into(),
+                }))
+            };
+        }
+        for c in copies {
+            let bytes = match c.src {
+                StateLoc::Slot(StateSlot(s)) => self.read_slot_state(s)?,
+                StateLoc::Snapshot(r) => self
+                    .snapshots
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("a state snapshot of an executor without the buffer".into())
+                    })?
+                    .read(r.entry)?,
+            };
+            match c.dst {
+                StateLoc::Slot(StateSlot(s)) => self.write_slot_state(s, &bytes)?,
+                StateLoc::Snapshot(r) => self
+                    .snapshots
+                    .as_ref()
+                    .ok_or_else(|| {
+                        invalid("a state snapshot of an executor without the buffer".into())
+                    })?
+                    .write(r.entry, &bytes)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Never for a tensor- or expert-parallel rank: its collectives run inside the launch. Never
+    /// for a hybrid family: the Gated DeltaNet `g`/`beta` host round trip is not safe with two
+    /// launches in flight.
     fn overlaps(&self) -> bool {
-        self.group().is_none() && self.head.overlaps() && self.meta.is_async()
+        self.group().is_none()
+            && self.head.overlaps()
+            && self.meta.is_async()
+            && self.dims.gdn.is_none()
     }
 
     fn launch(&mut self, batch: &BatchInput<'_>, feeds: &[TokenFeed]) -> Result<(), ModelError> {
@@ -2487,10 +3725,17 @@ impl ModelExecutor for DecoderExecutor {
         // Feeds read the previous launch's choices: resolve them before this launch replans.
         let runs = feed_runs(feeds, batch.tokens.len(), |slot| self.head.feed_word(slot))?;
         let order = self.head.plan(batch.seqs).to_vec();
+        // A hybrid family's per-sequence Gated DeltaNet state slots, before the batch is packed.
+        self.resolve_gdn_slots(batch)?;
         let graph_top_n = self
             .graphs
             .as_ref()
-            .filter(|g| g.is_enabled() && !self.profiler.is_on() && !self.trace.is_on())
+            .filter(|g| {
+                g.is_enabled()
+                    && !self.profiler.is_on()
+                    && !self.trace.is_on()
+                    && !self.routing.is_on()
+            })
             // E.g. a MoE provider reading the group sizes on the host copies them back
             // mid-forward.
             .filter(|_| {
@@ -2498,7 +3743,10 @@ impl ModelExecutor for DecoderExecutor {
                     .ffn
                     .graph_capturable(&self.dims, &self.registry, batch.tokens.len())
             })
+            // A hybrid family's Gated DeltaNet layers read `g`/`beta` back on the host: no graph.
+            .filter(|_| self.dims.gdn.is_none())
             .and_then(|_| self.head.graph_top_n());
+        self.routing.begin(batch.positions);
         let (host, meta, limits) = (&mut self.host, &mut self.meta, &self.limits);
         let (p, key) = self.profiler.step(
             self.mem.as_ref(),
@@ -2892,6 +4140,8 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(s, table)| SeqSlice {
+                            state_slot: None,
+                            snapshot_blocks: &[],
                             seq: SeqId(s as u64 + 1),
                             q_start: s as u32,
                             q_len: 1,
@@ -2970,6 +4220,8 @@ mod tests {
         // A prefill is never a decode graph.
         let table: Vec<BlockId> = (0..3).map(BlockId).collect();
         let seqs = [SeqSlice {
+            state_slot: None,
+            snapshot_blocks: &[],
             seq: SeqId(1),
             q_start: 0,
             q_len: 2,
@@ -2995,6 +4247,8 @@ mod tests {
             .enumerate()
             .map(|(i, &(q_len, cached))| {
                 let s = SeqSlice {
+                    state_slot: None,
+                    snapshot_blocks: &[],
                     seq: SeqId(i as u64 + 1),
                     q_start: start,
                     q_len,

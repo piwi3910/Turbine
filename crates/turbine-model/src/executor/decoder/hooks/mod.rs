@@ -7,13 +7,19 @@
 //!   unfused.
 //! - [`SWIGLU`]: the dense `down(silu(gate(x)) · up(x))` MLP (Llama).
 //! - [`MOE`]: the sparse mixture of SwiGLU experts behind a softmax top-k router (OLMoE).
+//! - [`ATTENTION_SINKS_WINDOW`]: biased Q/K/V/O projections and learned attention sinks
+//!   (gpt-oss; the sliding window is per layer, from the family's layer kinds).
+//! - [`MOE_GPT_OSS`]: gpt-oss's mixture of MXFP4 experts with biases, the clamped gated
+//!   activation and interleaved gate/up rows, behind a top-k-then-softmax router with a bias.
 
+mod attention_sinks_window;
 mod moe;
 mod plain_attention;
 mod qk_norm;
 mod swiglu;
 
-pub use moe::{MOE, Moe};
+pub use attention_sinks_window::{ATTENTION_SINKS_WINDOW, AttentionSinksWindow};
+pub use moe::{GPT_OSS_SWIGLU_LIMIT, MOE, MOE_GPT_OSS, MOE_SHARED, Moe, experts_served};
 pub use plain_attention::{PLAIN_ATTENTION, PlainAttention};
 pub use qk_norm::{QK_NORM_FULL, QK_NORM_PER_HEAD, QkNormFull, QkNormPerHead};
 pub use swiglu::{SWIGLU, SwiGlu};

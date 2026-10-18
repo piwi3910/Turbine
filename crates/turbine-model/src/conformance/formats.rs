@@ -7,6 +7,7 @@ use turbine_core::registry::Registry;
 
 use super::{ConformanceFailure, Report, ensure};
 use crate::ModelError;
+use crate::formats::envelope::is_marker_atom;
 use crate::formats::{BoundToolFormat, Opening, ToolFormat, bind};
 use crate::structured::{GrammarCompiler, GrammarLimits, TokenMask, TokenMatcher, step_mask};
 use crate::testing::TempDir;
@@ -76,8 +77,20 @@ pub fn formats_suite(reg: &Registry<dyn ToolFormat>) -> Result<(), Vec<Conforman
     let mut tiny = None;
     report.check("registry", "tokenizer", || {
         let spec = write_tiny_llama(dir.path(), 7);
-        let tokenizer =
+        let mut tokenizer =
             Tokenizer::from_file(&spec.dir.join("tokenizer.json")).map_err(|e| e.to_string())?;
+        // A format's marker-atom tokens (`<|...|>`: the grammar references them as llguidance
+        // special-token atoms) are special tokens of its models; the fixture tokenizer carries
+        // them too, or the compile finds no such special token. Plain-text markers (`hermes`'s
+        // <tool_call>) stay plain: their grammars quote them.
+        let markers: Vec<&str> = reg
+            .iter()
+            .flat_map(|f| f.special_tokens().iter().map(|t| t.text))
+            .filter(|t| is_marker_atom(t))
+            .collect();
+        tokenizer
+            .add_special_tokens(&markers)
+            .map_err(|e| e.to_string())?;
         let compiler = GrammarCompiler::new(&tokenizer, &TINY_EOS).map_err(|e| e.to_string())?;
         tiny = Some((tokenizer, compiler));
         Ok(())

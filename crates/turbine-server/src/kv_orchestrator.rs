@@ -64,6 +64,7 @@ use turbine_kv::hierarchy::{
 use turbine_kv::identity::{KvFormat, KvKey, KvScaleHashes, namespace_key};
 use turbine_kv::metrics::EvictReason;
 use turbine_kv::planner::PathCost;
+use turbine_kv::state::SnapshotStore;
 use turbine_kv::tier::{
     KvTier, L0_FORMAT, L1Config, L1PinnedTier, L2Config, L2NvmeTier, ShardSlots, ShardedL1Tier,
     TierBlockMut, TierBlockRef, TierError, TierId, TierSlot,
@@ -669,6 +670,45 @@ impl KvOrchestrator {
         self.h.set_ladder_dwell(dwell);
     }
 
+    /// P7 S-12 (Task 32): marks the model hybrid and sizes the block-boundary snapshot pool (one
+    /// entry per L0 block) from the model's `layout`.
+    pub fn set_hybrid_state(&mut self, layout: turbine_core::types::StateLayout, blocks: u32) {
+        self.h.set_hybrid_state(layout, blocks);
+    }
+
+    /// `kv.hybrid_snapshot_interval_blocks` (P7 S-12), always `≥ 1`.
+    pub fn snapshot_interval(&self) -> u32 {
+        self.h.snapshot_interval()
+    }
+
+    /// Reserves `block`'s snapshot entry (P7 S-12); `None` for an attention-only model or when
+    /// the pool is exhausted.
+    pub fn snapshot_alloc(&mut self, block: BlockId) -> Option<turbine_kv::state::SnapshotRef> {
+        self.h.snapshot_alloc(block)
+    }
+
+    /// Records `block`'s snapshot on its directory entry once the block's key is committed (P7
+    /// S-12), so a later prefix hit restores it.
+    pub fn snapshot_record(&mut self, block: BlockId, snapshot: turbine_kv::state::SnapshotRef) {
+        self.h.snapshot_record(block, snapshot);
+    }
+
+    /// Releases `block`'s snapshot entry (P7 S-12): the L0 block is freed, or a step that
+    /// reserved the entry failed before committing the block.
+    pub fn snapshot_release(&mut self, block: BlockId) {
+        self.h.release_snapshot(block);
+    }
+
+    /// P7 S-12 (Task 33): gives the device path the L0 snapshot store a hybrid block's tail
+    /// travels through and turns the hierarchy's tier travel on, so a demoted block's snapshot
+    /// is restored when it returns to L0. Without a store the tail stays in L0 and a hybrid
+    /// block's state is recomputed on return.
+    pub fn set_snapshot_store(&mut self, store: Arc<dyn SnapshotStore>) {
+        self.backend.set_snapshot_store(store);
+        self.h
+            .set_snapshot_tier_travel(self.backend.supports_snapshot_travel());
+    }
+
     /// The lock-free reclaim requests the Phase 3 controller issues (`KvReclaimer`).
     pub fn reclaimer(&self) -> Arc<KvReclaimHandle> {
         self.h.reclaimer()
@@ -1230,15 +1270,17 @@ enum IoOp {
         codec: HostTranscode,
     },
     /// The staged shards of an L0 → L2 copy, stored as one block (the shards concatenated),
-    /// encoded in the tier's format.
+    /// encoded in the tier's format. `tail` is the block's exact snapshot bytes (P7 S-12,
+    /// Task 33), read from the L0 snapshot entry on the engine thread, appended after the KV.
     Write {
         to: Arc<dyn KvTier>,
         key: KvKey,
         bufs: Staged,
         codec: HostTranscode,
+        tail: Vec<u8>,
     },
     /// The first half of an L2 → L0 copy: the block decoded to the L0 format and split into
-    /// the shards' staging buffers.
+    /// the shards' staging buffers; the snapshot tail comes back in `IoDone.tail`.
     Read {
         from: Arc<dyn KvTier>,
         key: KvKey,
@@ -1342,22 +1384,46 @@ impl HostTranscode {
             .map_err(|e| TierError::Io(e.to_string()))
     }
 
-    /// Stores `l0` (an L0-format block) under `key` in `to`, in the destination format.
-    fn store(&self, to: &dyn KvTier, key: KvKey, l0: &[u8]) -> Result<TierSlot, TierError> {
+    /// Stores `l0` (an L0-format block) under `key` in `to`, in the destination format, with
+    /// the block's exact snapshot `tail` (P7 S-12, Task 33) appended after the KV bytes.
+    fn store(
+        &self,
+        to: &dyn KvTier,
+        key: KvKey,
+        l0: &[u8],
+        tail: &[u8],
+    ) -> Result<TierSlot, TierError> {
         let bytes = self.encode(l0)?;
+        if tail.is_empty() {
+            return to.put_as(
+                key,
+                self.codec.to,
+                bytes.len() as u64,
+                TierBlockRef::Host(&bytes),
+            );
+        }
+        let mut record = Vec::with_capacity(bytes.len() + tail.len());
+        record.extend_from_slice(&bytes);
+        record.extend_from_slice(tail);
         to.put_as(
             key,
             self.codec.to,
-            bytes.len() as u64,
-            TierBlockRef::Host(&bytes),
+            record.len() as u64,
+            TierBlockRef::Host(&record),
         )
     }
 
-    /// Reads the source copy of `key` from `from` (`codec.from_bytes`).
+    /// Reads the whole record of `key` from `from` (`from_bytes` KV bytes plus the snapshot
+    /// tail, P7 S-12, Task 33).
     fn load(&self, from: &dyn KvTier, key: &KvKey) -> Result<Vec<u8>, TierError> {
-        let mut v = vec![0u8; self.codec.from_bytes as usize];
+        let mut v = vec![0u8; self.codec.from_record_bytes() as usize];
         from.get(key, TierBlockMut::Host(&mut v))?;
         Ok(v)
+    }
+
+    /// The snapshot tail of a record [`load`](Self::load) returned.
+    fn tail<'a>(&self, record: &'a [u8]) -> &'a [u8] {
+        &record[self.codec.from_bytes as usize..]
     }
 }
 
@@ -1365,11 +1431,14 @@ struct IoDone {
     ticket: u64,
     result: Result<TierSlot, TierError>,
     bufs: Staged,
+    /// P7 S-12 (Task 33): the snapshot tail read out of the tier record, for the engine thread
+    /// to write into the promoted block's fresh L0 entry. Empty for an attention-only block.
+    tail: Vec<u8>,
     /// When the I/O thread finished the job: the copy's end, not the poll that collects it.
     finished: Instant,
 }
 
-fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
+fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged, Vec<u8>) {
     match op {
         IoOp::Move {
             from,
@@ -1382,30 +1451,32 @@ fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
                     to.put_as(key, codec.codec.to, v.len() as u64, TierBlockRef::Host(&v))
                 } else {
                     let host = codec.host()?;
+                    let tail = codec.tail(&v).to_vec();
                     let mut l0 = vec![0u8; host.layout.block_bytes() as usize];
-                    codec.decode(&v, &mut l0)?;
-                    codec.store(to.as_ref(), key, &l0)
+                    codec.decode(&v[..codec.codec.from_bytes as usize], &mut l0)?;
+                    codec.store(to.as_ref(), key, &l0, &tail)
                 }
             });
-            (r, Staged::new())
+            (r, Staged::new(), Vec::new())
         }
         IoOp::Write {
             to,
             key,
             bufs,
             codec,
+            tail,
         } => {
             let r = match bufs.as_slice() {
-                [one] => one.with(|b| codec.store(to.as_ref(), key, b)),
+                [one] => one.with(|b| codec.store(to.as_ref(), key, b, &tail)),
                 shards => {
                     let mut v = Vec::with_capacity(shards.iter().map(HostBuf::len).sum());
                     for b in shards {
                         b.with(|b| v.extend_from_slice(b));
                     }
-                    codec.store(to.as_ref(), key, &v)
+                    codec.store(to.as_ref(), key, &v, &tail)
                 }
             };
-            (r, bufs)
+            (r, bufs, Vec::new())
         }
         IoOp::Read {
             from,
@@ -1413,43 +1484,74 @@ fn run_io(op: IoOp) -> (Result<TierSlot, TierError>, Staged) {
             mut bufs,
             codec,
         } => {
-            let r = match bufs.as_mut_slice() {
-                [one] if codec.pre_encoded => {
-                    let n = codec.codec.from_bytes as usize;
-                    one.with_mut(|b| match b.get_mut(..n) {
-                        Some(part) => from.get(&key, TierBlockMut::Host(part)),
-                        None => Err(TierError::Io(
-                            "staging buffer shorter than the block".into(),
-                        )),
-                    })
-                }
-                [one] if codec.codec.from == L0_FORMAT => {
-                    one.with_mut(|b| from.get(&key, TierBlockMut::Host(b)))
-                }
-                [one] => codec
-                    .load(from.as_ref(), &key)
-                    .and_then(|v| one.with_mut(|b| codec.decode(&v, b))),
-                shards => {
-                    let mut v = vec![0u8; shards.iter().map(HostBuf::len).sum()];
-                    let read = if codec.codec.from == L0_FORMAT {
-                        from.get(&key, TierBlockMut::Host(&mut v))
-                    } else {
-                        codec
-                            .load(from.as_ref(), &key)
-                            .and_then(|src| codec.decode(&src, &mut v))
-                    };
-                    read.map(|()| {
-                        let mut at = 0usize;
-                        for b in shards.iter_mut() {
-                            b.with_mut(|b| {
-                                b.copy_from_slice(&v[at..at + b.len()]);
-                                at += b.len();
-                            });
+            let snap = codec.codec.snapshot_bytes as usize;
+            let mut tail = Vec::new();
+            let r = if snap > 0 {
+                // Read the whole record and split off the tail (P7 S-12, Task 33).
+                let mut v = vec![0u8; codec.codec.from_record_bytes() as usize];
+                from.get(&key, TierBlockMut::Host(&mut v)).and_then(|()| {
+                    tail.extend_from_slice(&v[codec.codec.from_bytes as usize..]);
+                    let kv = &v[..codec.codec.from_bytes as usize];
+                    match bufs.as_mut_slice() {
+                        [one] => one.with_mut(|b| {
+                            if codec.pre_encoded || codec.codec.from == L0_FORMAT {
+                                b[..kv.len()].copy_from_slice(kv);
+                                Ok(())
+                            } else {
+                                codec.decode(kv, b)
+                            }
+                        }),
+                        shards => {
+                            let mut at = 0usize;
+                            for b in shards.iter_mut() {
+                                b.with_mut(|b| {
+                                    b.copy_from_slice(&kv[at..at + b.len()]);
+                                    at += b.len();
+                                });
+                            }
+                            Ok(())
                         }
-                    })
+                    }
+                })
+            } else {
+                match bufs.as_mut_slice() {
+                    [one] if codec.pre_encoded => {
+                        let n = codec.codec.from_bytes as usize;
+                        one.with_mut(|b| match b.get_mut(..n) {
+                            Some(part) => from.get(&key, TierBlockMut::Host(part)),
+                            None => Err(TierError::Io(
+                                "staging buffer shorter than the block".into(),
+                            )),
+                        })
+                    }
+                    [one] if codec.codec.from == L0_FORMAT => {
+                        one.with_mut(|b| from.get(&key, TierBlockMut::Host(b)))
+                    }
+                    [one] => codec
+                        .load(from.as_ref(), &key)
+                        .and_then(|v| one.with_mut(|b| codec.decode(&v, b))),
+                    shards => {
+                        let mut v = vec![0u8; shards.iter().map(HostBuf::len).sum()];
+                        let read = if codec.codec.from == L0_FORMAT {
+                            from.get(&key, TierBlockMut::Host(&mut v))
+                        } else {
+                            codec
+                                .load(from.as_ref(), &key)
+                                .and_then(|src| codec.decode(&src, &mut v))
+                        };
+                        read.map(|()| {
+                            let mut at = 0usize;
+                            for b in shards.iter_mut() {
+                                b.with_mut(|b| {
+                                    b.copy_from_slice(&v[at..at + b.len()]);
+                                    at += b.len();
+                                });
+                            }
+                        })
+                    }
                 }
             };
-            (r.map(|()| TierSlot(0)), bufs)
+            (r.map(|()| TierSlot(0)), bufs, tail)
         }
     }
 }
@@ -1490,12 +1592,13 @@ impl IoPoolBackend {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .recv();
                             let Ok((ticket, op)) = job else { return };
-                            let (result, bufs) = run_io(op);
+                            let (result, bufs, tail) = run_io(op);
                             if tx
                                 .send(IoDone {
                                     ticket,
                                     result,
                                     bufs,
+                                    tail,
                                     finished: Instant::now(),
                                 })
                                 .is_err()
@@ -2117,6 +2220,68 @@ fn encoded_bytes(name: &str, layout: &KvLayout) -> Result<usize, TierError> {
         .ok_or_else(|| TierError::Io(format!("no kv_format codec `{name}`")))
 }
 
+/// The device-path [`SnapshotStore`] (P7 S-12, Task 33): reads and writes the L0 snapshot
+/// entries of the buffer the engine allocated for the executor over the KV pool's memory. Entry
+/// `e` starts at `base + e * entry_bytes`. The copies are synchronous (the engine thread reads a
+/// tail to hand to the I/O pool, and writes one back after a promotion).
+pub(crate) struct DeviceSnapshotStore {
+    mem: Arc<dyn DeviceMemory>,
+    base: DevicePtr,
+    entry_bytes: u64,
+    entries: u32,
+}
+
+impl DeviceSnapshotStore {
+    pub(crate) fn new(
+        mem: Arc<dyn DeviceMemory>,
+        base: DevicePtr,
+        entries: u32,
+        entry_bytes: u64,
+    ) -> Self {
+        DeviceSnapshotStore {
+            mem,
+            base,
+            entry_bytes,
+            entries,
+        }
+    }
+
+    fn at(&self, entry: u32, len: usize) -> Result<DevicePtr, TierError> {
+        if len as u64 != self.entry_bytes {
+            return Err(TierError::Io(format!(
+                "snapshot entry is {} bytes, buffer {len}",
+                self.entry_bytes
+            )));
+        }
+        if entry >= self.entries {
+            return Err(TierError::Missing);
+        }
+        Ok(self.base.offset(u64::from(entry) * self.entry_bytes))
+    }
+}
+
+impl SnapshotStore for DeviceSnapshotStore {
+    fn entry_bytes(&self) -> u64 {
+        self.entry_bytes
+    }
+
+    fn read(&self, entry: u32, dst: &mut [u8]) -> Result<(), TierError> {
+        let ptr = self.at(entry, dst.len())?;
+        self.mem
+            .copy_d2h(dst, ptr)
+            .and_then(|()| self.mem.synchronize())
+            .map_err(|e| TierError::Io(format!("snapshot read: {e}")))
+    }
+
+    fn write(&self, entry: u32, src: &[u8]) -> Result<(), TierError> {
+        let ptr = self.at(entry, src.len())?;
+        self.mem
+            .copy_h2d(ptr, src)
+            .and_then(|()| self.mem.synchronize())
+            .map_err(|e| TierError::Io(format!("snapshot write: {e}")))
+    }
+}
+
 /// One rank's end of the copy backend: its device, its pool's block addresses and its staging
 /// buffers (pinned through its own context with a copy stream).
 struct Shard {
@@ -2162,6 +2327,10 @@ pub struct CopyStreamBackend {
     metrics: Option<KvMetrics>,
     /// `kv.transfer.promotion_copy: kernel`: pinned → L0 batches run on the copy kernel.
     kernel_promotions: bool,
+    /// P7 S-12 (Task 33): the L0 snapshot entries a hybrid block's tail is read from (on
+    /// demotion) and written to (on promotion). `None` for an attention-only model, and until
+    /// the engine hands one over; a hybrid block then has its state recomputed on return.
+    snapshot: Option<Arc<dyn SnapshotStore>>,
 }
 
 impl CopyStreamBackend {
@@ -2201,6 +2370,7 @@ impl CopyStreamBackend {
             gpu: None,
             metrics: None,
             kernel_promotions: false,
+            snapshot: None,
         }
     }
 
@@ -2335,6 +2505,44 @@ impl CopyStreamBackend {
     /// The KV metrics a ladder rewrite's `no_room` skip is counted in.
     pub fn set_metrics(&mut self, metrics: KvMetrics) {
         self.metrics = Some(metrics);
+    }
+
+    /// Gives the device path the L0 snapshot store a hybrid block's tail travels through (P7
+    /// S-12, Task 33). Without one the hierarchy keeps tier travel off and a hybrid block's
+    /// state is recomputed when it returns to L0.
+    pub fn set_snapshot_store(&mut self, store: Arc<dyn SnapshotStore>) {
+        self.snapshot = Some(store);
+    }
+
+    /// Whether the device path can move a hybrid block's snapshot tail (P7 S-12, Task 33): the
+    /// engine enables the hierarchy's tier travel only then.
+    pub fn supports_snapshot_travel(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    /// The snapshot tail of `t`'s block, read out of its L0 entry for an L0 → tier copy.
+    fn read_snapshot_tail(&self, t: &TransferTicket) -> Result<Vec<u8>, TierError> {
+        let n = t.req.codec.snapshot_bytes as usize;
+        let (Some(store), Some(r)) = (self.snapshot.as_ref(), t.req.snapshot) else {
+            return Ok(Vec::new());
+        };
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut tail = vec![0u8; n];
+        store.read(r.entry, &mut tail)?;
+        Ok(tail)
+    }
+
+    /// Writes `tail` into `t`'s fresh L0 entry for a tier → L0 copy (P7 S-12, Task 33).
+    fn write_snapshot_tail(&self, t: &TransferTicket, tail: &[u8]) -> Result<(), TierError> {
+        if tail.is_empty() {
+            return Ok(());
+        }
+        match (self.snapshot.as_ref(), t.req.snapshot) {
+            (Some(store), Some(r)) => store.write(r.entry, tail),
+            _ => Ok(()),
+        }
     }
 
     /// `kv.transfer.promotion_copy` (P6b, decisions "6b: KV promotions slow decode — which fix"
@@ -2618,9 +2826,14 @@ impl CopyStreamBackend {
                 self.io.start(t)?;
                 Ok(Job::Io(IoStage::Final))
             }
-            TransferPath::L0ToL1 | TransferPath::L1ToL0 if !req.codec.is_identity() => {
+            TransferPath::L0ToL1 | TransferPath::L1ToL0
+                if !req.codec.is_identity() || req.codec.snapshot_bytes > 0 =>
+            {
                 // Copy-stream L1 slots hold what the device pages hold: another format goes
-                // through the staging buffers and the I/O pool like L2's.
+                // through the staging buffers and the I/O pool like L2's. A hybrid block's
+                // snapshot tail (P7 S-12, Task 33) needs the staging buffers too, so an
+                // identity copy that carries one takes this path rather than the pure
+                // copy-stream one.
                 let l1: Arc<dyn KvTier> = self.l1.clone().ok_or(TierError::Missing)?;
                 if req.path == TransferPath::L0ToL1 {
                     self.start_write(t, l1)
@@ -3186,6 +3399,7 @@ impl CopyStreamBackend {
             } => {
                 // The encoded bytes are out of the device slot.
                 self.gpu_give(gpu_slot);
+                let tail = self.read_snapshot_tail(t)?;
                 let mut codec = self.io.transcode(t.req.codec);
                 codec.pre_encoded = gpu_slot.is_some();
                 self.io.submit(
@@ -3195,6 +3409,7 @@ impl CopyStreamBackend {
                         key,
                         bufs,
                         codec,
+                        tail,
                     },
                 )?;
                 Ok(Job::Io(IoStage::Final))
@@ -3215,6 +3430,7 @@ impl CopyStreamBackend {
                         key: t.req.key,
                         bufs,
                         codec,
+                        tail: Vec::new(),
                     },
                 )?;
                 Ok(Job::Io(IoStage::Final))
@@ -3272,7 +3488,9 @@ impl CopyStreamBackend {
         stage: IoStage,
         done: IoDone,
     ) -> Result<Job, TierError> {
-        let IoDone { result, bufs, .. } = done;
+        let IoDone {
+            result, bufs, tail, ..
+        } = done;
         match stage {
             IoStage::Final => {
                 self.release_staging(bufs);
@@ -3291,6 +3509,7 @@ impl CopyStreamBackend {
                     self.gpu_give(Some(gpu_slot));
                     return Err(e);
                 }
+                self.write_snapshot_tail(t, &tail)?;
                 match self.slot_copies(gpu_slot, &mut bufs, bytes, true) {
                     Ok(copies) => {
                         let then = AfterCopies::Decode {
@@ -3347,6 +3566,7 @@ impl CopyStreamBackend {
                     self.release_staging(bufs);
                     return Err(e);
                 }
+                self.write_snapshot_tail(t, &tail)?;
                 match self.staged_copies(block, &mut bufs, true) {
                     Ok(copies) if copies.is_empty() => {
                         self.release_staging(bufs);
@@ -3644,12 +3864,13 @@ mod tests {
             req: TransferRequest {
                 path,
                 key,
-                bytes: codec.from_bytes.min(codec.to_bytes),
+                bytes: codec.from_bytes.min(codec.to_bytes) + codec.snapshot_bytes,
                 owner: None,
                 purpose: TransferPurpose::Demote,
                 src_slot,
                 dst_slot,
                 codec,
+                snapshot: None,
             },
         }
     }
@@ -3897,6 +4118,7 @@ mod tests {
             from_bytes: bb as u64,
             to: "fp8_e4m3",
             to_bytes: small,
+            snapshot_bytes: 0,
         };
         let key = KvKey([5; 16]);
         run_as(&mut o, 1, TransferPath::L0ToL2, key, (4, 0), down).unwrap();
@@ -3914,6 +4136,7 @@ mod tests {
             from_bytes: small,
             to: L0_FORMAT,
             to_bytes: bb as u64,
+            snapshot_bytes: 0,
         };
         run_as(&mut o, 2, TransferPath::L2ToL0, key, (0, 9), up).unwrap();
         let mut want = vec![0u8; bb];
@@ -3961,12 +4184,14 @@ mod tests {
             from_bytes: bb as u64,
             to: "fp8_e4m3",
             to_bytes: small,
+            snapshot_bytes: 0,
         };
         let up = TransferCodec {
             from: "fp8_e4m3",
             from_bytes: small,
             to: L0_FORMAT,
             to_bytes: bb as u64,
+            snapshot_bytes: 0,
         };
 
         for device_path in [false, true] {
@@ -4182,6 +4407,7 @@ mod tests {
                 from_bytes: bytes(w[0]),
                 to: w[1],
                 to_bytes: bytes(w[1]),
+                snapshot_bytes: 0,
             };
             let mut t = ticket(10 + i as u64, up, key, (0, 0), codec);
             t.req.purpose = TransferPurpose::Compress;
@@ -4207,6 +4433,7 @@ mod tests {
             from_bytes: bytes(last),
             to: L0_FORMAT,
             to_bytes: bb as u64,
+            snapshot_bytes: 0,
         };
         run_as(&mut o, 99, up, key, (0, 11), promote).unwrap();
         let mut want_dec = vec![0u8; bb];
@@ -4294,6 +4521,7 @@ mod tests {
             from_bytes: bb,
             to: "fp8_e4m3",
             to_bytes: encoded_bytes("fp8_e4m3", &layout()).unwrap() as u64,
+            snapshot_bytes: 0,
         };
         let mut t = ticket(2, TransferPath::L2ToL0, key, (0, 0), codec);
         t.req.purpose = TransferPurpose::Compress;
@@ -4380,6 +4608,7 @@ mod tests {
             from_bytes: bb,
             to: "fp8_e4m3",
             to_bytes: encoded_bytes("fp8_e4m3", &layout()).unwrap() as u64,
+            snapshot_bytes: 0,
         };
         let mut t = ticket(2, TransferPath::L2ToL0, key, (0, 0), codec);
         t.req.purpose = TransferPurpose::Compress;
@@ -4596,12 +4825,14 @@ mod tests {
             from_bytes: bb as u64,
             to: name,
             to_bytes: small,
+            snapshot_bytes: 0,
         };
         let up = TransferCodec {
             from: name,
             from_bytes: small,
             to: L0_FORMAT,
             to_bytes: bb as u64,
+            snapshot_bytes: 0,
         };
         let key = KvKey([7; 16]);
         run_as(&mut o, 1, TransferPath::L0ToL2, key, (4, 0), down).unwrap();
@@ -4781,6 +5012,7 @@ mod tests {
                 src_slot,
                 dst_slot,
                 codec: TransferCodec::l0(bb as u64),
+                snapshot: None,
             },
         };
         let late = Duration::from_millis(600);
@@ -5454,6 +5686,7 @@ mod tests {
                 src_slot,
                 dst_slot,
                 codec: TransferCodec::l0(o.backend.block_bytes as u64),
+                snapshot: None,
             },
         };
         let driver = o.remote.as_mut().expect("a static group");

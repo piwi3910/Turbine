@@ -258,6 +258,107 @@ bool silu_mul_supported(const turbine_silu_mul_desc *d) {
          d->out_stride_row >= d->cols;
 }
 
+// ---- sigmoid_mul (ABI v2.19) ----
+
+// out = a * sigmoid(gate): the gated-attention output gate of Qwen3.5's
+// full-attention layers. Same shape, dtype and rounding as silu_mul (the
+// sigmoid is rounded to dtype before the multiply, the product once after).
+template <typename T>
+__global__ void sigmoid_mul_kernel(const T *a, const T *gate, T *out,
+                                   int64_t cols, int64_t a_stride,
+                                   int64_t gate_stride, int64_t out_stride) {
+  const int64_t r = blockIdx.x;
+  const T *a_row = a + r * a_stride;
+  const T *g_row = gate + r * gate_stride;
+  T *o_row = out + r * out_stride;
+  const int64_t step = static_cast<int64_t>(gridDim.y) * blockDim.x;
+  for (int64_t j = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+       j < cols; j += step) {
+    const float g = to_f32<T>(g_row[j]);
+    const float sig = 1.0f / (1.0f + expf(-g));
+    o_row[j] = from_f32<T>(round_to<T>(sig) * to_f32<T>(a_row[j]));
+  }
+}
+
+// sigmoid_mul_kernel's arithmetic on 8 BF16 at a time (the silu_mul vector
+// path): grid (rows, column chunks of kBlock * kSiluVec), each thread one
+// 16-byte slice of a, gate and out. Launched only when sigmoid_vec_eligible
+// holds.
+__global__ __launch_bounds__(kBlock) void sigmoid_mul_vec_kernel(
+    const Bf16 *a, const Bf16 *gate, Bf16 *out, int64_t cols, int64_t a_stride,
+    int64_t gate_stride, int64_t out_stride) {
+  const int64_t r = blockIdx.x;
+  const int64_t j =
+      (static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x) * kSiluVec;
+  if (j >= cols)
+    return;
+  const uint4 a4 = *reinterpret_cast<const uint4 *>(a + r * a_stride + j);
+  const uint4 g4 = *reinterpret_cast<const uint4 *>(gate + r * gate_stride + j);
+  const uint32_t aw[4] = {a4.x, a4.y, a4.z, a4.w};
+  const uint32_t gw[4] = {g4.x, g4.y, g4.z, g4.w};
+  uint32_t ow[4];
+#pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    uint32_t packed = 0;
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      const int shift = part * 16;
+      const float a =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((aw[w] >> shift) & 0xffffu)});
+      const float g =
+          to_f32<Bf16>(Bf16{static_cast<uint16_t>((gw[w] >> shift) & 0xffffu)});
+      const float sig = 1.0f / (1.0f + expf(-g));
+      packed |= static_cast<uint32_t>(
+                    from_f32<Bf16>(round_to<Bf16>(sig) * a).bits)
+                << shift;
+    }
+    ow[w] = packed;
+  }
+  *reinterpret_cast<uint4 *>(out + r * out_stride + j) =
+      make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+// d runs through sigmoid_mul_vec_kernel: BF16, enough rows, and every 8-element
+// slice of every row 16-byte aligned.
+bool sigmoid_vec_eligible(const turbine_sigmoid_mul_desc *d) {
+  const auto aligned16 = [](const void *p) {
+    return reinterpret_cast<uintptr_t>(p) % 16 == 0;
+  };
+  return d->dtype == TURBINE_DTYPE_BF16 && d->rows >= kSiluVecMinRows &&
+         d->cols % kSiluVec == 0 && d->a_stride_row % kSiluVec == 0 &&
+         d->gate_stride_row % kSiluVec == 0 &&
+         d->out_stride_row % kSiluVec == 0 && aligned16(d->a) &&
+         aligned16(d->gate) && aligned16(d->out) &&
+         (d->cols / kSiluVec + kBlock - 1) / kBlock <= 65535;
+}
+
+template <typename T> struct SigmoidMulLaunch {
+  static void run(hipStream_t s, const turbine_sigmoid_mul_desc *d) {
+    if (sigmoid_vec_eligible(d)) {
+      const int64_t chunks = (d->cols / kSiluVec + kBlock - 1) / kBlock;
+      hipLaunchKernelGGL(
+          sigmoid_mul_vec_kernel,
+          dim3(static_cast<unsigned>(d->rows), static_cast<unsigned>(chunks)),
+          dim3(kBlock), 0, s, static_cast<const Bf16 *>(d->a),
+          static_cast<const Bf16 *>(d->gate), static_cast<Bf16 *>(d->out),
+          d->cols, d->a_stride_row, d->gate_stride_row, d->out_stride_row);
+      return;
+    }
+    hipLaunchKernelGGL(
+        sigmoid_mul_kernel<T>,
+        dim3(static_cast<unsigned>(d->rows), silu_chunks(d->cols)),
+        dim3(kBlock), 0, s, static_cast<const T *>(d->a),
+        static_cast<const T *>(d->gate), static_cast<T *>(d->out), d->cols,
+        d->a_stride_row, d->gate_stride_row, d->out_stride_row);
+  }
+};
+
+bool sigmoid_mul_supported(const turbine_sigmoid_mul_desc *d) {
+  return d != nullptr && float_dtype(d->dtype) && d->rows >= 0 &&
+         d->rows <= INT32_MAX && d->cols >= 1 && d->a_stride_row >= d->cols &&
+         d->gate_stride_row >= d->cols && d->out_stride_row >= d->cols;
+}
+
 // ---- rope (half-split, HF rotate_half) ----
 
 // Rotary pairs whose cos/sin a block stages in LDS (half of rotary_dim); a
@@ -698,6 +799,40 @@ int32_t turbine_silu_mul(turbine_ctx *ctx, const turbine_silu_mul_desc *d) {
     return rc;
   dispatch<SiluMulLaunch>(d->dtype, ctx->stream, d);
   return check_hip(ctx, hipGetLastError(), "silu_mul kernel launch");
+}
+
+// ---- sigmoid_mul (ABI v2.19) ----
+
+int32_t turbine_sigmoid_mul_supported(const turbine_sigmoid_mul_desc *d) {
+  return sigmoid_mul_supported(d) ? 1 : 0;
+}
+
+const char *turbine_sigmoid_mul_impl(const turbine_sigmoid_mul_desc *d) {
+  (void)d;
+  return kImpl;
+}
+
+int32_t turbine_sigmoid_mul(turbine_ctx *ctx,
+                            const turbine_sigmoid_mul_desc *d) {
+  if (ctx == nullptr)
+    return TURBINE_E_ARGUMENT;
+  if (d == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT,
+                "turbine_sigmoid_mul: descriptor is NULL");
+  }
+  if (!sigmoid_mul_supported(d)) {
+    return fail(ctx, TURBINE_E_UNSUPPORTED,
+                unsupported("turbine_sigmoid_mul", d->dtype));
+  }
+  if (d->rows == 0)
+    return TURBINE_OK;
+  if (d->a == nullptr || d->gate == nullptr || d->out == nullptr) {
+    return fail(ctx, TURBINE_E_ARGUMENT, "turbine_sigmoid_mul: NULL operand");
+  }
+  if (int32_t rc = enter(ctx); rc != TURBINE_OK)
+    return rc;
+  dispatch<SigmoidMulLaunch>(d->dtype, ctx->stream, d);
+  return check_hip(ctx, hipGetLastError(), "sigmoid_mul kernel launch");
 }
 
 // ---- rope ----

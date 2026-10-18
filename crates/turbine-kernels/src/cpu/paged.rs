@@ -183,6 +183,14 @@ pub(super) fn attention_with(
         || ctx.classes.is_some()
         || formats.iter().flatten().any(|f| Some(*f) != base)
     {
+        if ctx.cfg.window.is_some() || ctx.cfg.sinks {
+            return Err(KernelError::Unsupported {
+                message: format!(
+                    "cpu-reference mixed-format paged attention with a window or sinks ({})",
+                    ctx.cfg
+                ),
+            });
+        }
         return mixed(ctx, formats);
     }
     let hq = ctx.cfg.num_q_heads as usize;
@@ -230,6 +238,13 @@ pub(super) fn attention_with(
         )));
     }
     let seqs = sequences(ctx, total_q, num_blocks, block_tokens)?;
+    let sinks = load_sinks(ctx, hq)?;
+    if ctx.cfg.window.is_some() && !ctx.cfg.causal {
+        return Err(invalid(format!(
+            "a sliding window needs causal attention ({})",
+            ctx.cfg
+        )));
+    }
 
     let q = load(&ctx.q)?;
     let k_new = load(&ctx.k_new)?;
@@ -288,14 +303,16 @@ pub(super) fn attention_with(
             hkv,
             d,
             causal: ctx.cfg.causal,
+            window: ctx.cfg.window.map(|w| w as usize),
         };
         let rows = seq.row * hq * d..(seq.row + seq.q_len) * hq * d;
-        let o = math::attention(
+        let o = math::attention_sinks(
             &q[rows.clone()],
             &k,
             &v,
             &shape,
             ctx.scale,
+            sinks.as_deref(),
             |p| match p_rounding {
                 PRounding::Activation => super::round_to(act, p),
                 PRounding::F32 => p,
@@ -304,6 +321,30 @@ pub(super) fn attention_with(
         out[rows].copy_from_slice(&o);
     }
     store(&ctx.out, &out)
+}
+
+/// The sink logits of `ctx` (`None` without `cfg.sinks`): `[num_q_heads]` F32, present exactly
+/// when the config names sinks.
+fn load_sinks(ctx: &PagedAttentionContext<'_>, hq: usize) -> Result<Option<Vec<f32>>, KernelError> {
+    match (&ctx.sinks, ctx.cfg.sinks) {
+        (None, false) => Ok(None),
+        (Some(v), true) => {
+            if v.dtype != DType::F32 {
+                return Err(invalid(format!(
+                    "sinks must be f32, is {}",
+                    v.dtype.as_str()
+                )));
+            }
+            expect_shape("sinks", v, &[hq])?;
+            Ok(Some(load(v)?))
+        }
+        (Some(_), false) => Err(invalid(
+            "sinks were passed but the config names none".into(),
+        )),
+        (None, true) => Err(invalid(
+            "the config names sinks but none were passed".into(),
+        )),
+    }
 }
 
 /// The block formats of `ctx` (`None`: every block in `cfg.dtype`): a dense U8
@@ -649,6 +690,8 @@ mod tests {
             dtype: DType::Tq4,
             block_tokens: Some(bt as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let pool = Tensor::empty(&mem, &[region], DType::U8).expect("pool");
         let mut raw = vec![0u8; region];
@@ -751,6 +794,7 @@ mod tests {
                         device: None,
                     }),
                     rope: None,
+                    sinks: None,
                 })
                 .expect("mixed paged attention");
             let got = load(&out.view()).expect("out");
@@ -809,6 +853,8 @@ mod tests {
             dtype: cfg_dtype,
             block_tokens: Some(bt as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let pool = Tensor::empty(&mem, &[4, 2, bt, hkv, d], pool_dtype).expect("pool");
         let q = tensor(&mem, &[t, hq, d], DType::BF16, &seeded(41, t * hq * d));
@@ -840,6 +886,7 @@ mod tests {
             classes: None,
             tq: None,
             rope: None,
+            sinks: None,
         })?;
         Ok((
             load(&out.view()).expect("out"),
@@ -893,6 +940,8 @@ mod tests {
                     dtype: DType::F8E4M3,
                     block_tokens: Some(16),
                     causal: true,
+                    window: None,
+                    sinks: false,
                 }
             ),
             "cpu_attention_paged_fp8kv_f32acc"
@@ -936,6 +985,165 @@ mod tests {
         assert!(err.to_string().contains("f8e4m3 kv_layer"), "{err}");
     }
 
+    /// Phase 7 S-8: a sliding window and per-head sink logits against a naive f64 softmax over
+    /// the masked scores plus the sink term. Two sequences in one F32 call (P rounding is the
+    /// identity): a 20-token prefill, and 3 new rows over 6 earlier (zero) pool tokens, so the
+    /// window crosses both the block edge (16) and the start of the new rows. Breaks if the
+    /// window is off by one, counts from the wrong end, the sink adds to the numerator, is
+    /// skipped in the max, or is read from the KV head instead of the query head.
+    #[test]
+    fn sinks_and_window_match_naive() {
+        let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
+        let (hq, hkv, d, bt) = (4usize, 2usize, 8usize, 16usize);
+        // (q_len, kv_len) per sequence; sequence 1's first 6 tokens are the pool's zeros.
+        let seqs = [(20usize, 20usize), (3, 9)];
+        let total_q: usize = seqs.iter().map(|s| s.0).sum();
+        let scale = 1.0 / (d as f32).sqrt();
+        let q = seeded(51, total_q * hq * d)
+            .iter()
+            .map(|x| x * 3.0)
+            .collect::<Vec<_>>();
+        let k = seeded(52, total_q * hkv * d)
+            .iter()
+            .map(|x| x * 3.0)
+            .collect::<Vec<_>>();
+        let v = seeded(53, total_q * hkv * d);
+        let sink_logits = [0.5f32, -1.0, 2.5, 0.0];
+        for (window, sinks) in [
+            (None, true),
+            (Some(4u32), true),
+            (Some(4), false),
+            (Some(40), true),
+        ] {
+            let cfg = AttentionConfig {
+                kind: AttentionKind::PrefillPaged,
+                num_q_heads: hq as u32,
+                num_kv_heads: hkv as u32,
+                head_dim: d as u32,
+                dtype: DType::F32,
+                block_tokens: Some(bt as u32),
+                causal: true,
+                window,
+                sinks,
+            };
+            let pool = Tensor::empty(&mem, &[4, 2, bt, hkv, d], DType::F32).expect("pool");
+            pool.view()
+                .slice
+                .write_bytes(&vec![0u8; 4 * 2 * bt * hkv * d * 4])
+                .expect("zero pool");
+            let qt = tensor(&mem, &[total_q, hq, d], DType::F32, &q);
+            let kn = tensor(&mem, &[total_q, hkv, d], DType::F32, &k);
+            let vn = tensor(&mem, &[total_q, hkv, d], DType::F32, &v);
+            let out = Tensor::empty(&mem, &[total_q, hq, d], DType::F32).expect("out");
+            let table = i32_tensor_2d(&mem, 2, &[3, 1, 0, 2]);
+            let q_indptr = i32_tensor(&mem, &[0, 20, 23]);
+            let kv_lens = i32_tensor(&mem, &[20, 9]);
+            let sink_t = tensor(&mem, &[hq], DType::F32, &sink_logits);
+            let provider = cpu_reference_provider();
+            let attn = provider.attention().expect("attention family");
+            assert!(attn.supports(&cfg), "{cfg}");
+            attn.execute_paged(&mut PagedAttentionContext {
+                cfg,
+                q: qt.view(),
+                k_new: kn.view(),
+                v_new: vn.view(),
+                out: out.view(),
+                kv_layer: pool.view(),
+                block_table: table.view(),
+                q_indptr: q_indptr.view(),
+                kv_lens: kv_lens.view(),
+                max_q_len: 20,
+                max_kv_len: 20,
+                max_blocks_per_seq: 2,
+                scale,
+                k_scale: 1.0,
+                v_scale: 1.0,
+                block_formats: None,
+                classes: None,
+                tq: None,
+                rope: None,
+                sinks: sinks.then(|| sink_t.view()),
+            })
+            .expect("attention");
+            let got = load(&out.view()).expect("out");
+
+            // The naive reference, in f64.
+            let mut want = vec![0f32; total_q * hq * d];
+            let mut row0 = 0;
+            for &(q_len, kv_len) in &seqs {
+                let first_new = kv_len - q_len;
+                // The sequence's keys and values: zeros before its new rows.
+                let key = |j: usize, kvh: usize, e: usize, x: &[f32]| -> f64 {
+                    if j < first_new {
+                        0.0
+                    } else {
+                        f64::from(x[((row0 + j - first_new) * hkv + kvh) * d + e])
+                    }
+                };
+                for i in 0..q_len {
+                    let p = first_new + i;
+                    let lo = window.map_or(0, |w| p.saturating_sub(w as usize));
+                    for (h, &sink_logit) in sink_logits.iter().enumerate() {
+                        let kvh = h / (hq / hkv);
+                        let qr = ((row0 + i) * hq + h) * d;
+                        let logits: Vec<f64> = (lo..=p)
+                            .map(|j| {
+                                (0..d)
+                                    .map(|e| f64::from(q[qr + e]) * key(j, kvh, e, &k))
+                                    .sum::<f64>()
+                                    * f64::from(scale)
+                            })
+                            .collect();
+                        let sink = sinks.then(|| f64::from(sink_logit));
+                        let m = logits
+                            .iter()
+                            .copied()
+                            .chain(sink)
+                            .fold(f64::NEG_INFINITY, f64::max);
+                        let den: f64 = logits
+                            .iter()
+                            .chain(sink.iter())
+                            .map(|s| (s - m).exp())
+                            .sum();
+                        for e in 0..d {
+                            let num: f64 = logits
+                                .iter()
+                                .enumerate()
+                                .map(|(n, s)| (s - m).exp() * key(lo + n, kvh, e, &v))
+                                .sum();
+                            want[qr + e] = (num / den) as f32;
+                        }
+                    }
+                }
+                row0 += q_len;
+            }
+            assert_close(&got, &want, 2e-6);
+        }
+
+        // A window needs causal attention; sinks need their tensor and the config to agree.
+        let base = AttentionConfig {
+            kind: AttentionKind::PrefillPaged,
+            num_q_heads: hq as u32,
+            num_kv_heads: hkv as u32,
+            head_dim: d as u32,
+            dtype: DType::F32,
+            block_tokens: Some(bt as u32),
+            causal: false,
+            window: Some(4),
+            sinks: false,
+        };
+        assert!(!AttentionKernel::supports(&CpuReference, &base));
+        let contiguous = AttentionConfig {
+            kind: AttentionKind::Prefill,
+            block_tokens: None,
+            causal: true,
+            sinks: true,
+            window: None,
+            ..base
+        };
+        assert!(!AttentionKernel::supports(&CpuReference, &contiguous));
+    }
+
     #[test]
     fn paged_attention_equals_contiguous_and_moe_route_ties() {
         let mem = HostMemory::new(DeviceId(0), 1 << 22) as Arc<dyn DeviceMemory>;
@@ -955,6 +1163,8 @@ mod tests {
             dtype,
             block_tokens: Some(bt as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let attn = cpu.attention().expect("attention family");
         assert!(attn.supports(&paged_cfg));
@@ -1027,6 +1237,7 @@ mod tests {
             classes: None,
             tq: None,
             rope: None,
+            sinks: None,
         })
         .expect("paged attention");
         let paged_out = load(&out.view()).expect("load");
@@ -1082,6 +1293,7 @@ mod tests {
             top_k: 2,
             renormalize: false,
             bf16_logits: false,
+            ..Default::default()
         };
         let moe = cpu.moe().expect("moe family");
         assert!(moe.supports_route(&route_cfg));
@@ -1103,6 +1315,7 @@ mod tests {
             topk_weights: topk_weights.view(),
             sorted_rows: sorted_rows.view(),
             expert_offsets: expert_offsets.view(),
+            router_bias: None,
         })
         .expect("route");
         assert_eq!(load_i32(&topk_ids.view()).expect("ids"), [0, 1, 3, 2]);
@@ -1132,6 +1345,7 @@ mod tests {
                 top_k: 1,
                 renormalize: false,
                 bf16_logits,
+                ..Default::default()
             };
             moe.route(&mut MoeRouteContext {
                 cfg,
@@ -1140,6 +1354,7 @@ mod tests {
                 topk_weights: weights.view(),
                 sorted_rows: rows.view(),
                 expert_offsets: expert_offsets.view(),
+                router_bias: None,
             })
             .expect("route");
             assert_eq!(load_i32(&ids.view()).expect("ids"), [want_id], "{cfg}");
@@ -1244,6 +1459,8 @@ mod tests {
             dtype: DType::BF16,
             block_tokens: Some(bt as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         // Slots of BF16 pages (the largest format); positions 0..16 in block 2 (tq4),
         // 16..32 in block 0 (bf16), 32..40 in block 1 (fp8).
@@ -1299,6 +1516,7 @@ mod tests {
                     device: None,
                 }),
                 rope: None,
+                sinks: None,
             })
             .expect("mixed paged attention");
         let got = load(&out.view()).expect("out");
@@ -1450,6 +1668,8 @@ mod tests {
             dtype: DType::Tq4,
             block_tokens: Some(bt as u32),
             causal: true,
+            window: None,
+            sinks: false,
         };
         let table = [5i32, 8];
         let formats = [KV_FMT_TQ4, KV_FMT_BF16];
@@ -1503,6 +1723,7 @@ mod tests {
                     device: None,
                 }),
                 rope: None,
+                sinks: None,
             })
             .expect("classed paged attention");
         let bytes = pool.view().slice.read_bytes().expect("pool");

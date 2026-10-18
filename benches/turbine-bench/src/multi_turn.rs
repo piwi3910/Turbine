@@ -190,5 +190,10 @@ fn turn_body(
     if args.ignore_eos {
         body["ignore_eos"] = json!(true);
     }
+    if let Some(effort) = &args.reasoning_effort
+        && matches!(args.endpoint, EndpointArg::Chat)
+    {
+        body["reasoning_effort"] = json!(effort);
+    }
     body
 }

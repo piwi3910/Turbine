@@ -51,6 +51,18 @@ pub enum OpKind {
     /// ABI v2.11 (optional in a shim library): encode KV blocks into a lower tier's codec and
     /// decode them back (Phase 6b).
     KvTranscode,
+    /// ABI v2.18 (optional in a shim library): Gated DeltaNet over prefill sequences (Phase 7).
+    GdnPrefill,
+    /// ABI v2.18 (optional in a shim library): Gated DeltaNet, one token per sequence.
+    GdnDecode,
+    /// ABI v2.18 (optional in a shim library): causal conv1d over prefill sequences.
+    Conv1dPrefill,
+    /// ABI v2.18 (optional in a shim library): causal conv1d, one token per sequence, the state
+    /// read from and written back to the sequence's slot.
+    Conv1dUpdate,
+    /// ABI v2.19 (optional in a shim library): the gated-attention sigmoid-multiply
+    /// `out = a · sigmoid(gate)` (Phase 7).
+    SigmoidMul,
 }
 
 impl OpKind {
@@ -77,6 +89,11 @@ impl OpKind {
         OpKind::QGemm,
         OpKind::QuantizeAct,
         OpKind::KvTranscode,
+        OpKind::GdnPrefill,
+        OpKind::GdnDecode,
+        OpKind::Conv1dPrefill,
+        OpKind::Conv1dUpdate,
+        OpKind::SigmoidMul,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -101,6 +118,11 @@ impl OpKind {
             OpKind::QGemm => "qgemm",
             OpKind::QuantizeAct => "quantize_act",
             OpKind::KvTranscode => "kv_transcode",
+            OpKind::GdnPrefill => "gdn_prefill",
+            OpKind::GdnDecode => "gdn_decode",
+            OpKind::Conv1dPrefill => "conv1d_prefill",
+            OpKind::Conv1dUpdate => "conv1d_update",
+            OpKind::SigmoidMul => "sigmoid_mul",
         }
     }
 
@@ -127,6 +149,11 @@ impl OpKind {
             OpKind::QGemm => 17,
             OpKind::QuantizeAct => 18,
             OpKind::KvTranscode => 19,
+            OpKind::GdnPrefill => 20,
+            OpKind::GdnDecode => 21,
+            OpKind::Conv1dPrefill => 22,
+            OpKind::Conv1dUpdate => 23,
+            OpKind::SigmoidMul => 24,
         }
     }
 
@@ -138,6 +165,11 @@ impl OpKind {
             OpKind::RowSumsq | OpKind::RmsnormSharded => 6,
             OpKind::QGemm | OpKind::QuantizeAct => 9,
             OpKind::KvTranscode => 11,
+            OpKind::GdnPrefill
+            | OpKind::GdnDecode
+            | OpKind::Conv1dPrefill
+            | OpKind::Conv1dUpdate => 18,
+            OpKind::SigmoidMul => 19,
             _ => 0,
         }
     }
@@ -280,6 +312,15 @@ pub struct AttentionConfig {
     /// Phase 1.
     pub block_tokens: Option<u32>,
     pub causal: bool,
+    /// Phase 7 S-8 (kernel ABI v2.17), paged kinds only: a sliding window. Query position `p`
+    /// attends keys `p − w ..= p` for `Some(w)` (the C ABI's `window_left`); `None` = every key
+    /// `≤ p`. Needs `causal`.
+    pub window: Option<u32>,
+    /// Phase 7 S-8 (kernel ABI v2.17), paged kinds only: one learned sink logit per query head
+    /// ([`PagedAttentionContext::sinks`]) joins the softmax denominator (gpt-oss): the row's
+    /// probabilities are `exp(s_j − m) / (Σ exp(s_k − m) + exp(sink − m))` with
+    /// `m = max(max_k s_k, sink)`, and the sink adds nothing to the output.
+    pub sinks: bool,
 }
 
 impl AttentionConfig {
@@ -307,6 +348,12 @@ impl fmt::Display for AttentionConfig {
         )?;
         if let Some(block_tokens) = self.block_tokens {
             write!(f, " block_tokens={block_tokens}")?;
+        }
+        if let Some(window) = self.window {
+            write!(f, " window={window}")?;
+        }
+        if self.sinks {
+            write!(f, " sinks=1")?;
         }
         Ok(())
     }
@@ -362,6 +409,19 @@ impl fmt::Display for ActivationConfig {
     }
 }
 
+/// `a · sigmoid(gate)` over rows of `cols` elements (ABI v2.19, Phase 7 gated attention).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SigmoidMulConfig {
+    pub cols: u64,
+    pub dtype: DType,
+}
+
+impl fmt::Display for SigmoidMulConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cols={} dtype={}", self.cols, self.dtype.as_str())
+    }
+}
+
 /// Row gather from a `[vocab_rows, hidden]` table.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct EmbeddingConfig {
@@ -412,9 +472,24 @@ impl fmt::Display for KvCopyConfig {
     }
 }
 
+/// How the router turns logits into expert weights.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
+pub enum RouteMode {
+    /// Softmax over all experts, then the top `top_k` of the probabilities (Llama-family MoE,
+    /// OLMoE, Qwen3-MoE, Mixtral); `renormalize` divides the selected weights by their sum.
+    #[default]
+    SoftmaxThenTopk,
+    /// The top `top_k` of the logits (bias included), then a softmax over those `top_k` only
+    /// (gpt-oss, `TURBINE_ROUTE_TOPK_THEN_SOFTMAX`, kernel ABI v2.16); the weights already sum
+    /// to one, so `renormalize` is ignored.
+    TopkThenSoftmax,
+}
+
 /// MoE router: softmax over `num_experts` F32 logits, top-`top_k` selected as PyTorch's CPU
-/// `torch.topk` selects ([`crate::torch_topk`]), optional renormalisation.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// `torch.topk` selects ([`crate::torch_topk`]), optional renormalisation; or, in
+/// [`RouteMode::TopkThenSoftmax`], the top-`top_k` of the logits and a softmax over those.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct MoeRouteConfig {
     pub num_experts: u32,
     pub top_k: u32,
@@ -424,6 +499,18 @@ pub struct MoeRouteConfig {
     /// output of a BF16 model in transformers (`self.gate(hidden_states)` is a BF16 linear).
     /// Kernel ABI v2.2 (`TURBINE_MOE_ROUTE_BF16_LOGITS`).
     pub bf16_logits: bool,
+    /// Softmax then top-k (default) or top-k then softmax. Kernel ABI v2.16.
+    pub mode: RouteMode,
+    /// The call passes a `router_bias` (`[num_experts]` F32) added to the logits (before the BF16
+    /// rounding). Kernel ABI v2.16.
+    pub bias: bool,
+}
+
+impl MoeRouteConfig {
+    /// True when any v2.16 field is set: a library reporting a minor below 16 cannot run it.
+    pub fn needs_v2_16(&self) -> bool {
+        self.mode != RouteMode::SoftmaxThenTopk || self.bias
+    }
 }
 
 impl fmt::Display for MoeRouteConfig {
@@ -435,12 +522,100 @@ impl fmt::Display for MoeRouteConfig {
             self.top_k,
             u8::from(self.renormalize),
             u8::from(self.bf16_logits)
-        )
+        )?;
+        if self.mode == RouteMode::TopkThenSoftmax {
+            f.write_str(" router=topk_then_softmax")?;
+        }
+        if self.bias {
+            f.write_str(" router_bias=1")?;
+        }
+        Ok(())
     }
 }
 
-/// SwiGLU experts `down(silu(gate(x)) · up(x))` of width `inter` over the local expert range
-/// `[expert_begin, expert_end)` of `num_experts`.
+/// Storage of the expert weights (`TURBINE_EXPERT_*`, kernel ABI v2.16). The quantized forms
+/// are the 6a layouts per expert; [`MoeExpertsExtra`] lists the shapes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
+pub enum ExpertDtype {
+    /// Weights in the config's `dtype` (the pre-v2.16 form).
+    #[default]
+    Bf16,
+    /// FP8 e4m3 with one F32 scale per 128 x 128 block.
+    Fp8Block,
+    /// FP8 e4m3 with one F32 scale per expert and projection; with `act_static_scale` the
+    /// activations are quantized to FP8 too (W8A8).
+    Fp8Tensor,
+    /// OCP MXFP4: E2M1 elements, one E8M0 exponent per 32 columns.
+    Mxfp4,
+}
+
+impl ExpertDtype {
+    /// `TURBINE_EXPERT_*` (`weight_dtype`).
+    pub fn abi_code(self) -> i32 {
+        match self {
+            ExpertDtype::Bf16 => 0,
+            ExpertDtype::Fp8Block => 1,
+            ExpertDtype::Fp8Tensor => 2,
+            ExpertDtype::Mxfp4 => 3,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExpertDtype::Bf16 => "bf16",
+            ExpertDtype::Fp8Block => "fp8_block",
+            ExpertDtype::Fp8Tensor => "fp8_tensor",
+            ExpertDtype::Mxfp4 => "mxfp4",
+        }
+    }
+}
+
+/// The expert's gated activation (`TURBINE_EXPERT_SWIGLU` / `_GPTOSS_CLAMP`, kernel ABI v2.16).
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum ExpertActivation {
+    /// `silu(gate) · up`.
+    #[default]
+    SwiGlu,
+    /// gpt-oss: `gate` clamped to `≤ limit`, `up` to `±limit`, `out = (up + 1) · gate ·
+    /// σ(1.702 · gate)` (`limit` 7.0).
+    GptOssClamp { limit: f32 },
+}
+
+impl PartialEq for ExpertActivation {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for ExpertActivation {}
+
+impl std::hash::Hash for ExpertActivation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
+}
+
+impl ExpertActivation {
+    /// The identity of the activation (the limit by its bits, so `Eq` and `Hash` agree).
+    fn key(&self) -> (i32, u32) {
+        match *self {
+            ExpertActivation::SwiGlu => (0, 0),
+            ExpertActivation::GptOssClamp { limit } => (1, limit.to_bits()),
+        }
+    }
+
+    /// `TURBINE_EXPERT_*` (`activation`).
+    pub fn abi_code(self) -> i32 {
+        self.key().0
+    }
+}
+
+/// Gated experts `down(act(gate(x), up(x)))` of width `inter` over the local expert range
+/// `[expert_begin, expert_end)` of `num_experts`. The activation is SwiGLU unless
+/// `activation` says otherwise; the v2.16 fields (all defaulted off) select quantized weights,
+/// biases, gpt-oss's interleaved gate/up layout and a shared expert.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct MoeExpertsConfig {
     pub hidden: u32,
@@ -449,7 +624,40 @@ pub struct MoeExpertsConfig {
     pub top_k: u32,
     pub expert_begin: u32,
     pub expert_end: u32,
+    /// Activation (x, out and BF16 weight) dtype.
     pub dtype: DType,
+    /// Weight storage. Kernel ABI v2.16.
+    pub weight_dtype: ExpertDtype,
+    /// Gated activation. Kernel ABI v2.16.
+    pub activation: ExpertActivation,
+    /// The call passes `b_gate`, `b_up` and `b_down` (`[local, n]` in `dtype`). Kernel ABI v2.16.
+    pub biases: bool,
+    /// `w_gate` holds gpt-oss's interleaved gate/up rows: row `2j` is gate column `j`, row
+    /// `2j + 1` is up column `j` (`w_gate` is then `[local, 2 · inter, hidden]`, `w_up` unused).
+    /// Kernel ABI v2.16.
+    pub gate_up_interleaved: bool,
+    /// Width of the shared expert added to every token (`Some` when the call passes the
+    /// `shared_*` weights). Kernel ABI v2.16.
+    pub shared_inter: Option<u32>,
+}
+
+impl Default for MoeExpertsConfig {
+    fn default() -> Self {
+        Self {
+            hidden: 0,
+            inter: 0,
+            num_experts: 0,
+            top_k: 0,
+            expert_begin: 0,
+            expert_end: 0,
+            dtype: DType::BF16,
+            weight_dtype: ExpertDtype::Bf16,
+            activation: ExpertActivation::SwiGlu,
+            biases: false,
+            gate_up_interleaved: false,
+            shared_inter: None,
+        }
+    }
 }
 
 impl MoeExpertsConfig {
@@ -462,6 +670,15 @@ impl MoeExpertsConfig {
     /// [`MoeKernel::needs_host_offsets`] answer depends on. Known on the host before routing.
     pub fn routed_rows(&self, tokens: usize) -> usize {
         tokens.saturating_mul(self.top_k as usize)
+    }
+
+    /// True when any v2.16 field is set: a library reporting a minor below 16 cannot run it.
+    pub fn needs_v2_16(&self) -> bool {
+        self.weight_dtype != ExpertDtype::Bf16
+            || self.activation != ExpertActivation::SwiGlu
+            || self.biases
+            || self.gate_up_interleaved
+            || self.shared_inter.is_some()
     }
 }
 
@@ -477,7 +694,23 @@ impl fmt::Display for MoeExpertsConfig {
             self.expert_begin,
             self.expert_end,
             self.dtype.as_str()
-        )
+        )?;
+        if self.weight_dtype != ExpertDtype::Bf16 {
+            write!(f, " weight_dtype={}", self.weight_dtype.as_str())?;
+        }
+        if let ExpertActivation::GptOssClamp { limit } = self.activation {
+            write!(f, " activation=gptoss_clamp({limit})")?;
+        }
+        if self.biases {
+            f.write_str(" biases=1")?;
+        }
+        if self.gate_up_interleaved {
+            f.write_str(" gate_up_interleaved=1")?;
+        }
+        if let Some(s) = self.shared_inter {
+            write!(f, " shared_inter={s}")?;
+        }
+        Ok(())
     }
 }
 
@@ -740,6 +973,155 @@ pub struct QuantizeActContext<'a> {
     pub static_scale: f32,
 }
 
+/// Which Gated DeltaNet / causal-conv call a config describes: a batch of prefill sequences
+/// (`cu_seqlens` delimits them) or a decode step (one token per sequence).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GdnMode {
+    Prefill,
+    Decode,
+}
+
+impl GdnMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GdnMode::Prefill => "prefill",
+            GdnMode::Decode => "decode",
+        }
+    }
+}
+
+/// Gated DeltaNet (ABI v2.18 `gdn_prefill` / `gdn_decode`, Phase 7): the delta-rule recurrence
+/// of transformers' `torch_recurrent_gated_delta_rule` with `use_qk_l2norm_in_kernel`, per
+/// (sequence, value head). Value head `h` reads key head `h / (v_heads / k_heads)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct GdnConfig {
+    pub k_heads: u32,
+    pub v_heads: u32,
+    pub k_dim: u32,
+    pub v_dim: u32,
+    pub mode: GdnMode,
+    /// The dtype of q, k, v and the output (the state, `g` and `beta` are F32).
+    pub dtype: DType,
+}
+
+impl GdnConfig {
+    /// The op this config runs.
+    pub fn op(&self) -> OpKind {
+        match self.mode {
+            GdnMode::Prefill => OpKind::GdnPrefill,
+            GdnMode::Decode => OpKind::GdnDecode,
+        }
+    }
+
+    /// The `k_heads` a value head shares: `v_heads / k_heads`, `None` unless it divides.
+    pub fn heads_per_key(&self) -> Option<u32> {
+        (self.k_heads > 0 && self.v_heads.is_multiple_of(self.k_heads))
+            .then(|| self.v_heads / self.k_heads)
+    }
+}
+
+impl fmt::Display for GdnConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} k_heads={} v_heads={} k_dim={} v_dim={} dtype={}",
+            self.mode.as_str(),
+            self.k_heads,
+            self.v_heads,
+            self.k_dim,
+            self.v_dim,
+            self.dtype.as_str()
+        )
+    }
+}
+
+/// Causal depthwise conv1d with an optional SiLU (ABI v2.18 `conv1d_prefill` /
+/// `conv1d_update`, Phase 7): `out[t, c] = silu(bias[c] + Σ_i w[c, i] · x[t − (kernel − 1) + i, c])`
+/// with the inputs before a sequence start read from its state.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Conv1dConfig {
+    pub channels: u32,
+    /// The window; the ABI supports 4.
+    pub kernel: u32,
+    pub mode: GdnMode,
+    /// The dtype of x, the weights, the state and the output.
+    pub dtype: DType,
+}
+
+impl Conv1dConfig {
+    /// The op this config runs.
+    pub fn op(&self) -> OpKind {
+        match self.mode {
+            GdnMode::Prefill => OpKind::Conv1dPrefill,
+            GdnMode::Decode => OpKind::Conv1dUpdate,
+        }
+    }
+}
+
+impl fmt::Display for Conv1dConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} channels={} kernel={} dtype={}",
+            self.mode.as_str(),
+            self.channels,
+            self.kernel,
+            self.dtype.as_str()
+        )
+    }
+}
+
+/// One Gated DeltaNet call over `num_tokens` tokens of `num_seqs` sequences. Row layout:
+/// `q`, `k`: `[tokens, k_heads, k_dim]`, `v`: `[tokens, v_heads, v_dim]` (each view's
+/// `strides[0]` is its token row stride, so the `q | k | v` columns of a conv output feed the
+/// kernel with no copy; the inner dimensions are dense); `g` (log decay, `exp(g)` multiplies
+/// the state) and `beta`: F32 `[tokens, v_heads]`; `state`: F32 `[slots, v_heads, v_dim, k_dim]`
+/// (k contiguous), the state of sequence `s` is slot `state_slots[s]`, read at the start and
+/// written back at the end of the call; `state_slots`: I32 `[seqs]`; `cu_seqlens`: I32
+/// `[seqs + 1]` token offsets (prefill; `None` for decode, which has one token per sequence);
+/// `out`: `[tokens, v_heads, v_dim]` of `cfg.dtype`; `boundary_states`: F32
+/// `[Σ floor(len_s / boundary_tokens), v_heads, v_dim, k_dim]` ordered by sequence then
+/// boundary, row `(s, j)` the state after token `(j + 1) · boundary_tokens` of this call's
+/// sequence `s` (`None` = no snapshots; prefill only). The layout of `state` is the kernel's
+/// own: callers move it between slots only as opaque `v_heads · v_dim · k_dim` F32 blocks.
+pub struct GdnContext<'a> {
+    pub cfg: GdnConfig,
+    pub q: TensorView<'a>,
+    pub k: TensorView<'a>,
+    pub v: TensorView<'a>,
+    pub g: TensorView<'a>,
+    pub beta: TensorView<'a>,
+    pub state: TensorView<'a>,
+    pub state_slots: TensorView<'a>,
+    pub cu_seqlens: Option<TensorView<'a>>,
+    pub out: TensorView<'a>,
+    pub boundary_states: Option<TensorView<'a>>,
+    pub boundary_tokens: u32,
+}
+
+/// One causal conv1d call. `x`: `[tokens, channels]` (token row stride = `strides[0]`);
+/// `weight`: `[channels, kernel]`; `bias`: `[channels]` or `None`; `conv_state`:
+/// `[slots, channels, kernel − 1]`, the last `kernel − 1` inputs before the sequence, oldest
+/// first (read at the start, the new tail written at the end; a new sequence's slot is zeroed
+/// by the caller); `state_slots`, `cu_seqlens` and `boundary_conv_states` as in
+/// [`GdnContext`] (`boundary_conv_states`: `[Σ floor(len_s / boundary_tokens), channels,
+/// kernel − 1]`, the tail after each boundary token, `boundary_tokens` ≥ `kernel − 1`); `out`:
+/// `[tokens, channels]`, may be strided.
+pub struct Conv1dContext<'a> {
+    pub cfg: Conv1dConfig,
+    pub x: TensorView<'a>,
+    pub weight: TensorView<'a>,
+    pub bias: Option<TensorView<'a>>,
+    pub conv_state: TensorView<'a>,
+    pub state_slots: TensorView<'a>,
+    pub cu_seqlens: Option<TensorView<'a>>,
+    pub out: TensorView<'a>,
+    pub boundary_conv_states: Option<TensorView<'a>>,
+    pub boundary_tokens: u32,
+    /// 1 = SiLU after the convolution (the only activation of the ABI), 0 = none.
+    pub activation: i32,
+}
+
 /// The host codecs a transcode runs on the CPU (the `cpu-reference` provider; a library
 /// ignores it). `turbine-kernels` does not depend on `turbine-kv`: the server hands in a table
 /// over `turbine_kv::codec`, and the kernel tests one over the same codecs, so the reference a
@@ -891,6 +1273,9 @@ pub struct PagedAttentionContext<'a> {
     /// to a kernel whose [`AttentionKernel::fuses_decode_rope`] holds; `None` = `q` and `k_new`
     /// are already rotated.
     pub rope: Option<FusedRope<'a>>,
+    /// Phase 7 S-8 (kernel ABI v2.17): `[num_q_heads]` F32 sink logits (already in the scaled
+    /// score domain, compared with `scale · q·k`), required exactly when `cfg.sinks`.
+    pub sinks: Option<TensorView<'a>>,
 }
 
 /// The RoPE operands of a fused decode call ([`PagedAttentionContext::rope`]): those of the
@@ -1000,6 +1385,8 @@ pub struct MoeRouteContext<'a> {
     pub topk_weights: TensorView<'a>,
     pub sorted_rows: TensorView<'a>,
     pub expert_offsets: TensorView<'a>,
+    /// `[num_experts]` F32 added to the logits when `cfg.bias` (kernel ABI v2.16).
+    pub router_bias: Option<TensorView<'a>>,
 }
 
 /// `out[t] += Σ w[t, slot] · down(silu(gate(x[t])) · up(x[t]))` over the slots routed to a local
@@ -1027,6 +1414,188 @@ pub struct MoeExpertsContext<'a> {
     pub host_expert_offsets: &'a [i32],
     pub out: TensorView<'a>,
     pub workspace: Option<DeviceSlice<'a>>,
+    /// The v2.16 tensors (all `None` for BF16 SwiGLU experts without biases or shared expert).
+    pub extra: MoeExpertsExtra<'a>,
+}
+
+/// The tensors a v2.16 [`MoeExpertsConfig`] adds to [`MoeExpertsContext`]. Shapes, with `n` the
+/// projection's output rows and `k` its input columns, over `local` experts:
+///
+/// - With a quantized `weight_dtype` the weights are `[local, n, k]` F8E4M3 (FP8) or
+///   `[local, n, k/2]` U8 (MXFP4, low nibble first), and `*_scale` (per `w_gate` / `w_up` /
+///   `w_down`) is, for [`ExpertDtype::Fp8Block`], F32 `[local, ceil(n/128), ceil(k/128)]`; for
+///   [`ExpertDtype::Fp8Tensor`] F32 `[local]`; for [`ExpertDtype::Mxfp4`] U8 (E8M0)
+///   `[local, n, k/32]`.
+/// - `act_static_scale`: F32 `[local]`, [`ExpertDtype::Fp8Tensor`] only. With it the input of
+///   `gate` / `up` is quantized to FP8 with that expert's scale (W8A8); the input of `down` is
+///   quantized with `act_static_scale_down` (F32 `[local]`, same form) or, when that is absent,
+///   per token with a dynamic scale; without `act_static_scale` the activations stay in `dtype`
+///   (W8A16) and `act_static_scale_down` alone is invalid.
+/// - `b_*`: `[local, n]` in `dtype` (`b_gate` / `b_up` `[local, inter]`, `b_down`
+///   `[local, hidden]`; with `gate_up_interleaved` `b_gate` is `[local, 2 · inter]`, `b_up`
+///   unused).
+/// - `shared_w_gate` / `shared_w_up`: `[shared_inter, hidden]`; `shared_w_down`:
+///   `[hidden, shared_inter]` (all `dtype`); `shared_gate_w`: `[hidden]` (when present the
+///   shared output is scaled by `σ(x · shared_gate_w)`, else by 1). The shared expert is added
+///   once per call, so a caller splitting the experts over several calls passes it to one.
+#[derive(Default)]
+pub struct MoeExpertsExtra<'a> {
+    pub w_gate_scale: Option<TensorView<'a>>,
+    pub w_up_scale: Option<TensorView<'a>>,
+    pub w_down_scale: Option<TensorView<'a>>,
+    pub act_static_scale: Option<TensorView<'a>>,
+    pub act_static_scale_down: Option<TensorView<'a>>,
+    pub b_gate: Option<TensorView<'a>>,
+    pub b_up: Option<TensorView<'a>>,
+    pub b_down: Option<TensorView<'a>>,
+    pub shared_w_gate: Option<TensorView<'a>>,
+    pub shared_w_up: Option<TensorView<'a>>,
+    pub shared_w_down: Option<TensorView<'a>>,
+    pub shared_gate_w: Option<TensorView<'a>>,
+}
+
+/// One operand a [`MoeExpertsContext`] must carry: its name, view, expected shape and dtype.
+pub type ExpertOperand<'c, 'a> = (&'static str, &'c TensorView<'a>, Vec<usize>, DType);
+
+impl<'a> MoeExpertsContext<'a> {
+    /// Every weight, scale, bias and shared-expert operand the config calls for, with the shape
+    /// and dtype each must have (the layouts of [`MoeExpertsExtra`]); an operand the config
+    /// does not call for must be absent, one it calls for must be present. A provider checks
+    /// each pair against the view it was given.
+    pub fn weight_operands<'c>(&'c self) -> Result<Vec<ExpertOperand<'c, 'a>>, KernelError> {
+        let cfg = &self.cfg;
+        let (h, inter) = (cfg.hidden as usize, cfg.inter as usize);
+        let local = cfg.num_local_experts() as usize;
+        let x = &self.extra;
+        let bad = |message: String| KernelError::InvalidArgument { message };
+        let gate_rows = if cfg.gate_up_interleaved {
+            2 * inter
+        } else {
+            inter
+        };
+        let (wdt, packed) = match cfg.weight_dtype {
+            ExpertDtype::Bf16 => (cfg.dtype, 1),
+            ExpertDtype::Fp8Block | ExpertDtype::Fp8Tensor => (DType::F8E4M3, 1),
+            ExpertDtype::Mxfp4 => (DType::U8, 2),
+        };
+        if cfg.weight_dtype == ExpertDtype::Mxfp4 {
+            for (what, v) in [("hidden", h), ("inter", inter)] {
+                if !v.is_multiple_of(32) {
+                    return Err(bad(format!(
+                        "mxfp4 experts need {what} a multiple of 32, got {v}"
+                    )));
+                }
+            }
+        }
+        let mut ops: Vec<ExpertOperand<'c, 'a>> = vec![
+            (
+                "w_gate",
+                &self.w_gate,
+                vec![local, gate_rows, h / packed],
+                wdt,
+            ),
+            ("w_down", &self.w_down, vec![local, h, inter / packed], wdt),
+        ];
+        if !cfg.gate_up_interleaved {
+            ops.push(("w_up", &self.w_up, vec![local, inter, h / packed], wdt));
+        }
+        let scales = [
+            ("w_gate_scale", &x.w_gate_scale, gate_rows, h),
+            ("w_up_scale", &x.w_up_scale, inter, h),
+            ("w_down_scale", &x.w_down_scale, h, inter),
+        ];
+        for (name, view, n, k) in scales {
+            let skip = cfg.gate_up_interleaved && name == "w_up_scale";
+            match (cfg.weight_dtype, view, skip) {
+                (ExpertDtype::Bf16, None, _) | (_, None, true) => {}
+                (ExpertDtype::Bf16, Some(_), _) => {
+                    return Err(bad(format!("{name} is only read by quantized experts")));
+                }
+                (_, Some(_), true) => {
+                    return Err(bad(format!("{name} is unused with gate_up_interleaved")));
+                }
+                (_, None, false) => {
+                    return Err(bad(format!(
+                        "{} experts need {name}",
+                        cfg.weight_dtype.as_str()
+                    )));
+                }
+                (dt, Some(v), false) => {
+                    let (shape, sdt) = match dt {
+                        ExpertDtype::Fp8Block => {
+                            (vec![local, n.div_ceil(128), k.div_ceil(128)], DType::F32)
+                        }
+                        ExpertDtype::Fp8Tensor => (vec![local], DType::F32),
+                        _ => (vec![local, n, k / 32], DType::U8),
+                    };
+                    ops.push((name, v, shape, sdt));
+                }
+            }
+        }
+        if x.act_static_scale.is_none() && x.act_static_scale_down.is_some() {
+            return Err(bad("act_static_scale_down needs act_static_scale".into()));
+        }
+        for (name, view) in [
+            ("act_static_scale", &x.act_static_scale),
+            ("act_static_scale_down", &x.act_static_scale_down),
+        ] {
+            match (view, cfg.weight_dtype) {
+                (None, _) => {}
+                (Some(v), ExpertDtype::Fp8Tensor) => {
+                    ops.push((name, v, vec![local], DType::F32));
+                }
+                (Some(_), _) => {
+                    return Err(bad(format!("{name} is only read by fp8_tensor experts")));
+                }
+            }
+        }
+        let biases = [
+            ("b_gate", &x.b_gate, gate_rows),
+            ("b_up", &x.b_up, inter),
+            ("b_down", &x.b_down, h),
+        ];
+        for (name, view, n) in biases {
+            let skip = cfg.gate_up_interleaved && name == "b_up";
+            match (cfg.biases && !skip, view) {
+                (false, None) => {}
+                (false, Some(_)) => {
+                    return Err(bad(format!("{name} is passed but the config has no bias")));
+                }
+                (true, None) => return Err(bad(format!("{name} is missing (config biases)"))),
+                (true, Some(v)) => ops.push((name, v, vec![local, n], cfg.dtype)),
+            }
+        }
+        let shared = [
+            ("shared_w_gate", &x.shared_w_gate),
+            ("shared_w_up", &x.shared_w_up),
+            ("shared_w_down", &x.shared_w_down),
+        ];
+        match cfg.shared_inter {
+            None => {
+                if shared.iter().any(|(_, v)| v.is_some()) || x.shared_gate_w.is_some() {
+                    return Err(bad("shared expert tensors without shared_inter".into()));
+                }
+            }
+            Some(si) => {
+                let si = si as usize;
+                for (name, view) in shared {
+                    let shape = if name == "shared_w_down" {
+                        vec![h, si]
+                    } else {
+                        vec![si, h]
+                    };
+                    let v = view
+                        .as_ref()
+                        .ok_or_else(|| bad(format!("{name} is missing (shared_inter)")))?;
+                    ops.push((name, v, shape, cfg.dtype));
+                }
+                if let Some(v) = &x.shared_gate_w {
+                    ops.push(("shared_gate_w", v, vec![h], cfg.dtype));
+                }
+            }
+        }
+        Ok(ops)
+    }
 }
 
 /// `q`/`out`: `[q_len, num_q_heads, head_dim]`; `k_cache`/`v_cache`:
@@ -1070,6 +1639,13 @@ pub struct RopeContext<'a> {
 pub struct ActivationContext<'a> {
     pub gate: TensorView<'a>,
     pub up: TensorView<'a>,
+    pub out: TensorView<'a>,
+}
+
+/// `out = a · sigmoid(gate)`, all `[rows, cols]` (ABI v2.19).
+pub struct SigmoidMulContext<'a> {
+    pub a: TensorView<'a>,
+    pub gate: TensorView<'a>,
     pub out: TensorView<'a>,
 }
 
@@ -1297,6 +1873,13 @@ pub trait ActivationKernel: Send + Sync {
     fn execute(&self, ctx: &mut ActivationContext<'_>) -> Result<(), KernelError>;
 }
 
+/// Sigmoid-multiply `a · sigmoid(gate)` (ABI v2.19, Phase 7 gated attention).
+pub trait SigmoidMulKernel: Send + Sync {
+    fn supports(&self, cfg: &SigmoidMulConfig) -> bool;
+    fn implementation(&self, cfg: &SigmoidMulConfig) -> String;
+    fn execute(&self, ctx: &mut SigmoidMulContext<'_>) -> Result<(), KernelError>;
+}
+
 /// Embedding gather.
 pub trait EmbeddingKernel: Send + Sync {
     fn supports(&self, cfg: &EmbeddingConfig) -> bool;
@@ -1384,6 +1967,20 @@ pub trait QuantizeActKernel: Send + Sync {
     fn execute(&self, ctx: &mut QuantizeActContext<'_>) -> Result<(), KernelError>;
 }
 
+/// Gated DeltaNet (ABI v2.18).
+pub trait GdnKernel: Send + Sync {
+    fn supports(&self, cfg: &GdnConfig) -> bool;
+    fn implementation(&self, cfg: &GdnConfig) -> String;
+    fn execute(&self, ctx: &mut GdnContext<'_>) -> Result<(), KernelError>;
+}
+
+/// Causal conv1d (ABI v2.18).
+pub trait Conv1dKernel: Send + Sync {
+    fn supports(&self, cfg: &Conv1dConfig) -> bool;
+    fn implementation(&self, cfg: &Conv1dConfig) -> String;
+    fn execute(&self, ctx: &mut Conv1dContext<'_>) -> Result<(), KernelError>;
+}
+
 /// KV transcode (ABI v2.11).
 pub trait KvTranscodeKernel: Send + Sync {
     fn supports(&self, cfg: &KvTranscodeConfig) -> bool;
@@ -1447,6 +2044,18 @@ pub trait KernelProvider: Send + Sync {
     fn kv_transcode(&self) -> Option<&dyn KvTranscodeKernel> {
         None
     }
+    /// ABI v2.18: `None` (the default) for a provider without Gated DeltaNet.
+    fn gdn(&self) -> Option<&dyn GdnKernel> {
+        None
+    }
+    /// ABI v2.18: `None` (the default) for a provider without the causal conv1d.
+    fn conv1d(&self) -> Option<&dyn Conv1dKernel> {
+        None
+    }
+    /// ABI v2.19: `None` (the default) for a provider without the sigmoid-multiply.
+    fn sigmoid_mul(&self) -> Option<&dyn SigmoidMulKernel> {
+        None
+    }
 
     /// The implementations of `op` the provider enumerates (kernel ABI v2.4), in its own order.
     /// Empty (the default) when the provider chooses the implementation of every call itself.
@@ -1508,7 +2117,12 @@ mod tests {
                 "rmsnorm_sharded",
                 "qgemm",
                 "quantize_act",
-                "kv_transcode"
+                "kv_transcode",
+                "gdn_prefill",
+                "gdn_decode",
+                "conv1d_prefill",
+                "conv1d_update",
+                "sigmoid_mul"
             ]
         );
         assert_eq!(OpKind::SiluMul.to_string(), "silu_mul");
@@ -1525,6 +2139,8 @@ mod tests {
             dtype: DType::BF16,
             block_tokens: None,
             causal: true,
+            window: None,
+            sinks: false,
         };
         assert_eq!(
             attn.to_string(),
@@ -1553,7 +2169,8 @@ mod tests {
                 num_experts: 64,
                 top_k: 8,
                 renormalize: false,
-                bf16_logits: true
+                bf16_logits: true,
+                ..Default::default()
             }
             .to_string(),
             "experts=64 top_k=8 renormalize=0 bf16_logits=1"
@@ -1566,6 +2183,7 @@ mod tests {
             expert_begin: 0,
             expert_end: 64,
             dtype: DType::BF16,
+            ..Default::default()
         };
         assert_eq!(
             experts.to_string(),
@@ -1618,6 +2236,14 @@ mod tests {
             "cols=8192 dtype=bf16"
         );
         assert_eq!(
+            SigmoidMulConfig {
+                cols: 4096,
+                dtype: DType::BF16
+            }
+            .to_string(),
+            "cols=4096 dtype=bf16"
+        );
+        assert_eq!(
             EmbeddingConfig {
                 hidden: 3072,
                 vocab_rows: 128256,
@@ -1666,9 +2292,10 @@ mod tests {
     }
 
     /// The minor that introduced each op: the v2 ops 0, the v2.1 fused ops 1, the v2.6 sharded
-    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11. Breaks if a new op
-    /// is appended without saying which minor group adds it (an older library would be asked for
-    /// an op code it does not know).
+    /// RMSNorm ops 6, the v2.9 quantization ops 9, the v2.11 KV transcode 11, the v2.18 GDN and
+    /// conv1d ops 18, the v2.19 sigmoid-multiply 19. Breaks if a new op is appended without
+    /// saying which minor group adds it (an older library would be asked for an op code it does
+    /// not know).
     #[test]
     fn op_minor_revisions() {
         for &op in OpKind::ALL {
@@ -1677,9 +2304,80 @@ mod tests {
                 13 | 14 => 1,
                 15 | 16 => 6,
                 17 | 18 => 9,
-                _ => 11,
+                19 => 11,
+                20..=23 => 18,
+                _ => 19,
             };
             assert_eq!(op.abi_minor(), want, "{op}");
+        }
+    }
+
+    /// `sigmoid_mul` on the cpu-reference provider against the hand-written `a · sigmoid(gate)`
+    /// (the sigmoid and the product each rounded to the output dtype), over a couple of shapes
+    /// and gate extremes (large positive → ≈1, large negative → ≈0, 0 → 0.5).
+    #[test]
+    fn sigmoid_mul_matches_reference() {
+        use std::sync::Arc;
+
+        use turbine_core::types::DeviceId;
+        use turbine_tensor::host::HostMemory;
+        use turbine_tensor::{DeviceMemory, Tensor};
+
+        use crate::cpu::{CpuReference, load, round_to, store};
+
+        let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 16);
+        let kernel = CpuReference
+            .sigmoid_mul()
+            .expect("cpu-reference implements sigmoid_mul");
+        for (rows, cols) in [(1usize, 7usize), (2, 4)] {
+            let n = rows * cols;
+            // Gates covering both saturations, the midpoint, and a spread of finite values.
+            let gate_v: Vec<f32> = (0..n)
+                .map(|i| match i % 4 {
+                    0 => 40.0,
+                    1 => -40.0,
+                    2 => 0.0,
+                    _ => i as f32 * 0.5 - 3.0,
+                })
+                .collect();
+            let a_v: Vec<f32> = (0..n).map(|i| 0.25 + i as f32 * 0.5).collect();
+            for dtype in [DType::BF16, DType::F32] {
+                let cfg = SigmoidMulConfig {
+                    cols: cols as u64,
+                    dtype,
+                };
+                assert!(kernel.supports(&cfg), "cpu supports {cfg}");
+                let a = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc a");
+                let gate = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc gate");
+                let out = Tensor::empty(&mem, &[rows, cols], dtype).expect("alloc out");
+                store(&a.view(), &a_v).expect("store a");
+                store(&gate.view(), &gate_v).expect("store gate");
+                kernel
+                    .execute(&mut SigmoidMulContext {
+                        a: a.view(),
+                        gate: gate.view(),
+                        out: out.view(),
+                    })
+                    .expect("sigmoid_mul");
+                let a_r = load(&a.view()).expect("load a");
+                let g_r = load(&gate.view()).expect("load gate");
+                let got = load(&out.view()).expect("load out");
+                let want: Vec<f32> = a_r
+                    .iter()
+                    .zip(&g_r)
+                    .map(|(&a, &g)| {
+                        let sig = round_to(dtype, 1.0 / (1.0 + (-g).exp()));
+                        round_to(dtype, sig * a)
+                    })
+                    .collect();
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-6,
+                        "{} [{rows},{cols}] element {i}: got {g}, want {w}",
+                        dtype.as_str()
+                    );
+                }
+            }
         }
     }
 }

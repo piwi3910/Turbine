@@ -47,6 +47,7 @@ use turbine_kv::tier::L2NvmeTier;
 use turbine_kv::{KvDocument, KvMetrics};
 use turbine_model::ModelMetrics;
 use turbine_model::executor::ModelExecutor;
+use turbine_reliability::budget::PoolKind;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_scheduler::{Scheduler, SchedulerMetrics, SchedulerSnapshot, SubmitError, policy};
 
@@ -58,7 +59,7 @@ use crate::reliability::{self as rel, EngineLedgerProbe, ReliabilityInputs};
 
 pub(crate) use deadlines::Timeouts;
 pub(crate) use r#loop::{EngineLoop, EngineParts};
-pub(crate) use requests::{Submission, ToolOutput, ToolParser};
+pub(crate) use requests::{ReasoningStart, Submission, ToolOutput, ToolParser};
 
 /// Events buffered per request between the engine and the HTTP response (P2 S-7); one slot
 /// of it stays reserved for the error event that ends a stream the engine closes on a slow
@@ -122,13 +123,27 @@ pub struct EngineDocs {
 }
 
 /// State the engine publishes for the HTTP side; `None` until the engine runs.
-#[derive(Default)]
 pub struct EngineShared {
     docs: Mutex<Option<EngineDocs>>,
     /// Tokens this engine still has to process for the requests it holds: per request its
     /// prompt plus `n × max_tokens`, less what it generated. Raised when a submission is
     /// accepted and recomputed after every step; the data-parallel router's load (P5 S-7).
     outstanding_tokens: AtomicU64,
+    /// P7 S-12 (Task 32): free entries of the scheduler's state-slot pool, or `u32::MAX` for an
+    /// attention-only family. A health signal (a slot must return on every finish, cancel and
+    /// preemption); the engine republishes it every turn.
+    state_slots_free: AtomicU64,
+}
+
+impl Default for EngineShared {
+    fn default() -> EngineShared {
+        EngineShared {
+            docs: Mutex::new(None),
+            outstanding_tokens: AtomicU64::new(0),
+            // `u64::MAX`: an attention-only family (no state-slot pool) until a run says otherwise.
+            state_slots_free: AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl EngineShared {
@@ -142,6 +157,22 @@ impl EngineShared {
 
     pub(crate) fn set_outstanding(&self, tokens: u64) {
         self.outstanding_tokens.store(tokens, Ordering::Release);
+    }
+
+    /// P7 S-12 (Task 32): free entries of the scheduler's state-slot pool, or `None` for an
+    /// attention-only family. Read by the S-12 engine test to assert no slot leaks (a hybrid's
+    /// slot pool must return every slot on finish, cancel and preemption).
+    #[cfg(test)]
+    pub fn state_slots_free(&self) -> Option<u32> {
+        match self.state_slots_free.load(Ordering::Acquire) {
+            u64::MAX => None,
+            n => Some(n as u32),
+        }
+    }
+
+    pub(crate) fn set_state_slots_free(&self, free: Option<u32>) {
+        self.state_slots_free
+            .store(free.map_or(u64::MAX, u64::from), Ordering::Release);
     }
 
     pub fn publish(&self, docs: EngineDocs) {
@@ -350,6 +381,19 @@ pub fn spawn(
                 let ledger = Arc::clone(&loaded.ledger);
                 // P5 S-8: a tensor-parallel group admits against every rank's ledger.
                 let group = std::mem::take(&mut loaded.group);
+                // P7 S-7: each rank's KV headroom for the KV document: its budget's KV pool
+                // (after the weights, workspace, collective, runtime and emergency reserve),
+                // at most the L0 pool the engine runs.
+                let pool_bytes = u64::from(pool.total_blocks()) * pool.layout().block_bytes();
+                let ranks: Vec<turbine_kv::KvRankDocument> = std::iter::once(&loaded.budget)
+                    .chain(group.iter().map(|(b, _)| b))
+                    .enumerate()
+                    .map(|(rank, b)| turbine_kv::KvRankDocument {
+                        rank: rank as u32,
+                        device: b.device.0,
+                        headroom_bytes: b.pool(PoolKind::Kv).min(pool_bytes),
+                    })
+                    .collect();
                 let probe_group = group
                     .iter()
                     .map(|(b, l)| (b.device, Arc::clone(l)))
@@ -429,6 +473,7 @@ pub fn spawn(
                 let (sampler, latest) = TelemetrySampler::spawn_core(core);
 
                 let PreparedModel {
+                    arch,
                     tokenizer,
                     max_seq_len,
                     scheduler: params,
@@ -441,7 +486,8 @@ pub fn spawn(
                     .with_policy(policy)
                     .with_metrics(metrics.scheduler.clone())
                     .with_gate(parts.gate)
-                    .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches));
+                    .with_micro_batches(stats.as_ref().map_or(1, |s| s.micro_batches))
+                    .with_state_layout(arch.state);
                 let (submit_tx, commands) = mpsc::channel(queue_capacity.max(1));
                 let stop = Arc::new(AtomicBool::new(false));
                 if let Err(e) = rel::spawn_controller(
@@ -476,6 +522,7 @@ pub fn spawn(
                     pipeline: stats,
                     jump_forward: structured_output.jump_forward,
                     jump_forward_max_tokens: structured_output.jump_forward_max_tokens,
+                    ranks,
                 });
                 backend.set_ready(
                     replica,

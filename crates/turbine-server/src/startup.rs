@@ -130,6 +130,27 @@ pub fn run(cli: Cli) -> ExitCode {
             return ExitCode::Config;
         }
     };
+    // P7 S-1: model features no executor implements (a sliding window), exit 2 before
+    // discovery and before binding, also under --check-config.
+    if let Err(e) = support_startup::model_feature_refusal(&config.model.path) {
+        eprintln!("turbine-server: invalid configuration: {e}");
+        return ExitCode::Config;
+    }
+    // P7 S-12 (Task 32): a family with per-sequence state (a hybrid) has no stateless model for
+    // the verified jump-forward's forced-token run to verify against. An explicit
+    // `structured_output.jump_forward: true` is a configuration error (exit 2, also under
+    // --check-config); otherwise jump-forward is turned off for it, with a WARN once at startup.
+    let hybrid_jump_forward_off =
+        match support_startup::hybrid_jump_forward(&config, cli.config.as_deref(), &cli.set) {
+            Ok((effective, hybrid)) => {
+                config.structured_output.jump_forward = effective;
+                hybrid && !effective
+            }
+            Err(e) => {
+                eprintln!("turbine-server: invalid configuration: {e}");
+                return ExitCode::Config;
+            }
+        };
     // The support-matrix row before discovery (device arch unknown): an unsupported row is a
     // configuration error, exit 2, also under --check-config.
     let support = support_startup::before_discovery(&config);
@@ -151,6 +172,13 @@ pub fn run(cli: Cli) -> ExitCode {
         return ExitCode::Startup;
     }
     tracing::info!(config = %config_path.display(), listen = %config.server.listen, "configuration loaded");
+    if hybrid_jump_forward_off {
+        tracing::warn!(
+            event = "jump_forward_disabled",
+            reason = "jump_forward_hybrid",
+            "jump-forward is off for a family with per-sequence state (a hybrid)"
+        );
+    }
     let support = match support {
         Ok(decision) => decision,
         Err(e) => return refuse_support(&e),
@@ -351,6 +379,11 @@ pub fn run(cli: Cli) -> ExitCode {
         if pipeline.is_none()
             && let Err(e) = prepared.share_device(slots_on(device))
         {
+            return startup_failed(r, &e);
+        }
+        // P7 S-15: FP8 KV on a checkpoint without K/V scales gets calibrated ones, before the
+        // KV namespace (which hashes them) is built.
+        if let Err(e) = model::calibrate_kv_scales(&mut prepared) {
             return startup_failed(r, &e);
         }
         let mut workers = Vec::with_capacity(group.ranks.len().saturating_sub(1));

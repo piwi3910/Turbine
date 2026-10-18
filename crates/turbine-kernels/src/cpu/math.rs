@@ -55,6 +55,9 @@ pub(crate) struct AttnShape {
     pub hkv: usize,
     pub d: usize,
     pub causal: bool,
+    /// Sliding window (Phase 7 S-8): with `causal`, query position `p` sees keys
+    /// `p − w ..= p` only. `None` (and every non-causal shape) = no window.
+    pub window: Option<usize>,
 }
 
 /// GQA attention in the CK FMHA order (also PyTorch's CPU flash attention): scores and their
@@ -71,18 +74,41 @@ pub(crate) fn attention(
     scale: f32,
     round_p: impl Fn(f32) -> f32,
 ) -> Vec<f32> {
+    attention_sinks(q, k, v, s, scale, None, round_p)
+}
+
+/// [`attention`] with learned sink logits (Phase 7 S-8, gpt-oss): `sinks[h]` (`[hq]`, in the
+/// scaled score domain) joins each row of head `h` as one more logit of the softmax — it
+/// starts the row max and adds `exp(sink − max)` to the f32 sum (CK FMHA's order: the sink is
+/// the running max and a sum of 1 before the first key) — but has no value, so it only scales
+/// the output down. `None` is exactly [`attention`].
+pub(crate) fn attention_sinks(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    s: &AttnShape,
+    scale: f32,
+    sinks: Option<&[f32]>,
+    round_p: impl Fn(f32) -> f32,
+) -> Vec<f32> {
     let group = s.hq / s.hkv;
     let kv_len = s.q_start + s.q_len;
     let mut out = vec![0f32; s.q_len * s.hq * s.d];
     let mut scores = vec![0f32; kv_len];
     for i in 0..s.q_len {
         let visible = if s.causal { s.q_start + i + 1 } else { kv_len };
+        let first = match s.window {
+            Some(w) if s.causal => (s.q_start + i).saturating_sub(w),
+            _ => 0,
+        };
         for h in 0..s.hq {
             let kvh = h / group;
             let row = (i * s.hq + h) * s.d;
             let qv = &q[row..row + s.d];
-            let mut max = f32::NEG_INFINITY;
-            for (j, score) in scores[..visible].iter_mut().enumerate() {
+            let sink = sinks.map(|x| x[h]);
+            let mut max = sink.unwrap_or(f32::NEG_INFINITY);
+            for (j, score) in scores[first..visible].iter_mut().enumerate() {
+                let j = first + j;
                 let kr = (j * s.hkv + kvh) * s.d;
                 let mut dot = 0f32;
                 for (x, y) in qv.iter().zip(&k[kr..kr + s.d]) {
@@ -91,13 +117,14 @@ pub(crate) fn attention(
                 *score = dot * scale;
                 max = max.max(*score);
             }
-            let mut sum = 0f32;
-            for score in &mut scores[..visible] {
+            let mut sum = sink.map_or(0f32, |x| (x - max).exp());
+            for score in &mut scores[first..visible] {
                 *score = (*score - max).exp();
                 sum += *score;
             }
             let o = &mut out[row..row + s.d];
-            for (j, score) in scores[..visible].iter().enumerate() {
+            for (j, score) in scores[first..visible].iter().enumerate() {
+                let j = first + j;
                 let p = round_p(*score);
                 let vr = (j * s.hkv + kvh) * s.d;
                 for (acc, x) in o.iter_mut().zip(&v[vr..vr + s.d]) {
@@ -203,6 +230,11 @@ pub(crate) fn rope(
 /// `silu(g) = g · σ(g)`, in f32.
 pub(crate) fn silu(g: f32) -> f32 {
     g / (1.0 + (-g).exp())
+}
+
+/// `sigmoid(g) = 1 / (1 + e^{-g})`, in f32 (ABI v2.19 `sigmoid_mul`).
+pub(crate) fn sigmoid(g: f32) -> f32 {
+    1.0 / (1.0 + (-g).exp())
 }
 
 // Logits reduction (ABI v2.1 `logits_reduce`). These mirror the host sampler of
@@ -405,6 +437,7 @@ mod tests {
             hkv: 1,
             d: 1,
             causal: false,
+            window: None,
         };
         // Equal scores: the output is the mean of the values.
         let out = attention(&[0.0], &[1.0, 2.0], &[4.0, 8.0], &s, 1.0, |p| p);

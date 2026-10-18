@@ -3,8 +3,23 @@
 #
 #   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-novanas|collbench-sweep-novanas|
 #                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
-#                                       ep2-novanas|pp2-novanas>
+#                                       ep2-novanas|pp2-novanas|
+#                                       <qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas|
+#                                       <qwen3moe|mixtral|qwen36>-spread-novanas>
 #   scripts/lab-cluster.sh [--dry-run] --stop <run-id>
+#
+# Phase 7 family scenarios (plan Task 9, user decision 2026-10-08 B), <short>-<placement>-novanas:
+# Turbine legs only (the pod has no vLLM, and GPUs are per container; the vLLM-ROCm ratio comes
+# from scripts/lab-perf.sh --placement). Serves scripts/lab/phase7-novanas-<short>-<placement>.yaml
+# on the pod loopback; golden c1 and c16 with --multi-gpu-bounds against tests/golden/<slug>/
+# (the two-card MoE rows of S-13, decision 2026-10-08 A; falls back to the batched bounds while
+# tolerance.json carries no `_multi_gpu` keys yet); the
+# GSM8K set at concurrency 16 into $RUN_DIR/results/turbine-<placement>.json (copied back to
+# target/lab-cluster/<run id>/ before cleanup) and eval-compare against the committed
+# tests/eval/<slug>/vllm-<placement>.json with gate.json's max_drop (gsm8k=nobaseline when it is
+# not committed yet); the c16 bench after a 16-request warm-up. The Job's last line is
+# `lab-cluster: <scenario> PASS|FAIL golden1=… golden16=… gsm8k=<PASS|FAIL|nobaseline> tok_s=<t>`;
+# --dry-run prints these in-Job steps too (the other scenarios' dry runs do not).
 #
 # Scenarios (P5 S-9; everything runs inside the Job on loopback — no Service, no host port):
 #   collbench-novanas  turbine-collbench --backend rccl --devices 0,1 --op all --max-bytes 1GiB;
@@ -63,8 +78,8 @@
 #                      positions` report of p14, the standard throughput workload: 512-word
 #                      prompts, 256 tokens with --ignore-eos, concurrency 16, 200 requests,
 #                      after a 16-request warm-up); then ep 2 with tp 1 over rccl, ep 2 over
-#                      hostmem, and a check that ep 2 with tp 2 is refused (exit 2,
-#                      olmoe_ep_tp_drift). The accuracy gate of every EP run is the ep 1
+#                      hostmem, and ep 2 with tp 2 (golden c1 and c16 against the committed
+#                      reference with --multi-gpu-bounds). The accuracy gate of every EP run is the ep 1
 #                      capture of the same run: strict bounds at concurrency 1, batched at 16
 #                      (user decision "P5: OLMoE golden tolerance under expert parallelism");
 #                      the transformers reference is compared for information only (and p14's
@@ -109,7 +124,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas"
+SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas|<qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas|<qwen3moe|mixtral|qwen36>-spread-novanas"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -118,7 +133,47 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas)$ ]]
+	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas)$ ]] ||
+		family_scenario "$1" || family_spread_scenario "$1"
+}
+
+# family_scenario <scenario>: a Phase 7 two-card family scenario (<short>-<tp2|ep2>-novanas).
+family_scenario() {
+	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-(tp2|ep2)-novanas$ ]]
+}
+
+# family_spread_scenario <scenario>: a Phase 7 family's placement-spread calibration run
+# (<short>-spread-novanas), the Task 13 pattern: per-placement greedy captures for
+# scripts/golden/engine_spread.py (multi-GPU captures named mg-*).
+family_spread_scenario() {
+	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-spread-novanas$ ]]
+}
+
+# family_slug <short>: the checkpoint slug (weights, tests/golden/<slug>, tests/eval/<slug>).
+family_slug() {
+	case "$1" in
+	qwen3moe) echo qwen3-30b-a3b-instruct-2507-fp8 ;;
+	mixtral) echo mixtral-8x7b-instruct-v0.1-fp8 ;;
+	qwen36) echo qwen3.6-35b-a3b-fp8 ;;
+	esac
+}
+
+# family_prompts <slug>: the prompts file of a family's fixture — the slug's own prompts.jsonl
+# when it has one (a hybrid's thinking-off `chat_template_kwargs` live there, so the captures and
+# compares render the same prompt as the reference), else the shared tests/golden/prompts.jsonl.
+family_prompts() {
+	local own="tests/golden/$1/prompts.jsonl"
+	if [[ -f $own ]]; then echo "$own"; else echo tests/golden/prompts.jsonl; fi
+}
+
+# family_chat_kwargs <short>: the `--chat-template-kwargs` value of a family, empty when the
+# family needs none. The Qwen3.5/3.6 hybrids run thinking off (their golden references are
+# thinking-off), so their golden compare and GSM8K eval carry it.
+family_chat_kwargs() {
+	case "$1" in
+	qwen36) echo '{"enable_thinking":false}' ;;
+	*) echo "" ;;
+	esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -808,18 +863,14 @@ scenario_ep2() {
 	ep_counts ep2-hostmem
 	stop_servers
 
-	# OLMoE at ep 2 x tp 2 is refused (user decision 2026-09-28, olmoe_ep_tp_drift, until the
-	# phase 7 OLMoE tensor-parallel drift investigation): the server must exit 2 with the reason
-	# before binding.
-	local rc=0
-	timeout 600 "${BIN}/turbine-server" --config "$ep2" --set parallel.tensor_parallel_size=2 \
-		>"${WORK}/ep2-tp2.log" 2>&1 || rc=$?
-	if [[ $rc -eq 2 ]] && grep -q "olmoe_ep_tp_drift" "${WORK}/ep2-tp2.log"; then
-		echo "lab-step: olmoe ep2 tp2 refused: exit 2, olmoe_ep_tp_drift"
-	else
-		tail -n 20 "${WORK}/ep2-tp2.log"
-		GATE_FAILED+=("olmoe ep2 tp2 not refused (exit ${rc})")
-	fi
+	# OLMoE at ep 2 x tp 2 (the Phase 7 Task 13 gate, decision 2026-10-08 A): golden c1 and c16
+	# against the committed reference with the multi-GPU bounds calibrated from the placement
+	# spread (`_multi_gpu` keys of tolerance.json, scripts/golden/engine_spread.py --multi-gpu).
+	start_server "${WORK}/ep2-tp2.log" "$ep2" --set parallel.tensor_parallel_size=2
+	wait_ready "$URL" "${WORK}/ep2-tp2.log"
+	golden_gate "$slug" "olmoe ep2 tp2 c1 vs HF" --multi-gpu-bounds
+	golden_gate "$slug" "olmoe ep2 tp2 c16 vs HF" --multi-gpu-bounds --concurrency 16
+	stop_servers
 
 	local f
 	for f in ep1-c16 ep2-c16 ep2-hostmem-c16; do
@@ -829,6 +880,77 @@ scenario_ep2() {
 	if [[ ${#GATE_FAILED[@]} -gt 0 ]]; then
 		job_fail "outside tolerance: ${GATE_FAILED[*]}"
 	fi
+}
+
+# olmoe_capture_set <dir> <prefix> <rotated-dir> <prompts> [chat-kwargs...]: the greedy captures
+# of one placement: c1 as <prefix>c1 and 16 prompt-rotated captures at once as <prefix>c16-NN
+# (batched, like the par-* captures of scripts/lab/golden-engine-spread.sh). `prompts` is the
+# fixture prompts file (a hybrid's own, thinking off) and any further args are forwarded to
+# `turbine-golden capture`.
+olmoe_capture_set() {
+	local dir="$1" prefix="$2" rot="$3" prompts="$4"
+	shift 4
+	local i pids=()
+	echo "lab-step: turbine-golden capture ${prefix}c1"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" --out "${dir}/${prefix}c1.jsonl" "$@" || job_fail "turbine-golden capture ${prefix}c1 failed"
+	for i in $(seq 0 15); do
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" --out "${dir}/$(printf '%sc16-%02d' "$prefix" "$i").jsonl" "$@" &
+		pids+=($!)
+	done
+	# Not a bare wait: the server is a child of this shell too.
+	for i in "${pids[@]}"; do
+		wait "$i" || job_fail "a ${prefix}c16 capture failed"
+	done
+}
+
+# olmoe_spread (Phase 7 Task 13, decision 2026-10-08 A): captures of OLMoE's greedy outputs per
+# placement into results/spread/<slug>/ (copied back to target/lab-cluster/<run id>/): one GPU
+# as c1-cold, c1-warm and par-NN, then tp 2, ep 2 and ep 2 x tp 2 as mg-<placement>-c1 and
+# mg-<placement>-c16-NN. scripts/golden/engine_spread.py derives the `_multi_gpu` bounds from them.
+scenario_olmoe_spread() {
+	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
+	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
+	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i k placement
+	mkdir -p "$dir" "$rot" || job_fail "cannot create ${dir}"
+	chmod -R a+rwx "${results}" || true
+	n=$(grep -c . tests/golden/prompts.jsonl)
+	for i in $(seq 0 15); do
+		k=$((i % n))
+		{
+			tail -n +$((k + 1)) tests/golden/prompts.jsonl
+			head -n $k tests/golden/prompts.jsonl
+		} | grep . >"${rot}/${i}.jsonl"
+	done
+	start_server "${WORK}/spread-1gpu.log" "$ep2" --set parallel.expert_parallel_size=1 \
+		--set "parallel.devices=[0]"
+	wait_ready "$URL" "${WORK}/spread-1gpu.log"
+	echo "lab-step: turbine-golden capture c1-cold"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${dir}/c1-cold.jsonl" || job_fail "turbine-golden capture c1-cold failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts tests/golden/prompts.jsonl \
+		--out "${dir}/c1-warm.jsonl" || job_fail "turbine-golden capture c1-warm failed"
+	local pids=()
+	for i in $(seq 0 15); do
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" \
+			--out "${dir}/$(printf 'par-%02d' "$i").jsonl" &
+		pids+=($!)
+	done
+	for i in "${pids[@]}"; do
+		wait "$i" || job_fail "a par capture failed"
+	done
+	stop_servers
+	for placement in tp2 ep2 ep2tp2; do
+		case "$placement" in
+		tp2) set -- --set parallel.expert_parallel_size=1 --set parallel.tensor_parallel_size=2 ;;
+		ep2) set -- ;;
+		ep2tp2) set -- --set parallel.tensor_parallel_size=2 ;;
+		esac
+		start_server "${WORK}/spread-${placement}.log" "$ep2" "$@"
+		wait_ready "$URL" "${WORK}/spread-${placement}.log"
+		olmoe_capture_set "$dir" "mg-${placement}-" "$rot" tests/golden/prompts.jsonl
+		stop_servers
+	done
+	echo "lab-info: spread captures $(find "$dir" -name '*.jsonl' | wc -l) in ${dir}"
 }
 
 # pp_parallel <label>: the running server's parallel plan (backend, pp, stages, reasons) and
@@ -915,6 +1037,138 @@ scenario_pp2() {
 	fi
 }
 
+# Phase 7 family scenarios (plan Task 9, decision 2026-10-08 B). FAMILY_DRY=1 (the workstation's
+# --dry-run) prints each step as `+ <command>` instead of running it.
+FAMILY_DRY=0
+
+# fam_run <out file|-> <command>...: runs a family step (stdout into <out file> unless -), or
+# prints it under FAMILY_DRY; returns the command's status.
+fam_run() {
+	local out="$1"
+	shift
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		if [[ $out == - ]]; then echo "+ $*"; else echo "+ $* > ${out}"; fi
+		return 0
+	fi
+	echo "lab-step: $*"
+	if [[ $out == - ]]; then "$@"; else "$@" >"$out"; fi
+}
+
+# scenario_family <short> <tp2|ep2>: the Turbine legs of a family's two-card gate (S-13).
+scenario_family() {
+	local short="$1" placement="$2" slug c
+	slug="$(family_slug "$short")"
+	local config="scripts/lab/phase7-novanas-${short}-${placement}.yaml"
+	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
+	local eval_json="${results}/turbine-${placement}.json"
+	local baseline="tests/eval/${slug}/vllm-${placement}.json"
+	local golden1=PASS golden16=PASS gsm8k=nobaseline tok_s=none verdict=PASS
+	local kw_json; kw_json="$(family_chat_kwargs "$short")"
+	local kw=(); [[ -n $kw_json ]] && kw=(--chat-template-kwargs "$kw_json")
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		echo "+ ${BIN}/turbine-server --config ${config} (background; until ${URL}/ready answers 200)"
+	else
+		start_server "${WORK}/${short}-${placement}.log" "$config"
+		wait_ready "$URL" "${WORK}/${short}-${placement}.log"
+	fi
+	for c in 1 16; do
+		if ! fam_run - "${BIN}/turbine-golden" compare --url "$URL" \
+			--reference "tests/golden/${slug}/reference.jsonl" --concurrency "$c" --multi-gpu-bounds \
+			"${kw[@]}"; then
+			if [[ $c == 1 ]]; then golden1=FAIL; else golden16=FAIL; fi
+			verdict=FAIL
+		fi
+	done
+	fam_run - mkdir -p "$results" || job_fail "cannot create ${results}"
+	# The pod runs as root: a world-writable directory lets the host's user remove its files
+	# (cleanup's rm -rf of the run directory).
+	fam_run - chmod a+rwx "$results" || true
+	fam_run "$eval_json" "${BIN}/turbine-golden" eval --url "$URL" --tasks tests/eval/gsm8k-200.jsonl \
+		--concurrency 16 --output json "${kw[@]}" || job_fail "turbine-golden eval failed"
+	local drop="<gate.json max_drop>"
+	if [[ $FAMILY_DRY -eq 0 ]]; then
+		drop="$(jq -r '.max_drop // 0.01' "tests/eval/${slug}/gate.json" 2>/dev/null || echo 0.01)"
+	fi
+	if [[ $FAMILY_DRY -eq 1 || -f $baseline ]]; then
+		if fam_run - "${BIN}/turbine-golden" eval-compare --baseline "$baseline" \
+			--candidate "$eval_json" --max-drop "$drop"; then
+			gsm8k=PASS
+		else
+			gsm8k=FAIL
+			verdict=FAIL
+		fi
+	else
+		echo "lab-info: ${baseline} is not committed: no GSM8K verdict (lab-perf.sh --placement ${placement} --eval writes it)"
+	fi
+	local bench=("${BIN}/turbine-bench" --url "$URL" "${STANDARD_BENCH[@]}" --concurrency 16)
+	if [[ $FAMILY_DRY -eq 1 ]]; then
+		fam_run "${WORK}/c16-warmup.json" "${bench[@]}" --requests 16 --output json
+		fam_run "${WORK}/c16-bench.json" "${bench[@]}" --requests 200 --output json
+		echo "lab-cluster: dry run: in-Job steps of ${SCENARIO} (above); the Job ends with"
+		echo "lab-cluster: dry run:   lab-cluster: ${SCENARIO} PASS|FAIL golden1=<PASS|FAIL> golden16=<PASS|FAIL> gsm8k=<PASS|FAIL|nobaseline> tok_s=<t>"
+		return 0
+	fi
+	bench_ok 16 "${WORK}/c16-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 16
+	bench_ok 200 "${WORK}/c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 --requests 200
+	tok_s="$(jq -r '.output_token_throughput * 10 | round / 10' "${WORK}/c16-bench.json")"
+	cp "${WORK}/c16-bench.json" "${results}/turbine-${placement}-c16-bench.json" || true
+	stop_servers
+	echo "lab-cluster: ${SCENARIO} ${verdict} golden1=${golden1} golden16=${golden16} gsm8k=${gsm8k} tok_s=${tok_s}"
+	[[ $verdict == PASS ]] || exit 1
+	exit 0
+}
+
+# scenario_family_spread (Phase 7 Task 18, the Task 13 pattern): per-placement greedy captures of
+# a family that does not fit one GPU for scripts/golden/engine_spread.py: the reference capture
+# (c1-cold, c1-warm, par-00..15) at tp2 — a family that does not fit one GPU uses tp2 as the
+# reference capture — then mg-ep2-c1 and mg-ep2-c16-00..15 at ep2, into results/spread/<slug>/
+# (copied back to target/lab-cluster/<run id>/).
+scenario_family_spread() {
+	local short="$1"
+	local slug c
+	slug="$(family_slug "$short")"
+	local tp2="scripts/lab/phase7-novanas-${short}-tp2.yaml" ep2="scripts/lab/phase7-novanas-${short}-ep2.yaml"
+	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
+	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i
+	local prompts; prompts="$(family_prompts "$slug")"
+	local kw_json; kw_json="$(family_chat_kwargs "$short")"
+	local kw=(); [[ -n $kw_json ]] && kw=(--chat-template-kwargs "$kw_json")
+	mkdir -p "$dir" "$rot" || job_fail "cannot create ${dir}"
+	chmod -R a+rwx "${results}" || true
+	n=$(grep -c . "$prompts")
+	for i in $(seq 0 15); do
+		k=$((i % n))
+		{
+			tail -n +$((k + 1)) "$prompts"
+			head -n $k "$prompts"
+		} | grep . >"${rot}/${i}.jsonl"
+	done
+	start_server "${WORK}/spread-tp2.log" "$tp2"
+	wait_ready "$URL" "${WORK}/spread-tp2.log"
+	# The reference capture set of the baseline placement (as scenario_olmoe_spread's one-GPU set):
+	# c1-cold, c1-warm, then the 16 rotated captures at once as par-NN.
+	echo "lab-step: turbine-golden capture c1-cold"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" \
+		--out "${dir}/c1-cold.jsonl" "${kw[@]}" || job_fail "turbine-golden capture c1-cold failed"
+	"${BIN}/turbine-golden" capture --url "$URL" --prompts "$prompts" \
+		--out "${dir}/c1-warm.jsonl" "${kw[@]}" || job_fail "turbine-golden capture c1-warm failed"
+	local pids=()
+	for i in $(seq 0 15); do
+		"${BIN}/turbine-golden" capture --url "$URL" --prompts "${rot}/${i}.jsonl" \
+			--out "${dir}/$(printf 'par-%02d' "$i").jsonl" "${kw[@]}" &
+		pids+=($!)
+	done
+	for i in "${pids[@]}"; do
+		wait "$i" || job_fail "a par capture failed"
+	done
+	stop_servers
+	start_server "${WORK}/spread-ep2.log" "$ep2"
+	wait_ready "$URL" "${WORK}/spread-ep2.log"
+	olmoe_capture_set "$dir" "mg-ep2-" "$rot" "$prompts" "${kw[@]}"
+	stop_servers
+	echo "lab-info: spread captures $(find "$dir" -name '*.jsonl' | wc -l) in ${dir}"
+}
+
 in_job() {
 	SCENARIO="$1"
 	valid_scenario "$SCENARIO" || usage
@@ -931,6 +1185,9 @@ in_job() {
 	dp2-novanas) scenario_dp2 ;;
 	ep2-novanas) scenario_ep2 ;;
 	pp2-novanas) scenario_pp2 ;;
+	olmoe-spread-novanas) scenario_olmoe_spread ;;
+	*-spread-novanas) scenario_family_spread "${SCENARIO%%-*}" ;;
+	*) scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")" ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
 }
@@ -1238,6 +1495,16 @@ run_scenario() {
 	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
+	if family_scenario "$SCENARIO" || family_spread_scenario "$SCENARIO" || [[ $SCENARIO == olmoe-spread-novanas ]]; then
+		# A dry run cannot stream the pod log: print the in-Job steps of the family scenario.
+		[[ $DRY_RUN -eq 0 ]] || ! family_scenario "$SCENARIO" || family_dry_steps
+		# The GSM8K report (and the bench) outlive the run directory: copy them back first.
+		local results="${REPO_ROOT}/target/lab-cluster/${RUN_ID}/"
+		say "copying ${RUN_DIR}/results/ to ${results}"
+		run mkdir -p "$results"
+		run rsync -rlpcz -e "ssh ${SSH_OPTS[*]}" "${REMOTE}:${RUN_DIR}/results/" "$results" ||
+			echo "lab-cluster: novanas: no results copied from ${RUN_DIR}/results/" >&2
+	fi
 	say "deleting the jobs of run ${RUN_ID}"
 	cleanup
 	[[ $DRY_RUN -eq 1 ]] && say "dry run: nothing contacted"
@@ -1246,6 +1513,21 @@ run_scenario() {
 	else
 		fail "job ${JOB} failed (see the log above)"
 	fi
+}
+
+# family_dry_steps: the in-Job commands of the family scenario, printed by scenario_family itself
+# (the Job's paths stand in as their variable names).
+family_dry_steps() {
+	(
+		FAMILY_DRY=1
+		# shellcheck disable=SC2016 # the Job's variable names, printed on purpose
+		BIN='$CARGO_TARGET_DIR/release'
+		# shellcheck disable=SC2016
+		WORK='$WORK'
+		TURBINE_LAB_ROOT="$CI_ROOT"
+		TURBINE_LAB_RUN_ID="$RUN_ID"
+		scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")"
+	)
 }
 
 stop_run() {

@@ -110,6 +110,11 @@ pub struct BenchArgs {
     /// Adds "ignore_eos": true (vLLM / SGLang fixed-length outputs).
     #[arg(long)]
     pub ignore_eos: bool,
+    /// Sent as the Chat request's top-level `reasoning_effort` (`low`, `medium` or `high`). A
+    /// reasoning model (gpt-oss Harmony) without it reasons past `--max-tokens` and a
+    /// content-only client sees an empty stream; `low` keeps it reaching the final channel.
+    #[arg(long, value_parser = parse_reasoning_effort)]
+    pub reasoning_effort: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub output: OutputFormat,
     /// Run for this long (`<integer><ms|s|m|h>`, e.g. `10m`) instead of --requests.
@@ -188,6 +193,16 @@ pub fn parse_rate(s: &str) -> Result<f64, String> {
     Ok(r)
 }
 
+/// `low`, `medium` or `high` (the OpenAI `reasoning_effort` values).
+pub fn parse_reasoning_effort(s: &str) -> Result<String, String> {
+    match s {
+        "low" | "medium" | "high" => Ok(s.to_string()),
+        other => Err(format!(
+            "reasoning effort must be one of `low`, `medium`, `high`, got `{other}`"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +243,24 @@ mod tests {
         assert_eq!(a.rate, Some(5.0));
         assert_eq!(a.duration, Some(Duration::from_secs(2)));
         assert_eq!(a.max_tokens_range, Some(RangeArg { min: 1, max: 4 }));
+    }
+
+    #[test]
+    fn reasoning_effort_accepts_the_three_levels_only() {
+        assert_eq!(parse_reasoning_effort("low"), Ok("low".to_string()));
+        assert_eq!(parse_reasoning_effort("medium"), Ok("medium".to_string()));
+        assert_eq!(parse_reasoning_effort("high"), Ok("high".to_string()));
+        for bad in ["", "LOW", "extreme", "0"] {
+            assert!(parse_reasoning_effort(bad).is_err(), "{bad:?} accepted");
+        }
+        let a = BenchArgs::try_parse_from([
+            "turbine-bench",
+            "--url",
+            "http://127.0.0.1:1",
+            "--reasoning-effort",
+            "low",
+        ])
+        .expect("valid reasoning effort");
+        assert_eq!(a.reasoning_effort.as_deref(), Some("low"));
     }
 }

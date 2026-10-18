@@ -563,6 +563,7 @@ fn module_names_are_open() {
 fn task1_modules() -> ModuleNames<'static> {
     ModuleNames {
         tool_formats: &["llama3_json"],
+        reasoning_parsers: &["qwen_think"],
         backends: &["cpu", "hip"],
         card_profiles: &["gfx1201"],
         scheduling_policies: &["default"],
@@ -572,6 +573,26 @@ fn task1_modules() -> ModuleNames<'static> {
         router_policies: &["prefix_affinity", "least_loaded"],
         kv_formats: &["l0", "fp8_e4m3", "tq4", "tq2"],
     }
+}
+
+/// Phase 7 S-10: `model.reasoning_parser` defaults to `auto`; `auto`, `none` and a registered
+/// parser pass `validate_modules`, any other name is refused naming the key. Breaks if the
+/// default changes or an unregistered parser reaches the server.
+#[test]
+fn reasoning_parser_key() {
+    let base = "model:\n  path: /m\n";
+    let known = task1_modules();
+    let c = parse(base, &[]).unwrap();
+    assert_eq!(c.model.reasoning_parser.as_str(), "auto");
+    assert!(c.validate_modules(&known).is_ok());
+    for ok in ["none", "qwen_think"] {
+        let c = parse(base, &[&format!("model.reasoning_parser={ok}")]).unwrap();
+        assert!(c.validate_modules(&known).is_ok(), "{ok}");
+    }
+    let c = parse(base, &["model.reasoning_parser=nope"]).unwrap();
+    let err = c.validate_modules(&known).unwrap_err();
+    assert_eq!(err.key(), Some("model.reasoning_parser"), "{err}");
+    assert!(err.to_string().contains("is not registered"), "{err}");
 }
 
 #[test]
@@ -929,6 +950,33 @@ fn kv_config_validation() {
     let err = small_slab.validate_block_bytes(block).unwrap_err();
     assert_eq!(err.key(), Some("kv.nvme.slab_bytes"));
     assert_eq!(KV_IO_ALIGN, 4096);
+}
+
+/// `kv.hybrid_snapshot_interval_blocks` (P7 S-12, Task 32) defaults to 8, takes any value ≥ 1,
+/// and `0` exits 2 naming the key. Breaks if the default moves or the key is not validated.
+#[test]
+fn hybrid_snapshot_interval() {
+    let base = "model:\n  path: /m\n";
+    assert_eq!(
+        parse(base, &[])
+            .expect("defaults")
+            .kv
+            .hybrid_snapshot_interval_blocks,
+        8
+    );
+    for n in [1u32, 2, 16] {
+        let cfg = parse(
+            &format!("{base}kv:\n  hybrid_snapshot_interval_blocks: {n}\n"),
+            &[],
+        )
+        .expect("in range");
+        assert_eq!(cfg.kv.hybrid_snapshot_interval_blocks, n);
+    }
+    assert_rejected(
+        &format!("{base}kv:\n  hybrid_snapshot_interval_blocks: 0\n"),
+        &[],
+        "kv.hybrid_snapshot_interval_blocks",
+    );
 }
 
 #[test]

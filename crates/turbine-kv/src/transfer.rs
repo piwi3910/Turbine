@@ -12,6 +12,7 @@ use turbine_core::types::RequestId;
 
 use crate::identity::KvKey;
 use crate::planner::PathCost;
+use crate::state::SnapshotStore;
 use crate::tier::{KvTier, TierBlockMut, TierBlockRef, TierError, TierId, TierSlot};
 
 /// One local copy direction; label of `turbine_kv_transfer_*{path}` (CONFLICT C-9: local tier
@@ -131,29 +132,47 @@ impl TransferPurpose {
 
 /// The formats at both ends of a copy (P6b S-1): the source copy is decoded from `from` and the
 /// destination copy encoded in `to`, both `kv_format` codec names (`l0` for an L0 block, whose
-/// pages hold the L0 format). `from_bytes` / `to_bytes` are the two copies' sizes.
+/// pages hold the L0 format). `from_bytes` / `to_bytes` are the two copies' KV sizes.
+///
+/// `snapshot_bytes` is the exact hybrid-state snapshot tail appended to both ends (P7 S-12,
+/// Task 33): 0 for a block without a snapshot. A tier slot holds `[kv in the tier format][snapshot
+/// exact]`, so the record the tier stores is `bytes + snapshot_bytes`. The tail is identical at
+/// both ends — state is never transcoded, only the KV part is (decision "P7 Task 33 snapshot
+/// transfer", (a)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferCodec {
     pub from: &'static str,
     pub from_bytes: u64,
     pub to: &'static str,
     pub to_bytes: u64,
+    pub snapshot_bytes: u64,
 }
 
 impl TransferCodec {
-    /// A copy at the L0 format on both ends, `bytes` each.
+    /// A copy at the L0 format on both ends, `bytes` each, no snapshot tail.
     pub fn l0(bytes: u64) -> Self {
         TransferCodec {
             from: crate::tier::L0_FORMAT,
             from_bytes: bytes,
             to: crate::tier::L0_FORMAT,
             to_bytes: bytes,
+            snapshot_bytes: 0,
         }
     }
 
     /// The bytes move unchanged (no decode, no encode).
     pub fn is_identity(&self) -> bool {
         self.from == self.to
+    }
+
+    /// Bytes of the source record a tier stores (`from_bytes` plus the snapshot tail).
+    pub fn from_record_bytes(&self) -> u64 {
+        self.from_bytes + self.snapshot_bytes
+    }
+
+    /// Bytes of the destination record a tier stores (`to_bytes` plus the snapshot tail).
+    pub fn to_record_bytes(&self) -> u64 {
+        self.to_bytes + self.snapshot_bytes
     }
 }
 
@@ -172,6 +191,10 @@ pub struct TransferRequest {
     pub dst_slot: u64,
     /// Formats of the source and destination copies (P6b S-1).
     pub codec: TransferCodec,
+    /// P7 S-12 (Task 33): the L0 snapshot entry the copy reads from (a demotion of an L0 block
+    /// that carries a snapshot) or writes to (a promotion into a fresh L0 entry). `None` for an
+    /// attention-only block and for an L1 ↔ L2 copy, whose record already carries the tail.
+    pub snapshot: Option<crate::state::SnapshotRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -664,6 +687,9 @@ pub struct SimTransferBackend {
     /// False when built with `block_bytes` 0: the tiers are payload-free and copies move no
     /// bytes (a payload-free `MemTier` accounts the logical size `put_as` names).
     payload: bool,
+    /// P7 S-12 (Task 33): the L0 snapshot entries a hybrid block's tail is read from and written
+    /// to; `None` for an attention-only model.
+    snapshot: Option<Arc<dyn SnapshotStore>>,
     /// Per ticket: when the copy completes and how long it takes.
     due: HashMap<u64, (Duration, Duration)>,
     /// Durations of copies `poll` just completed, until `took` reads them.
@@ -685,10 +711,16 @@ impl SimTransferBackend {
             l2,
             scratch: Vec::with_capacity(block_bytes),
             payload: block_bytes > 0,
+            snapshot: None,
             due: HashMap::new(),
             took: HashMap::new(),
             fail_next: 0,
         }
+    }
+
+    /// Gives the simulator the L0 snapshot store a hybrid block's tail travels through.
+    pub fn set_snapshot_store(&mut self, store: Arc<dyn SnapshotStore>) {
+        self.snapshot = Some(store);
     }
 
     pub fn set_cost(&mut self, p: TransferPath, c: PathCost) {
@@ -708,9 +740,12 @@ impl SimTransferBackend {
         }
     }
 
-    /// Reads the source copy (`codec.from_bytes`) and stores the destination copy
-    /// (`codec.to_bytes`, labelled `codec.to`). The simulator does not transcode: when the
-    /// sizes differ, the destination holds the source bytes cut or zero-padded to its size.
+    /// Reads the source copy and stores the destination copy. A hybrid block's record is
+    /// `[kv in the copy's format][snapshot exact]` (P7 S-12, Task 33): the KV part comes from the
+    /// source tier, or is zero for an L0 source (L0 holds no bytes in the simulator), and the
+    /// snapshot tail comes from the L0 snapshot store on a demotion, or travels inside the record
+    /// between two tiers. The simulator does not transcode: when the KV sizes differ, the
+    /// destination holds the source KV bytes cut or zero-padded to its size.
     fn move_block(&self, req: &TransferRequest, buf: &mut Vec<u8>) -> Result<TierSlot, TierError> {
         let src = self.tier(req.path.from());
         // A ladder rewrite stores the re-encoded copy back in its own tier.
@@ -720,28 +755,64 @@ impl SimTransferBackend {
             self.tier(req.path.to())
         };
         if src.is_none() && dst.is_none() {
+            // An L0 → L0 rewrite: nothing moves through the simulator.
             return Ok(TierSlot(req.dst_slot));
         }
         let c = req.codec;
-        let (from_len, to_len) = if self.payload {
-            (c.from_bytes as usize, c.to_bytes as usize)
+        let (from_len, to_len, snap) = if self.payload {
+            (
+                c.from_bytes as usize,
+                c.to_bytes as usize,
+                c.snapshot_bytes as usize,
+            )
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
+        let src_rec = from_len + snap;
+        let dst_rec = to_len + snap;
         buf.clear();
-        buf.resize(from_len.max(to_len), 0);
-        if let Some(src) = src {
-            src.get(&req.key, TierBlockMut::Host(&mut buf[..from_len]))?;
-            buf[from_len..].fill(0);
+        buf.resize(src_rec.max(dst_rec), 0);
+        match src {
+            Some(src) => {
+                // The tier record already carries the tail.
+                src.get(&req.key, TierBlockMut::Host(&mut buf[..src_rec]))?;
+            }
+            None => {
+                // L0 source: the KV part is zero; the snapshot tail comes from the store.
+                if snap > 0
+                    && let (Some(store), Some(r)) = (self.snapshot.as_ref(), req.snapshot)
+                {
+                    store.read(r.entry, &mut buf[from_len..src_rec])?;
+                }
+            }
+        }
+        // The KV part is re-sized (a lossy codec's is smaller): move the tail to the destination
+        // record's offset so it stays right after the KV bytes. An L0 destination only needs the
+        // tail at its source offset (the KV part goes to the page).
+        if dst.is_some() && from_len != to_len && snap > 0 {
+            buf.copy_within(from_len..src_rec, to_len);
         }
         match dst {
-            Some(dst) => dst.put_as(
-                req.key,
-                c.to,
-                c.to_bytes,
-                TierBlockRef::Host(&buf[..to_len]),
-            ),
-            None => Ok(TierSlot(req.dst_slot)),
+            Some(dst) => {
+                // Payload-free tiers store no bytes: they account the logical record size
+                // (`to_bytes` plus the tail), not the empty slice the simulator moves.
+                let logical = if self.payload {
+                    dst_rec as u64
+                } else {
+                    c.to_record_bytes()
+                };
+                dst.put_as(req.key, c.to, logical, TierBlockRef::Host(&buf[..dst_rec]))
+            }
+            None => {
+                // L0 destination: the KV part is written to the L0 page by the caller; the tail
+                // goes into the fresh snapshot entry.
+                if snap > 0
+                    && let (Some(store), Some(r)) = (self.snapshot.as_ref(), req.snapshot)
+                {
+                    store.write(r.entry, &buf[from_len..src_rec])?;
+                }
+                Ok(TierSlot(req.dst_slot))
+            }
         }
     }
 }
@@ -822,6 +893,7 @@ mod tests {
             dst_slot: u64::from(key),
             // `bytes` only paces the copy; the tiers of these tests hold 4 KiB blocks.
             codec: TransferCodec::l0(4096),
+            snapshot: None,
         }
     }
 
@@ -901,6 +973,7 @@ mod tests {
                 from_bytes: encoded,
                 to: crate::tier::L0_FORMAT,
                 to_bytes: 4 * encoded,
+                snapshot_bytes: 0,
             };
             engine.submit(req).unwrap();
             engine.pump(&mut backend);
@@ -1052,6 +1125,8 @@ mod tests {
             lossy_penalty: &[],
             allow_lossy: true,
             partial_tokens: 0,
+            hybrid: false,
+            snapshots: &[],
         });
         assert_eq!(
             (plan.cutoff_blocks(), plan.reason),
@@ -1367,6 +1442,8 @@ mod tests {
             lossy_penalty: &[],
             allow_lossy: true,
             partial_tokens: 0,
+            hybrid: false,
+            snapshots: &[],
         });
         assert_eq!(plan.reason, PlanReason::RetrieveCheaper);
 

@@ -16,8 +16,23 @@ use crate::pool::BlockPool;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct KvDocument {
     pub tiers: Vec<KvTierDocument>,
+    /// P7 S-7: the KV headroom of every rank of the placement, in rank order (empty until the
+    /// engine sets it: a pool outside a running server has no ranks).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ranks: Vec<KvRankDocument>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub summary: Option<KvSummary>,
+}
+
+/// One rank's KV headroom (`ranks[]` of the document, P7 S-7): the bytes of its device budget
+/// left for the L0 pool after the model's weights, the executor workspace, the collective and
+/// runtime reserves and the emergency reserve, never more than the L0 pool the engine runs
+/// (every rank of a group holds a pool of the same block count, the tightest rank sizes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct KvRankDocument {
+    pub rank: u32,
+    pub device: u32,
+    pub headroom_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -41,6 +56,12 @@ pub struct KvTierDocument {
     /// full blocks).
     #[serde(skip_serializing_if = "is_zero")]
     pub partial_entries: u64,
+    /// P7 S-12 (Task 33): the bytes of the hybrid state snapshots the tier holds, stored in the
+    /// block's tier record next to its KV bytes. L0 counts the live snapshot entries (the entry
+    /// bytes of every block that carries a snapshot); L1/L2 count the snapshot tails of the
+    /// blocks stored there. Zero for an attention-only model (no [`TierState`] of its own).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub state_bytes: u64,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -141,7 +162,9 @@ impl KvDocument {
                 state: None,
                 formats: BTreeMap::new(),
                 partial_entries: 0,
+                state_bytes: 0,
             }],
+            ranks: Vec::new(),
             summary: None,
         }
     }

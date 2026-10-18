@@ -1,9 +1,12 @@
 //! The Mistral family (`mistral`, `MistralForCausalLM`; Phase 8 run-ahead, Phase 2m S-11): the
 //! Llama layer as is ([`PLAIN_ATTENTION`], [`SWIGLU`], Llama's weight slots). Its key:
 //! `sliding_window` must be null or at least `max_position_embeddings` (it then never limits
-//! attention); a real window is refused (an open Phase 8 decision). Tool calls default to
-//! `mistral`. CPU backend only: the support matrix refuses it on GPU vendors until its Phase 8
-//! track closes.
+//! attention); a real window is refused (no executor implements a sliding window). Tool calls
+//! default to `mistral`. Runs on every backend the Llama layer runs on, tensor parallel too
+//! (P7 S-6, [`Mistral::tp_decoder_spec`]); on `amd` its support row stays `experimental` until
+//! its Phase 7 gate closes. The checkpoint is the Hugging Face one: a `consolidated.safetensors`
+//! beside it (Mistral's native layout) is skipped, alone it is refused
+//! ([`crate::SafetensorsIndex::open`]).
 
 use std::sync::Arc;
 
@@ -84,6 +87,11 @@ impl ModelFamily for Mistral {
 
     fn workspace_bytes(&self, cfg: &ModelArchConfig, limits: ExecutorLimits) -> u64 {
         DecoderExecutor::workspace_bytes(cfg, &decoder_spec(), limits)
+    }
+
+    /// Tensor parallelism (P7 S-6): Llama's hooks on the rank's shard.
+    fn tp_decoder_spec(&self) -> Option<DecoderSpec> {
+        Some(decoder_spec())
     }
 
     fn default_tool_format(&self) -> Option<&'static str> {

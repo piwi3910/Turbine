@@ -110,6 +110,10 @@ pub struct KvBlock {
     pub tokens: Box<[u32]>,
     /// P6b S-3: exact, or computed over (or promoted from) a lossy block.
     pub lineage: Lineage,
+    /// P7 S-12 (Task 32): the per-sequence state a hybrid family snapshotted at this block's
+    /// boundary, when it carries one. A partial entry never carries one (`insert_partial`
+    /// clears it); an attention-only family's blocks never do.
+    pub snapshot: Option<crate::state::SnapshotRef>,
 }
 
 impl KvBlock {
@@ -139,6 +143,10 @@ pub struct MatchedBlock {
     /// `Some(codec)` when the block is served lossy: a copy in a lossy codec, or an entry of
     /// lossy lineage (P6b S-3). Never `Some` in a lookup that denied lossy reuse.
     pub lossy: Option<&'static str>,
+    /// P7 S-12 (Task 32): the per-sequence state snapshot the block carries, when it has one and
+    /// the model keeps hybrid state; `None` otherwise. The planner's cutoff restores the nearest
+    /// snapshot at or before it.
+    pub snapshot: Option<crate::state::SnapshotRef>,
 }
 
 /// A token-granular match beyond the matched full blocks (P5p S-4): the first `tokens` tokens
@@ -302,11 +310,14 @@ impl KvDirectory {
     /// its parent. Beyond [`PARTIAL_PER_PARENT`] entries under one parent, and when the
     /// directory is full, the least recently used partial entry is evicted first (its L0 slot
     /// is handed to the caller through [`KvDirectory::evicted_partials`]).
-    pub fn insert_partial(&mut self, block: KvBlock) -> Result<(), DirectoryError> {
+    pub fn insert_partial(&mut self, mut block: KvBlock) -> Result<(), DirectoryError> {
         debug_assert!(
             block.location(TierId::L0).is_some(),
             "a partial entry is L0-only"
         );
+        // A partial entry carries no snapshot (P7 S-12): state is restored only at full-block
+        // boundaries.
+        block.snapshot = None;
         let block_tokens = block.format.layout.block_tokens;
         let parent = block.parent;
         // Room: drop the LRU partial entry of this parent (any parent when the entry has no
@@ -414,6 +425,15 @@ impl KvDirectory {
         if let Some(b) = self.blocks.get_mut(key) {
             b.locations.retain(|l| l.tier != loc.tier);
             b.locations.push(loc);
+        }
+    }
+
+    /// Records (`Some`) or clears (`None`) the snapshot a hybrid block carries (P7 S-12). A
+    /// full block's `SnapshotRef` is compared on lookups and reused with it; a partial entry's
+    /// is always cleared by [`KvDirectory::insert_partial`].
+    pub fn set_snapshot(&mut self, key: &KvKey, snapshot: Option<crate::state::SnapshotRef>) {
+        if let Some(b) = self.blocks.get_mut(key) {
+            b.snapshot = snapshot;
         }
     }
 
@@ -551,6 +571,7 @@ impl KvDirectory {
                         tier: location.tier,
                         location,
                         lossy: served_lossy,
+                        snapshot: self.blocks.get(&k).and_then(|b| b.snapshot),
                     });
                 }
                 None => {
@@ -795,6 +816,7 @@ pub(crate) mod tests {
             tier: TierId::L0,
             slot,
             format: crate::tier::L0_FORMAT,
+            snapshot_bytes: 0,
         }
     }
 
@@ -828,6 +850,7 @@ pub(crate) mod tests {
             child_count: 0,
             tokens: tokens.into(),
             lineage: Lineage::Exact,
+            snapshot: None,
         }
     }
 
@@ -889,6 +912,7 @@ pub(crate) mod tests {
                 tier,
                 slot: i as u64,
                 format: crate::tier::L0_FORMAT,
+                snapshot_bytes: 0,
             };
             dir.insert(block(
                 keys[i],
@@ -1064,6 +1088,7 @@ pub(crate) mod tests {
                         tier: TierId::L1,
                         slot: i as u64,
                         format: crate::tier::L0_FORMAT,
+                        snapshot_bytes: 0,
                     }
                 } else {
                     l0(i as u64)

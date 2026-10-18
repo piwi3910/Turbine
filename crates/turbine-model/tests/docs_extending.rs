@@ -19,8 +19,8 @@ use turbine_core::support::{
     SupportKey, TIER_FORMAT_REFUSALS, WeightFormatColumn,
 };
 
-/// The thirteen extension points, one page each.
-const PAGES: [&str; 13] = [
+/// The fourteen extension points, one page each.
+const PAGES: [&str; 14] = [
     "model-family",
     "tool-format",
     "weight-format",
@@ -28,6 +28,7 @@ const PAGES: [&str; 13] = [
     "card-family",
     "backend",
     "logits-processor",
+    "reasoning-parser",
     "scheduling-policy",
     "eviction-policy",
     "kv-format",
