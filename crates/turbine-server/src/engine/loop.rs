@@ -2304,11 +2304,19 @@ impl EngineLoop {
                 let data = &mut logits.data[first * vocab..(first + k as usize + 1) * vocab];
                 let rows: Vec<&mut [f32]> = data.chunks_mut(vocab).collect();
                 let draft = self.jump_drafts.remove(&row.seq).unwrap_or_default();
-                let constrained = self
-                    .requests
-                    .get(&id)
-                    .is_some_and(|r| r.choices[choice].is_constrained());
-                self.sample_forced(id, choice, rows, &draft, !constrained, outcome);
+                let (constrained, greedy) = self.requests.get(&id).map_or((true, true), |r| {
+                    (
+                        r.choices[choice].is_constrained(),
+                        r.choices[choice].is_greedy(),
+                    )
+                });
+                if constrained {
+                    self.sample_forced(id, choice, rows, &draft, false, outcome);
+                } else if greedy {
+                    self.sample_forced(id, choice, rows, &draft, true, outcome);
+                } else {
+                    self.sample_speculative(id, choice, rows, &draft, outcome);
+                }
                 continue;
             }
             let forks = if choice == 0 && row.prefill {
@@ -2627,7 +2635,6 @@ impl EngineLoop {
                             && c.finish.is_none()
                             && !c.is_constrained()
                             && !c.is_seeded()
-                            && c.is_greedy()
                     })
                 })
             })
@@ -2896,6 +2903,115 @@ impl EngineLoop {
             self.rel.circuit_event(event);
             self.fail_requests(ids, iteration, code, &error.message);
         }
+    }
+
+    /// Phase 8 S-3: a sampled-choice speculative round. Each of the `k + 1` rows is
+    /// post-processed by the choice's own sampler without observing a token; proposal `j` is
+    /// accepted with probability `p(t)`, and on rejection the emitted token is drawn from
+    /// `p` without it. The accepted proposals and the fallback/next token go through the
+    /// ordinary `step_sampled` pipeline, so penalties, detokenisation, stops, tool calls and
+    /// logprobs see exactly the emitted stream. The scheduler rolls back the unemitted
+    /// proposals.
+    fn sample_speculative(
+        &mut self,
+        id: RequestId,
+        choice: usize,
+        rows: Vec<&mut [f32]>,
+        proposals: &[u32],
+        outcome: &mut IterationOutcome,
+    ) {
+        let k = proposals.len() as u32;
+        let Some(r) = self.requests.get_mut(&id) else {
+            return;
+        };
+        if r.done || r.choices[choice].finish.is_some() {
+            return;
+        }
+        let seq = r.choices[choice].seq;
+        let http_id = r.request.http_request_id.clone();
+        let mut steps = Vec::with_capacity(rows.len());
+        let mut accepted = 0u32;
+        let mut finished = None;
+        let mut constraint_error = None;
+        for (j, row) in rows.into_iter().enumerate() {
+            let sampled = {
+                let c = &mut r.choices[choice];
+                let processed = c.sampler_mut().row(row, None);
+                let token = if j < proposals.len() {
+                    let proposal = proposals[j];
+                    if f64::from(c.sampler_mut().next_uniform())
+                        < f64::from(processed.probability(proposal))
+                    {
+                        proposal
+                    } else {
+                        c.sampler_mut().draw_over(&processed.probs, Some(proposal))
+                    }
+                } else {
+                    c.sampler_mut().draw_over(&processed.probs, None)
+                };
+                SampledToken {
+                    token,
+                    logprob: processed.logprob_of(row, token),
+                    top_logprobs: processed.top_logprobs.clone(),
+                }
+            };
+            let accepted_here = j < proposals.len() && sampled.token == proposals[j];
+            let step = match r.step_sampled(
+                choice,
+                sampled,
+                self.max_seq_len,
+                Some(&self.metrics.model),
+            ) {
+                Ok(step) => step,
+                Err(e) => {
+                    constraint_error = Some(e.to_string());
+                    break;
+                }
+            };
+            let step_finish = step.finish;
+            steps.push(step);
+            if step_finish.is_some() {
+                finished = step_finish;
+                break;
+            }
+            if accepted_here {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+        if let Some(message) = constraint_error {
+            self.constraint_failed(id, &message, outcome);
+            return;
+        }
+        if let Some(reason) = finished {
+            tracing::debug!(
+                event = "speculative_finished",
+                request_id = %http_id,
+                choice,
+                accepted,
+                reason = reason.as_str(),
+                "the speculative round ended inside its span"
+            );
+        }
+        for step in steps {
+            self.deliver_choice(id, choice, seq, step, outcome);
+        }
+        let rolled_back = k.saturating_sub(accepted);
+        if rolled_back > 0 {
+            outcome.rolled_back.push((seq, rolled_back));
+            tracing::debug!(
+                event = "speculative_rollback",
+                request_id = %http_id,
+                choice,
+                accepted,
+                rolled_back,
+                "the target rejected the proposals' tail"
+            );
+        }
+        self.metrics
+            .server
+            .speculative_round(u64::from(accepted), u64::from(k));
     }
 
     /// Samples a verified jump-forward row group (P5p S-10): the choice's `k + 1` logits rows
@@ -3301,7 +3417,6 @@ impl EngineLoop {
             || c.generated.is_empty()
             || c.is_constrained()
             || c.is_seeded()
-            || !c.is_greedy()
         {
             return;
         }
@@ -5380,6 +5495,63 @@ mod tests {
                 ) > 0.0,
             "speculative turns are serial: {rendered}"
         );
+    }
+
+    /// Phase 8 S-3/S-6: a sampled request runs speculative rounds and keeps its output in the
+    /// vocabulary; a seeded request bypasses speculation and is bit-identical with and
+    /// without the draft.
+    #[test]
+    fn speculative_sampling_and_seeded_bypass() {
+        let (_dir, spec, tokenizer) = tiny();
+        let draft_dir = TempDir::new("turbine-engine-loop-sampling-draft");
+        let draft = write_tiny_llama(draft_dir.path(), 11);
+        let none = || Vec::<Box<dyn TokenMatcher>>::new();
+        let mut req = request(&[256, 72, 101, 108, 108, 111], 16);
+        req.sampling.temperature = 0.8;
+        req.sampling.top_p = 0.9;
+        req.sampling.top_k = 32;
+
+        let requests = [req.clone()];
+        let (sampled, reg) =
+            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &requests, &none, false);
+        assert_eq!(sampled[0][0].tokens.len(), 16);
+        let vocab = spec.config.shape().vocab;
+        assert!(
+            sampled[0][0].tokens.iter().all(|&t| t < vocab),
+            "every emitted token is in the vocabulary"
+        );
+        let rendered = reg.render().unwrap();
+        assert!(
+            metric(
+                &reg,
+                r#"turbine_speculative_rounds_total{outcome="accepted_all"}"#
+            ) > 0.0
+                || metric(
+                    &reg,
+                    r#"turbine_speculative_rounds_total{outcome="partial"}"#
+                ) > 0.0,
+            "a sampled speculative round ran: {rendered}"
+        );
+
+        // A seeded request must not speculate: its token stream is the un-drafted stream.
+        let mut seeded = req;
+        seeded.sampling.seed = Some(7);
+        let requests = [seeded];
+        let (serial, _) = run_submissions(&spec, &tokenizer, &requests, &none, false, false);
+        let (with_draft, reg) =
+            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &requests, &none, false);
+        assert_eq!(with_draft, serial, "seeded streams are identical");
+        let rendered = reg.render().unwrap();
+        for outcome in ["accepted_all", "partial", "none"] {
+            assert_eq!(
+                metric(
+                    &reg,
+                    &format!(r#"turbine_speculative_rounds_total{{outcome="{outcome}"}}"#)
+                ),
+                0.0,
+                "a seeded request never speculates: {rendered}"
+            );
+        }
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::bf16;
+use turbine_core::request::SamplingParams;
 use turbine_core::types::{BlockId, DType, DeviceId, KvLayout, SeqId};
 use turbine_distributed::collective::{Collective, HostCollective};
 use turbine_kernels::cards::{CardProfile, OpPreference};
@@ -42,6 +43,7 @@ use turbine_model::executor::{
 use turbine_model::families;
 use turbine_model::kv_scales::{self, KvCache, TqKv};
 use turbine_model::pp;
+use turbine_model::sampling::sampler::Sampler;
 use turbine_model::testing::TempDir;
 use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_quantized,
@@ -8126,4 +8128,49 @@ fn qwen3_5_moe_matches_reference() {
         "op mismatch against transformers:\n{}",
         failures.join("\n")
     );
+}
+
+/// Phase 8 S-3/S-11: the point-mass acceptance/fallback reproduces the target's
+/// post-processing distribution on the tiny model's own logits.
+#[test]
+fn speculative_sampling_exactness() {
+    let tmp = TempDir::new("turbine-p8-sampling-exactness");
+    let spec = write_tiny_llama(tmp.path(), 7);
+    let mem = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = executor(&spec, cpu_reference_provider(), mem);
+    let logits = forward(&mut exec, &[256, 72, 101, 108, 108, 111], 0);
+    let LogitsSlot::Full(row) = logits.slot(0) else {
+        panic!("the tiny model returns a full row");
+    };
+    let row = row.to_vec();
+    let params = SamplingParams {
+        temperature: 0.8,
+        top_p: 0.9,
+        top_k: 32,
+        seed: None,
+        ..SamplingParams::default()
+    };
+    let mut sampler = Sampler::new(&params, &[], &[]);
+    let mut probe = row.clone();
+    let processed = sampler.row(&mut probe, None);
+    let proposal = argmax(&row);
+    let rounds = 1_000_000u64;
+    let mut counts = vec![0u64; processed.probs.len()];
+    for _ in 0..rounds {
+        let accepted =
+            f64::from(sampler.next_uniform()) < f64::from(processed.probability(proposal));
+        let token = if accepted {
+            proposal
+        } else {
+            sampler.draw_over(&processed.probs, Some(proposal))
+        };
+        counts[token as usize] += 1;
+    }
+    let tv: f32 = counts
+        .iter()
+        .zip(&processed.probs)
+        .map(|(&count, &p)| ((count as f32 / rounds as f32) - p).abs())
+        .sum::<f32>()
+        / 2.0;
+    assert!(tv < 0.01, "total variation {tv}");
 }
