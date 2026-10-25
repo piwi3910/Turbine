@@ -297,8 +297,9 @@ pub(crate) struct EngineLoop {
     /// Requests whose tail copies ran in the iteration in flight (overlap scheduling): their
     /// source references go back when that iteration completes.
     tail_done: Vec<RequestId>,
-    /// Each planned sequence's last table block ([`EngineLoop::note_table_blocks`]).
-    last_table_block: HashMap<SeqId, BlockId>,
+    /// Each planned sequence's table blocks ([`EngineLoop::note_table_blocks`]): a finish
+    /// inside a speculative span picks the block of the kept end, not the planned tail.
+    last_table_blocks: HashMap<SeqId, SmallVec<[BlockId; 16]>>,
     /// The forced-token run each sequence's planned extension feeds (P5p S-10): snapshotted
     /// when the extension was asked for, so the batch and the verification see exactly what
     /// was requested even if the choice's matcher state moves on; removed when the run was
@@ -543,7 +544,7 @@ impl EngineLoop {
             held: HashMap::new(),
             kv_done: Vec::new(),
             tail_done: Vec::new(),
-            last_table_block: HashMap::new(),
+            last_table_blocks: HashMap::new(),
             jump_drafts: HashMap::new(),
             pending_publishes: Vec::new(),
             retire_later: Vec::new(),
@@ -1582,9 +1583,8 @@ impl EngineLoop {
     /// before every executed iteration; `forget` drops the entries.
     fn note_table_blocks(&mut self, plan: &IterationPlan) {
         for item in &plan.items {
-            if let Some(&b) = item.block_table.blocks.last() {
-                self.last_table_block.insert(item.seq, b);
-            }
+            self.last_table_blocks
+                .insert(item.seq, item.block_table.blocks.clone());
         }
     }
 
@@ -1604,15 +1604,20 @@ impl EngineLoop {
             let Some(item) = plan.items.iter().find(|i| i.seq == *seq) else {
                 continue;
             };
-            let end = item.block_table.tokens;
+            let Some(r) = self.requests.get(&id) else {
+                continue;
+            };
+            // Kept tokens only (S-4): a speculative span's table covers its proposals, but
+            // the host may have rolled them back; the kept end chooses the block.
+            let end = item
+                .block_table
+                .tokens
+                .min(r.prompt_len() + r.choices[0].generated.len() as u32);
             let Some(&block) = item
                 .block_table
                 .blocks
                 .get((end.div_ceil(bt).saturating_sub(1)) as usize)
             else {
-                continue;
-            };
-            let Some(r) = self.requests.get(&id) else {
                 continue;
             };
             let Some(tokens) = (0..end).map(|p| r.token_at(0, p)).collect() else {
@@ -1938,6 +1943,28 @@ impl EngineLoop {
     fn release_snapshots(&mut self) {
         for (block, _) in self.snapshot_pending.drain() {
             self.kv.snapshot_release(block);
+        }
+    }
+
+    /// Phase 8 S-4: a speculative span's block-boundary snapshots past the kept end describe
+    /// planned state that was rolled back; they are released, and the next non-speculative
+    /// step takes the snapshot at the next boundary.
+    fn drop_rejected_snapshots(&mut self, seq: SeqId, kept_end: u32) {
+        let bt = self.pool.layout().block_tokens.max(1);
+        let keep = kept_end.div_ceil(bt);
+        let Some(blocks) = self.last_table_blocks.get(&seq) else {
+            return;
+        };
+        let rejected: Vec<BlockId> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index as u32 >= keep)
+            .map(|(_, block)| *block)
+            .collect();
+        for block in rejected {
+            if self.snapshot_pending.remove(&block).is_some() {
+                self.kv.snapshot_release(block);
+            }
         }
     }
 
@@ -3015,6 +3042,14 @@ impl EngineLoop {
         if let Some(r) = self.requests.get_mut(&id) {
             r.choices[choice].record_spec_round(accepted, k, self.speculative.min_acceptance);
         }
+        if rolled_back > 0 {
+            let kept_end = self
+                .requests
+                .get(&id)
+                .map(|r| r.prompt_len() + r.choices[choice].generated.len() as u32)
+                .unwrap_or(0);
+            self.drop_rejected_snapshots(seq, kept_end);
+        }
     }
 
     /// Samples a verified jump-forward row group (P5p S-10): the choice's `k + 1` logits rows
@@ -3113,6 +3148,14 @@ impl EngineLoop {
                     k,
                     self.speculative.min_acceptance,
                 );
+            }
+            if rolled_back > 0 {
+                let kept_end = self
+                    .requests
+                    .get(&id)
+                    .map(|r| r.prompt_len() + r.choices[choice].generated.len() as u32)
+                    .unwrap_or(0);
+                self.drop_rejected_snapshots(seq, kept_end);
             }
         } else {
             self.metrics
@@ -3558,15 +3601,21 @@ impl EngineLoop {
             // the iteration's KV commits — its table is released only at `complete`.
             if choice == 0
                 && !self.overlap
-                && let Some(&block) = self.last_table_block.get(&seq)
+                && let Some(blocks) = self.last_table_blocks.get(&seq)
             {
                 // The newest token is never fed: its KV is not written, so it is not part of
-                // the published entry's tokens.
+                // the published entry's tokens. A speculative span may have planned a later
+                // block than the kept end's; the kept end's block is the one that holds the
+                // written tokens (Phase 8 S-4).
                 let end =
                     (r.prompt_len() + r.choices[choice].generated.len() as u32).saturating_sub(1);
-                if let Some(tokens) = (0..end)
-                    .map(|p| r.token_at(0, p))
-                    .collect::<Option<Vec<_>>>()
+                let bt = self.pool.layout().block_tokens.max(1);
+                let idx = end.div_ceil(bt).saturating_sub(1) as usize;
+                let block = blocks.get(idx).copied();
+                if let Some(block) = block
+                    && let Some(tokens) = (0..end)
+                        .map(|p| r.token_at(0, p))
+                        .collect::<Option<Vec<_>>>()
                 {
                     self.pending_publishes.push((id, block, tokens));
                 }
@@ -3756,7 +3805,7 @@ impl EngineLoop {
             }
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
-                self.last_table_block.remove(&c.seq);
+                self.last_table_blocks.remove(&c.seq);
             }
         }
     }
@@ -5692,6 +5741,151 @@ mod tests {
             "{}",
             reg.render().unwrap()
         );
+    }
+
+    /// Phase 8 S-3/S-4: `max_tokens` inside a span, the finish reason, `usage` and the
+    /// per-token logprobs equal the serial run's.
+    #[test]
+    fn speculative_stop_and_usage() {
+        let (_dir, spec, tokenizer) = tiny();
+        let draft_dir = TempDir::new("turbine-engine-loop-stop-draft");
+        let draft = write_tiny_llama(draft_dir.path(), 11);
+        let none = || Vec::<Box<dyn TokenMatcher>>::new();
+        let mut req = request(&[256, 72, 101, 108, 108, 111], 5);
+        req.sampling.logprobs = Some(2);
+        req.stop.ignore_eos = false;
+
+        let (serial, _) = run_submissions(
+            &spec,
+            &tokenizer,
+            std::slice::from_ref(&req),
+            &none,
+            false,
+            false,
+        );
+        let (with_draft, _) = run_submissions_with_draft(
+            &spec,
+            &draft,
+            4,
+            &tokenizer,
+            std::slice::from_ref(&req),
+            &none,
+            false,
+        );
+        assert_eq!(
+            with_draft, serial,
+            "tokens, logprobs, finish reason and usage match the serial run"
+        );
+        assert_eq!(serial[0][0].finish.as_ref().unwrap().0.as_str(), "length");
+    }
+
+    /// Phase 8 S-3/S-4: a speculative request whose spans get rolled back publishes only its
+    /// kept prefix: a later request with that prefix hits the cache exactly as it does after
+    /// the serial run, the KV block counts match, and its output is unchanged. A rejected
+    /// position must not be served from the cache.
+    #[test]
+    fn speculative_rollback_publishes_kept_prefix() {
+        let (_dir, spec, tokenizer) = tiny();
+        let draft_dir = TempDir::new("turbine-engine-loop-publish-draft");
+        let draft = write_tiny_llama(draft_dir.path(), 11);
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..136).collect();
+        assert_eq!(prompt.len(), 40);
+
+        // The serial reference: same tiny model, no draft.
+        let serial_engine = engine_with(
+            tiny_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+        );
+        let TestEngine {
+            engine: serial,
+            tx: serial_tx,
+            shared: serial_shared,
+            ..
+        } = serial_engine;
+        let serial_handle = std::thread::spawn(move || serial.run());
+        let req = request(&prompt, 16);
+        let (serial_tokens, _) = run_one(&serial_tx, req.clone());
+        let serial_kv = serde_json::to_value(serial_shared.docs().unwrap().kv).unwrap();
+
+        // The speculative engine: the tiny draft (seed 11) proposes different tokens than
+        // the target (seed 7), so rounds reject and their spans cross block boundaries.
+        let t = engine_with(
+            tiny_executor(&spec, 16),
+            Arc::clone(&tokenizer),
+            params(16, 8),
+            false,
+        );
+        let mut engine = t.engine;
+        let pool = BlockPool::new(
+            BlockPoolConfig {
+                layout: draft.config.kv_layout(BLOCK_TOKENS),
+                num_blocks: 8,
+            },
+            mem(),
+        )
+        .unwrap();
+        let cfg = DraftProposerConfig {
+            executor: tiny_executor(&draft, 1),
+            pool,
+            tokenizer: Arc::clone(&tokenizer),
+            block_tokens: BLOCK_TOKENS,
+            max_seq_len: 64,
+            max_batch_tokens: 64,
+            target: spec.config.clone(),
+            draft: draft.config.clone(),
+        };
+        engine.draft = Some(DraftModelFactory.build(cfg).expect("draft proposer"));
+        engine.speculative = turbine_core::config::SpeculativeConfig {
+            method: SpeculativeMethod::Draft,
+            num_tokens: 4,
+            draft_model_path: Some("/unused".into()),
+            min_acceptance: 0.4,
+        };
+        let TestEngine { tx, shared, .. } = t;
+        let draft_handle = std::thread::spawn(move || engine.run());
+        let (draft_tokens, _) = run_one(&tx, req.clone());
+        assert_eq!(
+            draft_tokens, serial_tokens,
+            "the speculative greedy stream is the serial stream"
+        );
+        let draft_kv = serde_json::to_value(shared.docs().unwrap().kv).unwrap();
+        assert_eq!(
+            draft_kv["tiers"][0]["blocks_used"], serial_kv["tiers"][0]["blocks_used"],
+            "a rolled-back span leaves the same blocks used: {draft_kv}"
+        );
+        assert_eq!(
+            draft_kv["tiers"][0]["partial_entries"], serial_kv["tiers"][0]["partial_entries"],
+            "the kept prefix publishes exactly the serial run's partial entries: {draft_kv}"
+        );
+
+        // A later request with the kept prefix (the prompt plus the kept tokens) sees the
+        // same cached prefix and produces the same tokens as it does after the serial run.
+        let mut kept_prefix = prompt.clone();
+        kept_prefix.extend_from_slice(&draft_tokens);
+        let follow_up = request(&kept_prefix, 8);
+        let (serial_follow, serial_cached) = run_one(&serial_tx, follow_up.clone());
+        let (draft_follow, draft_cached) = run_one(&tx, follow_up);
+        assert_eq!(
+            draft_cached, serial_cached,
+            "the kept prefix's cache hit matches the serial run's"
+        );
+        assert_eq!(
+            draft_follow, serial_follow,
+            "the kept prefix's continuation matches the serial run's"
+        );
+        // The rejected positions are not served: a request whose prompt includes the
+        // first generated token (never a rejected one) still hits only what was kept.
+        assert!(
+            draft_cached > 0,
+            "the kept prefix was published: {draft_kv}"
+        );
+
+        drop(serial_tx);
+        serial_handle.join().unwrap().unwrap();
+        drop(tx);
+        draft_handle.join().unwrap().unwrap();
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is
