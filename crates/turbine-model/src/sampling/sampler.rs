@@ -28,6 +28,40 @@ pub struct SampledToken {
     pub top_logprobs: Vec<(u32, f32)>,
 }
 
+/// One row's post-processing distribution, for the Phase 8 verifier: the greedy token, the
+/// probabilities after bias/penalties/`min_tokens`/mask/temperature/top-k/top-p (empty for a
+/// greedy row), the raw log-softmax normaliser and the raw values of the ids the processors
+/// touched. [`Sampler::logprob_of`] turns it back into the reported logprob of an emitted token.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProcessedRow {
+    pub greedy: u32,
+    pub probs: Vec<f32>,
+    pub raw_lse: Option<f32>,
+    pub top_logprobs: Vec<(u32, f32)>,
+    pub originals: HashMap<u32, f32>,
+    pub all_forbidden: bool,
+}
+
+impl ProcessedRow {
+    /// The post-processing probability of `token` (`0` outside the nucleus).
+    pub fn probability(&self, token: u32) -> f32 {
+        self.probs.get(token as usize).copied().unwrap_or(0.0)
+    }
+
+    /// The reported logprob of `token` under the raw row, `None` without logprobs.
+    pub fn logprob_of(&self, logits: &[f32], token: u32) -> Option<f32> {
+        self.raw_lse.map(|lse| {
+            let raw = self.originals.get(&token).copied().unwrap_or_else(|| {
+                logits
+                    .get(token as usize)
+                    .copied()
+                    .unwrap_or(f32::NEG_INFINITY)
+            });
+            raw - lse
+        })
+    }
+}
+
 /// Everything a sampler needs to continue exactly where it stopped (P2 S-6: kept across
 /// preemption; P7: the TKV1 sampler segment): the ChaCha8 seed, its word position and the tokens
 /// generated so far (the penalty history).
@@ -367,6 +401,65 @@ impl Sampler {
     /// reported logprobs (only when requested) are the log-softmax of `logits` as passed in
     /// (before temperature).
     pub fn sample(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> SampledToken {
+        let row = self.row_inner(logits, mask, false);
+        let token = if row.all_forbidden || self.temperature <= 0.0 {
+            row.greedy
+        } else {
+            self.draw(logits)
+        };
+        SampledToken {
+            token,
+            logprob: row.logprob_of(logits, token),
+            top_logprobs: row.top_logprobs,
+        }
+    }
+
+    /// The Phase 8 verification row: as [`Sampler::sample`], but without observing a token and
+    /// with the post-processing distribution kept for the verifier. `logits` is adjusted in
+    /// place (the caller keeps it for [`ProcessedRow::logprob_of`]).
+    pub fn row(&mut self, logits: &mut [f32], mask: Option<&TokenMask>) -> ProcessedRow {
+        self.row_inner(logits, mask, true)
+    }
+
+    /// One uniform from the sampler's stream (the verifier's acceptance draw).
+    pub fn next_uniform(&mut self) -> f32 {
+        uniform(&mut self.rng)
+    }
+
+    /// A draw over the post-processing probabilities, excluding `exclude` and renormalising the
+    /// rest (the verifier's rejection fallback).
+    pub fn draw_over(&mut self, weights: &[f32], exclude: Option<u32>) -> u32 {
+        let total: f64 = weights
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i as u32) != exclude)
+            .map(|(_, w)| f64::from(*w))
+            .sum();
+        if total <= 0.0 {
+            return 0;
+        }
+        let u = f64::from(uniform(&mut self.rng)) * total;
+        let mut cum = 0.0;
+        let mut last = 0;
+        for (i, &w) in weights.iter().enumerate() {
+            if Some(i as u32) == exclude || w <= 0.0 {
+                continue;
+            }
+            cum += f64::from(w);
+            last = i as u32;
+            if u < cum {
+                return i as u32;
+            }
+        }
+        last
+    }
+
+    fn row_inner(
+        &mut self,
+        logits: &mut [f32],
+        mask: Option<&TokenMask>,
+        probs: bool,
+    ) -> ProcessedRow {
         let step = self.generated.len();
         self.pending.retain(|p| p.step > step);
         let lse = self.logprobs.then(|| log_sum_exp(logits));
@@ -382,29 +475,109 @@ impl Sampler {
             _ => Vec::new(),
         };
         self.adjust(logits, mask);
-        let token = if !logits.iter().any(|&v| v > f32::NEG_INFINITY) {
+        let all_forbidden = !logits.iter().any(|&v| v > f32::NEG_INFINITY);
+        let greedy = if all_forbidden {
             // `min_tokens` and the mask together forbid every id: the grammar wins, it ends here.
             self.best_allowed_eos(mask)
                 .unwrap_or_else(|| argmax(logits))
-        } else if self.temperature <= 0.0 {
-            argmax(logits)
         } else {
-            self.draw(logits)
+            argmax(logits)
         };
-        let logprob = lse.map(|lse| {
-            let raw = self
-                .touched
-                .originals()
-                .get(&token)
-                .copied()
-                .unwrap_or(logits[token as usize]);
-            raw - lse
-        });
-        SampledToken {
-            token,
-            logprob,
+        let probs = if probs && !all_forbidden && self.temperature > 0.0 {
+            self.post_distribution(logits)
+        } else {
+            Vec::new()
+        };
+        ProcessedRow {
+            greedy,
+            probs,
+            raw_lse: lse,
             top_logprobs,
+            originals: self.touched.originals().clone(),
+            all_forbidden,
         }
+    }
+
+    /// The post-processing distribution of an adjusted row: temperature → top-k → top-p over
+    /// the same candidates and in the same order as [`Sampler::draw_fast`], normalised.
+    fn post_distribution(&mut self, logits: &[f32]) -> Vec<f32> {
+        let inv_t = 1.0 / self.temperature;
+        let vocab = logits.len();
+        let mut probs = vec![0.0f32; vocab];
+        let k = self.top_k.map_or(vocab, |k| k.min(vocab));
+        if k < vocab {
+            let Scratch {
+                keys,
+                candidates,
+                fast,
+                ..
+            } = &mut self.scratch;
+            top_n_into(logits, k, keys, candidates);
+            let Some(max) = finite_max(candidates.iter().map(|c| c.1 * inv_t)) else {
+                return probs;
+            };
+            fast.clear();
+            fast.extend(candidates.iter().map(|c| exp_fast(c.1 * inv_t - max)));
+            let total = block_sum(fast);
+            let keep = top_p_prefix(fast.iter().copied(), self.top_p, total);
+            if keep.1 > 0.0 {
+                for (c, &w) in candidates.iter().zip(fast[..keep.0].iter()) {
+                    probs[c.0 as usize] = (f64::from(w) / keep.1) as f32;
+                }
+            }
+            return probs;
+        }
+        let Some(max) = scaled_max(logits, inv_t) else {
+            return probs;
+        };
+        let Scratch {
+            fast, blocks, keys, ..
+        } = &mut self.scratch;
+        fast.clear();
+        fast.resize(vocab, 0.0);
+        blocks.clear();
+        for (ws, vs) in fast.chunks_mut(FAST_BLOCK).zip(logits.chunks(FAST_BLOCK)) {
+            for (w, &v) in ws.iter_mut().zip(vs) {
+                *w = exp_fast(v * inv_t - max);
+            }
+            blocks.push(block_sum(ws));
+        }
+        let total: f64 = blocks.iter().sum();
+        if self.top_p < 1.0 {
+            let target = f64::from(self.top_p) * total;
+            for floor in [-8.0f32, -16.0, -32.0, f32::NEG_INFINITY] {
+                let min_weight = exp_fast(floor);
+                keys.clear();
+                keys.extend(
+                    fast.iter()
+                        .enumerate()
+                        .filter(|&(_, &w)| w > 0.0 && w >= min_weight)
+                        .map(|(i, _)| desc_key(i as u32, logits[i])),
+                );
+                let mass: f64 = keys
+                    .iter()
+                    .map(|&key| f64::from(fast[key as u32 as usize]))
+                    .sum();
+                if mass >= target {
+                    break;
+                }
+            }
+            keys.sort_unstable();
+            let weight_of = |key: u64| fast[key as u32 as usize];
+            let keep = top_p_prefix(keys.iter().map(|&key| weight_of(key)), self.top_p, total);
+            if keep.1 > 0.0 {
+                for &key in &keys[..keep.0] {
+                    probs[key as u32 as usize] = (f64::from(weight_of(key)) / keep.1) as f32;
+                }
+            }
+            return probs;
+        }
+        if total > 0.0 {
+            for (i, &w) in fast.iter().enumerate() {
+                probs[i] = (f64::from(w) / total) as f32;
+            }
+        }
+        probs
     }
 
     /// Whether this step's row can be reduced on the device (P2c S-4), and how. `None` when the
@@ -1255,6 +1428,53 @@ mod tests {
                 b.observe(t.token);
             }
         }
+    }
+
+    /// Phase 8 S-3: the verification row carries the same distribution the sampler draws from,
+    /// the same reported logprob, no distribution for a greedy row, and an excluding draw.
+    #[test]
+    fn row_matches_the_sampled_distribution() {
+        let raw: Vec<f32> = (0..8).map(|i| i as f32 * 0.7 - 1.0).collect();
+        let mut p = params(0.8, 0.9, 4, 1);
+        p.logprobs = Some(2);
+        let mut sampler = fast(&p);
+        let mut logits = raw.clone();
+        let row = sampler.row(&mut logits, None);
+        let sum: f32 = row.probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "{sum}");
+        assert_eq!(row.greedy, argmax(&raw));
+
+        let mut sampling = fast(&p);
+        let sampled = sampling.sample(&mut raw.clone(), None);
+        let mut row_logits = raw.clone();
+        let same = sampling.row(&mut row_logits, None);
+        assert!(same.probability(sampled.token) > 0.0);
+        assert!(
+            (sampled.logprob.unwrap() - same.logprob_of(&row_logits, sampled.token).unwrap()).abs()
+                < 1e-6
+        );
+
+        let mut greedy_sampler = fast(&greedy());
+        let mut greedy_logits = raw.clone();
+        let greedy_row = greedy_sampler.row(&mut greedy_logits, None);
+        assert!(greedy_row.probs.is_empty());
+        assert_eq!(greedy_row.greedy, argmax(&raw));
+
+        let mut draw = fast(&p);
+        for _ in 0..100 {
+            assert_ne!(draw.draw_over(&row.probs, Some(2)), 2);
+        }
+
+        let mut empirical = [0usize; 8];
+        let mut runs = fast(&p);
+        for _ in 0..200_000 {
+            empirical[runs.sample(&mut raw.clone(), None).token as usize] += 1;
+        }
+        let tv: f32 = (0..8)
+            .map(|i| (empirical[i] as f32 / 200_000.0 - row.probs[i]).abs())
+            .sum::<f32>()
+            / 2.0;
+        assert!(tv < 0.01, "total variation {tv}");
     }
 
     /// A sampler on the unseeded (fast) path with a repeatable stream.
