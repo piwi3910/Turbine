@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use turbine_model::testing::TempDir;
-use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_qwen3_5};
+use turbine_model::testing::tiny::{write_tiny_llama, write_tiny_quantized, write_tiny_qwen3_5};
 
 const POLL: Duration = Duration::from_millis(20);
 /// The server's test-only cap on each accepted connection's kernel send buffer.
@@ -1170,6 +1170,211 @@ fn hermes_config_loads() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains("(registered: llama3_json, hermes, mistral, harmony, qwen3_xml)"),
+        "{stderr}"
+    );
+}
+
+/// Copies a tiny checkpoint directory (files only; the writers make no subdirectories).
+fn copy_checkpoint(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file(), "unexpected directory");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+    }
+}
+
+/// Rewrites `config.json` of a checkpoint (a JSON object) with `edit` applied.
+fn edit_config(model_dir: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let path = model_dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    edit(&mut config);
+    std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+}
+
+/// Phase 8 S-1: the draft pair is validated before the target's budget, also under
+/// `--check-config`; each mismatch exits 2 with its reason code, a valid CPU pair prints the
+/// draft support row and `config ok`, and a corrupt draft shard exits 1 before ready.
+#[test]
+fn speculative_startup_refusals() {
+    let target = TempDir::new("turbine-server-p8-target");
+    write_tiny_llama(target.path(), 3);
+    let draft = TempDir::new("turbine-server-p8-draft");
+    write_tiny_llama(draft.path(), 4);
+    let cfg = TempConfig::new(
+        "p8-refusals",
+        &format!(
+            "model:\n  path: {}\n  max_seq_len: 64\n",
+            target.path().display()
+        ),
+    );
+    let check = |sets: &[String]| {
+        let mut args = vec!["--check-config".to_string()];
+        for set in sets {
+            args.push("--set".to_string());
+            args.push(set.clone());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        wait_with_timeout(spawn_server(&refs, &cfg.path), Duration::from_secs(20))
+    };
+    let draft_set = format!("speculative.draft_model_path={}", draft.path().display());
+    let base = [
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        draft_set.clone(),
+    ];
+
+    // A valid CPU pair: the experimental draft row and config ok.
+    let out = check(&base);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("support: experimental (cpu/cpu/LlamaForCausalLM/bf16/bf16/draft)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("config ok"), "{stdout}");
+
+    // Missing path.
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        "speculative.draft_model_path=/nonexistent".to_string(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_draft_path"), "{stderr}");
+
+    // Another family.
+    let qwen = TempDir::new("turbine-server-p8-draft-qwen");
+    write_tiny_qwen3_5(qwen.path(), 3);
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        format!("speculative.draft_model_path={}", qwen.path().display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_draft_family"), "{stderr}");
+
+    // A changed tokenizer vocabulary.
+    let tok = TempDir::new("turbine-server-p8-draft-tok");
+    copy_checkpoint(draft.path(), tok.path());
+    let path = tok.path().join("tokenizer.json");
+    let mut tokenizer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let vocab = tokenizer["model"]["vocab"].as_object_mut().unwrap();
+    let key = vocab.keys().next().unwrap().clone();
+    let id = vocab.remove(&key).unwrap();
+    vocab.insert(format!("{key}x"), id);
+    std::fs::write(&path, serde_json::to_string(&tokenizer).unwrap()).unwrap();
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        format!("speculative.draft_model_path={}", tok.path().display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_draft_tokenizer"), "{stderr}");
+
+    // A quantized draft checkpoint.
+    let quant = TempDir::new("turbine-server-p8-draft-quant");
+    let q = serde_json::json!({
+        "config_groups": {"group_0": {
+            "input_activations": {"num_bits": 8, "type": "float", "strategy": "tensor",
+                                  "dynamic": false, "symmetric": true},
+            "targets": ["Linear"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel",
+                        "dynamic": false, "symmetric": true},
+        }},
+        "format": "float-quantized",
+        "ignore": ["lm_head"],
+        "quant_method": "compressed-tensors",
+    });
+    let fixture = write_tiny_quantized(quant.path(), 5, &q, 64, 64);
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        format!(
+            "speculative.draft_model_path={}",
+            fixture.quantized.dir.display()
+        ),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_draft_format"), "{stderr}");
+
+    // A draft context shorter than the target's (the target is asked for 64 tokens).
+    let ctx = TempDir::new("turbine-server-p8-draft-ctx");
+    copy_checkpoint(draft.path(), ctx.path());
+    edit_config(ctx.path(), |config| {
+        config["max_position_embeddings"] = serde_json::json!(8);
+    });
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        format!("speculative.draft_model_path={}", ctx.path().display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_draft_context"), "{stderr}");
+
+    // k + 1 above the plan's row capacity.
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        draft_set.clone(),
+        "speculative.num_tokens=8".to_string(),
+        "scheduler.max_running_requests=8".to_string(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("speculative_rows"), "{stderr}");
+
+    // Tensor parallelism with a draft.
+    let out = check(&[
+        "execution.backend=cpu".to_string(),
+        "speculative.method=draft".to_string(),
+        draft_set,
+        "parallel.tensor_parallel_size=2".to_string(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("speculative_parallel_unsupported"),
+        "{stderr}"
+    );
+
+    // A corrupt draft shard: the target is fine, the draft load fails, exit 1 before ready.
+    let corrupt = TempDir::new("turbine-server-p8-draft-corrupt");
+    copy_checkpoint(draft.path(), corrupt.path());
+    std::fs::write(corrupt.path().join("model.safetensors"), [0xffu8; 8]).unwrap();
+    let port = free_port();
+    let run_cfg = TempConfig::new(
+        "p8-corrupt",
+        &format!(
+            "model:\n  path: {}\n  max_seq_len: 64\nserver:\n  listen: 127.0.0.1:{port}\n\
+             execution:\n  backend: cpu\nreliability:\n  emergency_vram_reserve: 1MiB\n",
+            target.path().display()
+        ),
+    );
+    let draft_arg = format!("speculative.draft_model_path={}", corrupt.path().display());
+    let args = [
+        "--set",
+        "speculative.method=draft",
+        "--set",
+        draft_arg.as_str(),
+    ];
+    let out = wait_with_timeout(spawn_server(&args, &run_cfg.path), Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("speculative.draft_model_path") || stderr.contains("weights"),
         "{stderr}"
     );
 }

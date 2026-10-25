@@ -12,8 +12,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use turbine_core::config::{
-    ByteSize, Config, KvDtypeChoice, ReliabilityConfig, StructuredOutputConfig,
+    ByteSize, Config, ConfigError, KvDtypeChoice, ReliabilityConfig, SpeculativeMethod,
+    StructuredOutputConfig,
 };
 use turbine_core::types::{DType, DeviceId, KvLayout, MemoryKind, ModelIdentity, SeqId};
 use turbine_device::DeviceInventory;
@@ -45,7 +48,11 @@ use turbine_model::{
     load_generation_config, load_model_config_with,
 };
 use turbine_observability::MetricsRegistry;
-use turbine_reliability::budget::{BudgetInputs, DeviceBudget, PoolKind, compute_budget};
+
+use turbine_reliability::budget::{
+    BudgetInputs, DeviceBudget, DraftBudget, PoolKind, compute_budget, compute_budget_with_draft,
+    draft_slot_bytes,
+};
 use turbine_reliability::ledger::{Ledger, Reservation};
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::multi_device::SharedDeviceBudget;
@@ -573,6 +580,9 @@ pub struct PreparedModel {
     pub stage: Option<PpStage>,
     /// Bytes of the weights this rank loads: its shard, or the whole model.
     pub weight_bytes: u64,
+    /// The Phase 8 draft model's fixed device bytes (`speculative.method: draft`), already
+    /// charged in this model's budget; the engine loads the draft after the target.
+    pub draft: Option<DraftBudget>,
     /// P7 S-12 (Task 32): the model keeps per-sequence state (a hybrid family); its L0 pool
     /// budget then charges `ceil(state bytes / interval)` per block for block-boundary snapshots.
     pub hybrid: bool,
@@ -626,7 +636,248 @@ pub fn prepare_rank(
         &KernelMetrics::register(metrics),
         None,
         part,
+        None,
     )
+}
+
+/// [`prepare_rank`] with a Phase 8 draft model's fixed bytes charged in the target's budget.
+pub fn prepare_rank_with_draft(
+    config: &Config,
+    inventory: &DeviceInventory,
+    metrics: &MetricsRegistry,
+    part: Option<RankPart>,
+    draft: Option<&DraftBudget>,
+) -> Result<PreparedModel, StartupError> {
+    prepare_with(
+        config,
+        inventory,
+        &KernelMetrics::register(metrics),
+        None,
+        part,
+        draft,
+    )
+}
+
+/// A tokenizer's identity for the Phase 8 draft pairing check: vocabulary size, the special
+/// added tokens and a hash over every `(id, token)` pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenizerFingerprint {
+    pub vocab_size: u32,
+    pub special_tokens: u32,
+    pub hash: u64,
+}
+
+/// [`TokenizerFingerprint`] of `tokenizer`.
+pub fn tokenizer_fingerprint(tokenizer: &Tokenizer) -> TokenizerFingerprint {
+    let inner = tokenizer.inner();
+    let mut hasher = DefaultHasher::new();
+    for id in 0..tokenizer.vocab_size() {
+        id.hash(&mut hasher);
+        tokenizer.id_to_token(id).hash(&mut hasher);
+    }
+    let mut specials: Vec<(u32, String)> = inner
+        .get_added_tokens_decoder()
+        .iter()
+        .filter(|(_, token)| token.special)
+        .map(|(id, token)| (*id, token.content.clone()))
+        .collect();
+    specials.sort_unstable();
+    for (id, content) in &specials {
+        id.hash(&mut hasher);
+        content.hash(&mut hasher);
+    }
+    if let Some(padding) = inner.get_padding() {
+        padding.pad_id.hash(&mut hasher);
+    }
+    TokenizerFingerprint {
+        vocab_size: tokenizer.vocab_size(),
+        special_tokens: specials.len() as u32,
+        hash: hasher.finish(),
+    }
+}
+
+/// Phase 8 S-1/S-7: validate the draft pair and measure its fixed device bytes — the weights,
+/// the executor workspace and one full-context KV slot — before the target's budget is taken
+/// (also under `--check-config`). Every refusal is a configuration error naming
+/// `speculative.draft_model_path` with its reason code.
+pub fn draft_budget(cfg: &Config) -> Result<Option<DraftBudget>, ConfigError> {
+    if cfg.speculative.method != SpeculativeMethod::Draft {
+        return Ok(None);
+    }
+    let refuse = |code: &str, detail: String| ConfigError::Invalid {
+        key: "speculative.draft_model_path".to_string(),
+        reason: format!("{code}: {detail}"),
+    };
+    let Some(path) = cfg.speculative.draft_model_path.as_deref() else {
+        return Err(refuse(
+            "speculative_draft_path",
+            "is required when speculative.method is draft".to_string(),
+        ));
+    };
+    if !path.is_dir() {
+        return Err(refuse(
+            "speculative_draft_path",
+            format!("{}: not an existing directory", path.display()),
+        ));
+    }
+    let target_arch = load_model_config_with(&cfg.model.path, cfg.model.rope_scaling.as_ref())
+        .map_err(|e| {
+            refuse(
+                "speculative_draft_family",
+                format!(
+                    "cannot read the target model config ({}): {e}",
+                    cfg.model.path.display()
+                ),
+            )
+        })?;
+    let draft_arch = load_model_config_with(path, None).map_err(|e| {
+        refuse(
+            "speculative_draft_family",
+            format!("{}: {e}", path.display()),
+        )
+    })?;
+    if draft_arch.hf_architecture != target_arch.hf_architecture {
+        return Err(refuse(
+            "speculative_draft_family",
+            format!(
+                "draft architecture {} differs from the target's {}",
+                draft_arch.hf_architecture, target_arch.hf_architecture
+            ),
+        ));
+    }
+    let target_tokenizer_path = cfg
+        .model
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| cfg.model.path.join("tokenizer.json"));
+    let target_tokenizer = Tokenizer::from_file(&target_tokenizer_path).map_err(|e| {
+        refuse(
+            "speculative_draft_tokenizer",
+            format!("{}: {e}", target_tokenizer_path.display()),
+        )
+    })?;
+    let draft_tokenizer_path = path.join("tokenizer.json");
+    let draft_tokenizer = Tokenizer::from_file(&draft_tokenizer_path).map_err(|e| {
+        refuse(
+            "speculative_draft_tokenizer",
+            format!("{}: {e}", draft_tokenizer_path.display()),
+        )
+    })?;
+    if tokenizer_fingerprint(&target_tokenizer) != tokenizer_fingerprint(&draft_tokenizer) {
+        return Err(refuse(
+            "speculative_draft_tokenizer",
+            "the draft tokenizer differs from the target's (vocabulary or special tokens)"
+                .to_string(),
+        ));
+    }
+    let column = crate::support_startup::weight_column(path);
+    if column != turbine_core::support::WeightFormatColumn::Bf16 {
+        return Err(refuse(
+            "speculative_draft_format",
+            format!(
+                "the draft checkpoint is not BF16 (detected {})",
+                column.as_str()
+            ),
+        ));
+    }
+    let target_max = resolve_max_seq_len(
+        cfg.model.max_seq_len,
+        target_arch.max_position_embeddings,
+        target_arch.max_positions(),
+    )
+    .map_err(|e| refuse("speculative_draft_context", e))?;
+    let draft_max = resolve_max_seq_len(
+        None,
+        draft_arch.max_position_embeddings,
+        draft_arch.max_positions(),
+    )
+    .map_err(|e| refuse("speculative_draft_context", e))?;
+    if draft_max < target_max {
+        return Err(refuse(
+            "speculative_draft_context",
+            format!("the draft context ({draft_max}) is shorter than the target's ({target_max})"),
+        ));
+    }
+    let workspace = executor::workspace_bytes(
+        &draft_arch,
+        cfg.kv.block_tokens,
+        cfg.scheduler.max_batch_tokens,
+        cfg.scheduler.max_running_requests,
+    );
+    let layout = draft_arch.kv_layout(cfg.kv.block_tokens);
+    Ok(Some(DraftBudget {
+        weights_bytes: draft_arch.shape().weight_bytes,
+        workspace_bytes: workspace,
+        slot_bytes: draft_slot_bytes(layout.bytes_per_token(), target_max, layout.block_bytes()),
+    }))
+}
+
+/// Phase 8: prepare the draft model as a second single-device model (its own provider, kernel
+/// registry and budget capped to the reserved slot). The target's budget already charged the
+/// draft's fixed bytes; this model's budget is only used to allocate its one-slot pool.
+pub fn prepare_draft(
+    cfg: &Config,
+    budget: &DraftBudget,
+    inventory: &DeviceInventory,
+    metrics: &MetricsRegistry,
+) -> Result<PreparedModel, StartupError> {
+    let path = cfg
+        .speculative
+        .draft_model_path
+        .clone()
+        .ok_or_else(|| StartupError::new("speculative.draft_model_path: missing"))?;
+    let mut draft_cfg = cfg.clone();
+    draft_cfg.model.path = path;
+    draft_cfg.model.served_name = None;
+    draft_cfg.model.tokenizer = None;
+    draft_cfg.model.chat_template = None;
+    draft_cfg.speculative = Default::default();
+    draft_cfg.kv.dtype = KvDtypeChoice::Bf16;
+    draft_cfg.kv.gpu.max_bytes = Some(ByteSize(budget.slot_bytes));
+    draft_cfg.kv.cpu.enabled = false;
+    draft_cfg.kv.nvme.enabled = false;
+    draft_cfg.kv.prefix_sharing = false;
+    draft_cfg.kv.partial_prefix_reuse = false;
+    draft_cfg.kv.ladder.enabled = false;
+    draft_cfg.reliability.emergency_vram_reserve = ByteSize(0);
+    draft_cfg.reliability.memory.device_budget_bytes = None;
+    draft_cfg.reliability.memory.runtime_overhead_bytes = ByteSize(0);
+    draft_cfg.reliability.memory.workspace_bytes = ByteSize(budget.workspace_bytes);
+    draft_cfg.execution.decode_graphs = false;
+    draft_cfg.execution.overlap_scheduling = false;
+    draft_cfg.parallel.tensor_parallel_size = turbine_core::config::SizeOrAuto::Size(1);
+    draft_cfg.parallel.data_parallel_size = turbine_core::config::SizeOrAuto::Size(1);
+    draft_cfg.parallel.pipeline_parallel_size = turbine_core::config::SizeOrAuto::Size(1);
+    draft_cfg.parallel.expert_parallel_size = turbine_core::config::SizeOrAuto::Size(1);
+    prepare_rank(&draft_cfg, inventory, metrics, None)
+}
+
+/// Phase 8: the loaded, warmed-up draft: its executor and one-sequence KV pool, its tokenizer
+/// and the architecture it was checked against.
+pub struct DraftModel {
+    pub loaded: LoadedModel,
+    pub tokenizer: Arc<Tokenizer>,
+    pub arch: ModelArchConfig,
+    pub max_seq_len: u32,
+    pub block_tokens: u32,
+}
+
+/// Phase 8: load and warm up the prepared draft; `None` is not needed here (the caller holds
+/// `Option<PreparedModel>`).
+pub fn load_draft(
+    prepared: &PreparedModel,
+    warmup_token: u32,
+    metrics: &ModelMetrics,
+    reliability: &ReliabilityMetrics,
+) -> Result<DraftModel, StartupError> {
+    let loaded = load(prepared, warmup_token, metrics, reliability)?;
+    Ok(DraftModel {
+        loaded,
+        tokenizer: Arc::clone(&prepared.tokenizer),
+        arch: prepared.arch.clone(),
+        max_seq_len: prepared.max_seq_len,
+        block_tokens: prepared.block_tokens,
+    })
 }
 
 /// Steps 4–6 for another data-parallel replica (P5 S-7), or another rank `shard` of a
@@ -638,7 +889,14 @@ pub fn prepare_replica(
     base: &PreparedModel,
     part: Option<RankPart>,
 ) -> Result<PreparedModel, StartupError> {
-    prepare_with(config, inventory, &base.kernel_metrics, Some(base), part)
+    prepare_with(
+        config,
+        inventory,
+        &base.kernel_metrics,
+        Some(base),
+        part,
+        base.draft.as_ref(),
+    )
 }
 
 /// The device bytes `slots` take in `format` (a stacked slot is its part of the stack; a padded
@@ -667,6 +925,7 @@ fn prepare_with(
     kernel_metrics: &KernelMetrics,
     base: Option<&PreparedModel>,
     part: Option<RankPart>,
+    draft: Option<&DraftBudget>,
 ) -> Result<PreparedModel, StartupError> {
     let (shard, expert, stage) = match part {
         Some(RankPart::Expert(e)) => (Some(RankPart::Expert(e.clone()).position()), Some(e), None),
@@ -940,6 +1199,7 @@ fn prepare_with(
         &reliability,
         config.kv.gpu.max_bytes,
         0,
+        draft,
         state_allocation(
             scheduler.max_running_requests,
             arch.state.bytes_per_sequence(),
@@ -1059,6 +1319,7 @@ fn prepare_with(
         expert,
         stage,
         weight_bytes: weights,
+        draft: draft.copied(),
         hybrid,
         hybrid_snapshot_interval_blocks: config.kv.hybrid_snapshot_interval_blocks,
     })
@@ -1101,6 +1362,7 @@ impl PreparedModel {
             &self.reliability,
             self.kv_cap,
             0,
+            self.draft.as_ref(),
             state_allocation(
                 self.scheduler.max_running_requests,
                 self.arch.state.bytes_per_sequence(),
@@ -1155,25 +1417,26 @@ pub(crate) fn measure_budget(
     reliability: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
     collective: u64,
+    draft: Option<&DraftBudget>,
     state_allocation: u64,
 ) -> Result<DeviceBudget, StartupError> {
     let host = read_host(&FsProc::default()).sample.mem_available_bytes;
-    let mut budget = compute_budget(
-        &BudgetInputs {
-            device,
-            memory_kind,
-            measured_free_bytes: measured_free,
-            already_held_bytes: already_held,
-            host_mem_available_bytes: host,
-            weights_bytes: weights,
-            kv_bytes_per_token: layout.bytes_per_token(),
-            max_seq_len,
-            block_bytes: layout.block_bytes(),
-            collective_bytes: collective,
-        },
-        reliability,
-        kv_cap,
-    )
+    let inputs = BudgetInputs {
+        device,
+        memory_kind,
+        measured_free_bytes: measured_free,
+        already_held_bytes: already_held,
+        host_mem_available_bytes: host,
+        weights_bytes: weights,
+        kv_bytes_per_token: layout.bytes_per_token(),
+        max_seq_len,
+        block_bytes: layout.block_bytes(),
+        collective_bytes: collective,
+    };
+    let mut budget = match draft {
+        Some(draft) => compute_budget_with_draft(&inputs, draft, reliability, kv_cap),
+        None => compute_budget(&inputs, reliability, kv_cap),
+    }
     .map_err(|e| StartupError::new(format!("startup: {e}")))?;
     // The state allocation (`max_running × state`, P7 review fix) is set aside inside the
     // `kv` pool: the pool left is the physical KV block pool, the ledger's `kv` capacity.
@@ -1618,6 +1881,7 @@ pub(crate) fn post_load_budget(
         &prepared.reliability,
         prepared.kv_cap,
         collective,
+        prepared.draft.as_ref(),
         state_allocation(
             prepared.scheduler.max_running_requests,
             prepared.arch.state.bytes_per_sequence(),
@@ -2248,5 +2512,29 @@ mod tests {
             quantized > bf16 / 2,
             "fp8-tensor budget {quantized} not above the 1-byte data floor of {bf16}"
         );
+    }
+
+    /// Phase 8 S-1: two tokenizers of the same tiny checkpoint have the same fingerprint; a
+    /// changed vocabulary entry changes the hash.
+    #[test]
+    fn draft_tokenizer_fingerprint_detects_a_change() {
+        let a = turbine_model::testing::TempDir::new("p8-fingerprint-a");
+        turbine_model::testing::tiny::write_tiny_llama(a.path(), 3);
+        let b = turbine_model::testing::TempDir::new("p8-fingerprint-b");
+        turbine_model::testing::tiny::write_tiny_llama(b.path(), 3);
+        let ta = Tokenizer::from_file(&a.path().join("tokenizer.json")).unwrap();
+        let tb = Tokenizer::from_file(&b.path().join("tokenizer.json")).unwrap();
+        assert_eq!(tokenizer_fingerprint(&ta), tokenizer_fingerprint(&tb));
+
+        let path = b.path().join("tokenizer.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let vocab = value["model"]["vocab"].as_object_mut().unwrap();
+        let key = vocab.keys().next().unwrap().clone();
+        let id = vocab.remove(&key).unwrap();
+        vocab.insert(format!("{key}x"), id);
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        let changed = Tokenizer::from_file(&path).unwrap();
+        assert_ne!(tokenizer_fingerprint(&ta), tokenizer_fingerprint(&changed));
     }
 }

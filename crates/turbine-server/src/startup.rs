@@ -151,6 +151,15 @@ pub fn run(cli: Cli) -> ExitCode {
                 return ExitCode::Config;
             }
         };
+    // Phase 8 S-1/S-7: the draft pair and its fixed device bytes, before the target's budget
+    // (exit 2, also under --check-config).
+    let draft_budget = match model::draft_budget(&config) {
+        Ok(budget) => budget,
+        Err(e) => {
+            eprintln!("turbine-server: invalid configuration: {e}");
+            return ExitCode::Config;
+        }
+    };
     // The support-matrix row before discovery (device arch unknown): an unsupported row is a
     // configuration error, exit 2, also under --check-config.
     let support = support_startup::before_discovery(&config);
@@ -365,9 +374,13 @@ pub fn run(cli: Cli) -> ExitCode {
                 pipeline = Some(start);
                 last
             }),
-            (None, _, _) => {
-                model::prepare_rank(&cfg, &inventory, &metrics, part(first_rank, stats))
-            }
+            (None, _, _) => model::prepare_rank_with_draft(
+                &cfg,
+                &inventory,
+                &metrics,
+                part(first_rank, stats),
+                draft_budget.as_ref(),
+            ),
             (Some(base), _, _) => {
                 model::prepare_replica(&cfg, &inventory, &base.prepared, part(first_rank, stats))
             }
@@ -381,6 +394,17 @@ pub fn run(cli: Cli) -> ExitCode {
         {
             return startup_failed(r, &e);
         }
+        // Phase 8: the draft is a second single-device model on the same device; tensor and
+        // pipeline parallelism were refused at startup, so it is prepared only on one device.
+        let draft = match draft_budget.as_ref() {
+            Some(budget) if pipeline.is_none() && plan.tp == 1 && plan.pp == 1 => {
+                match model::prepare_draft(&cfg, budget, &inventory, &metrics) {
+                    Ok(draft) => Some(draft),
+                    Err(e) => return startup_failed(r, &e),
+                }
+            }
+            _ => None,
+        };
         // P7 S-15: FP8 KV on a checkpoint without K/V scales gets calibrated ones, before the
         // KV namespace (which hashes them) is built.
         if let Err(e) = model::calibrate_kv_scales(&mut prepared) {
@@ -525,6 +549,7 @@ pub fn run(cli: Cli) -> ExitCode {
             });
         replicas.push(ReplicaStart {
             prepared,
+            draft,
             group,
             pipeline,
             experts,
@@ -636,6 +661,9 @@ struct ServeCluster {
 /// metrics and its L2 tier (Phase 4).
 struct ReplicaStart {
     prepared: PreparedModel,
+    /// Phase 8: the draft model prepared on this replica's device (charged in `prepared`'s
+    /// budget); the engine loads it after the target.
+    draft: Option<PreparedModel>,
     /// Tensor parallelism: the group's worker ranks and its collective backend (P5 S-6).
     group: Option<engine::tp::TpGroupStart>,
     /// Pipeline parallelism: the stages before the last and the collective backend (P5 S-10).
@@ -797,6 +825,7 @@ async fn serve(
         }
         match engine::spawn(
             replica.prepared,
+            replica.draft,
             replica.group,
             replica.pipeline,
             Arc::clone(&backend),

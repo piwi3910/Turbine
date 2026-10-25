@@ -103,6 +103,33 @@ pub struct BudgetError {
     pub breakdown: String,
 }
 
+/// The fixed device bytes a Phase 8 draft model costs beside the target: its weights, its
+/// executor workspace and its one full-context KV slot. Charged before serving (S-7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftBudget {
+    pub weights_bytes: u64,
+    pub workspace_bytes: u64,
+    pub slot_bytes: u64,
+}
+
+impl DraftBudget {
+    pub fn total(self) -> u64 {
+        self.weights_bytes
+            .saturating_add(self.workspace_bytes)
+            .saturating_add(self.slot_bytes)
+    }
+}
+
+/// One draft KV slot: `max_seq_len` tokens at `kv_bytes_per_token`, rounded up to whole
+/// `block_bytes` blocks.
+pub fn draft_slot_bytes(kv_bytes_per_token: u64, max_seq_len: u32, block_bytes: u64) -> u64 {
+    let block = block_bytes.max(1);
+    u64::from(max_seq_len)
+        .saturating_mul(kv_bytes_per_token)
+        .div_ceil(block)
+        .saturating_mul(block)
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 
 fn show(bytes: u64) -> String {
@@ -115,6 +142,27 @@ fn show(bytes: u64) -> String {
 /// (`kv.gpu.max_bytes`, CONFLICT C-8); it must hold one full-context sequence.
 pub fn compute_budget(
     inp: &BudgetInputs,
+    cfg: &ReliabilityConfig,
+    kv_cap: Option<ByteSize>,
+) -> Result<DeviceBudget, BudgetError> {
+    compute_budget_inner(inp, None, cfg, kv_cap)
+}
+
+/// [`compute_budget`] with a Phase 8 draft model's fixed bytes charged beside the target (S-7):
+/// the draft's weights, workspace and one full-context KV slot come out of the target's `kv`
+/// pool, and the breakdown names them when the combination no longer fits.
+pub fn compute_budget_with_draft(
+    inp: &BudgetInputs,
+    draft: &DraftBudget,
+    cfg: &ReliabilityConfig,
+    kv_cap: Option<ByteSize>,
+) -> Result<DeviceBudget, BudgetError> {
+    compute_budget_inner(inp, Some(draft), cfg, kv_cap)
+}
+
+fn compute_budget_inner(
+    inp: &BudgetInputs,
+    draft: Option<&DraftBudget>,
     cfg: &ReliabilityConfig,
     kv_cap: Option<ByteSize>,
 ) -> Result<DeviceBudget, BudgetError> {
@@ -163,12 +211,14 @@ pub fn compute_budget(
     let runtime = cfg.memory.runtime_overhead_bytes.0;
     let reserve = cfg.emergency_vram_reserve.0;
     let collective = inp.collective_bytes;
+    let draft_fixed = draft.map_or(0, |draft| draft.total());
     let fixed = inp
         .weights_bytes
         .saturating_add(workspace)
         .saturating_add(collective)
         .saturating_add(runtime)
-        .saturating_add(reserve);
+        .saturating_add(reserve)
+        .saturating_add(draft_fixed);
     let block = inp.block_bytes.max(1);
     let seq_bytes = u64::from(inp.max_seq_len).saturating_mul(inp.kv_bytes_per_token);
     let min_kv = seq_bytes.div_ceil(block).saturating_mul(block);
@@ -184,9 +234,19 @@ pub fn compute_budget(
             .filter(|c| c.0 < remainder)
             .map(|c| format!(", capped by kv.gpu.max_bytes={}", show(c.0)))
             .unwrap_or_default();
+        let draft_note = draft
+            .map(|d| {
+                format!(
+                    "; draft_weights={}; draft_workspace={}; draft_slot={}",
+                    show(d.weights_bytes),
+                    show(d.workspace_bytes),
+                    show(d.slot_bytes)
+                )
+            })
+            .unwrap_or_default();
         return Err(BudgetError {
             breakdown: format!(
-                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; collective={}; runtime={}; reserve={}; kv={}{kv_capped} (minimum {} for one {}-token sequence)",
+                "device {device} {}: budget={} ({source}{cap}); weights={}; workspace={}; collective={}; runtime={}; reserve={}{draft_note}; kv={}{kv_capped} (minimum {} for one {}-token sequence)",
                 memory_kind_str(inp.memory_kind),
                 show(budget),
                 show(inp.weights_bytes),
@@ -222,8 +282,11 @@ mod tests {
     use turbine_core::types::PressureSignal;
 
     const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
     /// Llama-3.2-3B BF16: 28 layers × 2 × 8 KV heads × 128 × 2 bytes.
     const PER_TOKEN: u64 = 114_688;
+    /// Llama-3.2-1B BF16: 16 layers × 2 × 8 KV heads × 64 × 2 bytes.
+    const DRAFT_PER_TOKEN: u64 = 32_768;
 
     fn inputs(kind: MemoryKind, free: Option<u64>, avail: Option<u64>) -> BudgetInputs {
         BudgetInputs {
@@ -304,6 +367,44 @@ mod tests {
         assert_eq!(kv_capped.budget_bytes, 30 * GIB);
         assert_eq!(kv_capped.pool(PoolKind::Kv), 4 * GIB);
         assert!(pool_sum(&kv_capped) <= 30 * GIB);
+    }
+
+    /// Phase 8 S-7: the draft's weights, workspace and one full-context slot come out of the
+    /// target's kv pool, leave the target's other pools alone, and are named when they do not fit.
+    #[test]
+    fn speculative_draft_footprint() {
+        let base = inputs(MemoryKind::Dedicated, Some(40 * GIB), None);
+        let cfg = cfg_with_cap(None);
+        let without = compute_budget(&base, &cfg, None).unwrap();
+        let slot = draft_slot_bytes(DRAFT_PER_TOKEN, 32_768, DRAFT_PER_TOKEN * 16);
+        assert_eq!(slot, GIB, "32768 tokens x 32 KiB in 16-token blocks");
+        assert_eq!(
+            draft_slot_bytes(DRAFT_PER_TOKEN, 1, DRAFT_PER_TOKEN * 16),
+            DRAFT_PER_TOKEN * 16,
+            "one token rounds up to a block"
+        );
+        let draft = DraftBudget {
+            weights_bytes: 2 * GIB,
+            workspace_bytes: 256 * MIB,
+            slot_bytes: slot,
+        };
+        let with = compute_budget_with_draft(&base, &draft, &cfg, None).unwrap();
+        assert_eq!(with.pool(PoolKind::Weights), base.weights_bytes);
+        assert_eq!(
+            with.pool(PoolKind::Kv),
+            without.pool(PoolKind::Kv) - 3 * GIB - 256 * MIB
+        );
+        assert_eq!(
+            with.pool(PoolKind::Workspace),
+            without.pool(PoolKind::Workspace)
+        );
+
+        // A target whose minimum KV no longer fits names the draft terms.
+        let tight = inputs(MemoryKind::Dedicated, Some(8 * GIB), None);
+        let err = compute_budget_with_draft(&tight, &draft, &cfg, None).unwrap_err();
+        assert!(err.breakdown.contains("draft_weights="), "{err}");
+        assert!(err.breakdown.contains("draft_workspace="), "{err}");
+        assert!(err.breakdown.contains("draft_slot="), "{err}");
     }
 
     #[test]

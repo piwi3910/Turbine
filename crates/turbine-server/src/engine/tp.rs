@@ -1909,6 +1909,7 @@ mod tests {
             jump_forward: true,
             jump_forward_max_tokens: 32,
             ranks: Vec::new(),
+            draft: None,
         });
         (engine, tx, shared, reg)
     }

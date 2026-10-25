@@ -248,6 +248,7 @@ pub(crate) fn copy_device(prepared: &PreparedModel) -> CopyDevice {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     prepared: PreparedModel,
+    draft: Option<PreparedModel>,
     group: Option<tp::TpGroupStart>,
     pipeline: Option<pp::PipelineStart>,
     backend: Arc<ModelBackend>,
@@ -316,6 +317,40 @@ pub fn spawn(
                         return;
                     }
                 };
+                // Phase 8: the draft loads after the target, its fixed bytes already charged
+                // in the target's budget (S-7); a load failure is exit 1 before ready.
+                let draft = match draft {
+                    Some(draft) => match model::load_draft(
+                        &draft,
+                        warmup_token,
+                        &metrics.model,
+                        &startup.metrics,
+                    ) {
+                        Ok(d) => Some(d),
+                        Err(e) => {
+                            let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                if let Some(draft) = draft.as_ref() {
+                    tracing::info!(
+                        event = "speculative",
+                        method = "draft",
+                        family = draft.arch.family.0.name(),
+                        format = draft.arch.weight_format.0.name(),
+                        max_seq_len = draft.max_seq_len,
+                        block_tokens = draft.block_tokens,
+                        vocab_size = draft.tokenizer.vocab_size(),
+                        weight_bytes = draft.loaded.weight_bytes,
+                        kv_slot_bytes = draft
+                            .loaded
+                            .budget
+                            .pool(turbine_reliability::budget::PoolKind::Kv),
+                        "draft model loaded; speculative rounds are on"
+                    );
+                }
                 let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
                 // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
                 // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
@@ -523,6 +558,7 @@ pub fn spawn(
                     jump_forward: structured_output.jump_forward,
                     jump_forward_max_tokens: structured_output.jump_forward_max_tokens,
                     ranks,
+                    draft,
                 });
                 backend.set_ready(
                     replica,

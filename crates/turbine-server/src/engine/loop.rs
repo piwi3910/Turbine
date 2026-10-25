@@ -168,6 +168,9 @@ pub(crate) struct EngineParts {
     pub jump_forward_max_tokens: u32,
     /// Every rank's KV headroom, published in the KV document (P7 S-7).
     pub ranks: Vec<turbine_kv::KvRankDocument>,
+    /// The Phase 8 draft (loaded by the engine after the target): `None` without
+    /// `speculative.method: draft`.
+    pub draft: Option<crate::model::DraftModel>,
 }
 
 /// The message of the `slow_client` error event.
@@ -222,6 +225,10 @@ pub(crate) struct EngineLoop {
     seqs: HashMap<SeqId, (RequestId, usize)>,
     next_seq: u64,
     rel: EngineReliability,
+    /// The loaded Phase 8 draft; `None` without `speculative.method: draft` (used by the
+    /// speculative round, Task 7).
+    #[allow(dead_code)]
+    draft: Option<crate::model::DraftModel>,
     /// The controller snapshot read at the start of this turn.
     snap: Arc<Snapshot>,
     /// The circuit probe in flight and its (unread) event channel.
@@ -499,6 +506,7 @@ impl EngineLoop {
             seqs: HashMap::new(),
             next_seq: 1,
             rel: p.reliability,
+            draft: p.draft,
             snap,
             probe: None,
             probe_prompt,
@@ -3986,6 +3994,7 @@ mod tests {
             jump_forward: true,
             jump_forward_max_tokens: 32,
             ranks: Vec::new(),
+            draft: None,
         });
         TestEngine {
             engine,
