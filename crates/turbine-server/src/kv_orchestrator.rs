@@ -50,7 +50,7 @@ use turbine_core::clock::Clock;
 use turbine_core::config::{KvConfig, PromotionCopy};
 use turbine_core::telemetry::{StorageProbe, StorageSample};
 use turbine_core::types::{
-    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId,
+    BlockId, DType, KvDtype, KvLayout, MemoryKind, ModelIdentity, PressureState, RequestId, SeqId,
 };
 use turbine_kernels::{
     KernelProvider, KvCodecFns, KvTranscodeConfig, KvTranscodeContext, KvTranscodeFormat,
@@ -99,6 +99,14 @@ const REFRESH_FREE_SHARE: u32 = 10;
 const PREFILL_ALPHA: f64 = 0.2;
 /// Prefill iterations smaller than this do not update the prefill rate (launch overhead).
 const PREFILL_MIN_TOKENS: u32 = 64;
+
+/// The snapshot-pool key of sequence `seq`'s Phase 8 scratch state entry (S-5): a reserved
+/// block id above every real L0 block (the pool's ids are its block indices, far below
+/// `u32::MAX`). Keys in this range are never committed to the directory or a tier, so the
+/// entry only ever holds the live state a verification span copied aside.
+fn state_scratch_block(seq: SeqId) -> BlockId {
+    BlockId(u32::MAX - (seq.0 as u32))
+}
 
 /// Refuses (exit 1) a lower-tier format the host path cannot store (P6b S-1): one the codec
 /// cannot encode for this layout, or any format other than `l0` when a block is split into
@@ -697,6 +705,22 @@ impl KvOrchestrator {
     /// reserved the entry failed before committing the block.
     pub fn snapshot_release(&mut self, block: BlockId) {
         self.h.release_snapshot(block);
+    }
+
+    /// P8 S-5: reserves sequence `seq`'s scratch state entry — a state-sized snapshot entry
+    /// the engine copies the live recurrent/conv state into before a verification span and
+    /// restores on a partial accept. The block-boundary snapshot pool's conservative
+    /// `one entry per L0 block` allocation already backs it, so the budget needs no new term.
+    /// `None` for an attention-only model or when every snapshot entry is in use (speculation
+    /// then falls back to a plain decode).
+    pub fn state_scratch_alloc(&mut self, seq: SeqId) -> Option<turbine_kv::state::SnapshotRef> {
+        self.h.snapshot_alloc(state_scratch_block(seq))
+    }
+
+    /// P8 S-5: releases `seq`'s scratch state entry with its live slot (finish, cancel,
+    /// preemption). Releasing a sequence without an entry is a no-op.
+    pub fn state_scratch_release(&mut self, seq: SeqId) {
+        self.h.release_snapshot(state_scratch_block(seq));
     }
 
     /// P7 S-12 (Task 33): gives the device path the L0 snapshot store a hybrid block's tail

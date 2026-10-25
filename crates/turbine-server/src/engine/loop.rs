@@ -104,7 +104,7 @@ use turbine_kv::BlockPool;
 use turbine_kv::hierarchy::{AttachOutcome, AttachRequest, CAPACITY_BATCH, PrefixAttach};
 use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
-    SnapshotRef, StateLoc, StateSnapshots, TokenFeed,
+    SnapshotRef, StateCopy, StateLoc, StateSnapshots, TokenFeed,
 };
 use turbine_model::speculative::{ProposeError, ProposeRequest};
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
@@ -305,6 +305,15 @@ pub(crate) struct EngineLoop {
     /// was requested even if the choice's matcher state moves on; removed when the run was
     /// verified or its extension was dropped.
     jump_drafts: HashMap<SeqId, Vec<u32>>,
+    /// Phase 8 S-5: each speculating sequence's scratch state entry (a state-sized snapshot
+    /// entry the live recurrent/conv state is copied into before a verification span and
+    /// restored from on a partial accept). Allocated on the first span, released with the
+    /// sequence on finish, cancel and preemption. Empty for an attention-only target.
+    spec_scratch: HashMap<SeqId, turbine_model::executor::SnapshotRef>,
+    /// Phase 8 S-5: the span the current iteration launched per speculating sequence — its
+    /// first position, the tokens it fed and its block table — so a partial accept can replay
+    /// the kept tokens over the restored state. Removed when the span is verified.
+    spec_spans: HashMap<SeqId, SpecSpan>,
     /// Choice 0's final partial block per request that finished at sampling time
     /// (`sample_choice`, serial and pipelined paths): published before the iteration's
     /// `complete` releases the finished tables, dropped when the iteration failed.
@@ -403,6 +412,16 @@ struct Built {
     /// P7 S-12 (Task 32): per row, the block-boundary snapshots the step must fill, `(token
     /// offset within the step, entry)`. Empty for an attention-only model.
     snapshots: Vec<SmallVec<[(u32, SnapshotRef); 2]>>,
+}
+
+/// Phase 8 S-5: the verification span one iteration launched for a sequence.
+struct SpecSpan {
+    /// Absolute position of the span's first fed token.
+    start: u32,
+    /// The span's tokens, `1 + k`: the sampled-but-unfed token and the proposals.
+    tokens: Vec<u32>,
+    /// The block table the span ran over.
+    blocks: SmallVec<[BlockId; 16]>,
 }
 
 enum Build {
@@ -546,6 +565,8 @@ impl EngineLoop {
             tail_done: Vec::new(),
             last_table_blocks: HashMap::new(),
             jump_drafts: HashMap::new(),
+            spec_scratch: HashMap::new(),
+            spec_spans: HashMap::new(),
             pending_publishes: Vec::new(),
             retire_later: Vec::new(),
             reattaching: HashSet::new(),
@@ -791,6 +812,7 @@ impl EngineLoop {
     fn try_launch(&mut self, plan: &IterationPlan) -> Result<Option<Built>, IterationError> {
         self.fork_copies(plan)?;
         self.state_copies(plan)?;
+        self.spec_state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -1860,6 +1882,7 @@ impl EngineLoop {
     ) -> Result<Option<(Vec<RowInfo>, Logits)>, IterationError> {
         self.fork_copies(plan)?;
         self.state_copies(plan)?;
+        self.spec_state_copies(plan)?;
         self.stages.mark(Stage::Prepare);
         if plan.items.is_empty() {
             return Ok(None);
@@ -1928,6 +1951,34 @@ impl EngineLoop {
         Ok(())
     }
 
+    /// Phase 8 S-5: copies each speculating sequence's live state into its scratch entry before
+    /// the verification step, after the plan's own state copies (a prefix restore or a fork
+    /// must land in the live slot first). Attention-only targets have no scratch entries.
+    fn spec_state_copies(&mut self, plan: &IterationPlan) -> Result<(), IterationError> {
+        let mut copies = Vec::new();
+        for item in &plan.items {
+            if item.draft.is_empty() {
+                continue;
+            }
+            let Some(scratch) = self.spec_scratch.get(&item.seq).copied() else {
+                continue;
+            };
+            let Some(live) = self.sched.state_slot_of(item.seq) else {
+                continue;
+            };
+            copies.push(StateCopy {
+                src: StateLoc::Slot(live),
+                dst: StateLoc::Snapshot(scratch),
+            });
+        }
+        if copies.is_empty() {
+            return Ok(());
+        }
+        self.exec
+            .copy_state(&copies)
+            .map_err(|e| IterationError::model("speculative scratch copy failed", e))
+    }
+
     /// P7 S-12 (Task 32): records this turn's reserved snapshot entries on their directory
     /// entries (the step committed their blocks). A block with no committed key is dropped: its
     /// entry stays reserved but unused (freed with the block).
@@ -1966,6 +2017,64 @@ impl EngineLoop {
                 self.kv.snapshot_release(block);
             }
         }
+    }
+
+    /// Phase 8 S-5: a verification span was partly accepted. Copy the pre-span state back over
+    /// the live slot and re-advance it through the kept tokens only — the sampled-but-unfed
+    /// token plus the `accepted` accepted proposals — with one small forward, so the state at
+    /// the rollback point equals a token-by-token run. The span's boundary snapshots past the
+    /// kept end were already released ([`EngineLoop::drop_rejected_snapshots`]); the replay does
+    /// not take snapshots (the kept blocks' entries hold the correct boundary state).
+    fn restore_speculative_state(&mut self, seq: SeqId, accepted: u32) -> Result<(), String> {
+        let Some(span) = self.spec_spans.remove(&seq) else {
+            return Ok(());
+        };
+        let Some(scratch) = self.spec_scratch.get(&seq).copied() else {
+            return Ok(());
+        };
+        let Some(live) = self.sched.state_slot_of(seq) else {
+            return Ok(());
+        };
+        self.exec
+            .copy_state(&[StateCopy {
+                src: StateLoc::Snapshot(scratch),
+                dst: StateLoc::Slot(live),
+            }])
+            .map_err(|e| format!("restoring the speculative scratch state failed: {e}"))?;
+        // Kept tokens: the span's first token (the sampled-but-unfed one) and the accepted
+        // proposals. They end at the position the next decode feeds.
+        let kept = (accepted as usize + 1).min(span.tokens.len());
+        if kept == 0 {
+            return Ok(());
+        }
+        let tokens = &span.tokens[..kept];
+        let positions: Vec<u32> = (span.start..span.start + kept as u32).collect();
+        let slice = SeqSlice {
+            state_slot: Some(live.0),
+            snapshot_blocks: &[],
+            seq,
+            q_start: 0,
+            q_len: kept as u32,
+            kv_len: span.start + kept as u32,
+            block_table: &span.blocks,
+            block_formats: &[],
+            reduce: None,
+            logits_rows: 1,
+        };
+        let started = Instant::now();
+        let view = self.pool.view();
+        self.exec
+            .forward(&BatchInput {
+                tokens,
+                positions: &positions,
+                seqs: std::slice::from_ref(&slice),
+                kv: &view,
+            })
+            .map_err(|e| format!("replaying the kept speculative tokens failed: {e}"))?;
+        self.metrics
+            .model
+            .observe_forward(ForwardPhase::Prefill, started.elapsed().as_secs_f64());
+        Ok(())
     }
 
     /// Packs `plan` into one ragged batch. Each item's tokens come from its request's history;
@@ -2149,6 +2258,18 @@ impl EngineLoop {
                     token: q_start + it.len - 1,
                     prev_slot: slot as u32,
                 });
+            }
+            // Phase 8 S-5: remember a speculative span's tokens and table so a partial accept
+            // can replay the kept tokens over the restored scratch state.
+            if self.spec_scratch.contains_key(&seq) && !plan.items[it.index].draft.is_empty() {
+                self.spec_spans.insert(
+                    seq,
+                    SpecSpan {
+                        start: it.start,
+                        tokens: built.tokens[q_start as usize..][..it.len as usize].to_vec(),
+                        blocks: plan.items[it.index].block_table.blocks.clone(),
+                    },
+                );
             }
             let seeded = r.choices[it.choice].is_seeded();
             let feedable =
@@ -3021,10 +3142,26 @@ impl EngineLoop {
                 "the speculative round ended inside its span"
             );
         }
+        let rolled_back = k.saturating_sub(accepted);
+        if rolled_back > 0 && finished.is_none() {
+            if let Err(message) = self.restore_speculative_state(seq, accepted) {
+                tracing::error!(
+                    event = "speculative_replay_failed",
+                    request_id = %http_id,
+                    choice,
+                    accepted,
+                    error = %message,
+                    "the hybrid state could not be rolled back"
+                );
+                outcome.failed = Some(IterationFailure { message });
+                return;
+            }
+        } else {
+            self.spec_spans.remove(&seq);
+        }
         for step in steps {
             self.deliver_choice(id, choice, seq, step, outcome);
         }
-        let rolled_back = k.saturating_sub(accepted);
         if rolled_back > 0 {
             outcome.rolled_back.push((seq, rolled_back));
             tracing::debug!(
@@ -3109,11 +3246,28 @@ impl EngineLoop {
             }
         }
         // One appended token per step comes from `deliver_choice`; the rollback is the only
-        // count the plain path never sees.
+        // count the plain path never sees. Phase 8 S-5: a partly accepted hybrid span restores
+        // the pre-span state and replays the kept tokens before the emitted tokens move on.
+        let rolled_back = k.saturating_sub(forced.accepted);
+        if speculative && rolled_back > 0 && forced.finished.is_none() {
+            if let Err(message) = self.restore_speculative_state(seq, forced.accepted) {
+                tracing::error!(
+                    event = "speculative_replay_failed",
+                    request_id = %http_id,
+                    choice,
+                    accepted = forced.accepted,
+                    error = %message,
+                    "the hybrid state could not be rolled back"
+                );
+                outcome.failed = Some(IterationFailure { message });
+                return;
+            }
+        } else {
+            self.spec_spans.remove(&seq);
+        }
         for step in forced.steps {
             self.deliver_choice(id, choice, seq, step, outcome);
         }
-        let rolled_back = k.saturating_sub(forced.accepted);
         if rolled_back > 0 {
             outcome.rolled_back.push((seq, rolled_back));
             if speculative {
@@ -3549,6 +3703,16 @@ impl EngineLoop {
         if proposals.is_empty() {
             return;
         }
+        // Phase 8 S-5: a hybrid target keeps a per-sequence scratch state entry for the
+        // duration of its speculation (allocated on the first span, released with the
+        // sequence). Without a free entry the round falls back to a plain decode.
+        if self.hybrid_interval.is_some() && !self.spec_scratch.contains_key(&seq) {
+            let Some(scratch) = self.kv.state_scratch_alloc(seq) else {
+                self.metrics.server.speculative_disabled("no_room");
+                return;
+            };
+            self.spec_scratch.insert(seq, scratch);
+        }
         self.jump_drafts.insert(seq, proposals.clone());
         if let Err(e) = self.sched.extend(seq, proposals) {
             self.jump_drafts.remove(&seq);
@@ -3806,16 +3970,27 @@ impl EngineLoop {
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
                 self.last_table_blocks.remove(&c.seq);
+                // Phase 8 S-5: the scratch state entry goes with the live slot.
+                self.spec_spans.remove(&c.seq);
+                if self.spec_scratch.remove(&c.seq).is_some() {
+                    self.kv.state_scratch_release(c.seq);
+                }
             }
         }
     }
 
-    /// Phase 8: a preempted sequence's draft slot goes back with its KV, before the next plan
-    /// can ask for proposals.
+    /// Phase 8: a preempted sequence's draft slot and scratch state entry go back with its KV,
+    /// before the next plan can ask for proposals; the recompute rebuilds the state from zero.
     fn release_preempted(&mut self, plan: &IterationPlan) {
         if let Some(proposer) = self.draft.as_mut() {
             for (seq, _) in &plan.preempted {
                 proposer.release(*seq);
+            }
+        }
+        for (seq, _) in &plan.preempted {
+            self.spec_spans.remove(seq);
+            if self.spec_scratch.remove(seq).is_some() {
+                self.kv.state_scratch_release(*seq);
             }
         }
     }
@@ -3863,6 +4038,8 @@ impl EngineLoop {
         self.shared.set_outstanding(pending);
         self.shared
             .set_state_slots_free(self.sched.state_slots().map(|p| p.free()));
+        self.shared
+            .set_spec_scratch_entries(self.spec_scratch.len() as u64);
     }
 }
 
@@ -4061,7 +4238,9 @@ mod tests {
     use crate::kv_orchestrator::{CopyDevice, KvStart, kv_format};
     use crate::metrics::ServerMetrics;
     use crate::reliability::{DeviceReserve, ReliabilityInputs};
-    use turbine_model::speculative::{DraftModelFactory, DraftProposerConfig, ProposerFactory};
+    use turbine_model::speculative::{
+        DraftModelFactory, DraftProposerConfig, Proposals, Proposer, ProposerFactory,
+    };
     use turbine_model::{TokenMask, TokenMatcher};
 
     const BLOCK_TOKENS: u32 = 16;
@@ -5886,6 +6065,214 @@ mod tests {
         serial_handle.join().unwrap().unwrap();
         drop(tx);
         draft_handle.join().unwrap().unwrap();
+    }
+
+    /// A deterministic test proposer (Phase 8 S-5): it proposes the tokens `tokens` (the
+    /// serial run's greedy stream) from the request's accepted length, except on its second
+    /// round, where the first proposal is shifted by one and must be rejected. It owns no
+    /// draft model, so the test isolates the target's rollback.
+    struct ScriptedProposer {
+        tokens: Vec<u32>,
+        prompt_len: u32,
+        vocab: u32,
+        round: u32,
+        begun: Option<SeqId>,
+    }
+
+    impl Proposer for ScriptedProposer {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn validate(
+            &self,
+            _target: &turbine_model::config::ModelArchConfig,
+            _draft: &turbine_model::config::ModelArchConfig,
+            _tokenizer: &Tokenizer,
+        ) -> Result<(), ProposeError> {
+            Ok(())
+        }
+
+        fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<(), ProposeError> {
+            if self.begun.is_some() && self.begun != Some(seq) {
+                return Err(ProposeError::SlotBusy);
+            }
+            self.begun = Some(seq);
+            self.prompt_len = prompt.len() as u32;
+            Ok(())
+        }
+
+        fn propose(&mut self, request: ProposeRequest) -> Result<Proposals, ProposeError> {
+            if self.begun != Some(request.seq) {
+                return Err(ProposeError::NotBegun);
+            }
+            // `accepted_len` is the newest generated token's position; the proposals are the
+            // serial tokens after it.
+            let first = (request.accepted_len.saturating_sub(self.prompt_len) + 1) as usize;
+            let mut tokens: Vec<u32> = (0..request.num_tokens)
+                .filter_map(|j| self.tokens.get(first + j as usize).copied())
+                .collect();
+            if self.round == 1 && tokens.len() > 1 {
+                tokens[1] = (tokens[1] + 1) % self.vocab;
+            }
+            self.round += 1;
+            Ok(Proposals { tokens })
+        }
+
+        fn truncate(&mut self, _seq: SeqId, _len: u32) -> Result<(), ProposeError> {
+            Ok(())
+        }
+
+        fn release(&mut self, _seq: SeqId) {}
+    }
+
+    /// Phase 8 S-5: on the tiny hybrid (Qwen3.5, Gated DeltaNet state) a partly accepted span
+    /// restores the scratch state and replays the kept tokens, so the next round's stream equals
+    /// the serial one; a boundary inside the rejected span is not committed; the scratch entry
+    /// returns on finish, cancel and preemption.
+    #[test]
+    fn hybrid_speculative_rollback_matches_serial() {
+        let (_dir, spec, tokenizer) = hybrid_tiny();
+        let kv = KvConfig {
+            hybrid_snapshot_interval_blocks: 1,
+            ..KvConfig::default()
+        };
+        let prompt: Vec<u32> = std::iter::once(256).chain(97..120).collect();
+        let serial_req = hybrid_request(&prompt, 20);
+
+        // The serial run (no draft).
+        let serial_engine = engine_with_kv(
+            hybrid_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv.clone(),
+            |_, _, _| None,
+        );
+        let TestEngine {
+            engine: serial,
+            tx: serial_tx,
+            reg: serial_reg,
+            ..
+        } = serial_engine;
+        let serial_handle = std::thread::spawn(move || serial.run());
+        let (serial_tokens, _) = run_one(&serial_tx, serial_req.clone());
+        drop(serial_tx);
+        serial_handle.join().unwrap().unwrap();
+
+        // The speculative run: a scripted proposer repeats the serial stream and rejects its
+        // own first proposal on the second round, so a span is partly accepted mid-request.
+        let blocked = engine_with_kv(
+            hybrid_executor(&spec, 16),
+            Arc::clone(&tokenizer),
+            params(16, 8),
+            false,
+            kv,
+            |_, _, _| None,
+        );
+        let mut engine = blocked.engine;
+        engine.draft = Some(Box::new(ScriptedProposer {
+            tokens: serial_tokens.clone(),
+            prompt_len: prompt.len() as u32,
+            vocab: spec.vocab,
+            round: 0,
+            begun: None,
+        }));
+        engine.speculative = turbine_core::config::SpeculativeConfig {
+            num_tokens: 4,
+            ..turbine_core::config::SpeculativeConfig::default()
+        };
+        // Enable speculation for the tiny target regardless of the support matrix: the host
+        // test drives the rollback path directly.
+        engine.speculative.method = SpeculativeMethod::Draft;
+        engine.speculative.draft_model_path = Some("/unused".into());
+        let TestEngine {
+            tx, shared, reg, ..
+        } = blocked;
+        let handle = std::thread::spawn(move || engine.run());
+        let (draft_tokens, _) = run_one(&tx, serial_req.clone());
+        assert_eq!(
+            draft_tokens, serial_tokens,
+            "the hybrid speculative stream is the serial stream"
+        );
+        assert!(
+            metric(
+                &reg,
+                r#"turbine_speculative_rounds_total{outcome="partial"}"#
+            ) > 0.0,
+            "a span was partly accepted: {}",
+            reg.render().unwrap()
+        );
+        // A boundary inside the rejected span is not committed: the serial run stores the
+        // boundary the speculative span skipped and the speculative run never retakes it (the
+        // next boundary after the rollback is stored; S-5).
+        let serial_stored = metric(
+            &serial_reg,
+            r#"turbine_hybrid_state_snapshots_total{outcome="stored"}"#,
+        );
+        let draft_stored = metric(
+            &reg,
+            r#"turbine_hybrid_state_snapshots_total{outcome="stored"}"#,
+        );
+        assert!(
+            draft_stored < serial_stored && draft_stored > 0.0,
+            "a rejected span's boundary snapshot is not committed: speculative {draft_stored}, \
+             serial {serial_stored}"
+        );
+
+        // A cancelled request returns its scratch entry; a follow-up request drives the turns.
+        let (mut rx, admitted) = submit(&tx, hybrid_request(&prompt, 64));
+        assert_eq!(admitted.blocking_recv().unwrap(), Ok(()));
+        let mut seen = 0;
+        while seen < 3 {
+            match rx.blocking_recv().expect("stream ended early") {
+                GenerationEvent::Token { .. } => seen += 1,
+                GenerationEvent::Error { code, message } => panic!("{code:?}: {message}"),
+                _ => {}
+            }
+        }
+        drop(rx);
+        run_one(&tx, hybrid_request(&[256, 72, 101], 4));
+        drop(tx);
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            shared.spec_scratch_entries(),
+            0,
+            "the scratch entry returned on finish and cancel"
+        );
+    }
+
+    /// Phase 8 S-5: a preempted sequence gives its scratch state entry back with its live slot.
+    #[test]
+    fn speculative_scratch_released_on_preempt() {
+        let (_dir, spec, tokenizer) = hybrid_tiny();
+        let kv = KvConfig {
+            hybrid_snapshot_interval_blocks: 1,
+            ..KvConfig::default()
+        };
+        let t = engine_with_kv(
+            hybrid_executor(&spec, 4),
+            Arc::clone(&tokenizer),
+            params(4, 64),
+            false,
+            kv,
+            |_, _, _| None,
+        );
+        let mut engine = t.engine;
+        let seq = SeqId(7);
+        let scratch = engine
+            .kv
+            .state_scratch_alloc(seq)
+            .expect("a scratch state entry");
+        engine.spec_scratch.insert(seq, scratch);
+        let mut plan = IterationPlan::default();
+        plan.preempted
+            .push((seq, turbine_scheduler::PreemptReason::KvExhausted));
+        engine.release_preempted(&plan);
+        assert!(
+            engine.spec_scratch.is_empty(),
+            "the scratch entry returned on preemption"
+        );
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is

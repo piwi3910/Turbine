@@ -133,6 +133,10 @@ pub struct EngineShared {
     /// attention-only family. A health signal (a slot must return on every finish, cancel and
     /// preemption); the engine republishes it every turn.
     state_slots_free: AtomicU64,
+    /// Phase 8 S-5: speculating sequences that hold a scratch state entry; the engine
+    /// republishes it every turn (the S-5 test asserts it returns to zero on finish, cancel
+    /// and preemption).
+    spec_scratch_entries: AtomicU64,
 }
 
 impl Default for EngineShared {
@@ -142,6 +146,7 @@ impl Default for EngineShared {
             outstanding_tokens: AtomicU64::new(0),
             // `u64::MAX`: an attention-only family (no state-slot pool) until a run says otherwise.
             state_slots_free: AtomicU64::new(u64::MAX),
+            spec_scratch_entries: AtomicU64::new(0),
         }
     }
 }
@@ -173,6 +178,17 @@ impl EngineShared {
     pub(crate) fn set_state_slots_free(&self, free: Option<u32>) {
         self.state_slots_free
             .store(free.map_or(u64::MAX, u64::from), Ordering::Release);
+    }
+
+    /// Phase 8 S-5: speculating sequences holding a scratch state entry. Read by the S-5
+    /// engine test to assert the entry returns on finish, cancel and preemption.
+    #[cfg(test)]
+    pub fn spec_scratch_entries(&self) -> u64 {
+        self.spec_scratch_entries.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_spec_scratch_entries(&self, entries: u64) {
+        self.spec_scratch_entries.store(entries, Ordering::Release);
     }
 
     pub fn publish(&self, docs: EngineDocs) {
