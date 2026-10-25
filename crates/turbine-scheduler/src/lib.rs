@@ -10,6 +10,7 @@ pub mod queue;
 pub mod request;
 pub mod scheduler;
 pub mod sim;
+pub mod speculative;
 
 pub use gate::{AdmissionGate, GateOutcome};
 pub use metrics::SchedulerMetrics;
