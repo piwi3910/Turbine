@@ -5140,3 +5140,15 @@ The user amended the handoff's "the user pushes" rule: **the lead merges `p7-sta
 itself and never stops to ask for that.** `p7-stack` was merged into `main` (merge commit `66e42cc3`,
 clean; `main` was an ancestor). The user then also lifted the "never push" rule the same day:
 `main` is pushed to `origin` (`c3bf4acf..6a0d91f5`, 468 commits).
+
+## P7 uniform gpt-oss reference — abandoned (2026-10-25)
+
+The cosmetic uniform-reference regeneration (uniform `captured` stamps across the 16 gpt-oss records;
+the values are identical — the fixture is deterministic, so only timestamps differ) is **abandoned as
+disproportionate**. On CPU, transformers' gpt-oss MoE expert loop runs effectively on one core, so the
+9144-char p09 prompt alone had taken > 4 h and the remaining 7 prompts would have needed several more
+hours, holding the shared `fixture.lock` for 8–12 h. The committed reference stands (mixed `captured`
+stamps: p01/p10–p13 2026-10-18, p02–p09 2026-10-14, p14–p16 2026-10-16) — the golden c1/c16 verdicts
+are unaffected because the date-pinned template makes the render deterministic. The job's `.tmp`
+(8/16) is kept at `/home/piwi/turbine-ci/scratch/p7-t40/out/` if a later GPU-transformers regeneration
+is wanted; its job script is `.procoder/handoff/p7_ref_gptoss_uniform.sh`.
