@@ -20,7 +20,7 @@ use turbine_core::support::{
 };
 
 /// The fourteen extension points, one page each.
-const PAGES: [&str; 14] = [
+const PAGES: [&str; 15] = [
     "model-family",
     "tool-format",
     "weight-format",
@@ -35,6 +35,7 @@ const PAGES: [&str; 14] = [
     "collective-backend",
     "rank-transport",
     "dp-router-policy",
+    "speculative-proposer",
 ];
 
 const SECTIONS: [&str; 4] = [

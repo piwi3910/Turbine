@@ -23,6 +23,7 @@ pub mod reasoning;
 pub mod registries;
 pub mod safetensors;
 pub mod sampling;
+pub mod speculative;
 pub mod structured;
 pub mod testing;
 pub mod tokenizer;

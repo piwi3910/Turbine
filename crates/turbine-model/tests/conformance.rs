@@ -195,3 +195,25 @@ fn conformance_rejects_broken_module() {
     processors_suite(sampling::registry()).expect("every registered processor conforms");
     weights_suite(turbine_model::weights::registry()).expect("every weight format conforms");
 }
+
+/// Phase 8 S-2: the proposer registry carries the `draft_model` entry, names are unique, and
+/// lookup resolves every registered name.
+#[test]
+fn proposer_registry() {
+    let mut names = std::collections::BTreeSet::new();
+    for factory in turbine_model::speculative::PROPOSERS {
+        assert!(
+            names.insert(factory.name()),
+            "duplicate proposer {}",
+            factory.name()
+        );
+        assert_eq!(
+            turbine_model::speculative::proposer(factory.name())
+                .expect("a registered name resolves")
+                .name(),
+            factory.name()
+        );
+    }
+    assert!(names.contains("draft_model"), "{names:?}");
+    assert!(turbine_model::speculative::proposer("nope").is_none());
+}
