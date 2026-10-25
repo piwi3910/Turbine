@@ -5152,3 +5152,44 @@ stamps: p01/p10–p13 2026-10-18, p02–p09 2026-10-14, p14–p16 2026-10-16) �
 are unaffected because the date-pinned template makes the render deterministic. The job's `.tmp`
 (8/16) is kept at `/home/piwi/turbine-ci/scratch/p7-t40/out/` if a later GPU-transformers regeneration
 is wanted; its job script is `.procoder/handoff/p7_ref_gptoss_uniform.sh`.
+
+## Phase 8 spec: speculative decoding design choices (2026-10-25)
+
+Asked 2026-10-25 as Phase 8 started, after Phase 7 closed and the user's "ok start with phase 8".
+The umbrella S-7 already fixes the frame (a separate same-family draft behind a `Proposer` trait, a verifier in
+`turbine-scheduler`, k ≤ 8, greedy exact-prefix match plus standard rejection sampling, KV truncation rollback,
+per-request `min_acceptance`, global disable at pressure ORANGE+, colocated AMD only, the draft charged to the
+Phase 3 budget, the four `speculative.*` keys). Eight open choices remained; each was asked with options and the
+user picked the recommended one.
+
+1. **Non-greedy requests.** A) Exact rejection sampling (the draft is a point-mass proposer; the target accepts
+   p(t), rejects and resamples from p minus the proposal) with seeded requests bypassing; B) greedy-only, sampling
+   bypasses (amends S-7). **Decision: A** — the umbrella's sampling clause stands; the point-mass draft keeps the
+   scheme simple and exact.
+2. **Hybrid recurrent-state rollback.** A) One scratch `StateSlot` per speculating sequence, copied before the span
+   and restored on partial accept; B) recompute from the nearest block snapshot; C) defer hybrids (amends S-7).
+   **Decision: A** — no prefix recompute (the scratch restore is followed by one bounded replay forward of
+   at most k kept tokens), one state slot of extra memory, charged to the budget.
+3. **Batch rule.** A) Attempt a round only when the plan has exactly one item (a decode) and one live sequence;
+   B) draft for every eligible sequence. **Decision: A** — the c1 latency case, with c>1 unchanged (and a simple
+   single draft KV slot, S-7).
+4. **Structured output.** A) Constrained choices bypass speculation (`constrained`); B) masked verification.
+   **Decision: A** — the verified jump-forward already covers constrained output; combining verification schemes is
+   deferred.
+5. **Seeded requests.** A) Bypass (`seeded`), keeping seeded output bit-identical to a non-speculative run;
+   B) speculate and document a changed stream. **Decision: A**.
+6. **Parallel placements.** A) Refuse `speculative.method: draft` with tp > 1 or pp > 1 (`speculative_parallel_unsupported`);
+   B) support tp2 in this track. **Decision: A** — the gate is one R9700; tp2 draft placement is a follow-up.
+7. **Draft checkpoint and hybrid rows.** A) Fetch `unsloth/Llama-3.2-1B-Instruct` (pinned; ~2.5 GB) for the Llama-3B
+   target, implement host-tested hybrid rollback on the tiny fixture, and keep hybrid × draft rows unsupported;
+   B) use the gated `meta-llama` repo; C) also fetch a small Qwen3.5/3.6 draft. **Decision: A** — the download is
+   approved (revision `5a8abab4a5d6f164389b1079fb721cfab8d7126c`); no small same-family hybrid checkpoint is
+   provisioned, so no hybrid target is gated.
+8. **Speedup bar.** A) ≥ 1.3× single-stream decode tok/s vs `method: none` with TTFT p50 ≤ 1.15×, plus the golden,
+   serial A/B, c16 no-regression and soak gates; B) ≥ 1.5×; C) record only. **Decision: A** — the row turns
+   `supported` only on it; a performance-only miss leaves it `experimental` with the measurement in the reason.
+
+The spec is `.procoder/specs/phase-8-speculative-decoding.md` (Status: complete). The 2026-10-04 "~90 % of roofline
+before Phase 8" sequencing direction is treated as satisfied: the b1 attention follow-up landed in 5p and the 5p/7
+exits closed; the user's start instruction is the go for this track. Per the 2026-10-18 merge/push amendments the
+lead merges and pushes without asking.

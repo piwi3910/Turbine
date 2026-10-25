@@ -1,0 +1,201 @@
+# phase-8-speculative-decoding
+
+Status: complete
+
+Source: the umbrella spec `phase-6-8-expansion` (S-1, S-2, S-3, S-7, S-5 for vendor neutrality), `turbine-spec.md` §19 Phase 8, and TS §8 (quality), §16 (security and bounded inputs), §17 (testing), §18 (benchmarking), §20 (definition of done) and §21 (engineering rules). Decisions are recorded in `.procoder/ask/decisions.md`: the roadmap reorganisation of 2026-09-28 (track 3 is `phase-8-speculative-decoding`, AMD only, after `phase-7-model-families`), the sequencing direction of 2026-10-04 ("~90 % of roofline before Phase 8", whose b1 attention follow-up landed in 5p), the verified jump-forward design of 2026-10-07 (whose multi-token append and rollback Phase 8 reuses), the hybrid-cache design of 2026-10-08 (S-12, whose state slots and block-boundary snapshots this track extends), and the eight Phase 8 spec answers of 2026-10-25 ("Phase 8 spec: speculative decoding design choices").
+
+This is track 3 of 3 under the umbrella. `phase-6a-quantization`, `phase-6b-kv-compression`, `phase-5p-serving-efficiency` and `phase-7-model-families` are closed; `scripts/track-gate.sh phase-8-speculative-decoding` passes its order check because the matrix carries supported `amd` rows for Phase 7 families. Phase 8 runs on `novanas` (`gfx1201`) only.
+
+## Problem
+
+By the end of Phase 7 Turbine serves Llama-3.2-3B-Instruct, OLMoE, Qwen3-4B, Qwen3-MoE, Mistral, gpt-oss-20b and Mixtral on the R9700s, with quantized checkpoints, tiered compressed KV and the batch-1 attention kernel from Phase 5p. Decode is still memory-bandwidth bound: every emitted token reads the whole target weight set, so single-stream ITL on Llama-3.2-3B is about 15.3 ms (`itl_p50` in the Phase 7 exit run, 863.9 tok/s aggregate at concurrency 16) and the engine has no way to trade a small model's compute for fewer target steps. Engines that draft emit two to three tokens per target forward on this workload, so Turbine leaves single-stream latency on the table.
+
+A second gap is a correctness obligation the Phase 7 state design deliberately left open: the hybrids (Qwen3.5/3.6) keep per-sequence recurrent and conv state next to the paged KV, and multi-token verification must roll that state back when a span is partly rejected. Phase 7 refused the verified jump-forward for hybrids (`jump_forward_hybrid`) rather than solve it; Phase 8 owns the rollback.
+
+The feature must not change what clients observe: greedy tokens stay the target's greedy tokens, sampled streams keep the target's distribution, and the OpenAI API, `usage`, streaming order and structured-output behaviour do not change. It must also be bounded and honest about memory: a 1B draft costs weights, workspace and its own KV, all charged before serving, and a combination that does not fit is refused at startup rather than discovered in a request.
+
+## Users
+
+- **Operators:** configure one draft model for a target, see its memory cost and support status before deploying, and have an unsupported or mismatched pairing refused at startup with a reason rather than a mid-request failure.
+- **Clients of the OpenAI API:** get lower single-stream ITL and unchanged output semantics — the same greedy tokens, the same sampling distribution, unchanged streaming, `usage`, logprobs, tool calls and reasoning.
+- **Turbine developers (humans and agents):** build and verify the verifier, the proposer registry and the rollback on a macOS host with no GPU, and run the GPU/numerics gates on `novanas` with a fixed recipe.
+- **Benchmark runners:** compare Turbine with and without a draft, and against vLLM-ROCm's speculative mode on the identical checkpoint, hardware and request profile, with acceptance length as a first-class metric.
+
+## In scope
+
+- [S-1] **Draft model pairing and configuration.** `speculative.method: draft` plus `speculative.draft_model_path` load a separate small draft model of the same family as the target, sharing its tokenizer. First pairing: `meta-llama/Llama-3.2-1B-Instruct` drafting for `meta-llama/Llama-3.2-3B-Instruct`; the provisioned checkpoints are the `unsloth/Llama-3.2-1B-Instruct` and `unsloth/Llama-3.2-3B-Instruct` mirrors (slug `llama-3.2-1b-instruct`, pinned in Data). `speculative.num_tokens` is k ∈ 1..=8 (default 4), `speculative.min_acceptance` ∈ [0, 1] (default 0.4). `method: none` (the default) keeps the other keys inert. Startup validates, before binding: the path is a directory holding a loadable checkpoint; the draft's architecture is in the target family's allowed draft set (`speculative_draft_family`); the tokenizer fingerprint — vocabulary size, special-token ids and a hash of the vocabulary map — equals the target's (`speculative_draft_tokenizer`); the draft is BF16 (`speculative_draft_format`); the draft's context covers `model.max_seq_len` (`speculative_draft_context`); and `num_tokens + 1 ≤ scheduler.effective_max_running()` so the multi-row step fits the plan's logits-row capacity (`speculative_rows`). A draft that cannot be loaded or warmed up exits 1 before `/ready`. The draft model's own weights format, family and context are never re-negotiated at request time.
+- [S-2] **Proposer extension point.** The draft sits behind a `Proposer` trait with a compiled-in static registry in `turbine-model` (`turbine_model::speculative`), one implementation named `draft_model`, selected by `speculative.method: draft` (no new config key). The proposer owns the draft executor, its own KV layout and its per-sequence tables; it proposes exactly k tokens greedily (a point-mass proposal distribution), and it validates the target/draft pair at startup. The registry is covered by the Phase 2m conformance suite and a `docs/extending/speculative-proposer.md` page, kept true by the existing `docs_extending` test. No other family has a proposer in this track; a target family without one is refused by the support matrix.
+- [S-3] **Verification and exactness.** The engine reuses the Phase 5p multi-token append: after a decode yields a token, the draft proposes k tokens and `Scheduler::extend` plans one item that feeds the sampled token plus the k proposals as a single target forward with `k + 1` logits rows (the `BatchItem.draft` path; a speculative item is distinguished from the jump-forward's forced-token item). Greedy targets: accept the longest exact prefix against the target's argmax; at the first disagreement emit the target's token and roll back the rest. Sampled targets: the proposal distribution q is the draft's point mass at the proposed token, so the proposal is accepted with probability p(t) under the target's post-processing distribution p (temperature, penalties, logit bias, top-k/top-p and any mask), and on rejection the emitted token is drawn from p restricted to the vocabulary without t and renormalized after the same post-processing; that is the standard speculative rejection scheme and leaves the emitted stream distributed exactly as token-by-token sampling. Verification is side-effect free per row: it evaluates each row's post-processing distribution without observing a token, the acceptance and fallback draws use the choice's sampler RNG, and only the emitted tokens are observed and passed through the normal detokenization, stop-string, matcher, tool-call and reasoning pipeline (the rejected proposals never touch the penalty history, the detokenizer, the matcher or the output). Each round emits `accepted + 1` tokens (the accepted proposals plus the target's next token from the row after the last accepted proposal). A greedy request's emitted token at every position is the target's greedy token for the same accepted prefix; the lab gate judges the committed golden tolerance and records the serial A/B.
+- [S-4] **KV rollback and prefix invariants.** Rollback truncates the target's block table past the last accepted position and frees blocks that became empty, reusing `IterationOutcome::rolled_back`. Rejected positions' K/V bytes may remain in the sequence's private tail page, but they are excluded from the table length, the prefix hashes, prefix publishes and snapshots: a full block publishes only kept tokens, and a block-boundary snapshot planned inside a partly rejected span is not committed (its entry is released and a later non-speculative step takes the snapshot at the next boundary). Tail copies, L0-only partial reuse, the page classes (BF16, `fp8_e4m3`, `tq4`, `tq2`) and the tier hierarchy keep their Phase 4–7 rules; speculation adds no new sharing rule.
+- [S-5] **Hybrid recurrent-state rollback.** For a target family with per-sequence state, each speculating sequence owns one scratch `StateSlot` (charged to the budget) in addition to its live slot. Before the verification step the live state is copied to the scratch; a fully accepted span keeps the live state and releases the scratch use; a partly accepted span copies the scratch back over the live slot and then advances the live state through the kept tokens only with one small forward over at most k kept tokens (a bounded replay, not a prefix recompute), so the state at the rollback point equals a token-by-token run. Snapshot writes use the state after kept tokens only; the existing block-boundary snapshot and `n > 1` `Slot → Slot` copies are unchanged. The scratch is released with the sequence on finish, cancellation and preemption. This path is implemented and host-tested on the tiny Qwen3.5 fixture (a same-family tiny draft); hybrid × draft rows stay `unsupported` in this track because no small same-family hybrid checkpoint is provisioned (Data).
+- [S-6] **Eligibility and disable rules.** A round is attempted only when the plan that produced the token contained exactly one item, a decode, and the engine has one live sequence; the choice is unconstrained, unseeded, not paused and not finishing; `speculative.method` is `draft`; the pressure state is GREEN or YELLOW; and the target's k + 1 rows, the extension's token budget and the draft slot are available. Pressure ORANGE or worse disables drafting globally from the next round (an in-flight round completes) and re-enables at GREEN or YELLOW, riding the controller's own hysteresis. Per request, a trailing window of 8 completed rounds whose accepted fraction (accepted ÷ k) is below `min_acceptance` disables speculation for the rest of that request (`low_acceptance`); the window is only judged after 8 rounds. Runtime disable reasons are a bounded set: `method_none`, `pressure`, `batch`, `constrained`, `seeded`, `paused`, `low_acceptance`, `no_draft_kv`, `no_room`. A request is never failed, queued or delayed because of speculation: every unavailable condition falls back to the ordinary decode and is retried on a later round as the reason allows. `n > 1` choices produce a multi-item plan in this track, so they fall back through the `batch` rule.
+- [S-7] **Draft memory and prefill.** The draft's weights, its executor workspace and one full-context draft KV slot are charged to the device budget before serving, and the target's L0 KV pool is sized from the remainder; a combined footprint that cannot hold the target's minimum one-sequence KV fails startup with exit 1 naming the budget and `speculative.draft_model_path`, after weights are loaded and before `/ready`. The draft KV is a dedicated `BlockPool` with the draft's layout and the target's `kv.block_tokens` block size, holding one sequence at `model.max_seq_len` (Llama-3.2-1B: 16 layers × 8 KV heads × head_dim 64 × 2 bytes × 2 = 32 KiB per token, about 1 GiB at 32 768 tokens, recorded in the lab config) plus k positions of span slack. It is not tiered, not shared between requests and not reused as a prefix. The slot is taken when a request's first speculative round starts, after the target's prefill has completed; the draft then prefills the accepted prompt once (chunked by its own row and workspace limits) and appends each round's tokens. The draft prefill is part of TTFT and is measured; the draft KV is truncated with the target on rollback and released on finish, cancellation, preemption or permanent disable.
+- [S-8] **Execution restrictions.** `speculative.method: draft` with tensor parallelism above 1 or pipeline stages above 1 is refused at startup with exit 2 and reason `speculative_parallel_unsupported`; the first gate is one R9700. Each data-parallel replica loads and owns its own draft and draft slot. Overlap scheduling stays enabled for ordinary turns; a speculative round is a serial turn (like the jump-forward step) so the proposal and its verification are not overtaken. Decode graphs, device logits reduction and the existing multi-row logits path are used unchanged for the verify step. The verified jump-forward remains independent: constrained choices bypass speculation under S-6 and keep the jump-forward behaviour they had in 5p.
+- [S-9] **Support matrix.** On `amd`/`gfx1201`, the row `LlamaForCausalLM × bf16 weights × bf16 KV × draft` turns `supported` only after every gate item of S-11 passes; if only the performance bar misses, it stays `experimental` with a reason recording the measured result. A `cpu × bf16 × bf16 × draft` row is `experimental` so the host integration tests can run on the reference provider. Every other draft combination is `unsupported`, including quantized targets, non-bf16 KV and other families; the wildcard draft row stops saying "not validated yet" and names the validated pairing and the missing gate. `--support-matrix` prints the rows, `--check-config` resolves and exits 2 for an unsupported combination identifying `speculative.method`, and startup resolves before binding; `support::tests::baseline_rows_present` and a new `support::tests::phase8_rows` prove the set.
+- [S-10] **Observability.** Bounded metrics: `turbine_speculative_rounds_total{outcome="accepted_all|partial|none|disabled"}`, `turbine_speculative_proposed_tokens_total`, `turbine_speculative_accepted_tokens_total`, the `turbine_speculative_accepted_per_round` histogram (buckets 0..=8) and `turbine_speculative_disabled{reason}` (the bounded reason set of S-6, as a gauge of live requests). `GET /turbine/v1/status` gains a `speculative` object with `method`, `draft_model_path`, `num_tokens`, `min_acceptance`, `active` and the current aggregate acceptance; `/metrics` exposes the series above. Startup logs `event="speculative"` with the method, k, draft path/format and family; each request's transition logs `event="speculative_disabled"` with its reason, and a dropped extension logs `event="speculative_fallback"` with `no_room`/`no_draft_kv`. Per-round logging is off. The OpenAI `usage` still counts only emitted completion tokens.
+- [S-11] **Quality and performance gate.** With the draft configured and k = 4: the committed Llama-3.2-3B golden passes at concurrency 1 and 16 under the slug's tolerance (the speculative server's greedy output against the committed reference), and a serial A/B against the same server with `method: none` is recorded token by token; a sampling exactness test (synthetic categorical plus the tiny model, fixed seed, at least 10^6 draws, total-variation distance below 0.01) and the seeded-bypass identity test pass; single-stream decode throughput on the 512-word/256-token `--ignore-eos` profile is at least 1.3× the same server with `method: none`, and TTFT p50 is at most 1.15× it, with the acceptance length recorded from the metrics; the concurrency-16 throughput of the draft-configured server is at least 0.97× the Phase 7 Llama exit (863.9 tok/s) with speculation inactive under the single-item rule; `scripts/overload-soak.sh novanas --duration 10m` passes with the draft configured and a concurrency-1 probe that exercises speculation; and a vLLM-ROCm speculative run on the identical checkpoints, k and profile is recorded, or the no-vLLM rule applies with the failure logged. The row turns `supported` only when every item above passes.
+- [S-12] **Lifecycle and errors.** The draft is prepared, loaded and warmed up like the target before the listener binds (a configuration mismatch exits 2 before binding; an unusable checkpoint, budget or runtime failure exits 1 before `/ready`); `/ready` waits for both warm-ups. A draft step's device error is an iteration failure on the same path as a target step (the Phase 3 retry/circuit logic; a sticky error exits 3), and no token from a failed step is emitted. Draft work runs on the engine thread; shutdown drops the draft executor with the target, logs `engine_stopped` only after both are freed, and follows the existing SIGINT/SIGTERM graceful sequence. A slow draft step simply adds latency and remains under `server.request_timeout`.
+
+## Out of scope
+
+- Trained draft heads and self-speculation of any kind — MTP, EAGLE, DFlash and similar proposers. The proposer registry has one entry, `draft_model`.
+- A quantized or FP8 draft checkpoint. The draft is BF16; the FP8 draft idea from the 2026-10-04 candidate list stays recorded for a later decision.
+- More than one draft per target, draft ensembles, and per-request draft selection.
+- Speculation over tensor parallelism, pipeline parallelism or multiple nodes; only one device is gated.
+- Hybrid × draft supported rows. The recurrent rollback is implemented and host-tested (S-5), but no small same-family hybrid checkpoint is provisioned, so no hybrid target is gated in this track.
+- Draft KV tiering, prefix sharing, compression or snapshot travel; the draft KV is a private L0 slot.
+- Speculation for constrained (structured-output/tool) choices, seeded requests and multi-item plans; those bypass with the S-6 reason codes and keep their current behaviour.
+- New OpenAI request or response fields, a `usage` change, or a per-request speculative switch. The feature is server configuration only.
+- Changing the output distribution, the golden references or their tolerances; widening a bound to make the gate pass.
+- NVIDIA, Intel, Apple/Metal, multimodal input, training or producing draft checkpoints, hot-swapping models, and any model not in the support matrix.
+
+## Constraints
+
+- Rust only in the serving path, no Python runtime. No new crate; the proposer registry lives in `turbine-model` and the verifier in `turbine-scheduler`; `unsafe` stays in the existing allowlisted locations and no vendor type enters a core signature (umbrella S-5).
+- Bounded inputs (TS §16, §21 rule 8): k ≤ 8; one draft KV slot; the verification span is capped by the plan's token and logits-row budgets; no unbounded queue, cache or retry. A span the plan cannot cover is dropped, never forced.
+- Exactness: with `method: draft` the greedy token stream is the target's greedy stream for the accepted prefix, sampling is distribution-preserving by rejection, and seeded requests bypass so their output stays bit-identical. `method: none` changes nothing.
+- Memory: the draft's weights, workspace and slot are reserved through the Phase 3 budget before speculation is enabled; a combination that does not fit exits 1 before `/ready`; per-request draft KV failure falls back, never fails the request.
+- Latency and throughput: the S-11 bar (≥ 1.3× single-stream decode, TTFT ≤ 1.15×, c16 ≥ 0.97× the Phase 7 exit) is the gate; a miss leaves the row `experimental` and is recorded, not papered over. The 2026-10-04 sequencing direction is satisfied by the landed b1 attention base and the closed 5p/7 exits; the user instructed Phase 8 to start on 2026-10-25.
+- The draft checkpoint is provisioned once under `/home/piwi/turbine-models/<slug>` with the user's approval, pinned by revision, never committed and never downloaded by a test or by the server.
+- Lab rules: `novanas` only, the bench lock and fixture lock as in AGENTS.md, the user asked before any lab run outside the standing approvals; no workload on the host is moved, stopped or evicted.
+
+## Interfaces
+
+### Configuration
+
+| Key                          | Type    | Default | Validation                                                                                     |
+| ---------------------------- | ------- | ------- | ---------------------------------------------------------------------------------------------- |
+| _speculative.method_         | enum    | `none`  | `none`, `draft`; the only key that enables the feature                                         |
+| _speculative.num_tokens_     | integer | `4`     | 1..=8, and `num_tokens + 1 ≤ scheduler.effective_max_running()`                                 |
+| _speculative.draft_model_path_ | path  | `null`  | required with `draft`; a directory with `config.json`, safetensors and tokenizer files          |
+| _speculative.min_acceptance_ | float   | `0.4`   | 0 ≤ value ≤ 1                                                                                |
+
+`method: none` parses the other keys but never reads the path. Every rejection names its key and exits 2 under `--check-config`; a valid pairing prints `config ok`.
+
+### Startup refusals
+
+Reason codes (the first word of the message, logged and printed): `speculative_draft_path` (missing/empty path or not a directory), `speculative_draft_family` (draft architecture outside the target's allowed set), `speculative_draft_tokenizer` (fingerprint mismatch), `speculative_draft_format` (draft weights not BF16), `speculative_draft_context` (draft context shorter than `model.max_seq_len`), `speculative_rows` (k + 1 exceeds the row capacity), `speculative_parallel_unsupported` (tp > 1 or pp > 1), and `speculative_budget` (exit 1: the combined footprint cannot hold the target's minimum KV). The support matrix separately refuses an ungated target combination, blaming `speculative.method`.
+
+### Support matrix rows
+
+Added by this track (after the S-11 gate where stated):
+
+- `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` — `supported` once S-11 passes, otherwise `experimental` with the measured miss.
+- `cpu * * bf16 bf16 draft` — `experimental`, the host test and tiny-fixture path.
+- The existing `* * * * * draft` refusal stays for every other combination; its reason names the validated pairing and the missing checkpoint/gate. Quantized weights, `fp8_e4m3`/`tq4`/`tq2` KV and other families are deliberately not gated.
+
+### Status and metrics
+
+`GET /turbine/v1/status` gains:
+
+```json
+"speculative": {
+  "method": "draft",
+  "draft_model_path": "/home/piwi/turbine-models/llama-3.2-1b-instruct",
+  "num_tokens": 4,
+  "min_acceptance": 0.4,
+  "active": true,
+  "acceptance": 0.62
+}
+```
+
+`active` is false with `method: none` or a global pressure disable; `acceptance` is the trailing aggregate accepted fraction (0 when no round has completed). The metrics are the five series of S-10; labels are the fixed outcome/result/reason sets and nothing request- or model-specific.
+
+### Extension point
+
+`turbine_model::speculative` exposes a `Proposer` trait and a static registry. The contract this spec fixes:
+
+```rust
+pub trait Proposer: Send {
+    fn name(&self) -> &'static str;
+    /// Validate the target/draft pair before serving; every error is a startup refusal.
+    fn validate(
+        &self,
+        target: &ModelArchConfig,
+        draft: &ModelArchConfig,
+        tokenizer: &Tokenizer,
+    ) -> Result<(), ProposeError>;
+    /// Take the one full-context draft slot for `seq` and prefill `prompt`.
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<(), ProposeError>;
+    /// Propose `num_tokens` greedy tokens from the last accepted token at `accepted_len`.
+    fn propose(&mut self, request: ProposeRequest<'_>) -> Result<Proposals, ProposeError>;
+    /// Drop the draft KV past `len` (the target's accepted length after a partial accept).
+    fn truncate(&mut self, seq: SeqId, len: u32) -> Result<(), ProposeError>;
+    /// Free the slot (finish, cancel, preempt or permanent disable).
+    fn release(&mut self, seq: SeqId);
+}
+```
+
+`ProposeRequest` carries the sequence, the last accepted token, the accepted length and k; `Proposals` is the token vector. The `draft_model` implementation owns the draft executor, KV and slot. A family without an entry has no proposer and its draft key is refused by the matrix. The registry passes the compiled-in conformance suite and is documented in `docs/extending/speculative-proposer.md`.
+
+### Verifier
+
+`turbine_scheduler::speculative` owns the pure verification functions used by the engine: greedy prefix acceptance and the sampling rejection draw, with no I/O and no scheduler state beyond the arguments (the choice's sampler clone is passed in). They are unit-tested against a synthetic categorical target and draft, including p(t) = 0, k = 1 and k = 8.
+
+### Lab recipe
+
+- Serve: `scripts/lab-serve.sh novanas scripts/lab/phase8-novanas-llama-draft.yaml` (target `llama-3.2-3b-instruct`, draft `llama-3.2-1b-instruct`, `speculative.method: draft`, `num_tokens: 4`, `min_acceptance: 0.4`, the Phase 7 Llama scheduling/KV keys).
+- Latency/throughput: `turbine-bench --concurrency 1 --requests 50 --prompt-words 512 --max-tokens 256 --ignore-eos --output json` on the same server with the draft and with `--set speculative.method=none` (a second serve); the c16 profile from the Phase 7 exit.
+- Golden: `turbine-golden compare --url … --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl --concurrency 1` and `--concurrency 16`; the serial A/B replays the same 16 prompts and compares token streams.
+- Reference engine: `scripts/lab-serve.sh novanas --vllm llama-3.2-3b-instruct --vllm-speculative '{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}'`; if vLLM-ROCm cannot serve speculation on this card, the no-vLLM rule records it.
+- Soak: `scripts/overload-soak.sh novanas --duration 10m` against the draft-configured server, with a concurrency-1 probe.
+- Stop: `scripts/lab-serve.sh novanas --stop`.
+
+## Data
+
+- **Draft checkpoint (pinned):** `unsloth/Llama-3.2-1B-Instruct`, revision `5a8abab4a5d6f164389b1079fb721cfab8d7126c` (2025-05-09), BF16, about 2.5 GB, provisioned at `/home/piwi/turbine-models/llama-3.2-1b-instruct` through the repo's checkpoint fetch procedure (the plan adds the Phase 8 row/table; the user approved the download on 2026-10-25). The target is the existing `unsloth/Llama-3.2-3B-Instruct` at revision `006f5dcd1393c3add266de40994ba96225e9689d`.
+- **Configs:** a lab config `scripts/lab/phase8-novanas-llama-draft.yaml` (pinned draft path, the Phase 7 Llama keys, k = 4); the existing Phase 7 Llama config stays the no-draft baseline.
+- **Fixtures:** tiny same-family pairs built by `turbine_model::testing::tiny` (`write_tiny_llama_with` for the target and draft sizes, `write_tiny_qwen3_5` for the hybrid rollback), generated per test; no external fixture is added. The committed golden and eval references are unchanged, because speculation must not change the target's greedy or sampled distribution.
+- **Gate evidence:** `tests/bench/phase-8-speculative-decoding/README.md` plus the JSON reports of the S-11 gate (golden, A/B, bench, acceptance, vLLM/no-vLLM, soak), committed like the Phase 7 runbook reports.
+- **Metrics/status data:** the series and the `speculative` status object above; nothing per request is stored.
+
+## Edge cases
+
+- k = 1 and k = 8; a round with zero accepted proposals; a round accepting every proposal (the `k + 1`th token is the target's own next token).
+- A disagreement at the first proposal, at the last, and a target token with p(t) = 0 (a logit bias, a mask or top-p truncation) under sampling; the fallback must still be exact.
+- EOS, a stop string, a tool-call boundary or a reasoning marker inside the span; `max_new_tokens` reached mid-span; the draft's proposals crossing `model.max_seq_len` (k is capped or the round is skipped and a plain decode runs).
+- The extension cannot be covered by the token budget, the logits-row capacity or the target pool: the scheduler drops it, the sequence decodes, and the reason is counted; the next round retries.
+- A request is admitted, preempted, finished or cancelled between the decode and the verification plan; a paused sequence (full output channel); `n > 1` choices (multi-item plans); a preempted-and-recomputed sequence whose KV no longer matches the draft's accepted length (the draft slot is reset or re-prefilled).
+- A hybrid target with a partly accepted span, and a block boundary inside that span: the scratch state is restored, the snapshot for the rejected block is not committed, and the next non-speculative step takes the boundary snapshot.
+- Seeded requests, constrained choices, `method: none`, pressure ORANGE/RED/SURVIVAL, and a batch with more than one item: each falls back with its reason and no behaviour change.
+- Draft and target tokenizer mismatch (different special ids or vocabulary), a draft checkpoint in another format or family, a draft context shorter than the target's, and a draft whose weights do not fit the budget.
+- A draft or target step device error, an OOM in the draft slot, a slow draft, shutdown in the middle of a round, and a client that disconnects while the round runs.
+- `logprobs` responses, `echo`, `usage.prompt_tokens_details.cached_tokens`, the draft-configured server's concurrency-16 throughput, and a near-tie where the multi-row target forward rounds differently from a single-row decode (the golden tolerance is the judge; the serial A/B records it).
+- Prefix reuse with a cached prompt: the target attaches its cached prefix as before, the draft prefills its own copy; a lossy KV tier (`fp8_e4m3`/`tq4`/`tq2`) is not gated with a draft in this track.
+
+## Failure modes
+
+- **Invalid or mismatched draft configuration:** exit 2 before the listener binds, with the key and reason code; `--check-config` does the same.
+- **Unusable draft checkpoint, warm-up failure, or a footprint that cannot hold the target's minimum KV:** exit 1 before `/ready`, naming the path and the budget; the server does not serve a half-configured model.
+- **Unsupported combination (matrix):** exit 2/exit 1 as in the umbrella, naming `speculative.method` and the row reason; no request is received.
+- **Draft step error or device OOM:** the iteration fails through the Phase 3 path (retry/circuit; a sticky device error exits 3), no partial token is emitted, and the engine keeps serving if the circuit recovers.
+- **Verifier or rollback bug:** the golden/serial A/B and the synthetic exactness tests fail, the row does not flip, and the feature is not enabled for release.
+- **Performance bar misses:** the row stays `experimental` with the measured result in the reason and the gate report; it is not silently marked supported.
+- **vLLM-ROCm cannot run the speculative baseline:** the no-vLLM rule logs it and the Turbine baseline stands; this is not a failure of the row.
+- **Overload soak fails with the draft configured:** the row stays where it is; the failure is investigated as a Phase 8 defect, never excused by disabling the soak.
+- **A same-family hybrid draft is proposed later:** it needs a new recorded decision and a spec amendment; the hybrid path is not silently enabled.
+
+## Acceptance criteria
+
+- [ ] [S-1] `cargo test -p turbine-core config::speculative::tests::speculative_config_validation` exits 0: `method: draft` with `num_tokens: 4`, a draft path and `min_acceptance: 0.4` parses; the defaults are `none`/`4`/`0.4`; `num_tokens` 0 and 9, `min_acceptance` below 0 and above 1, and `draft` without a path fail naming their key; `method: none` accepts the other keys without reading the path. Fails if a bound or a default drifts.
+- [ ] [S-1] [S-8] `cargo test -p turbine-server --test server_cli speculative_startup_refusals` exits 0: `--check-config` on a tiny target/draft pair with a mismatched tokenizer, a different family, a non-BF16 draft, a short draft context, k + 1 above the row capacity, or tp/pp above 1 exits 2 with `speculative_draft_tokenizer`/`speculative_draft_family`/`speculative_draft_format`/`speculative_draft_context`/`speculative_rows`/`speculative_parallel_unsupported` and no `config ok`; a valid CPU pair prints `config ok`. Fails if a mismatch starts or a refusal loses its reason.
+- [ ] [S-2] `cargo test -p turbine-model --test conformance speculative_proposer_registry` and `cargo test -p turbine-model --test docs_extending` exit 0: the `draft_model` entry passes the registry conformance suite (name, validate, propose contract) and the new `docs/extending/speculative-proposer.md` matches the tree. Fails if the registry or the page drifts.
+- [ ] [S-3] `cargo test -p turbine-scheduler speculative::tests::` exits 0: greedy acceptance for all-accepted, first-disagreement and last-disagreement spans; the sampling rejection draw is exact on a synthetic categorical pair (accepted-token and fallback masses match the target within the test's tolerance, including p(t) = 0), with k = 1 and k = 8; the rows are evaluated without observing rejected tokens. Fails if acceptance or the fallback changes the target distribution.
+- [ ] [S-3] [S-4] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_greedy_matches_serial` exits 0 on the tiny target/draft pair: with the draft on, the greedy token stream equals the serial stream for every k in 1..=8, with prefix reuse on and off and after a preemption; the metrics count the accepted and rejected tokens and every rejected position is rolled back. Fails if a token, a metric or a rollback differs.
+- [ ] [S-3] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_stop_and_usage` exits 0: EOS, a stop string and `max_new_tokens` inside a span end the choice at the first accepted token that triggers them; `usage` counts only emitted tokens; SSE event order, `logprobs` of the emitted tokens and the held-token behaviour are unchanged. Fails if a rejected proposal leaks into the stream or the counts.
+- [ ] [S-4] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_rollback_publishes_kept_prefix` exits 0: after a partially accepted span the table is truncated, an emptied block is freed, a full block publishes only kept tokens, a rejected position is not served by a later prefix hit, and a tail copy still restores the shared prefix. Fails if rejected K/V becomes visible to reuse.
+- [ ] [S-5] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::hybrid_speculative_rollback_matches_serial` exits 0 on the tiny Qwen3.5 target and a same-family tiny draft: a partly accepted span restores the scratch state, the next round's greedy stream equals the serial stream, the block-boundary snapshot inside the rejected span is not committed, and the scratch slot is released on finish, cancel and preempt. Fails if the state or a snapshot diverges.
+- [ ] [S-6] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_disabled_reasons` exits 0: a two-item plan, a constrained choice, a seeded request, a paused sequence, pressure ORANGE (and RED/SURVIVAL) and a request whose 8-round acceptance is below `min_acceptance` each disable with their reason; GREEN after ORANGE re-enables; no request fails, is queued longer or loses a token because of the disable. Fails if a disable changes the stream or a request's outcome.
+- [ ] [S-7] `cargo test -p turbine-reliability budget::tests::speculative_draft_footprint` exits 0: the draft weights, workspace and one full-context slot are charged, the target KV pool shrinks by that amount, and a footprint below the target's minimum KV fails with the path and the budget figures. Fails if the draft is uncharged or a fit is reported when it does not fit.
+- [ ] [S-7] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::draft_kv_lifecycle` exits 0: the slot is taken on the first round after prefill, prefilled once, truncated with a partial accept, held across rounds, and released on finish, cancel, preempt and permanent disable; a second `begin` reports `draft_slot_busy` while it is held and succeeds after the release. Fails if the slot leaks, is shared, or the draft KV length drifts from the target's.
+- [ ] [S-9] `cargo test -p turbine-core support::tests::phase8_rows` and `cargo test -p turbine-core support::tests::baseline_rows_present` exit 0: the `amd/gfx1201 × LlamaForCausalLM × bf16 × bf16 × draft` row is supported after the gate, the `cpu × bf16 × bf16 × draft` row is experimental, every other draft key resolves unsupported with a reason naming the validated pairing or the missing checkpoint/gate, and the wildcard refusal stays for the rest. Fails if an ungated draft combination resolves as supported.
+- [ ] [S-10] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_metrics_and_status` exits 0: a speculative run produces the five series with only the documented label values, the `speculative` status object matches the configuration and the aggregate acceptance, and `method: none`, pressure ORANGE and a per-request disable show `active: false` or the matching reason gauge. Fails if a label escapes its set or the status lies.
+- [ ] [S-11] Manual lab gate on `novanas` (GPU 0, bench lock): the draft-configured server passes `turbine-golden compare` at `--concurrency 1` and `--concurrency 16` under the Llama slug's tolerance; the serial A/B on the 16 prompts is recorded; `turbine-bench --concurrency 1 --requests 50 --prompt-words 512 --max-tokens 256 --ignore-eos` measures at least 1.3× the `method: none` server's output throughput with TTFT p50 at most 1.15×, and the acceptance length is read from `/metrics`; the concurrency-16 profile is at least 0.97× the Phase 7 Llama exit (863.9 tok/s); the vLLM-ROCm speculative run is recorded or the no-vLLM rule logs its absence; every command's output and the JSON reports are pasted into the task evidence and committed under `tests/bench/phase-8-speculative-decoding/`. Fails if any item misses or a row is marked supported without all of them.
+- [ ] [S-11] `cargo test -p turbine-model --test tiny_model speculative_sampling_exactness` and `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_seeded_identical` exit 0: with a fixed seed, 10^6 draws through the acceptance/fallback scheme and through token-by-token sampling have a total-variation distance below 0.01 on the tiny model's next-token distribution; a seeded request with the draft on and off produces the same token stream. Fails if the distribution or the seeded identity moves.
+- [ ] [S-12] `cargo test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_errors` exits 0: a failing draft executor fails the iteration through the existing error path (the request gets the error, no partial token is emitted, the engine keeps serving), a missing/unloadable draft exits 1 before `/ready`, and shutdown in the middle of a round drops both executors and logs `engine_stopped` once. Fails if a draft error leaks a token, hangs the engine or leaves a resource behind.
+- [ ] [S-12] Lab lifecycle: starting the draft server and sending SIGTERM exits 0 with `event="engine_stopped"` after both models' resources are freed, and `scripts/lab-serve.sh novanas --stop` leaves no serve Job. Fails if the draft keeps the process or the device memory alive.
+- [ ] [S-1] [S-2] [S-9] Phase exit: `scripts/gate.sh --full`, `scripts/lab-test.sh novanas --tier full`, `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full`, `scripts/lab-bench.sh --golden16` for Llama and OLMoE and `scripts/overload-soak.sh novanas --duration 10m` with the draft configured all exit 0; `turbine-server --support-matrix --output json` shows the gated Llama draft row as `supported` and no other draft row as supported. Fails if a standard exit gate regresses.
+
+## Open questions
+
+<!-- None: every design question of the 2026-10-25 interview is decided and recorded in .procoder/ask/decisions.md ("Phase 8 spec: speculative decoding design choices"). -->
