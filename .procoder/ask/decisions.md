@@ -5193,3 +5193,11 @@ The spec is `.procoder/specs/phase-8-speculative-decoding.md` (Status: complete)
 before Phase 8" sequencing direction is treated as satisfied: the b1 attention follow-up landed in 5p and the 5p/7
 exits closed; the user's start instruction is the go for this track. Per the 2026-10-18 merge/push amendments the
 lead merges and pushes without asking.
+
+**Implementation note (2026-10-26, choice 2).** S-5's scratch is a state-sized entry reserved from the hybrid
+snapshot pool (`StateLoc::Snapshot`) rather than a second live `StateSlot`. The executor indexes live slots within
+the batch's `max_seqs`, so a second live slot per sequence would double every per-sequence state buffer (and the
+slot table tensors); the snapshot pool already reserves one state-sized entry per L0 block and its budget term is
+the conservative bound, so the scratch costs no new allocation and the copy/restore path is the existing
+`StateCopy`. The behavior of choice A is unchanged: copy before the span, restore and replay the kept tokens on a
+partial accept, release with the sequence on finish/cancel/preempt. Spec S-5 and plan Task 11 carry the note.
