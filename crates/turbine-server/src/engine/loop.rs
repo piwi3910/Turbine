@@ -3012,6 +3012,9 @@ impl EngineLoop {
         self.metrics
             .server
             .speculative_round(u64::from(accepted), u64::from(k));
+        if let Some(r) = self.requests.get_mut(&id) {
+            r.choices[choice].record_spec_round(accepted, k, self.speculative.min_acceptance);
+        }
     }
 
     /// Samples a verified jump-forward row group (P5p S-10): the choice's `k + 1` logits rows
@@ -3104,6 +3107,13 @@ impl EngineLoop {
             self.metrics
                 .server
                 .speculative_round(u64::from(forced.accepted), u64::from(k));
+            if let Some(r) = self.requests.get_mut(&id) {
+                r.choices[choice].record_spec_round(
+                    forced.accepted,
+                    k,
+                    self.speculative.min_acceptance,
+                );
+            }
         } else {
             self.metrics
                 .server
@@ -3397,6 +3407,11 @@ impl EngineLoop {
     /// decode, and a draft failure never fails the request.
     fn request_speculative(&mut self, id: RequestId, choice: usize, single_item: bool) {
         if !single_item || self.speculative.method != SpeculativeMethod::Draft {
+            if self.speculative.method != SpeculativeMethod::Draft {
+                self.metrics.server.speculative_disabled("method_none");
+            } else if !single_item {
+                self.metrics.server.speculative_disabled("batch");
+            }
             return;
         }
         if self.draft.is_none() {
@@ -3406,18 +3421,26 @@ impl EngineLoop {
             self.snap.state,
             PressureState::Green | PressureState::Yellow
         ) {
+            self.metrics.server.speculative_disabled("pressure");
             return;
         }
         let Some(r) = self.requests.get(&id) else {
             return;
         };
         let c = &r.choices[choice];
-        if choice != 0
-            || c.finish.is_some()
-            || c.generated.is_empty()
-            || c.is_constrained()
-            || c.is_seeded()
-        {
+        if choice != 0 || c.finish.is_some() || c.generated.is_empty() {
+            return;
+        }
+        if c.spec_disabled() {
+            self.metrics.server.speculative_disabled("low_acceptance");
+            return;
+        }
+        if c.is_constrained() {
+            self.metrics.server.speculative_disabled("constrained");
+            return;
+        }
+        if c.is_seeded() {
+            self.metrics.server.speculative_disabled("seeded");
             return;
         }
         let seq = c.seq;
@@ -3436,6 +3459,7 @@ impl EngineLoop {
             .saturating_sub(r.prompt_len() + generated + 1);
         let k = self.speculative.num_tokens.min(room).min(context);
         if k == 0 {
+            self.metrics.server.speculative_disabled("no_room");
             return;
         }
         let request = ProposeRequest {
@@ -3454,6 +3478,7 @@ impl EngineLoop {
                 // prefill (S-7), then proposes from the sampled token.
                 let prompt = r.request.prompt_tokens.clone();
                 if let Err(e) = proposer.begin(seq, &prompt) {
+                    self.metrics.server.speculative_disabled("no_draft_kv");
                     tracing::debug!(
                         event = "speculative_skip",
                         request_id = %r.request.http_request_id,
@@ -3467,6 +3492,7 @@ impl EngineLoop {
             match result {
                 Ok(proposals) => proposals.tokens,
                 Err(e) => {
+                    self.metrics.server.speculative_disabled("no_draft_kv");
                     tracing::debug!(
                         event = "speculative_skip",
                         request_id = %r.request.http_request_id,
@@ -3483,6 +3509,7 @@ impl EngineLoop {
         self.jump_drafts.insert(seq, proposals.clone());
         if let Err(e) = self.sched.extend(seq, proposals) {
             self.jump_drafts.remove(&seq);
+            self.metrics.server.speculative_disabled("no_room");
             tracing::debug!(
                 event = "speculative_skip",
                 seq = seq.0,
@@ -5552,6 +5579,105 @@ mod tests {
                 "a seeded request never speculates: {rendered}"
             );
         }
+    }
+
+    /// Phase 8 S-6: the per-request acceptance window disables speculation after eight low
+    /// rounds.
+    #[test]
+    fn acceptance_window_disables_after_eight_low_rounds() {
+        let (_dir, _spec, tokenizer) = tiny();
+        let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let req = request(&[1, 2, 3], 4);
+        let submission = Submission {
+            matchers: Vec::new(),
+            ..req.into()
+        };
+        let mut active = ActiveRequest::new(submission, tx, &[SeqId(1)], &tokenizer);
+        for _ in 0..7 {
+            active.choices[0].record_spec_round(0, 4, 0.4);
+        }
+        assert!(
+            !active.choices[0].spec_disabled(),
+            "seven rounds decide nothing"
+        );
+        active.choices[0].record_spec_round(0, 4, 0.4);
+        assert!(
+            active.choices[0].spec_disabled(),
+            "eight low rounds disable"
+        );
+
+        let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let req = request(&[1, 2, 3], 4);
+        let submission = Submission {
+            matchers: Vec::new(),
+            ..req.into()
+        };
+        let mut active = ActiveRequest::new(submission, tx, &[SeqId(1)], &tokenizer);
+        for _ in 0..8 {
+            active.choices[0].record_spec_round(4, 4, 0.4);
+        }
+        assert!(
+            !active.choices[0].spec_disabled(),
+            "full acceptance stays on"
+        );
+    }
+
+    /// Phase 8 S-6/S-10: the bounded disable reasons reach the gauge.
+    #[test]
+    fn speculative_disabled_reasons() {
+        let (_dir, spec, tokenizer) = tiny();
+        let draft_dir = TempDir::new("turbine-engine-loop-reasons-draft");
+        let draft = write_tiny_llama(draft_dir.path(), 11);
+        let none = || Vec::<Box<dyn TokenMatcher>>::new();
+        let req = request(&[256, 72, 101, 108, 108, 111], 4);
+
+        let (_, reg) = run_submissions(&spec, &tokenizer, &[req.clone()], &none, false, false);
+        assert!(
+            metric(
+                &reg,
+                r#"turbine_speculative_disabled{reason="method_none"}"#
+            ) > 0.0,
+            "{}",
+            reg.render().unwrap()
+        );
+
+        let mask = || vec![Box::new(AnyMask { forced: Vec::new() }) as Box<dyn TokenMatcher>];
+        let (_, reg) =
+            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &[req.clone()], &mask, false);
+        assert!(
+            metric(
+                &reg,
+                r#"turbine_speculative_disabled{reason="constrained"}"#
+            ) > 0.0,
+            "{}",
+            reg.render().unwrap()
+        );
+
+        let second = request(&[256, 72, 105], 4);
+        let (_, reg) = run_submissions_with_draft(
+            &spec,
+            &draft,
+            4,
+            &tokenizer,
+            &[req.clone(), second],
+            &none,
+            false,
+        );
+        assert!(
+            metric(&reg, r#"turbine_speculative_disabled{reason="batch"}"#) > 0.0,
+            "{}",
+            reg.render().unwrap()
+        );
+
+        let mut seeded = req;
+        seeded.sampling.seed = Some(7);
+        let (_, reg) =
+            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &[seeded], &none, false);
+        assert!(
+            metric(&reg, r#"turbine_speculative_disabled{reason="seeded"}"#) > 0.0,
+            "{}",
+            reg.render().unwrap()
+        );
     }
 
     /// A matcher for the jump-forward tests: its mask allows everything, and its forced run is

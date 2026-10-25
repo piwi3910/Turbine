@@ -727,6 +727,7 @@ async fn serve(
         )
         .with_replicas(replicas.len(), router_policy, &metrics)
         .with_support(support)
+        .with_speculative(config.speculative.clone())
         .with_topology(&cluster.topology)
         .with_parallel(cluster.parallel)
         .with_experts(replicas.iter().map(|r| r.experts.clone()).collect())

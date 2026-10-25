@@ -259,6 +259,10 @@ impl ActiveRequest {
                 generated: Vec::new(),
                 finish: None,
                 last_token_at: None,
+                spec_window: [0; 8],
+                spec_window_len: 0,
+                spec_window_index: 0,
+                spec_disabled: false,
             })
             .collect();
         // The channel is new and empty, so the reservation cannot fail on capacity.
@@ -732,6 +736,12 @@ pub(crate) struct Choice {
     pub finish: Option<FinishReason>,
     /// When the previous token was sampled (inter-token latency).
     pub last_token_at: Option<Instant>,
+    /// Phase 8 S-6: the trailing acceptance window (accepted proposals per round).
+    spec_window: [u32; 8],
+    spec_window_len: u8,
+    spec_window_index: u8,
+    /// Speculation stopped for this request (`low_acceptance`).
+    spec_disabled: bool,
 }
 
 impl Choice {
@@ -761,6 +771,29 @@ impl Choice {
     /// deterministic, so a speculative round's accepted proposals are the target's tokens.
     pub fn is_greedy(&self) -> bool {
         self.sampler.is_greedy()
+    }
+
+    /// Whether speculation was disabled for this request (Phase 8 S-6, `low_acceptance`).
+    pub fn spec_disabled(&self) -> bool {
+        self.spec_disabled
+    }
+
+    /// Records one completed speculative round and disables the request when the trailing
+    /// eight-round acceptance fraction falls below `min_acceptance`.
+    pub fn record_spec_round(&mut self, accepted: u32, k: u32, min_acceptance: f32) {
+        if k == 0 || self.spec_disabled {
+            return;
+        }
+        let slot = self.spec_window_index as usize % self.spec_window.len();
+        self.spec_window[slot] = accepted;
+        self.spec_window_index = ((self.spec_window_index + 1) as usize % 8) as u8;
+        self.spec_window_len = (self.spec_window_len + 1).min(8);
+        if self.spec_window_len == 8 {
+            let accepted_sum: u32 = self.spec_window.iter().sum();
+            if f64::from(accepted_sum) < f64::from(min_acceptance) * f64::from(k) * 8.0 {
+                self.spec_disabled = true;
+            }
+        }
     }
 
     /// Held text plus whatever the detokenizer still holds.

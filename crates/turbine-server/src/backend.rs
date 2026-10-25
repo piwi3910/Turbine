@@ -28,6 +28,7 @@ use turbine_api::{
     ModelCard, NotReadyReason, PrefetchAccepted, PrefetchRequest, Readiness, ReadyState,
     TopologyScope, readiness_for_circuit,
 };
+use turbine_core::config::{SpeculativeConfig, SpeculativeMethod};
 use turbine_core::request::{
     ConstraintSpec, Endpoint, ErrorCode, GenerationRequest, SamplingParams, SessionHints,
     StopConditions,
@@ -135,6 +136,20 @@ struct StatusDocument<'a> {
     /// Phase 6a S-19: the weight format, packaging, activation scheme and L0 KV dtype; with
     /// the 6b S-10 keys, the per-tier copy formats and the ladder state, once an engine runs.
     quantization: &'a Value,
+    /// Phase 8 S-10: the `speculative.method` configuration and the current acceptance.
+    speculative: SpeculativeStatus,
+}
+
+/// `speculative` object of `GET /turbine/v1/status`.
+#[derive(Serialize)]
+struct SpeculativeStatus {
+    method: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_model_path: Option<String>,
+    num_tokens: u32,
+    min_acceptance: f32,
+    active: bool,
+    acceptance: f64,
 }
 
 /// One entry of `kernels` in `GET /turbine/v1/status`: a `KernelRegistry` selection.
@@ -255,6 +270,8 @@ pub struct ModelBackend {
     /// Expert parallelism (P5 S-11): each replica's token counts, the `expert` section of its
     /// `/turbine/v1/scheduler` document; empty without it.
     experts: Vec<Option<Arc<ExpertStats>>>,
+    /// The Phase 8 `speculative` section (S-10).
+    speculative: SpeculativeConfig,
 }
 
 /// The status document's `kernels` view of the ABI v2.11 transcode the tier formats select
@@ -408,7 +425,14 @@ impl ModelBackend {
             topology: None,
             parallel: None,
             experts: Vec::new(),
+            speculative: SpeculativeConfig::default(),
         }
+    }
+
+    /// Reports the Phase 8 `speculative` configuration in the status document (S-10).
+    pub fn with_speculative(mut self, speculative: SpeculativeConfig) -> ModelBackend {
+        self.speculative = speculative;
+        self
     }
 
     /// Serves `replicas` data-parallel replicas (P5 S-7): `/ready` turns 200 once every one is
@@ -1065,6 +1089,30 @@ impl Diagnostics for ModelBackend {
             circuit_state,
             parallel: self.parallel.as_ref(),
             quantization: &quantization,
+            speculative: {
+                let proposed = self.metrics.speculative_proposed_tokens.get();
+                let accepted = self.metrics.speculative_accepted_tokens.get();
+                let active = speculative_active(&self.speculative, pressure_state, self.is_ready());
+                SpeculativeStatus {
+                    method: self.speculative.method.as_str(),
+                    draft_model_path: if self.speculative.method == SpeculativeMethod::Draft {
+                        self.speculative
+                            .draft_model_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                    } else {
+                        None
+                    },
+                    num_tokens: self.speculative.num_tokens,
+                    min_acceptance: self.speculative.min_acceptance,
+                    active,
+                    acceptance: if proposed > 0 {
+                        accepted as f64 / proposed as f64
+                    } else {
+                        0.0
+                    },
+                }
+            },
         })
         .unwrap_or(Value::Null)
     }
@@ -1182,5 +1230,43 @@ fn response_constraint(format: Option<&ResponseFormat>) -> Option<ConstraintSpec
             // The API requires `schema`; a missing one constrains to any JSON value.
             schema: json_schema.schema.clone().unwrap_or(Value::Bool(true)),
         }),
+    }
+}
+
+/// Phase 8 S-10: speculation is active only with `method: draft`, a ready model and pressure
+/// below ORANGE (S-6's global disable).
+fn speculative_active(
+    speculative: &SpeculativeConfig,
+    pressure: PressureState,
+    ready: bool,
+) -> bool {
+    speculative.method == SpeculativeMethod::Draft
+        && ready
+        && !matches!(
+            pressure,
+            PressureState::Orange | PressureState::Red | PressureState::Survival
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speculative_status_follows_pressure_and_method() {
+        let draft = SpeculativeConfig {
+            method: SpeculativeMethod::Draft,
+            ..SpeculativeConfig::default()
+        };
+        assert!(speculative_active(&draft, PressureState::Green, true));
+        assert!(speculative_active(&draft, PressureState::Yellow, true));
+        assert!(!speculative_active(&draft, PressureState::Orange, true));
+        assert!(!speculative_active(&draft, PressureState::Red, true));
+        assert!(!speculative_active(&draft, PressureState::Survival, true));
+        assert!(!speculative_active(&draft, PressureState::Green, false));
+        let none = SpeculativeConfig::default();
+        assert!(!speculative_active(&none, PressureState::Green, true));
+        assert_eq!(none.method.as_str(), "none");
+        assert_eq!(draft.method.as_str(), "draft");
     }
 }

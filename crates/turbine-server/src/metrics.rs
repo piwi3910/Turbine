@@ -152,6 +152,9 @@ pub struct ServerMetrics {
     pub speculative_accepted_tokens: Counter,
     /// `turbine_speculative_accepted_per_round`: accepted proposals per round (0..=8).
     pub speculative_accepted_per_round: Histogram,
+    /// `turbine_speculative_disabled{reason}`: 1 for each bounded reason a request skipped a
+    /// round (Phase 8 S-6/S-10).
+    pub speculative_disabled: Family<ReasonLabels, Gauge>,
     /// `turbine_hybrid_state_bytes` (P7 S-12, Task 32): hybrid state bytes held in L0 — the live
     /// slots in use plus the snapshot entries held for blocks.
     pub hybrid_state_bytes: Gauge,
@@ -252,6 +255,11 @@ impl ServerMetrics {
                 "Accepted proposals per speculative round",
                 Histogram::new([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
             ),
+            speculative_disabled: reg.register(
+                "turbine_speculative_disabled",
+                "Why a request did not speculate in a round",
+                Family::default(),
+            ),
             hybrid_state_bytes: reg.register(
                 "turbine_hybrid_state_bytes",
                 "Hybrid per-sequence state bytes held in L0 (live slots plus snapshots)",
@@ -316,6 +324,14 @@ impl ServerMetrics {
         self.speculative_proposed_tokens.inc_by(proposed);
         self.speculative_accepted_tokens.inc_by(accepted);
         self.speculative_accepted_per_round.observe(accepted as f64);
+    }
+
+    /// Marks one bounded disable reason (Phase 8 S-6: `method_none`, `pressure`, `batch`,
+    /// `constrained`, `seeded`, `paused`, `low_acceptance`, `no_draft_kv`, `no_room`).
+    pub fn speculative_disabled(&self, reason: &'static str) {
+        self.speculative_disabled
+            .get_or_create(&ReasonLabels { reason })
+            .set(1);
     }
 
     /// Counts one forward's logits rows: `reduced` reduced on the device, `full` copied whole.
