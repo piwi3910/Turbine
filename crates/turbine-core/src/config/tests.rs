@@ -1674,3 +1674,32 @@ fn phase5p_keys() {
         assert!(example.contains(key), "examples/turbine.yaml lacks {key}");
     }
 }
+
+#[test]
+fn speculative_parallel_refused() {
+    let sets = |tp: &str, pp: &str| -> Vec<String> {
+        vec![
+            "speculative.method=draft".to_string(),
+            "speculative.draft_model_path=/x".to_string(),
+            format!("parallel.tensor_parallel_size={tp}"),
+            format!("parallel.pipeline_parallel_size={pp}"),
+        ]
+    };
+    for (tp, pp) in [("2", "1"), ("1", "2")] {
+        let owned = sets(tp, pp);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let err =
+            parse(TS15_EXAMPLE, &refs).expect_err("a draft on more than one device is refused");
+        assert_eq!(err.key(), Some("speculative.method"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("speculative_parallel_unsupported:"),
+            "{err}"
+        );
+    }
+    for (tp, pp) in [("1", "1"), ("auto", "1")] {
+        let owned = sets(tp, pp);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        parse(TS15_EXAMPLE, &refs).expect("one device with a draft loads");
+    }
+}

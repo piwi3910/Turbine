@@ -564,6 +564,25 @@ impl Config {
             ));
         }
         self.validate_phase2()?;
+        self.speculative.validate(self.effective_max_running())?;
+        if self.speculative.method == SpeculativeMethod::Draft
+            && (self
+                .parallel
+                .tensor_parallel_size
+                .fixed()
+                .is_some_and(|n| n > 1)
+                || self
+                    .parallel
+                    .pipeline_parallel_size
+                    .fixed()
+                    .is_some_and(|n| n > 1))
+        {
+            return Err(invalid(
+                "speculative.method",
+                "speculative_parallel_unsupported: speculative.method=draft runs on one device; \
+                 tensor and pipeline parallelism need a later phase",
+            ));
+        }
         self.parallel.validate()
     }
 

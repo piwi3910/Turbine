@@ -214,3 +214,12 @@ parallel:
     # The registered rank transport carrying the static bootstrap and step plans
     # (docs/extending/rank-transport.md): tcp.
     transport: tcp
+
+speculative:
+  # Phase 8 draft-model speculation (off by default): one small same-family draft proposes
+  # num_tokens greedy tokens and the target verifies them in one step (one device only).
+  # `method: draft` needs draft_model_path; a request below min_acceptance stops speculating.
+  method: none
+  num_tokens: 4
+  draft_model_path: null
+  min_acceptance: 0.4
