@@ -3322,3 +3322,87 @@ fn phase7_novanas_configs_load() {
         }
     }
 }
+
+/// Phase 8 Task 12: the draft checkpoint table and the `--table` selector.
+#[test]
+fn fetch_checkpoint_phase8_table() {
+    let text = dry_run(
+        "fetch-checkpoint.sh",
+        "fetch-dry-p8-1b",
+        &[
+            "--dry-run",
+            "--table",
+            "scripts/lab/phase8-checkpoints.tsv",
+            "novanas",
+            "llama-3.2-1b-instruct",
+        ],
+    );
+    assert!(
+        text.contains(
+            "hf download unsloth/Llama-3.2-1B-Instruct --revision \
+             5a8abab4a5d6f164389b1079fb721cfab8d7126c --local-dir \
+             /home/piwi/turbine-models/llama-3.2-1b-instruct"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("HF_TOKEN"), "no token:\n{text}");
+    let (out, called) = lab_script(
+        "fetch-checkpoint.sh",
+        "fetch-p8-unknown",
+        &[
+            "--dry-run",
+            "--table",
+            "scripts/lab/phase8-checkpoints.tsv",
+            "novanas",
+            "no-such-model",
+        ],
+    );
+    assert_eq!(called, None, "contacted a host");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// Phase 8 Task 12: `--vllm-speculative` appends the JSON `--speculative-config` to the pinned
+/// vLLM Job; a JSON with a single quote is refused before any host call.
+#[test]
+fn vllm_speculative_dry_run() {
+    let json = r#"{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}"#;
+    let text = dry_run(
+        "lab-serve.sh",
+        "p8-vllm-spec",
+        &[
+            "--dry-run",
+            "novanas",
+            "--vllm",
+            "llama-3.2-3b-instruct",
+            "--vllm-speculative",
+            json,
+        ],
+    );
+    assert!(text.contains("--speculative-config"), "{text}");
+    assert!(text.contains(json), "{text}");
+    let (out, called) = lab_script(
+        "lab-serve.sh",
+        "p8-vllm-spec-bad",
+        &[
+            "--dry-run",
+            "novanas",
+            "--vllm",
+            "llama-3.2-3b-instruct",
+            "--vllm-speculative",
+            "{'a':1}",
+        ],
+    );
+    assert_eq!(called, None, "contacted a host");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+/// Phase 8 Task 12: `--save-metrics` writes the final `/metrics` scrape beside the run.
+#[test]
+fn lab_bench_save_metrics_dry_run() {
+    let text = dry_run(
+        "lab-bench.sh",
+        "p8-bench-metrics",
+        &["--dry-run", "--model", "llama", "--save-metrics"],
+    );
+    assert!(text.contains("metrics.prom"), "{text}");
+}

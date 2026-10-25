@@ -2588,3 +2588,8 @@ The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this
 - **Disk** (`ssh novanas 'du -sh /home/piwi/turbine-models/*'`; `/` 889 G, 76 % used; build caches on the iSCSI bind mounts `/dev/sda[/turbine-ci/remote]` and `/dev/sda[/turbine-ci/cache/slots]`): the Phase 7 closed checkpoints — `qwen3-4b-instruct-2507` 7.6 G, `qwen3-30b-a3b-instruct-2507-fp8` 30 G, `mistral-7b-instruct-v0.3` 14 G, `gpt-oss-20b` 13 G (+`gpt-oss-20b-bf16` 39 G dequant fixture), `mixtral-8x7b-instruct-v0.1-fp8` 44 G, `qwen3.5-9b` 19 G, `qwen3.6-35b-a3b-fp8` 35 G (+`-bf16` 67 G dequant fixture); Phase 1/2 `llama-3.2-3b-instruct` 6.1 G, `olmoe-1b-7b-0125-instruct` 13 G.
 - **Overload soak** (`scripts/overload-soak.sh novanas --duration 10m`, `target/soak/novanas-20261018T043632Z/verdict.json`): **pass** — ITL p99 204 ms vs 173 ms calibrated (within 2×), all checks green (`server_never_restarted`, `only_503_overload`, `streams_complete`, `itl_p99_within_2x`, `reached_orange`, `green_within_60s`, `kv_idle`, `reserve_held`), `queue_timeout` 3473 / `queue_full` 73, 0 drops, no ladder actions (shared-prefix share 0). Run by the lead on 2026-10-18 after the user's amended rule; the phase-exit box closes.
 
+### P8 draft checkpoint fetch (plan Task 12, 2026-10-26)
+
+- `scripts/fetch-checkpoint.sh --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` → `fetch: llama-3.2-1b-instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c ok` in 44 s; `/home/piwi/turbine-models/llama-3.2-1b-instruct` holds the pinned `unsloth/Llama-3.2-1B-Instruct` revision (2.5 GB, the Phase 8 pairing of user decision 2026-10-25/7).
+
+

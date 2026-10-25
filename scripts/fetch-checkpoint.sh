@@ -16,24 +16,42 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] novanas <slug>" >&2
+	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] [--table <tsv>] novanas <slug>" >&2
 	exit 2
 }
 
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 dry_run=0
-if [[ ${1:-} == --dry-run ]]; then
-	dry_run=1
-	shift
-fi
+table="$here/lab/phase7-checkpoints.tsv"
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--dry-run)
+		dry_run=1
+		shift
+		;;
+	--table)
+		[[ $# -ge 2 ]] || usage
+		table="$2"
+		shift 2
+		;;
+	-*)
+		usage
+		;;
+	*)
+		break
+		;;
+	esac
+done
 [[ $# -eq 2 ]] || usage
 [[ $1 == novanas ]] || usage
 slug=$2
-
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-table="$here/lab/phase7-checkpoints.tsv"
+if [[ ! -f $table ]]; then
+	echo "fetch: no checkpoint table at $table" >&2
+	exit 2
+fi
 row="$(awk -F'\t' -v s="$slug" '$1 !~ /^#/ && $1 == s { print; exit }' "$table")"
 if [[ -z $row ]]; then
-	echo "fetch: unknown slug '$slug' (rows of scripts/lab/phase7-checkpoints.tsv:" \
+	echo "fetch: unknown slug '$slug' (rows of $table:" \
 		"$(awk -F'\t' '$1 !~ /^#/ { printf "%s ", $1 }' "$table"))" >&2
 	exit 2
 fi

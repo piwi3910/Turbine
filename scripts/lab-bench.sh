@@ -59,6 +59,7 @@ run_c1=0
 run_quality=0
 quick=0
 dry=0
+save_metrics=0
 conc=16
 multi_turn=0
 mt_sessions=0
@@ -68,7 +69,7 @@ mt_only=0
 cfg_override=""
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--chat-template-kwargs <json>] [--quick] [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--chat-template-kwargs <json>] [--quick] [--concurrency <n>] [--save-metrics] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4 qwen3-4b mistral-7b gpt-oss-20b qwen3.5-9b" >&2
 	exit 2
 }
@@ -109,6 +110,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--quality)
 		run_quality=1
+		shift
+		;;
+	--save-metrics)
+		save_metrics=1
 		shift
 		;;
 	--chat-template-kwargs)
@@ -467,6 +472,7 @@ steps=(
 	"curl -s '$url/turbine/v1/kv' > '$out/kv.json'"
 	${share_cmds[@]+"${share_cmds[@]}"}
 )
+[[ $save_metrics -eq 1 ]] && steps+=("curl -s '$url/metrics' > '$out/metrics.prom'")
 if [[ $multi_turn -eq 1 ]]; then
 	[[ $mt_sessions -eq 0 ]] && mt_sessions=16
 	# Standard profile: 16 sessions at c8 (the Phase 4 command); saturated (--multi-turn-sessions):

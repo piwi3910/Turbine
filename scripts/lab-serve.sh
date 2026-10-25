@@ -79,6 +79,7 @@ SERVER_ARGS=""
 VLLM_GPUS=1
 SERVE_GPUS=1
 VLLM_ARGS=()
+VLLM_SPECULATIVE=""
 case "$2" in
 --stop)
 	[[ $# -le 3 ]] || usage
@@ -113,6 +114,14 @@ case "$2" in
 				exit 2
 			fi
 			VLLM_ARGS+=("$2")
+			;;
+		--vllm-speculative)
+			[[ $# -ge 2 ]] || usage
+			if [[ $2 != \{*\} || $2 == *"'"* ]]; then
+				echo "lab-serve: ${HOST}: --vllm-speculative expects a JSON object without a single quote, got: $2" >&2
+				exit 2
+			fi
+			VLLM_SPECULATIVE="$2"
 			;;
 		*) usage ;;
 		esac
@@ -545,7 +554,7 @@ start() {
 }
 
 start_vllm() {
-	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}})"
+	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}}${VLLM_SPECULATIVE:+, --speculative-config ${VLLM_SPECULATIVE}})"
 	require_free_port
 	gpu_lock
 	remote "test -d /home/piwi/turbine-models/${SLUG}" ||
@@ -559,6 +568,10 @@ start_vllm() {
 	for a in "${VLLM_ARGS[@]+"${VLLM_ARGS[@]}"}"; do
 		extra+="            - \"${a}\"\n"
 	done
+	if [[ -n $VLLM_SPECULATIVE ]]; then
+		extra+="            - \"--speculative-config\"\n"
+		extra+="            - '${VLLM_SPECULATIVE}'\n"
+	fi
 	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__SLUG__/${SLUG}/g" \
 		-e "s|__SERVED_NAME__|${SERVED_NAME}|g" -e "s/__MAX_MODEL_LEN__/${MAX_MODEL_LEN}/g" \
 		-e "s/__GPUS__/${VLLM_GPUS}/g" \

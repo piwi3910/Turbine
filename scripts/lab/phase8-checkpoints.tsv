@@ -1,0 +1,3 @@
+# Phase 8 speculative-decoding draft checkpoints (plan Task 12). Columns: slug, repo, revision
+# (pinned), include globs (`*` = everything), approximate download GB.
+llama-3.2-1b-instruct	unsloth/Llama-3.2-1B-Instruct	5a8abab4a5d6f164389b1079fb721cfab8d7126c	*	3
