@@ -826,6 +826,7 @@ async fn serve(
         match engine::spawn(
             replica.prepared,
             replica.draft,
+            config.speculative.clone(),
             replica.group,
             replica.pipeline,
             Arc::clone(&backend),

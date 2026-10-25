@@ -757,6 +757,12 @@ impl Choice {
         self.sampler.is_seeded()
     }
 
+    /// The choice's sampler always takes the argmax (temperature 0): its greedy output is
+    /// deterministic, so a speculative round's accepted proposals are the target's tokens.
+    pub fn is_greedy(&self) -> bool {
+        self.sampler.is_greedy()
+    }
+
     /// Held text plus whatever the detokenizer still holds.
     fn drain_all(&mut self) -> String {
         let mut rest = std::mem::take(&mut self.held_text);

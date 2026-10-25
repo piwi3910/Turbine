@@ -580,6 +580,11 @@ impl Sampler {
         probs
     }
 
+    /// Whether this sampler always takes the argmax (temperature 0).
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     /// Whether this step's row can be reduced on the device (P2c S-4), and how. `None` when the
     /// step needs the whole row: a logits processor that cannot run on the device applies to it
     /// (today every one: a `logit_bias`, a penalty, `min_tokens` not yet reached, a token mask),

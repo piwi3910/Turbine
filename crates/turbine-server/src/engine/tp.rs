@@ -1910,6 +1910,7 @@ mod tests {
             jump_forward_max_tokens: 32,
             ranks: Vec::new(),
             draft: None,
+            speculative: Default::default(),
         });
         (engine, tx, shared, reg)
     }

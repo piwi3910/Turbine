@@ -78,6 +78,12 @@ pub struct JumpOutcomeLabels {
     pub outcome: &'static str,
 }
 
+/// `turbine_speculative_rounds_total{outcome}` values (Phase 8 S-10).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct SpecOutcomeLabels {
+    pub outcome: &'static str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ReasonLabels {
     pub reason: &'static str,
@@ -137,6 +143,15 @@ pub struct ServerMetrics {
     /// (`jump_forward_step`, `jump_forward_eligible`, `unstarted_admitted`, `request_ended`;
     /// P5p S-3, S-10).
     pub overlap_serial_turns: Family<ReasonLabels, Counter>,
+    /// `turbine_speculative_rounds_total{outcome}`: Phase 8 rounds by result
+    /// (`accepted_all`, `partial`, `none`).
+    pub speculative_rounds: Family<SpecOutcomeLabels, Counter>,
+    /// `turbine_speculative_proposed_tokens_total`: tokens the draft proposed.
+    pub speculative_proposed_tokens: Counter,
+    /// `turbine_speculative_accepted_tokens_total`: proposed tokens the target accepted.
+    pub speculative_accepted_tokens: Counter,
+    /// `turbine_speculative_accepted_per_round`: accepted proposals per round (0..=8).
+    pub speculative_accepted_per_round: Histogram,
     /// `turbine_hybrid_state_bytes` (P7 S-12, Task 32): hybrid state bytes held in L0 — the live
     /// slots in use plus the snapshot entries held for blocks.
     pub hybrid_state_bytes: Gauge,
@@ -217,6 +232,26 @@ impl ServerMetrics {
                 "Overlap-scheduling turns that completed the iteration in flight serially, by reason",
                 Family::default(),
             ),
+            speculative_rounds: reg.register(
+                "turbine_speculative_rounds",
+                "Speculative rounds by result",
+                Family::default(),
+            ),
+            speculative_proposed_tokens: reg.register(
+                "turbine_speculative_proposed_tokens",
+                "Tokens the draft proposed",
+                Counter::default(),
+            ),
+            speculative_accepted_tokens: reg.register(
+                "turbine_speculative_accepted_tokens",
+                "Proposed tokens the target accepted",
+                Counter::default(),
+            ),
+            speculative_accepted_per_round: reg.register(
+                "turbine_speculative_accepted_per_round",
+                "Accepted proposals per speculative round",
+                Histogram::new([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            ),
             hybrid_state_bytes: reg.register(
                 "turbine_hybrid_state_bytes",
                 "Hybrid per-sequence state bytes held in L0 (live slots plus snapshots)",
@@ -264,6 +299,23 @@ impl ServerMetrics {
             })
             .inc_by(rolled_back);
         self.jump_forward_steps.inc();
+    }
+
+    /// Counts one Phase 8 speculative round: its accepted and proposed proposals.
+    pub fn speculative_round(&self, accepted: u64, proposed: u64) {
+        let outcome = if accepted == proposed {
+            "accepted_all"
+        } else if accepted == 0 {
+            "none"
+        } else {
+            "partial"
+        };
+        self.speculative_rounds
+            .get_or_create(&SpecOutcomeLabels { outcome })
+            .inc();
+        self.speculative_proposed_tokens.inc_by(proposed);
+        self.speculative_accepted_tokens.inc_by(accepted);
+        self.speculative_accepted_per_round.observe(accepted as f64);
     }
 
     /// Counts one forward's logits rows: `reduced` reduced on the device, `full` copied whole.

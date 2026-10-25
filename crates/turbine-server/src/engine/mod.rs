@@ -249,6 +249,7 @@ pub(crate) fn copy_device(prepared: &PreparedModel) -> CopyDevice {
 pub fn spawn(
     prepared: PreparedModel,
     draft: Option<PreparedModel>,
+    speculative: turbine_core::config::SpeculativeConfig,
     group: Option<tp::TpGroupStart>,
     pipeline: Option<pp::PipelineStart>,
     backend: Arc<ModelBackend>,
@@ -351,6 +352,43 @@ pub fn spawn(
                         "draft model loaded; speculative rounds are on"
                     );
                 }
+                // Phase 8 S-2: the loaded draft becomes the proposer that owns its executor
+                // and its one-sequence KV pool; a build failure is a startup failure.
+                let draft = match draft {
+                    Some(draft) => {
+                        let crate::model::DraftModel {
+                            loaded,
+                            tokenizer,
+                            arch,
+                            max_seq_len,
+                            block_tokens,
+                        } = draft;
+                        let crate::model::LoadedModel { executor, pool, .. } = loaded;
+                        let config = turbine_model::speculative::DraftProposerConfig {
+                            executor,
+                            pool,
+                            tokenizer,
+                            block_tokens,
+                            max_seq_len: prepared.max_seq_len.min(max_seq_len),
+                            max_batch_tokens: prepared.scheduler.max_batch_tokens,
+                            target: prepared.arch.clone(),
+                            draft: arch,
+                        };
+                        let factory = turbine_model::speculative::proposer("draft_model")
+                            .expect("the draft_model proposer is registered");
+                        match factory.build(config) {
+                            Ok(proposer) => Some(proposer),
+                            Err(e) => {
+                                let _ = fatal.send(Fatal::LoadFailed(format!(
+                                    "speculative draft proposer: {} ({e})",
+                                    e.reason()
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
                 // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
                 // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
@@ -559,6 +597,7 @@ pub fn spawn(
                     jump_forward_max_tokens: structured_output.jump_forward_max_tokens,
                     ranks,
                     draft,
+                    speculative,
                 });
                 backend.set_ready(
                     replica,

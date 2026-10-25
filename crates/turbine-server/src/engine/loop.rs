@@ -93,6 +93,7 @@ use std::time::{Duration, Instant};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 use turbine_core::clock::Clock;
+use turbine_core::config::SpeculativeMethod;
 use turbine_core::request::{
     Endpoint, ErrorCode, FinishReason, GenerationEvent, GenerationRequest, SamplingParams,
     StopConditions,
@@ -105,6 +106,7 @@ use turbine_model::executor::{
     BatchInput, GraphCounters, Logits, LogitsSlot, ModelExecutor, ReducedRow, RowReduce, SeqSlice,
     SnapshotRef, StateLoc, StateSnapshots, TokenFeed,
 };
+use turbine_model::speculative::{ProposeError, ProposeRequest};
 use turbine_model::{ForwardPhase, ModelError, SampleJob, SampledToken, Tokenizer, sample_rows};
 use turbine_reliability::budget::PoolKind;
 use turbine_reliability::circuit::{CircuitEvent, CircuitReason, RequestFailureReason};
@@ -168,9 +170,11 @@ pub(crate) struct EngineParts {
     pub jump_forward_max_tokens: u32,
     /// Every rank's KV headroom, published in the KV document (P7 S-7).
     pub ranks: Vec<turbine_kv::KvRankDocument>,
-    /// The Phase 8 draft (loaded by the engine after the target): `None` without
+    /// The Phase 8 draft proposer (loaded by the engine after the target): `None` without
     /// `speculative.method: draft`.
-    pub draft: Option<crate::model::DraftModel>,
+    pub draft: Option<Box<dyn turbine_model::speculative::Proposer>>,
+    /// The Phase 8 `speculative.*` configuration (k, tolerance, method).
+    pub speculative: turbine_core::config::SpeculativeConfig,
 }
 
 /// The message of the `slow_client` error event.
@@ -189,9 +193,14 @@ enum Turn {
 enum SerialTurn {
     /// The iteration in flight is a jump-forward step: its verification decides the tokens.
     JumpForwardStep,
+    /// It is a Phase 8 speculative step: its verification decides the proposals.
+    SpeculativeStep,
     /// It holds a row of a jump-forward-eligible constrained choice (P5p S-10, decision
     /// 2026-10-07 A): its forced run is asked for before the next plan.
     JumpForwardEligible,
+    /// It holds the single decode row of a speculative-eligible choice (Phase 8 S-8): the
+    /// draft proposals are asked for before the next plan.
+    SpeculativeEligible,
     /// An admitted request waits for its first prefill chunk (P5p S-3).
     UnstartedAdmitted,
     /// A request ended since the last turn (P5p S-3, decision "5p Task 4" B).
@@ -202,7 +211,9 @@ impl SerialTurn {
     fn as_str(self) -> &'static str {
         match self {
             SerialTurn::JumpForwardStep => "jump_forward_step",
+            SerialTurn::SpeculativeStep => "speculative_step",
             SerialTurn::JumpForwardEligible => "jump_forward_eligible",
+            SerialTurn::SpeculativeEligible => "speculative_eligible",
             SerialTurn::UnstartedAdmitted => "unstarted_admitted",
             SerialTurn::RequestEnded => "request_ended",
         }
@@ -225,10 +236,10 @@ pub(crate) struct EngineLoop {
     seqs: HashMap<SeqId, (RequestId, usize)>,
     next_seq: u64,
     rel: EngineReliability,
-    /// The loaded Phase 8 draft; `None` without `speculative.method: draft` (used by the
-    /// speculative round, Task 7).
-    #[allow(dead_code)]
-    draft: Option<crate::model::DraftModel>,
+    /// The loaded Phase 8 draft proposer; `None` without `speculative.method: draft`.
+    draft: Option<Box<dyn turbine_model::speculative::Proposer>>,
+    /// The Phase 8 `speculative.*` configuration.
+    speculative: turbine_core::config::SpeculativeConfig,
     /// The controller snapshot read at the start of this turn.
     snap: Arc<Snapshot>,
     /// The circuit probe in flight and its (unread) event channel.
@@ -507,6 +518,7 @@ impl EngineLoop {
             next_seq: 1,
             rel: p.reliability,
             draft: p.draft,
+            speculative: p.speculative,
             snap,
             probe: None,
             probe_prompt,
@@ -616,6 +628,7 @@ impl EngineLoop {
         self.kv_before_plan();
         let mut plan = self.sched.plan(&mut self.pool, &limits);
         self.kv.after_plan(&mut self.pool);
+        self.release_preempted(&plan);
         self.note_table_blocks(&plan);
         for &(id, reason) in &plan.dropped {
             self.on_dropped(id, reason);
@@ -706,6 +719,7 @@ impl EngineLoop {
         while self.pipe.len() < micro_batches {
             let plan = self.sched.plan(&mut self.pool, &limits);
             self.kv.after_plan(&mut self.pool);
+            self.release_preempted(&plan);
             for &(id, reason) in &plan.dropped {
                 self.on_dropped(id, reason);
             }
@@ -846,7 +860,7 @@ impl EngineLoop {
                     iteration: f.plan.iteration,
                     ..IterationOutcome::default()
                 };
-                self.sample(&f.built.rows, logits, &mut outcome);
+                self.sample(&f.built.rows, logits, false, &mut outcome);
                 self.rel.recovery_succeeded();
                 for (id, blocks, tokens) in self.kv_commits(&f.plan) {
                     self.kv.commit(&mut self.pool, id, &blocks, &tokens);
@@ -1770,7 +1784,10 @@ impl EngineLoop {
             let error = match self.attempt(plan) {
                 Ok(None) => return outcome,
                 Ok(Some((rows, logits))) => {
-                    self.sample(&rows, logits, &mut outcome);
+                    let single_item = plan.items.len() == 1
+                        && matches!(plan.items[0].kind, BatchKind::Decode)
+                        && self.sched.running_ids().len() == 1;
+                    self.sample(&rows, logits, single_item, &mut outcome);
                     self.rel.recovery_succeeded();
                     return outcome;
                 }
@@ -2252,7 +2269,13 @@ impl EngineLoop {
     /// prefill of an `n` > 1 request also gives every forking choice its first token, each
     /// from its own copy of the prompt's last logits row. A request whose token the next launch
     /// took on the device but the host chose differently (a row without a finite logit) fails.
-    fn sample(&mut self, rows: &[RowInfo], mut logits: Logits, outcome: &mut IterationOutcome) {
+    fn sample(
+        &mut self,
+        rows: &[RowInfo],
+        mut logits: Logits,
+        single_item: bool,
+        outcome: &mut IterationOutcome,
+    ) {
         let (mut drawn, diverged) = self.draw_decode_tokens(rows, &mut logits);
         for id in diverged {
             self.token_diverged(id, outcome);
@@ -2281,7 +2304,11 @@ impl EngineLoop {
                 let data = &mut logits.data[first * vocab..(first + k as usize + 1) * vocab];
                 let rows: Vec<&mut [f32]> = data.chunks_mut(vocab).collect();
                 let draft = self.jump_drafts.remove(&row.seq).unwrap_or_default();
-                self.sample_forced(id, choice, rows, &draft, outcome);
+                let constrained = self
+                    .requests
+                    .get(&id)
+                    .is_some_and(|r| r.choices[choice].is_constrained());
+                self.sample_forced(id, choice, rows, &draft, !constrained, outcome);
                 continue;
             }
             let forks = if choice == 0 && row.prefill {
@@ -2296,12 +2323,12 @@ impl EngineLoop {
             };
             let shared = (!forks.is_empty()).then(|| row_logits.to_vec());
             let token = drawn[slot].take();
-            if !self.sample_choice(id, choice, row_logits, token, outcome) {
+            if !self.sample_choice(id, choice, row_logits, token, single_item, outcome) {
                 continue;
             }
             for fork in forks {
                 let mut own = shared.clone().unwrap_or_default();
-                if !self.sample_choice(id, fork, &mut own, None, outcome) {
+                if !self.sample_choice(id, fork, &mut own, None, false, outcome) {
                     break;
                 }
             }
@@ -2451,9 +2478,22 @@ impl EngineLoop {
         self.stages.mark(Stage::Schedule);
         if let Some(prev) = self.in_flight.take() {
             let serial = if prev.launched && prev.rows.iter().any(|r| r.forced.is_some()) {
-                Some(SerialTurn::JumpForwardStep)
+                let speculative = prev.rows.iter().filter(|r| r.forced.is_some()).any(|row| {
+                    self.seqs.get(&row.seq).is_some_and(|&(id, choice)| {
+                        self.requests
+                            .get(&id)
+                            .is_some_and(|r| !r.choices[choice].is_constrained())
+                    })
+                });
+                Some(if speculative {
+                    SerialTurn::SpeculativeStep
+                } else {
+                    SerialTurn::JumpForwardStep
+                })
             } else if self.jump_forward_running(&prev) {
                 Some(SerialTurn::JumpForwardEligible)
+            } else if self.speculative_running(&prev) {
+                Some(SerialTurn::SpeculativeEligible)
             } else if self.sched.has_unstarted_admitted() {
                 Some(SerialTurn::UnstartedAdmitted)
             } else if ended {
@@ -2564,6 +2604,31 @@ impl EngineLoop {
                             let c = &r.choices[0];
                             !r.done && c.finish.is_none() && c.is_constrained()
                         })
+                })
+            })
+    }
+
+    /// The launched iteration `f` holds the only row of a one-item decode plan and the choice
+    /// is a Phase 8 speculative candidate (S-6/S-8): its proposals must be asked for before
+    /// the next plan, so the turn completes serially.
+    fn speculative_running(&self, f: &InFlight) -> bool {
+        self.speculative.method == SpeculativeMethod::Draft
+            && self.draft.is_some()
+            && f.launched
+            && f.plan.items.len() == 1
+            && matches!(f.plan.items[0].kind, BatchKind::Decode)
+            && self.sched.running_ids().len() == 1
+            && f.rows.iter().any(|row| {
+                self.seqs.get(&row.seq).is_some_and(|&(id, choice)| {
+                    self.requests.get(&id).is_some_and(|r| {
+                        let c = &r.choices[0];
+                        choice == 0
+                            && !r.done
+                            && c.finish.is_none()
+                            && !c.is_constrained()
+                            && !c.is_seeded()
+                            && c.is_greedy()
+                    })
                 })
             })
     }
@@ -2840,12 +2905,14 @@ impl EngineLoop {
     /// run is rolled back (S-9). The accepted and rolled-back counts go into `outcome` once;
     /// a plain decode never touches them (overlap scheduling completes this iteration from
     /// the real sample).
+    #[allow(clippy::too_many_arguments)]
     fn sample_forced(
         &mut self,
         id: RequestId,
         choice: usize,
         rows: Vec<&mut [f32]>,
         draft: &[u32],
+        speculative: bool,
         outcome: &mut IterationOutcome,
     ) {
         let k = draft.len() as u32;
@@ -2867,14 +2934,25 @@ impl EngineLoop {
             }
         };
         if let Some(reason) = forced.finished {
-            tracing::debug!(
-                event = "jump_forward_finished",
-                request_id = %r.request.http_request_id,
-                choice,
-                accepted = forced.accepted,
-                reason = reason.as_str(),
-                "the forced run ended inside its span"
-            );
+            if speculative {
+                tracing::debug!(
+                    event = "speculative_finished",
+                    request_id = %r.request.http_request_id,
+                    choice,
+                    accepted = forced.accepted,
+                    reason = reason.as_str(),
+                    "the speculative round ended inside its span"
+                );
+            } else {
+                tracing::debug!(
+                    event = "jump_forward_finished",
+                    request_id = %r.request.http_request_id,
+                    choice,
+                    accepted = forced.accepted,
+                    reason = reason.as_str(),
+                    "the forced run ended inside its span"
+                );
+            }
         }
         // One appended token per step comes from `deliver_choice`; the rollback is the only
         // count the plain path never sees.
@@ -2884,19 +2962,37 @@ impl EngineLoop {
         let rolled_back = k.saturating_sub(forced.accepted);
         if rolled_back > 0 {
             outcome.rolled_back.push((seq, rolled_back));
-            tracing::debug!(
-                event = "jump_forward_rollback",
-                request_id = %http_id,
-                choice,
-                accepted = forced.accepted,
-                rolled_back,
-                taken = forced.next.as_ref().map(|s| s.token),
-                "the model rejected the forced run's tail"
-            );
+            if speculative {
+                tracing::debug!(
+                    event = "speculative_rollback",
+                    request_id = %http_id,
+                    choice,
+                    accepted = forced.accepted,
+                    rolled_back,
+                    taken = forced.next.as_ref().map(|s| s.token),
+                    "the target rejected the proposals' tail"
+                );
+            } else {
+                tracing::debug!(
+                    event = "jump_forward_rollback",
+                    request_id = %http_id,
+                    choice,
+                    accepted = forced.accepted,
+                    rolled_back,
+                    taken = forced.next.as_ref().map(|s| s.token),
+                    "the model rejected the forced run's tail"
+                );
+            }
         }
-        self.metrics
-            .server
-            .jump_forward(u64::from(forced.accepted), u64::from(rolled_back));
+        if speculative {
+            self.metrics
+                .server
+                .speculative_round(u64::from(forced.accepted), u64::from(k));
+        } else {
+            self.metrics
+                .server
+                .jump_forward(u64::from(forced.accepted), u64::from(rolled_back));
+        }
     }
 
     /// Waits for the launched iteration `p` (only it; the next keeps running) and does its
@@ -3010,7 +3106,12 @@ impl EngineLoop {
                     iteration: p.plan.iteration,
                     ..IterationOutcome::default()
                 };
-                self.sample(&p.rows, logits, &mut outcome);
+                // Phase 8 S-6: speculation is attempted only on a plan with exactly one
+                // item, a decode, and one running sequence.
+                let single_item = p.plan.items.len() == 1
+                    && matches!(p.plan.items[0].kind, BatchKind::Decode)
+                    && self.sched.running_ids().len() == 1;
+                self.sample(&p.rows, logits, single_item, &mut outcome);
                 self.observe(&p.plan, (p.launch_time + waited).as_secs_f64(), p.copies);
                 (true, outcome)
             }
@@ -3082,6 +3183,7 @@ impl EngineLoop {
         choice: usize,
         row: &mut [f32],
         drawn: Option<SampledToken>,
+        speculative_ok: bool,
         outcome: &mut IterationOutcome,
     ) -> bool {
         let Some(r) = self.requests.get_mut(&id) else {
@@ -3105,6 +3207,7 @@ impl EngineLoop {
         };
         self.deliver_choice(id, choice, seq, step, outcome);
         self.request_forced(id, choice);
+        self.request_speculative(id, choice, speculative_ok);
         true
     }
 
@@ -3172,6 +3275,108 @@ impl EngineLoop {
         }
     }
 
+    /// Phase 8 S-3/S-6: after an unconstrained greedy choice sampled, asks the draft for k
+    /// proposals and plans the verified multi-token step (`Scheduler::extend`). Only a
+    /// one-item decode plan is attempted; every missing condition falls back to a plain
+    /// decode, and a draft failure never fails the request.
+    fn request_speculative(&mut self, id: RequestId, choice: usize, single_item: bool) {
+        if !single_item || self.speculative.method != SpeculativeMethod::Draft {
+            return;
+        }
+        if self.draft.is_none() {
+            return;
+        }
+        if !matches!(
+            self.snap.state,
+            PressureState::Green | PressureState::Yellow
+        ) {
+            return;
+        }
+        let Some(r) = self.requests.get(&id) else {
+            return;
+        };
+        let c = &r.choices[choice];
+        if choice != 0
+            || c.finish.is_some()
+            || c.generated.is_empty()
+            || c.is_constrained()
+            || c.is_seeded()
+            || !c.is_greedy()
+        {
+            return;
+        }
+        let seq = c.seq;
+        if self.jump_drafts.contains_key(&seq) {
+            return;
+        }
+        let unfed = r.prompt_len() + c.generated.len() as u32 - 1;
+        if self.sched.seq_tokens(seq) != Some(unfed) {
+            return;
+        }
+        let last = *c.generated.last().expect("checked non-empty");
+        let generated = c.generated.len() as u32;
+        let room = r.request.stop.max_tokens.saturating_sub(generated + 1);
+        let context = self
+            .max_seq_len
+            .saturating_sub(r.prompt_len() + generated + 1);
+        let k = self.speculative.num_tokens.min(room).min(context);
+        if k == 0 {
+            return;
+        }
+        let request = ProposeRequest {
+            seq,
+            last_token: last,
+            accepted_len: unfed,
+            num_tokens: k,
+        };
+        let proposals = {
+            let Some(proposer) = self.draft.as_mut() else {
+                return;
+            };
+            let mut result = proposer.propose(request);
+            if matches!(result, Err(ProposeError::NotBegun)) {
+                // The first round: the draft prefills the prompt now, after the target's
+                // prefill (S-7), then proposes from the sampled token.
+                let prompt = r.request.prompt_tokens.clone();
+                if let Err(e) = proposer.begin(seq, &prompt) {
+                    tracing::debug!(
+                        event = "speculative_skip",
+                        request_id = %r.request.http_request_id,
+                        reason = e.reason(),
+                        "the draft could not begin; the choice decodes"
+                    );
+                    return;
+                }
+                result = proposer.propose(request);
+            }
+            match result {
+                Ok(proposals) => proposals.tokens,
+                Err(e) => {
+                    tracing::debug!(
+                        event = "speculative_skip",
+                        request_id = %r.request.http_request_id,
+                        reason = e.reason(),
+                        "the draft could not propose; the choice decodes"
+                    );
+                    return;
+                }
+            }
+        };
+        if proposals.is_empty() {
+            return;
+        }
+        self.jump_drafts.insert(seq, proposals.clone());
+        if let Err(e) = self.sched.extend(seq, proposals) {
+            self.jump_drafts.remove(&seq);
+            tracing::debug!(
+                event = "speculative_skip",
+                seq = seq.0,
+                error = %e,
+                "the proposals' extension is not planned"
+            );
+        }
+    }
+
     /// The delivery of one stepped token ([`EngineLoop::sample_choice`] and the verified
     /// jump-forward rows share it): the latency samples, `appended`, the finish events and
     /// the request accounting.
@@ -3201,6 +3406,7 @@ impl EngineLoop {
         }
         c.last_token_at = Some(now);
         outcome.appended.push((seq, 1));
+        let finished = step.finish.is_some();
         let finished_event = step.finish.map(|reason| r.finished_event(choice, reason));
         let all_finished = r.all_finished();
         if let Some(reason) = step.finish {
@@ -3239,6 +3445,10 @@ impl EngineLoop {
             self.deliver(id, event);
         }
         self.stages.mark(Stage::Emit);
+        if finished && let Some(proposer) = self.draft.as_mut() {
+            // Phase 8: a finished choice gives its draft slot back at once.
+            proposer.release(seq);
+        }
         if all_finished {
             self.retire(id);
             self.stages.mark(Stage::Complete);
@@ -3397,9 +3607,24 @@ impl EngineLoop {
     fn forget(&mut self, id: RequestId) {
         self.deadlines.forget(id);
         if let Some(r) = self.requests.remove(&id) {
+            if let Some(proposer) = self.draft.as_mut() {
+                for c in &r.choices {
+                    proposer.release(c.seq);
+                }
+            }
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
                 self.last_table_block.remove(&c.seq);
+            }
+        }
+    }
+
+    /// Phase 8: a preempted sequence's draft slot goes back with its KV, before the next plan
+    /// can ask for proposals.
+    fn release_preempted(&mut self, plan: &IterationPlan) {
+        if let Some(proposer) = self.draft.as_mut() {
+            for (seq, _) in &plan.preempted {
+                proposer.release(*seq);
             }
         }
     }
@@ -3645,6 +3870,7 @@ mod tests {
     use crate::kv_orchestrator::{CopyDevice, KvStart, kv_format};
     use crate::metrics::ServerMetrics;
     use crate::reliability::{DeviceReserve, ReliabilityInputs};
+    use turbine_model::speculative::{DraftModelFactory, DraftProposerConfig, ProposerFactory};
     use turbine_model::{TokenMask, TokenMatcher};
 
     const BLOCK_TOKENS: u32 = 16;
@@ -3995,6 +4221,7 @@ mod tests {
             jump_forward_max_tokens: 32,
             ranks: Vec::new(),
             draft: None,
+            speculative: Default::default(),
         });
         TestEngine {
             engine,
@@ -4852,14 +5079,90 @@ mod tests {
         jump_forward: bool,
         overlap: bool,
     ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
+        run_submissions_inner(
+            spec,
+            None,
+            4,
+            tokenizer,
+            requests,
+            matchers,
+            jump_forward,
+            overlap,
+        )
+    }
+
+    /// [`run_submissions`] with the Phase 8 draft attached: the target's greedy stream must
+    /// equal the serial stream while speculative rounds run.
+    fn run_submissions_with_draft(
+        spec: &TinySpec,
+        draft: &TinySpec,
+        draft_k: u32,
+        tokenizer: &Arc<Tokenizer>,
+        requests: &[GenerationRequest],
+        matchers: &(dyn Fn() -> Vec<Box<dyn TokenMatcher>> + Sync),
+        overlap: bool,
+    ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
+        run_submissions_inner(
+            spec,
+            Some(draft),
+            draft_k,
+            tokenizer,
+            requests,
+            matchers,
+            false,
+            overlap,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_submissions_inner(
+        spec: &TinySpec,
+        draft: Option<&TinySpec>,
+        draft_k: u32,
+        tokenizer: &Arc<Tokenizer>,
+        requests: &[GenerationRequest],
+        matchers: &(dyn Fn() -> Vec<Box<dyn TokenMatcher>> + Sync),
+        jump_forward: bool,
+        overlap: bool,
+    ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
+        // The Phase 8 draft needs k + 1 logits rows (the plan's row cap is
+        // `max_running_requests`); the serial baseline keeps the smaller batch.
+        let max_running = if draft.is_some() { 16 } else { 4 };
         let t = engine_with(
-            tiny_reducing_executor(spec, 8),
+            tiny_reducing_executor(spec, max_running),
             Arc::clone(tokenizer),
-            params(4, 8),
+            params(max_running, 8),
             overlap,
         );
         let mut engine = t.engine;
         engine.jump_forward = jump_forward;
+        if let Some(draft) = draft {
+            let pool = BlockPool::new(
+                BlockPoolConfig {
+                    layout: draft.config.kv_layout(BLOCK_TOKENS),
+                    num_blocks: 8,
+                },
+                mem(),
+            )
+            .unwrap();
+            let cfg = DraftProposerConfig {
+                executor: tiny_executor(draft, 1),
+                pool,
+                tokenizer: Arc::clone(tokenizer),
+                block_tokens: BLOCK_TOKENS,
+                max_seq_len: 64,
+                max_batch_tokens: 64,
+                target: spec.config.clone(),
+                draft: draft.config.clone(),
+            };
+            engine.draft = Some(DraftModelFactory.build(cfg).expect("draft proposer"));
+            engine.speculative = turbine_core::config::SpeculativeConfig {
+                method: SpeculativeMethod::Draft,
+                num_tokens: draft_k,
+                draft_model_path: Some("/unused".into()),
+                min_acceptance: 0.4,
+            };
+        }
         let mut acks = Vec::new();
         let streams: Vec<_> = requests
             .iter()
@@ -5009,6 +5312,73 @@ mod tests {
                 r#"turbine_overlap_serial_turns_total{reason="jump_forward_eligible"}"#
             ) > 0.0,
             "the serial turns are counted: {metrics}"
+        );
+    }
+
+    /// Phase 8 S-3/S-8: the greedy speculative stream equals the serial stream for every
+    /// k in 1..=8, serial and overlapped, and the rounds, accepted proposals and speculative
+    /// serial turns are counted.
+    #[test]
+    fn speculative_greedy_matches_serial() {
+        let (_dir, spec, tokenizer) = tiny();
+        let draft_dir = TempDir::new("turbine-engine-loop-draft");
+        let draft = write_tiny_llama(draft_dir.path(), 11);
+        let req = request(&[256, 72, 101, 108, 108, 111], 24);
+        let requests = [req];
+        let none = || Vec::<Box<dyn TokenMatcher>>::new();
+
+        let (serial, _) = run_submissions(&spec, &tokenizer, &requests, &none, false, false);
+        for k in 1..=8 {
+            let (with_draft, reg) =
+                run_submissions_with_draft(&spec, &draft, k, &tokenizer, &requests, &none, false);
+            assert_eq!(
+                with_draft, serial,
+                "draft k={k} differs from the serial stream"
+            );
+            if k == 4 {
+                let rendered = reg.render().unwrap();
+                assert!(
+                    metric(
+                        &reg,
+                        r#"turbine_speculative_rounds_total{outcome="accepted_all"}"#
+                    ) > 0.0
+                        || metric(
+                            &reg,
+                            r#"turbine_speculative_rounds_total{outcome="partial"}"#
+                        ) > 0.0,
+                    "a speculative round ran: {rendered}"
+                );
+                assert!(
+                    metric(&reg, "turbine_speculative_proposed_tokens_total") > 0.0,
+                    "{rendered}"
+                );
+                assert!(
+                    metric(&reg, "turbine_speculative_accepted_tokens_total") > 0.0,
+                    "the draft proposed at least one accepted token: {rendered}"
+                );
+            }
+        }
+
+        // Overlap scheduling: the same stream, and the eligible/step turns are serial.
+        let (serial_overlap, _) = run_submissions(&spec, &tokenizer, &requests, &none, false, true);
+        let (draft_overlap, reg_overlap) =
+            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &requests, &none, true);
+        assert_eq!(draft_overlap, serial_overlap, "overlap differs from serial");
+        assert_eq!(
+            draft_overlap, serial,
+            "overlap differs from the serial stream"
+        );
+        let rendered = reg_overlap.render().unwrap();
+        assert!(
+            metric(
+                &reg_overlap,
+                r#"turbine_overlap_serial_turns_total{reason="speculative_step"}"#
+            ) > 0.0
+                || metric(
+                    &reg_overlap,
+                    r#"turbine_overlap_serial_turns_total{reason="speculative_eligible"}"#
+                ) > 0.0,
+            "speculative turns are serial: {rendered}"
         );
     }
 
