@@ -5631,7 +5631,14 @@ mod tests {
         let none = || Vec::<Box<dyn TokenMatcher>>::new();
         let req = request(&[256, 72, 101, 108, 108, 111], 4);
 
-        let (_, reg) = run_submissions(&spec, &tokenizer, &[req.clone()], &none, false, false);
+        let (_, reg) = run_submissions(
+            &spec,
+            &tokenizer,
+            std::slice::from_ref(&req),
+            &none,
+            false,
+            false,
+        );
         assert!(
             metric(
                 &reg,
@@ -5642,8 +5649,15 @@ mod tests {
         );
 
         let mask = || vec![Box::new(AnyMask { forced: Vec::new() }) as Box<dyn TokenMatcher>];
-        let (_, reg) =
-            run_submissions_with_draft(&spec, &draft, 4, &tokenizer, &[req.clone()], &mask, false);
+        let (_, reg) = run_submissions_with_draft(
+            &spec,
+            &draft,
+            4,
+            &tokenizer,
+            std::slice::from_ref(&req),
+            &mask,
+            false,
+        );
         assert!(
             metric(
                 &reg,
