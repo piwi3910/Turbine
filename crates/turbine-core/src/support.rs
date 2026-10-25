@@ -260,6 +260,9 @@ pub const TQ2_L0_REASON: &str = "kv_tq2_l0_refused: TurboQuant 2-bit L0 pages fa
 /// Why a Phase 7 row on `amd` is `experimental`: its S-13 gate has not closed yet. Shown as the
 /// row's reason by `--support-matrix` (an `experimental` status carries no reason of its own).
 pub const P7_PENDING_REASON: &str = "gate pending (track phase-7-model-families)";
+/// Why the Phase 8 draft row is `experimental` before its S-11 gate: the row turns `supported`
+/// only after the golden, A/B, throughput, vLLM and soak gates (phase 8 Task 14).
+pub const P8_PENDING_REASON: &str = "gate pending (track phase-8-speculative-decoding)";
 /// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
 pub const NVIDIA_REASON: &str =
     "NVIDIA execution is deferred (phase-2b-nvidia, on hold until the user lifts it)";
@@ -682,6 +685,27 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         NO_SPEC,
         unsupported(TQ2_L0_REASON),
     ),
+    // Phase 8 (S-9): the CPU reference provider serves the tiny draft integration tests; the
+    // Llama pairing starts `experimental` (P8_PENDING_REASON) until its S-11 gate closes, then
+    // Task 14 flips it to `supported`. Every other draft combination is refused below.
+    row(
+        Some("cpu"),
+        None,
+        None,
+        BF16,
+        KV_BF16,
+        Some(SpeculativeColumn::Draft),
+        SupportStatus::Experimental,
+    ),
+    row(
+        Some("amd"),
+        Some("gfx1201"),
+        Some("LlamaForCausalLM"),
+        BF16,
+        KV_BF16,
+        Some(SpeculativeColumn::Draft),
+        SupportStatus::Experimental,
+    ),
     row(
         None,
         None,
@@ -690,7 +714,8 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         None,
         Some(SpeculativeColumn::Draft),
         unsupported(
-            "draft-model speculative decoding is not validated yet (track phase-8-speculative-decoding)",
+            "draft-model speculative decoding is supported only for the validated Llama-3.2-1B \
+             -> Llama-3.2-3B pairing (track phase-8-speculative-decoding)",
         ),
     ),
 ];
@@ -788,12 +813,23 @@ impl SupportKey {
     /// execution backend's vendor column, `arch` is unknown ([`WILDCARD`]) except on the
     /// [`HOST_VENDOR`], `architecture` is the model's Hugging Face architecture name, or
     /// [`WILDCARD`] when `config.json` cannot be read yet, and the format columns are the
-    /// checkpoint's detected weight format and the configured L0 KV dtype.
+    /// checkpoint's detected weight format and the configured L0 KV dtype; no speculation.
     pub fn before_discovery(
         vendor: &str,
         architecture: Option<&str>,
         weight: WeightFormatColumn,
         kv: KvFormatColumn,
+    ) -> SupportKey {
+        SupportKey::before_discovery_with(vendor, architecture, weight, kv, SpeculativeColumn::None)
+    }
+
+    /// [`SupportKey::before_discovery`] with the configured `speculative` column.
+    pub fn before_discovery_with(
+        vendor: &str,
+        architecture: Option<&str>,
+        weight: WeightFormatColumn,
+        kv: KvFormatColumn,
+        speculative: SpeculativeColumn,
     ) -> SupportKey {
         let arch = if vendor == HOST_VENDOR {
             HOST_VENDOR
@@ -806,7 +842,7 @@ impl SupportKey {
             architecture.unwrap_or(WILDCARD),
             weight,
             kv,
-            SpeculativeColumn::None,
+            speculative,
         )
     }
 
@@ -940,6 +976,7 @@ impl SupportDecision {
                         Some(&self.key.architecture),
                         Some(self.key.weight_format),
                         Some(self.key.kv_format),
+                        Some(self.key.speculative),
                     )
                 })
                 .map(str::to_string),
@@ -990,6 +1027,7 @@ impl SupportRow {
                         self.key.architecture,
                         self.key.weight_format,
                         self.key.kv_format,
+                        self.key.speculative,
                     )
                 })
                 .map(str::to_string),
@@ -1017,15 +1055,21 @@ fn pending_reason(
     architecture: Option<&str>,
     weight: Option<WeightFormatColumn>,
     kv: Option<KvFormatColumn>,
+    speculative: Option<SpeculativeColumn>,
 ) -> Option<&'static str> {
+    if *status != SupportStatus::Experimental || vendor != Some("amd") {
+        return None;
+    }
     let phase7 = architecture.is_some_and(|a| PHASE7_ARCHITECTURES.contains(&a))
         || PHASE7_ROWS.iter().any(|r| {
             architecture == Some(r.architecture)
                 && weight.map(WeightFormatColumn::as_str) == Some(r.weight)
                 && kv.map(KvFormatColumn::as_str) == Some(r.kv)
         });
-    let pending = *status == SupportStatus::Experimental && vendor == Some("amd") && phase7;
-    pending.then_some(P7_PENDING_REASON)
+    if phase7 {
+        return Some(P7_PENDING_REASON);
+    }
+    (speculative == Some(SpeculativeColumn::Draft)).then_some(P8_PENDING_REASON)
 }
 
 /// Where a Phase 7 row is gated (S-13): one card, two cards tensor-parallel, or two cards
@@ -1421,18 +1465,26 @@ mod tests {
             Some("no support-matrix row")
         );
 
-        // Draft on the real table: refused, naming speculative.method, also for a partial key.
+        // Draft outside the validated Llama pairing: refused, naming speculative.method, also
+        // for a partial key.
         let k = key(
             "amd",
             "gfx1201",
-            "LlamaForCausalLM",
+            "Qwen3ForCausalLM",
             W::Bf16,
             K::Bf16,
             S::Draft,
         );
         let err = check(k).unwrap_err();
         assert_eq!(err.key(), Some("speculative.method"));
-        let k = key("amd", WILDCARD, WILDCARD, W::Bf16, K::Bf16, S::Draft);
+        let k = key(
+            "amd",
+            WILDCARD,
+            "Qwen3ForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::Draft,
+        );
         assert_eq!(check(k).unwrap_err().key(), Some("speculative.method"));
         let k = key("amd", WILDCARD, WILDCARD, W::Bf16, K::Bf16, S::None);
         assert_eq!(check(k).unwrap().status, SupportStatus::Supported);
@@ -1718,12 +1770,21 @@ mod tests {
             K::Bf16,
             S::Draft,
         );
+        let d = check(k).unwrap();
+        assert_eq!(d.status, SupportStatus::Experimental);
+        assert_eq!(d.view().reason.as_deref(), Some(P8_PENDING_REASON));
+        // A non-Llama draft is refused with the validated-pairing reason.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "Qwen3ForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::Draft,
+        );
         let status = resolve(&k);
         assert!(
-            status
-                .reason()
-                .unwrap()
-                .contains("phase-8-speculative-decoding"),
+            status.reason().unwrap().contains("validated Llama"),
             "{status:?}"
         );
         // Qwen3 BF16 on gfx1201 is supported since its gate closed (Task 11, 2026-10-08); the
@@ -1996,6 +2057,61 @@ mod tests {
             PHASE7_ROWS.len(),
             "duplicate PHASE7_ROWS entry"
         );
+    }
+
+    /// Phase 8 (S-9): the CPU reference serves the tiny draft tests, the Llama pairing starts
+    /// experimental until its S-11 gate, and every other draft combination is refused.
+    #[test]
+    fn phase8_rows() {
+        use KvFormatColumn as K;
+        use SpeculativeColumn as S;
+        use WeightFormatColumn as W;
+
+        let cpu = SupportKey::for_model("cpu", "*", "LlamaForCausalLM", W::Bf16, K::Bf16, S::Draft);
+        assert_eq!(
+            resolve_partial_in(SUPPORT_MATRIX, &cpu),
+            SupportStatus::Experimental,
+            "{cpu}"
+        );
+
+        let amd = key(
+            "amd",
+            "gfx1201",
+            "LlamaForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::Draft,
+        );
+        let d = check(amd.clone()).expect("an experimental row is not refused");
+        assert_eq!(d.status, SupportStatus::Experimental, "{amd}");
+        assert_eq!(d.view().reason.as_deref(), Some(P8_PENDING_REASON), "{amd}");
+
+        for (architecture, w, kv) in [
+            ("Qwen3ForCausalLM", W::Bf16, K::Bf16),
+            ("OlmoeForCausalLM", W::Bf16, K::Bf16),
+            ("MistralForCausalLM", W::Bf16, K::Bf16),
+            ("LlamaForCausalLM", W::Fp8, K::Bf16),
+            ("LlamaForCausalLM", W::Bf16, K::Tq4),
+        ] {
+            let k = key("amd", "gfx1201", architecture, w, kv, S::Draft);
+            let status = resolve(&k);
+            assert_eq!(status.as_str(), "unsupported", "{k}");
+            assert!(
+                status.reason().unwrap().contains("validated Llama"),
+                "{k}: {status:?}"
+            );
+        }
+
+        // `method: none` keys are untouched by the new rows.
+        let k = key(
+            "amd",
+            "gfx1201",
+            "LlamaForCausalLM",
+            W::Bf16,
+            K::Bf16,
+            S::None,
+        );
+        assert_eq!(resolve(&k), SupportStatus::Supported, "{k}");
     }
 
     /// Phase 2m: keys are built from the backend's vendor and the family's HF name; before

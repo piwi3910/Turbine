@@ -13,10 +13,10 @@
 
 use std::path::Path;
 
-use turbine_core::config::{Config, ConfigError, KvDtypeChoice};
+use turbine_core::config::{Config, ConfigError, KvDtypeChoice, SpeculativeMethod};
 use turbine_core::support::{
-    self, HOST_VENDOR, KvFormatColumn, SupportDecision, SupportKey, SupportStatus,
-    WeightFormatColumn,
+    self, HOST_VENDOR, KvFormatColumn, SpeculativeColumn, SupportDecision, SupportKey,
+    SupportStatus, WeightFormatColumn,
 };
 use turbine_device::DeviceInventory;
 
@@ -91,6 +91,15 @@ pub fn kv_column(dtype: KvDtypeChoice) -> KvFormatColumn {
         .expect("every kv.dtype value has a support-matrix KV column")
 }
 
+/// The speculative-matrix column of `speculative.method` (Phase 8): `draft` keys the draft rows.
+pub fn speculative_column(cfg: &Config) -> SpeculativeColumn {
+    if cfg.speculative.method == SpeculativeMethod::Draft {
+        SpeculativeColumn::Draft
+    } else {
+        SpeculativeColumn::None
+    }
+}
+
 /// The key before device discovery for `cfg` with the given format columns.
 pub fn key_before_discovery(
     cfg: &Config,
@@ -98,7 +107,13 @@ pub fn key_before_discovery(
     kv: KvFormatColumn,
 ) -> SupportKey {
     let architecture = read_architecture(&cfg.model.path);
-    SupportKey::before_discovery(vendor(cfg), architecture.as_deref(), weight, kv)
+    SupportKey::before_discovery_with(
+        vendor(cfg),
+        architecture.as_deref(),
+        weight,
+        kv,
+        speculative_column(cfg),
+    )
 }
 
 /// The decision before device discovery (startup and `--check-config`); the lower-tier KV
@@ -502,6 +517,23 @@ mod tests {
             }],
             backends: Vec::new(),
         }
+    }
+
+    /// Phase 8: `speculative.method: draft` reaches the matrix key (the CPU reference row is
+    /// experimental, so the tiny draft integration tests start).
+    #[test]
+    fn key_before_discovery_carries_draft() {
+        let llama = model_dir(
+            "draft-key",
+            serde_json::json!({"architectures": ["LlamaForCausalLM"]}),
+        );
+        let mut cfg = config("cpu", llama.path());
+        cfg.speculative.method = SpeculativeMethod::Draft;
+        cfg.speculative.draft_model_path = Some(llama.path().to_path_buf());
+        let key = key_before_discovery(&cfg, WeightFormatColumn::Bf16, KvFormatColumn::Bf16);
+        assert_eq!(key.to_string(), "cpu/cpu/LlamaForCausalLM/bf16/bf16/draft");
+        let d = before_discovery(&cfg).unwrap();
+        assert_eq!(d.status, SupportStatus::Experimental);
     }
 
     /// Spec edge case (the matrix and the family registry disagree): every registered family's
