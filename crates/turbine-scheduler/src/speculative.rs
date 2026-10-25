@@ -15,6 +15,11 @@ pub trait Rows {
     /// Rows available (the proposals plus the row that supplies the next token).
     fn len(&self) -> usize;
 
+    /// No rows (a verifier call never succeeds with none; the pair keeps `len` idiomatic).
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The greedy token of `row` (its argmax after post-processing).
     fn greedy(&self, row: usize) -> u32;
 
