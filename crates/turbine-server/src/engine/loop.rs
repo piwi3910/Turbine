@@ -4636,6 +4636,25 @@ mod tests {
         }
     }
 
+    /// The KV document once the engine has published a finished request's partial tail. The
+    /// publish runs in the same turn after `Finished` is delivered, so a plain read right after
+    /// `run_one` can race it on a loaded host.
+    fn kv_doc_when_finished(shared: &EngineShared) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let kv = serde_json::to_value(shared.docs().expect("the hierarchy's document").kv)
+                .expect("the KV document as JSON");
+            if kv["tiers"][0]["partial_entries"].as_u64().unwrap_or(0) > 0 {
+                return kv;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the finished request never published its partial tail: {kv}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// The value of the Prometheus series `series` (0 when absent).
     fn metric(reg: &MetricsRegistry, series: &str) -> f64 {
         reg.render()
@@ -5986,7 +6005,7 @@ mod tests {
         let serial_handle = std::thread::spawn(move || serial.run());
         let req = request(&prompt, 16);
         let (serial_tokens, _) = run_one(&serial_tx, req.clone());
-        let serial_kv = serde_json::to_value(serial_shared.docs().unwrap().kv).unwrap();
+        let serial_kv = kv_doc_when_finished(&serial_shared);
 
         // The speculative engine: the tiny draft (seed 11) proposes different tokens than
         // the target (seed 7), so rounds reject and their spans cross block boundaries.
@@ -6029,7 +6048,7 @@ mod tests {
             draft_tokens, serial_tokens,
             "the speculative greedy stream is the serial stream"
         );
-        let draft_kv = serde_json::to_value(shared.docs().unwrap().kv).unwrap();
+        let draft_kv = kv_doc_when_finished(&shared);
         assert_eq!(
             draft_kv["tiers"][0]["blocks_used"], serial_kv["tiers"][0]["blocks_used"],
             "a rolled-back span leaves the same blocks used: {draft_kv}"
