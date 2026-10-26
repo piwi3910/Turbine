@@ -54,6 +54,8 @@ usage() {
 SERVED_TESTS=(
 	# crates/turbine-server/tests/lab_openai.rs (P7 Task 19)
 	mistral_tool_call_round_trip
+	# crates/turbine-server/tests/lab_openai.rs (P7 Task 27)
+	harmony_channels
 )
 # Lab tests that open two GPUs (Phase 5): skipped (libtest `--skip`, by substring) in a
 # one-GPU Job, where they would fail on the missing device; run them with `--gpus 2`.
