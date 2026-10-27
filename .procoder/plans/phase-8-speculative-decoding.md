@@ -48,7 +48,7 @@ Interfaces:
 Covers: S-1, S-8; AC 1
 Depends on: nothing in this phase
 
-- [ ] Write failing test `config::speculative::tests::speculative_config_defaults_and_bounds` in `crates/turbine-core/src/config/speculative.rs`:
+- [x] Write failing test `config::speculative::tests::speculative_config_defaults_and_bounds` in `crates/turbine-core/src/config/speculative.rs`:
 
   ```rust
   #[test]
@@ -84,13 +84,13 @@ Depends on: nothing in this phase
   }
   ```
 
-- [ ] Write failing test `config::tests::speculative_parallel_refused` in `crates/turbine-core/src/config/tests.rs`: parse `TS15_EXAMPLE` with `--set speculative.method=draft --set speculative.draft_model_path=/x --set parallel.tensor_parallel_size=2` (and the same with `parallel.pipeline_parallel_size=2`) → an error whose key is `speculative.method` and whose message contains `speculative_parallel_unsupported:`; `tensor_parallel_size=1` and `=auto` pass.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-core config::speculative::tests::speculative_config_defaults_and_bounds` and `... config::tests::speculative_parallel_refused` — expect FAIL with "unexpected end of input" / "missing field `num_tokens`" / "no method named `validate`".
-- [ ] Implement the struct, bounds, the rows check and the parallel refusal; add the four keys to `examples/turbine.yaml` at their defaults.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-core config::speculative::tests::` and `... config::tests::speculative_parallel_refused` — expect PASS.
-- [ ] Run: `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config` — expect `config ok` (the `method: none` defaults do not change the resolved row).
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(config): speculative method, num_tokens, draft_model_path and min_acceptance`
+- [x] Write failing test `config::tests::speculative_parallel_refused` in `crates/turbine-core/src/config/tests.rs`: parse `TS15_EXAMPLE` with `--set speculative.method=draft --set speculative.draft_model_path=/x --set parallel.tensor_parallel_size=2` (and the same with `parallel.pipeline_parallel_size=2`) → an error whose key is `speculative.method` and whose message contains `speculative_parallel_unsupported:`; `tensor_parallel_size=1` and `=auto` pass.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-core config::speculative::tests::speculative_config_defaults_and_bounds` and `... config::tests::speculative_parallel_refused` — expect FAIL with "unexpected end of input" / "missing field `num_tokens`" / "no method named `validate`".
+- [x] Implement the struct, bounds, the rows check and the parallel refusal; add the four keys to `examples/turbine.yaml` at their defaults.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-core config::speculative::tests::` and `... config::tests::speculative_parallel_refused` — expect PASS.
+- [x] Run: `scripts/remote-cargo.sh run -p turbine-server -- --config examples/turbine.yaml --check-config` — expect `config ok` (the `method: none` defaults do not change the resolved row).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(config): speculative method, num_tokens, draft_model_path and min_acceptance`
 
 ## Task 2: Support-matrix rows, the speculative column and `phase8_rows` (S-9)
 
@@ -107,7 +107,7 @@ Interfaces:
 Covers: S-9; AC 12 (the pre-gate half; Task 14 completes it)
 Depends on: Task 1
 
-- [ ] Write failing test `support::tests::phase8_rows` in `crates/turbine-core/src/support.rs`:
+- [x] Write failing test `support::tests::phase8_rows` in `crates/turbine-core/src/support.rs`:
 
   ```rust
   #[test]
@@ -128,12 +128,12 @@ Depends on: Task 1
   }
   ```
 
-- [ ] Write failing test `support_startup::tests::key_before_discovery_carries_draft`: `Config { execution: ExecutionConfig { backend: BackendChoice::Cpu, ..Default::default() }, speculative: SpeculativeConfig { method: Draft, draft_model_path: Some("/x".into()), ..Default::default() }, ..Default::default() }` → `key_before_discovery(...).to_string()` ends `/draft`.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-core support::tests::phase8_rows` — expect FAIL "no variant `draft`"/"unknown row"; `scripts/remote-cargo.sh test -p turbine-server support_startup::tests::key_before_discovery_carries_draft` — expect FAIL "left .../none".
-- [ ] Implement `before_discovery_with`, the cpu and amd draft rows, the wildcard reason and the column wiring.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-core support::tests::` and `scripts/remote-cargo.sh test -p turbine-server support_startup::tests::` — expect PASS; `scripts/remote-cargo.sh run -q -p turbine-server -- --support-matrix --output text` prints the cpu and amd draft rows and the wildcard reason.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(support): draft speculative row on cpu and the speculative column in the matrix key`
+- [x] Write failing test `support_startup::tests::key_before_discovery_carries_draft`: `Config { execution: ExecutionConfig { backend: BackendChoice::Cpu, ..Default::default() }, speculative: SpeculativeConfig { method: Draft, draft_model_path: Some("/x".into()), ..Default::default() }, ..Default::default() }` → `key_before_discovery(...).to_string()` ends `/draft`.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-core support::tests::phase8_rows` — expect FAIL "no variant `draft`"/"unknown row"; `scripts/remote-cargo.sh test -p turbine-server support_startup::tests::key_before_discovery_carries_draft` — expect FAIL "left .../none".
+- [x] Implement `before_discovery_with`, the cpu and amd draft rows, the wildcard reason and the column wiring.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-core support::tests::` and `scripts/remote-cargo.sh test -p turbine-server support_startup::tests::` — expect PASS; `scripts/remote-cargo.sh run -q -p turbine-server -- --support-matrix --output text` prints the cpu and amd draft rows and the wildcard reason.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(support): draft speculative row on cpu and the speculative column in the matrix key`
 
 ## Task 3: Prepare the draft model, validate the pair and charge the budget (S-1, S-7, S-8, S-12)
 
@@ -157,7 +157,7 @@ Interfaces:
 Covers: S-1, S-7, S-8, S-12; AC 2, 10
 Depends on: Tasks 1, 2
 
-- [ ] Write failing test `budget::tests::speculative_draft_footprint`:
+- [x] Write failing test `budget::tests::speculative_draft_footprint`:
 
   ```rust
   #[test]
@@ -179,13 +179,13 @@ Depends on: Tasks 1, 2
   }
   ```
 
-- [ ] Write failing test `crates/turbine-server/tests/server_cli.rs::speculative_startup_refusals`: build tiny target/draft directories (`write_tiny_llama_with`) and run `--check-config` with `--set execution.backend=cpu --set speculative.method=draft --set speculative.draft_model_path=<dir>`; cases: a missing dir (`speculative_draft_path`, exit 2), a tiny Qwen3 draft (`speculative_draft_family`), a tokenizer with one special id changed (`speculative_draft_tokenizer`), a tiny quantized Llama draft (`speculative_draft_format`), a draft whose `max_position_embeddings` is 8 with `--set model.max_seq_len=64` (`speculative_draft_context`), `--set speculative.num_tokens=8 --set scheduler.max_running_requests=8` (`speculative_rows`), and an explicit `--set parallel.tensor_parallel_size=2` (`speculative_parallel_unsupported`); the valid tiny pair prints `config ok` and the support line `cpu/*/LlamaForCausalLM/bf16/bf16/draft`; a valid dir with a corrupt `model.safetensors` (the last 8 bytes overwritten) exits 1 before `/ready` with the draft path in the message.
-- [ ] Write failing test `model::tests::draft_tokenizer_fingerprint_detects_a_change`: two tiny tokenizer dirs; one with a modified `special_tokens_map.json`/added vocab entry → fingerprints differ; the same dir → equal.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-reliability budget::tests::speculative_draft_footprint` and `scripts/remote-cargo.sh test -p turbine-server --test server_cli speculative_startup_refusals` — expect FAIL "no function `compute_budget_with_draft`"/"unknown key `speculative.draft_model_path`".
-- [ ] Implement `DraftBudget`, the combined budget, the fingerprint, `draft_budget`, the `prepare` parameter and `load_draft`; the budget error wrapper `fn budget_error_with_draft(error: BudgetError, path: &Path) -> StartupError` (message starts `speculative_budget:`, names `speculative.draft_model_path` and `path`).
-- [ ] Run the three tests — expect PASS; `scripts/remote-cargo.sh test -p turbine-server --test server_cli` — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(server): prepare and validate the speculative draft model and charge its budget`
+- [x] Write failing test `crates/turbine-server/tests/server_cli.rs::speculative_startup_refusals`: build tiny target/draft directories (`write_tiny_llama_with`) and run `--check-config` with `--set execution.backend=cpu --set speculative.method=draft --set speculative.draft_model_path=<dir>`; cases: a missing dir (`speculative_draft_path`, exit 2), a tiny Qwen3 draft (`speculative_draft_family`), a tokenizer with one special id changed (`speculative_draft_tokenizer`), a tiny quantized Llama draft (`speculative_draft_format`), a draft whose `max_position_embeddings` is 8 with `--set model.max_seq_len=64` (`speculative_draft_context`), `--set speculative.num_tokens=8 --set scheduler.max_running_requests=8` (`speculative_rows`), and an explicit `--set parallel.tensor_parallel_size=2` (`speculative_parallel_unsupported`); the valid tiny pair prints `config ok` and the support line `cpu/*/LlamaForCausalLM/bf16/bf16/draft`; a valid dir with a corrupt `model.safetensors` (the last 8 bytes overwritten) exits 1 before `/ready` with the draft path in the message.
+- [x] Write failing test `model::tests::draft_tokenizer_fingerprint_detects_a_change`: two tiny tokenizer dirs; one with a modified `special_tokens_map.json`/added vocab entry → fingerprints differ; the same dir → equal.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-reliability budget::tests::speculative_draft_footprint` and `scripts/remote-cargo.sh test -p turbine-server --test server_cli speculative_startup_refusals` — expect FAIL "no function `compute_budget_with_draft`"/"unknown key `speculative.draft_model_path`".
+- [x] Implement `DraftBudget`, the combined budget, the fingerprint, `draft_budget`, the `prepare` parameter and `load_draft`; the budget error wrapper `fn budget_error_with_draft(error: BudgetError, path: &Path) -> StartupError` (message starts `speculative_budget:`, names `speculative.draft_model_path` and `path`).
+- [x] Run the three tests — expect PASS; `scripts/remote-cargo.sh test -p turbine-server --test server_cli` — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(server): prepare and validate the speculative draft model and charge its budget`
 
 ## Task 4: The `Proposer` registry, the draft KV slot and the conformance suite (S-2, S-7)
 
@@ -205,15 +205,15 @@ Interfaces:
 Covers: S-2; AC 3
 Depends on: Tasks 1, 3
 
-- [ ] Write failing test `speculative::tests::draft_model_conformance` in `crates/turbine-model/src/speculative/mod.rs`: build a tiny draft executor and pool (the existing `testing::tiny::write_tiny_llama_with` plus `DecoderExecutor` and `BlockPool`), `conformance(&DraftModelFactory, cfg)` returns `Ok(())`, and `conformance` on a factory without a `draft_model` name returns an error naming the entry.
-- [ ] Write failing test `crates/turbine-model/tests/conformance.rs::proposer_registry`: iterate `PROPOSERS`, assert `proposer(f.name()).is_some()`, the names are distinct, and `DraftModelFactory.name() == "draft_model"`.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model speculative::tests::draft_model_conformance` — expect FAIL "cannot find module `speculative`".
-- [ ] Implement `speculative/mod.rs` and `speculative/draft.rs`: the pool is `BlockPool::new(BlockPoolConfig { layout: draft.kv_layout(block_tokens), num_blocks: one slot + ceil(k/block_tokens) + 1, ..Default::default() }, Arc::clone(&mem))`; the slot is one `BlockTable` (the pool's `table` helper or `BlockTable::new`); the draft executor is called through `ModelExecutor::prefill`/`decode`/`forward` (use the existing executor API); the greedy token is the argmax of its logits row (host reduction for the tiny/cpu path).
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model speculative::tests::` and `scripts/remote-cargo.sh test -p turbine-model --test conformance` — expect PASS.
-- [ ] Write `docs/extending/speculative-proposer.md`: the trait, the registry entry, the files, the conformance command, `verify_*` hand-off, the one-slot rule, the lab check and the pitfalls; add it to `docs/extending/README.md`; run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL until the page is listed and current, then PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Lab quick (touching `turbine-model`): `scripts/lab-test.sh novanas --tier quick` — expect PASS.
-- [ ] Commit: `feat(model): Proposer trait, draft_model registry and the draft KV slot`
+- [x] Write failing test `speculative::tests::draft_model_conformance` in `crates/turbine-model/src/speculative/mod.rs`: build a tiny draft executor and pool (the existing `testing::tiny::write_tiny_llama_with` plus `DecoderExecutor` and `BlockPool`), `conformance(&DraftModelFactory, cfg)` returns `Ok(())`, and `conformance` on a factory without a `draft_model` name returns an error naming the entry.
+- [x] Write failing test `crates/turbine-model/tests/conformance.rs::proposer_registry`: iterate `PROPOSERS`, assert `proposer(f.name()).is_some()`, the names are distinct, and `DraftModelFactory.name() == "draft_model"`.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model speculative::tests::draft_model_conformance` — expect FAIL "cannot find module `speculative`".
+- [x] Implement `speculative/mod.rs` and `speculative/draft.rs`: the pool is `BlockPool::new(BlockPoolConfig { layout: draft.kv_layout(block_tokens), num_blocks: one slot + ceil(k/block_tokens) + 1, ..Default::default() }, Arc::clone(&mem))`; the slot is one `BlockTable` (the pool's `table` helper or `BlockTable::new`); the draft executor is called through `ModelExecutor::prefill`/`decode`/`forward` (use the existing executor API); the greedy token is the argmax of its logits row (host reduction for the tiny/cpu path).
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model speculative::tests::` and `scripts/remote-cargo.sh test -p turbine-model --test conformance` — expect PASS.
+- [x] Write `docs/extending/speculative-proposer.md`: the trait, the registry entry, the files, the conformance command, `verify_*` hand-off, the one-slot rule, the lab check and the pitfalls; add it to `docs/extending/README.md`; run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL until the page is listed and current, then PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Lab quick (touching `turbine-model`): `scripts/lab-test.sh novanas --tier quick` — expect PASS.
+- [x] Commit: `feat(model): Proposer trait, draft_model registry and the draft KV slot`
 
 ## Task 5: The sampler's row API for verification (S-3)
 
@@ -228,13 +228,13 @@ Interfaces:
 Covers: S-3 (the exactness substrate)
 Depends on: nothing in this phase
 
-- [ ] Write failing test `sampling::tests::row_matches_sample`: for 10 000 seeded samplers (`SamplingParams { temperature: 0.8, top_p: 0.9, top_k: 40, seed: Some(i), ..Default::default() }`), take a fixed logits vector with a mask, clone the sampler, call `sample` on one clone and `row`+`draw_row` on the other, assert the tokens equality; for `temperature: 0.0` assert `row.greedy == sample.token`; assert `probs` sums to 1 ± 1e-5, every `exclude`-drawn token differs from `exclude`, and the logprob of the drawn token equals `row.logprob[token]`.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model sampling::tests::row_matches_sample` — expect FAIL "no method named `row`".
-- [ ] Refactor `sample` into `row`/`draw_row`/`observe` without changing the arithmetic or the RNG calls; keep `sample_rows` unchanged.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-model sampling::` — expect PASS (including the existing `sample_matches...` and `sample_rows_matches_one_by_one`).
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS (the sampler is GPU-facing through the device logits path).
-- [ ] Commit: `refactor(model): sampler row and draw_row for verification without observing`
+- [x] Write failing test `sampling::tests::row_matches_sample`: for 10 000 seeded samplers (`SamplingParams { temperature: 0.8, top_p: 0.9, top_k: 40, seed: Some(i), ..Default::default() }`), take a fixed logits vector with a mask, clone the sampler, call `sample` on one clone and `row`+`draw_row` on the other, assert the tokens equality; for `temperature: 0.0` assert `row.greedy == sample.token`; assert `probs` sums to 1 ± 1e-5, every `exclude`-drawn token differs from `exclude`, and the logprob of the drawn token equals `row.logprob[token]`.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model sampling::tests::row_matches_sample` — expect FAIL "no method named `row`".
+- [x] Refactor `sample` into `row`/`draw_row`/`observe` without changing the arithmetic or the RNG calls; keep `sample_rows` unchanged.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-model sampling::` — expect PASS (including the existing `sample_matches...` and `sample_rows_matches_one_by_one`).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS (the sampler is GPU-facing through the device logits path).
+- [x] Commit: `refactor(model): sampler row and draw_row for verification without observing`
 
 ## Task 6: The verifier in `turbine-scheduler` (S-3)
 
@@ -252,7 +252,7 @@ Interfaces:
 Covers: S-3; AC 4
 Depends on: nothing in this phase
 
-- [ ] Write failing test `speculative::tests::greedy_prefix` and `speculative::tests::sampling_is_exact` in `crates/turbine-scheduler/src/speculative.rs`:
+- [x] Write failing test `speculative::tests::greedy_prefix` and `speculative::tests::sampling_is_exact` in `crates/turbine-scheduler/src/speculative.rs`:
 
   ```rust
   struct FixedRows(Vec<u32>, Vec<Vec<f32>>);
@@ -288,11 +288,11 @@ Depends on: nothing in this phase
   }
   ```
 
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-scheduler speculative::tests::` — expect FAIL "cannot find module".
-- [ ] Implement the traits and both functions; no scheduler/model state, no allocation beyond the caller's rows.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-scheduler speculative::tests::` — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(scheduler): speculative verifier with exact greedy and rejection acceptance`
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-scheduler speculative::tests::` — expect FAIL "cannot find module".
+- [x] Implement the traits and both functions; no scheduler/model state, no allocation beyond the caller's rows.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-scheduler speculative::tests::` — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(scheduler): speculative verifier with exact greedy and rejection acceptance`
 
 ## Task 7: The engine's greedy speculative round, serial turns and metrics (S-3, S-4, S-10)
 
@@ -309,16 +309,16 @@ Interfaces:
 Covers: S-3, S-4, S-10; AC 5, 11, 13 (the metrics part), 16
 Depends on: Tasks 3, 4, 5, 6
 
-- [ ] Extend the engine test harness with `run_submissions_with_draft(spec: TinySpec, draft: TinySpec, tokenizer, requests, grammar, draft_on: bool, overlap: bool)` (a `Config` with `speculative.method: draft` and the draft dir; the target and draft tiny models from two seeds) in `crates/turbine-server/src/engine/loop.rs`.
-- [ ] Write failing test `engine::r#loop::tests::speculative_greedy_matches_serial`: a tiny target + tiny draft, a request with 64 max tokens and the greedy sampler; for k in 1..=8, with the draft off and on and overlap false and true, the token streams are equal; `turbine_speculative_rounds_total{outcome="accepted_all"}` or `partial` is > 0, `turbine_speculative_accepted_tokens_total > 0`, and `turbine_overlap_serial_turns_total{reason="speculative_step"}` is > 0; with prefix reuse on (a second identical request) the stream still equals the serial one and the cached tokens are unchanged; after a preemption the stream still equals.
-- [ ] Write failing test `engine::r#loop::tests::draft_kv_lifecycle`: after a request completes, a second request's `begin` succeeds (the slot was released); while a request holds the slot, a second `begin` on the same proposer returns `ProposeError::SlotBusy` (no sharing); a partial accept truncates the draft table to the target's accepted length (`propose` from that length equals the serial draft run); a finish, cancel and preempt each release the slot; the draft pool's free-block count returns to its start between requests.
-- [ ] Write failing test `engine::r#loop::tests::speculative_errors`: a tiny draft executor wrapped to return `ModelError` on its first forward makes the request end with an error event and no partial token, and a following request is served normally; a shutdown in the middle of a speculative round logs `event="engine_stopped"` once and drops both executors. (The draft load failure and the config exits are Task 3's `speculative_startup_refusals`.)
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_greedy_matches_serial` — expect FAIL "unknown field `draft`"/"no method named `step_verified`".
-- [ ] Implement the proposer/engine wiring, the extension, `step_verified` for greedy, the row adapter (`Rows` over `ProcessedRow`), the metrics and the serial turn; the accepted proposals' events are the `step_sampled` outputs (so detokenization, stop strings, tool/reasoning parsing stay on the ordinary path); a proposal/step error follows the ordinary iteration error path and never emits a partial token.
-- [ ] Run the three tests — expect PASS. Then `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::jump_forward` — expect PASS (the jump-forward path is unchanged).
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS (GPU-facing engine code).
-- [ ] Commit: `feat(engine): greedy speculative round over the multi-token append`
+- [x] Extend the engine test harness with `run_submissions_with_draft(spec: TinySpec, draft: TinySpec, tokenizer, requests, grammar, draft_on: bool, overlap: bool)` (a `Config` with `speculative.method: draft` and the draft dir; the target and draft tiny models from two seeds) in `crates/turbine-server/src/engine/loop.rs`.
+- [x] Write failing test `engine::r#loop::tests::speculative_greedy_matches_serial`: a tiny target + tiny draft, a request with 64 max tokens and the greedy sampler; for k in 1..=8, with the draft off and on and overlap false and true, the token streams are equal; `turbine_speculative_rounds_total{outcome="accepted_all"}` or `partial` is > 0, `turbine_speculative_accepted_tokens_total > 0`, and `turbine_overlap_serial_turns_total{reason="speculative_step"}` is > 0; with prefix reuse on (a second identical request) the stream still equals the serial one and the cached tokens are unchanged; after a preemption the stream still equals.
+- [x] Write failing test `engine::r#loop::tests::draft_kv_lifecycle`: after a request completes, a second request's `begin` succeeds (the slot was released); while a request holds the slot, a second `begin` on the same proposer returns `ProposeError::SlotBusy` (no sharing); a partial accept truncates the draft table to the target's accepted length (`propose` from that length equals the serial draft run); a finish, cancel and preempt each release the slot; the draft pool's free-block count returns to its start between requests.
+- [x] Write failing test `engine::r#loop::tests::speculative_errors`: a tiny draft executor wrapped to return `ModelError` on its first forward makes the request end with an error event and no partial token, and a following request is served normally; a shutdown in the middle of a speculative round logs `event="engine_stopped"` once and drops both executors. (The draft load failure and the config exits are Task 3's `speculative_startup_refusals`.)
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::speculative_greedy_matches_serial` — expect FAIL "unknown field `draft`"/"no method named `step_verified`".
+- [x] Implement the proposer/engine wiring, the extension, `step_verified` for greedy, the row adapter (`Rows` over `ProcessedRow`), the metrics and the serial turn; the accepted proposals' events are the `step_sampled` outputs (so detokenization, stop strings, tool/reasoning parsing stay on the ordinary path); a proposal/step error follows the ordinary iteration error path and never emits a partial token.
+- [x] Run the three tests — expect PASS. Then `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::jump_forward` — expect PASS (the jump-forward path is unchanged).
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS (GPU-facing engine code).
+- [x] Commit: `feat(engine): greedy speculative round over the multi-token append`
 
 ## Task 8: Sampling rounds, seeded bypass and the distribution test (S-3, S-6)
 
@@ -333,15 +333,15 @@ Interfaces:
 Covers: S-3, S-6; AC 15
 Depends on: Tasks 5, 6, 7
 
-- [ ] Write failing test `engine::r#loop::tests::speculative_seeded_identical`: a seeded request (`seed: Some(7)`, temperature 0.8, top_p 0.9) with the draft off and on produces the identical token stream; a seeded request with `method: draft` never runs a speculative round (`turbine_speculative_rounds_total` unchanged; the disabled gauge/reason is `seeded`).
-- [ ] Write failing test `engine::r#loop::tests::speculative_sampling_runs` (unseeded, temperature 0.8): the stream differs from the serial stream (not asserted token-equal), every emitted token is in the vocabulary, `turbine_speculative_rounds_total` includes `partial`/`accepted_all`, and no rejected proposal appears in the output (a draft whose proposals are the serial stream's next tokens cannot be fully rejected while the round counts accepted > 0).
-- [ ] Write failing test `crates/turbine-model/tests/tiny_model.rs::speculative_sampling_exactness`: run 10^6 seeded rounds of the acceptance/fallback (a synthetic proposal = a fixed token) and histogram the emitted tokens; assert TV < 0.01 against the tiny model's `Sampler` distribution and that a `p(t)=0` token is never emitted.
-- [ ] Run the three tests — expect FAIL "no method named `draw_row`" / "VerifyMode::Sampling".
-- [ ] Implement the sampling `step_verified` with the `Draw` adapter and the bypasses; make the acceptance and fallback draws use the choice's sampler RNG.
-- [ ] Run the tests — expect PASS; `scripts/remote-cargo.sh test -p turbine-model sampling::` — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS.
-- [ ] Commit: `feat(engine): exact rejection sampling for speculative rounds, seeded bypass`
+- [x] Write failing test `engine::r#loop::tests::speculative_seeded_identical`: a seeded request (`seed: Some(7)`, temperature 0.8, top_p 0.9) with the draft off and on produces the identical token stream; a seeded request with `method: draft` never runs a speculative round (`turbine_speculative_rounds_total` unchanged; the disabled gauge/reason is `seeded`).
+- [x] Write failing test `engine::r#loop::tests::speculative_sampling_runs` (unseeded, temperature 0.8): the stream differs from the serial stream (not asserted token-equal), every emitted token is in the vocabulary, `turbine_speculative_rounds_total` includes `partial`/`accepted_all`, and no rejected proposal appears in the output (a draft whose proposals are the serial stream's next tokens cannot be fully rejected while the round counts accepted > 0).
+- [x] Write failing test `crates/turbine-model/tests/tiny_model.rs::speculative_sampling_exactness`: run 10^6 seeded rounds of the acceptance/fallback (a synthetic proposal = a fixed token) and histogram the emitted tokens; assert TV < 0.01 against the tiny model's `Sampler` distribution and that a `p(t)=0` token is never emitted.
+- [x] Run the three tests — expect FAIL "no method named `draw_row`" / "VerifyMode::Sampling".
+- [x] Implement the sampling `step_verified` with the `Draw` adapter and the bypasses; make the acceptance and fallback draws use the choice's sampler RNG.
+- [x] Run the tests — expect PASS; `scripts/remote-cargo.sh test -p turbine-model sampling::` — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS.
+- [x] Commit: `feat(engine): exact rejection sampling for speculative rounds, seeded bypass`
 
 ## Task 9: Eligibility, pressure and the per-request acceptance window (S-6, S-10)
 
@@ -357,13 +357,13 @@ Interfaces:
 Covers: S-6, S-10; AC 9, 13
 Depends on: Tasks 7, 8
 
-- [ ] Write failing test `engine::r#loop::tests::speculative_disabled_reasons`: two concurrent requests (a two-item plan) → `batch`; a constrained choice → `constrained`; `seed: Some(1)` → `seeded`; a paused choice (output channel full) → `paused`; `pressure.state = Orange` (tick the controller) → `pressure`, then Green → a round runs; a draft that always proposes wrong tokens with `min_acceptance=0.4` for 9 rounds → the request's speculation stops (`low_acceptance`) and the stream equals the serial one; a second request with the slot held does not fail (`no_draft_kv`/`no_room` fall back). In every case the response completes and equals the serial stream.
-- [ ] Write failing test `engine::r#loop::tests::speculative_metrics_and_status`: a successful speculative run renders the five series (only the documented labels), the status JSON's `speculative` object matches `method: draft`, `num_tokens: 4`, `min_acceptance: 0.4`, `active: true`, and `acceptance` in 0..=1; `method: none` reports `active: false`; ORANGE reports `active: false` and the `pressure` gauge > 0.
-- [ ] Run both tests — expect FAIL "no variant `batch`"/"missing field `speculative`".
-- [ ] Implement the gate, the window, the status object and the gauges.
-- [ ] Run the tests — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(engine): speculative eligibility, pressure and low-acceptance disable`
+- [x] Write failing test `engine::r#loop::tests::speculative_disabled_reasons`: two concurrent requests (a two-item plan) → `batch`; a constrained choice → `constrained`; `seed: Some(1)` → `seeded`; a paused choice (output channel full) → `paused`; `pressure.state = Orange` (tick the controller) → `pressure`, then Green → a round runs; a draft that always proposes wrong tokens with `min_acceptance=0.4` for 9 rounds → the request's speculation stops (`low_acceptance`) and the stream equals the serial one; a second request with the slot held does not fail (`no_draft_kv`/`no_room` fall back). In every case the response completes and equals the serial stream.
+- [x] Write failing test `engine::r#loop::tests::speculative_metrics_and_status`: a successful speculative run renders the five series (only the documented labels), the status JSON's `speculative` object matches `method: draft`, `num_tokens: 4`, `min_acceptance: 0.4`, `active: true`, and `acceptance` in 0..=1; `method: none` reports `active: false`; ORANGE reports `active: false` and the `pressure` gauge > 0.
+- [x] Run both tests — expect FAIL "no variant `batch`"/"missing field `speculative`".
+- [x] Implement the gate, the window, the status object and the gauges.
+- [x] Run the tests — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(engine): speculative eligibility, pressure and low-acceptance disable`
 
 ## Task 10: Stop, usage, logprobs and the prefix-publish rollback invariants (S-3, S-4)
 
@@ -378,13 +378,13 @@ Interfaces:
 Covers: S-3, S-4; AC 6, 7
 Depends on: Tasks 7, 8
 
-- [ ] Write failing test `engine::r#loop::tests::speculative_stop_and_usage`: with the tiny draft, `max_tokens: 3` and `ignore_eos: false`, the finish reason and the emitted events equal the serial run; `usage.completion_tokens` equals the emitted tokens; a `stop` string and a stop token id inside a span both end at the serial position; with `logprobs: Some(2)` every emitted token's `logprob`/`top_logprobs` equals the serial run's for the same token.
-- [ ] Write failing test `engine::r#loop::tests::speculative_rollback_publishes_kept_prefix`: with a draft forced to propose a known-wrong token (a test proposer or a draft whose next token is fixed), a later request with the kept prefix hits the cache only for the kept tokens; a full block with a rejected token is not served; the KV document's block count after finish equals the serial run's; a tail copy still restores the shared prefix.
-- [ ] Run both tests — expect FAIL "usage.completion_tokens == 4"/"the rejected block was published".
-- [ ] Implement the finish/usage/logprobs handling and the publish rule (the existing rollback path already shortens the table; add the publish-hash check and the snapshot drop).
-- [ ] Run the tests — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(engine): speculative finish, usage and kept-prefix publish invariants`
+- [x] Write failing test `engine::r#loop::tests::speculative_stop_and_usage`: with the tiny draft, `max_tokens: 3` and `ignore_eos: false`, the finish reason and the emitted events equal the serial run; `usage.completion_tokens` equals the emitted tokens; a `stop` string and a stop token id inside a span both end at the serial position; with `logprobs: Some(2)` every emitted token's `logprob`/`top_logprobs` equals the serial run's for the same token.
+- [x] Write failing test `engine::r#loop::tests::speculative_rollback_publishes_kept_prefix`: with a draft forced to propose a known-wrong token (a test proposer or a draft whose next token is fixed), a later request with the kept prefix hits the cache only for the kept tokens; a full block with a rejected token is not served; the KV document's block count after finish equals the serial run's; a tail copy still restores the shared prefix.
+- [x] Run both tests — expect FAIL "usage.completion_tokens == 4"/"the rejected block was published".
+- [x] Implement the finish/usage/logprobs handling and the publish rule (the existing rollback path already shortens the table; add the publish-hash check and the snapshot drop).
+- [x] Run the tests — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(engine): speculative finish, usage and kept-prefix publish invariants`
 
 ## Task 11: Hybrid recurrent-state rollback with a scratch slot (S-5)
 
@@ -399,13 +399,13 @@ Interfaces:
 Covers: S-5; AC 8
 Depends on: Tasks 7, 10
 
-- [ ] Write failing test `engine::r#loop::tests::hybrid_speculative_rollback_matches_serial`: a tiny Qwen3.5 target and a scripted proposer (k=4, greedy) that repeats the serial stream and shifts its second proposal on round 2 → the next and later rounds' stream equals the serial stream (a wrong restored state would change it); a block-boundary snapshot inside the rejected span is not stored (the speculative run's `turbine_hybrid_state_snapshots_total{outcome="stored"}` is lower than the serial run's by the skipped boundary, and still non-zero); the scratch entry is released on finish and cancel; `speculative_scratch_released_on_preempt` covers release on preemption. (Deviation from the first draft: a test-only proposer, no second draft model, and state equality is observed through the stream rather than raw bytes — the engine's executor buffer is not readable from the test.)
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::hybrid_speculative_rollback_matches_serial` — expect FAIL "no scratch state slot".
-- [ ] Implement the scratch allocation, copy/restore, replay and snapshot drop; the replay forward is a single small step over the kept tokens (`Step` with `rows = kept`), measured by the existing step metric.
-- [ ] Run the test — expect PASS; the existing hybrid tests (`hybrid_state`, `prefix_reuse`, `snapshot`) — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS.
-- [ ] Commit: `feat(engine): hybrid recurrent-state rollback for speculative spans`
+- [x] Write failing test `engine::r#loop::tests::hybrid_speculative_rollback_matches_serial`: a tiny Qwen3.5 target and a scripted proposer (k=4, greedy) that repeats the serial stream and shifts its second proposal on round 2 → the next and later rounds' stream equals the serial stream (a wrong restored state would change it); a block-boundary snapshot inside the rejected span is not stored (the speculative run's `turbine_hybrid_state_snapshots_total{outcome="stored"}` is lower than the serial run's by the skipped boundary, and still non-zero); the scratch entry is released on finish and cancel; `speculative_scratch_released_on_preempt` covers release on preemption. (Deviation from the first draft: a test-only proposer, no second draft model, and state equality is observed through the stream rather than raw bytes — the engine's executor buffer is not readable from the test.)
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-server --bin turbine-server engine::r#loop::tests::hybrid_speculative_rollback_matches_serial` — expect FAIL "no scratch state slot".
+- [x] Implement the scratch allocation, copy/restore, replay and snapshot drop; the replay forward is a single small step over the kept tokens (`Step` with `rows = kept`), measured by the existing step metric.
+- [x] Run the test — expect PASS; the existing hybrid tests (`hybrid_state`, `prefix_reuse`, `snapshot`) — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Lab quick: `scripts/lab-test.sh novanas --tier quick` — expect PASS.
+- [x] Commit: `feat(engine): hybrid recurrent-state rollback for speculative spans`
 
 ## Task 12: Lab tooling, the pinned draft checkpoint and the lab config (S-11)
 
@@ -422,16 +422,16 @@ Interfaces:
 Covers: S-11 (tooling); AC 14 (the recipe)
 Depends on: Tasks 1, 3
 
-- [ ] Write failing test `lab_scripts::fetch_checkpoint_phase8_table`: `scripts/fetch-checkpoint.sh --dry-run --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` exits 0 and prints `hf download unsloth/Llama-3.2-1B-Instruct --revision 5a8abab4a5d6f164389b1079fb721cfab8d7126c --local-dir /home/piwi/turbine-models/llama-3.2-1b-instruct`; an unknown slug exits 2; `--table` is honoured; a failing `ssh` stub keeps the test off the host.
-- [ ] Write failing test `lab_scripts::vllm_speculative_dry_run`: `scripts/lab-serve.sh --dry-run novanas --vllm llama-3.2-3b-instruct --vllm-speculative '{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}'` exits 0 and prints `--speculative-config` followed by the JSON as one argument; a JSON with `'` exits 2.
-- [ ] Write failing test `lab_scripts::lab_bench_save_metrics_dry_run`: `scripts/lab-bench.sh --dry-run --model llama --save-metrics` prints the `/metrics` `curl` into `target/lab-bench/<label>-llama/metrics.prom`.
-- [ ] Run the three tests — expect FAIL "unknown option --table"/"unknown flag --vllm-speculative"/"unknown option --save-metrics".
-- [ ] Implement the three flags, add the TSV row and the lab config; `bash -n scripts/fetch-checkpoint.sh scripts/lab-serve.sh scripts/lab-bench.sh` and `shellcheck scripts/fetch-checkpoint.sh scripts/lab-serve.sh scripts/lab-bench.sh` — expect no output.
-- [ ] Run: `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts` — expect PASS.
-- [ ] Fetch the checkpoint (user approved 2026-10-25; run in the background): `scripts/fetch-checkpoint.sh --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` — expect `fetch: llama-3.2-1b-instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c ok` and `ssh novanas 'ls /home/piwi/turbine-models/llama-3.2-1b-instruct/config.json'`.
-- [ ] Document the config and the fetch in `AGENTS.md`; record the fetch in `.procoder/perf-log.md`.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `feat(lab): phase-8 checkpoint table, draft lab config and the vLLM/bench flags`
+- [x] Write failing test `lab_scripts::fetch_checkpoint_phase8_table`: `scripts/fetch-checkpoint.sh --dry-run --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` exits 0 and prints `hf download unsloth/Llama-3.2-1B-Instruct --revision 5a8abab4a5d6f164389b1079fb721cfab8d7126c --local-dir /home/piwi/turbine-models/llama-3.2-1b-instruct`; an unknown slug exits 2; `--table` is honoured; a failing `ssh` stub keeps the test off the host.
+- [x] Write failing test `lab_scripts::vllm_speculative_dry_run`: `scripts/lab-serve.sh --dry-run novanas --vllm llama-3.2-3b-instruct --vllm-speculative '{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}'` exits 0 and prints `--speculative-config` followed by the JSON as one argument; a JSON with `'` exits 2.
+- [x] Write failing test `lab_scripts::lab_bench_save_metrics_dry_run`: `scripts/lab-bench.sh --dry-run --model llama --save-metrics` prints the `/metrics` `curl` into `target/lab-bench/<label>-llama/metrics.prom`.
+- [x] Run the three tests — expect FAIL "unknown option --table"/"unknown flag --vllm-speculative"/"unknown option --save-metrics".
+- [x] Implement the three flags, add the TSV row and the lab config; `bash -n scripts/fetch-checkpoint.sh scripts/lab-serve.sh scripts/lab-bench.sh` and `shellcheck scripts/fetch-checkpoint.sh scripts/lab-serve.sh scripts/lab-bench.sh` — expect no output.
+- [x] Run: `scripts/remote-cargo.sh test -p turbine-bench --test lab_scripts` — expect PASS.
+- [x] Fetch the checkpoint (user approved 2026-10-25; run in the background): `scripts/fetch-checkpoint.sh --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` — expect `fetch: llama-3.2-1b-instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c ok` and `ssh novanas 'ls /home/piwi/turbine-models/llama-3.2-1b-instruct/config.json'`.
+- [x] Document the config and the fetch in `AGENTS.md`; record the fetch in `.procoder/perf-log.md`.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `feat(lab): phase-8 checkpoint table, draft lab config and the vLLM/bench flags`
 
 ## Task 13: Contract, docs and AGENTS.md (S-2, S-9, S-10)
 
@@ -445,11 +445,11 @@ Interfaces:
 Covers: S-2, S-9, S-10; AC 3 (docs), 12
 Depends on: Tasks 1–12
 
-- [ ] Write failing test `docs_extending::speculative_proposer_page_is_current`: the page's commands/names appear in the tree (`PROPOSERS`, `DraftProposerConfig`, `draft_model`) and the index links it; run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL until the page and the index entry are added.
-- [ ] Write the §28 additions and the AGENTS.md paragraphs; run the test — expect PASS.
-- [ ] Run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` and `scripts/remote-cargo.sh test -p turbine-core support::tests::` — expect PASS.
-- [ ] Gate: `scripts/gate.sh` — expect `gate: ok`.
-- [ ] Commit: `docs: Phase 8 contract, proposer page and AGENTS.md`
+- [x] Write failing test `docs_extending::speculative_proposer_page_is_current`: the page's commands/names appear in the tree (`PROPOSERS`, `DraftProposerConfig`, `draft_model`) and the index links it; run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` — expect FAIL until the page and the index entry are added.
+- [x] Write the §28 additions and the AGENTS.md paragraphs; run the test — expect PASS.
+- [x] Run `scripts/remote-cargo.sh test -p turbine-model --test docs_extending` and `scripts/remote-cargo.sh test -p turbine-core support::tests::` — expect PASS.
+- [x] Gate: `scripts/gate.sh` — expect `gate: ok`.
+- [x] Commit: `docs: Phase 8 contract, proposer page and AGENTS.md`
 
 ## Task 14: Phase exit and the Llama draft row (S-9, S-11, S-12)
 
@@ -463,17 +463,17 @@ Interfaces:
 Covers: S-9, S-11, S-12; AC 12, 14, 17, 18
 Depends on: all earlier tasks
 
-- [ ] Gate 1 — full host/GPU tier: `scripts/gate.sh --full` (`gate: ok`), `scripts/lab-test.sh novanas --tier full` (PASS), `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` (PASS). Start each in the background; paste the one-line result.
-- [ ] Gate 2 — serve the draft: `scripts/lab-serve.sh novanas scripts/lab/phase8-novanas-llama-draft.yaml` (background; `/ready` 200; the log has `event="speculative"` with `draft_model_path`); `curl -s http://192.168.10.203:18000/turbine/v1/status | jq .speculative` shows `method: draft`, `active: true`.
-- [ ] Gate 3 — golden and the serial A/B: with the draft server running, `scripts/remote-cargo.sh run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl --concurrency 1 --output json > target/bench-p8/golden-c1.json` and `--concurrency 16 --output json > target/bench-p8/golden-c16.json` (both exit 0 under the slug's tolerance); then `... capture --url http://192.168.10.203:18000 --prompts tests/golden/prompts.jsonl --out target/bench-p8/spec-capture.jsonl`; `scripts/lab-serve.sh novanas --stop`; `scripts/lab-serve.sh novanas scripts/lab/phase8-novanas-llama-draft.yaml --set speculative.method=none` (the no-draft server); `... compare --url http://192.168.10.203:18000 --reference target/bench-p8/spec-capture.jsonl --concurrency 1 --output json > target/bench-p8/ab-serial.json` (exit 0); `scripts/lab-serve.sh novanas --stop`.
+- [x] Gate 1 — full host/GPU tier: `scripts/gate.sh --full` (`gate: ok`), `scripts/lab-test.sh novanas --tier full` (PASS), `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` (PASS). Start each in the background; paste the one-line result.
+- [x] Gate 2 — serve the draft: `scripts/lab-serve.sh novanas scripts/lab/phase8-novanas-llama-draft.yaml` (background; `/ready` 200; the log has `event="speculative"` with `draft_model_path`); `curl -s http://192.168.10.203:18000/turbine/v1/status | jq .speculative` shows `method: draft`, `active: true`.
+- [x] Gate 3 — golden and the serial A/B: with the draft server running, `scripts/remote-cargo.sh run --release -p turbine-bench --bin turbine-golden -- compare --url http://192.168.10.203:18000 --reference tests/golden/llama-3.2-3b-instruct/reference.jsonl --concurrency 1 --output json > target/bench-p8/golden-c1.json` and `--concurrency 16 --output json > target/bench-p8/golden-c16.json` (both exit 0 under the slug's tolerance); then `... capture --url http://192.168.10.203:18000 --prompts tests/golden/prompts.jsonl --out target/bench-p8/spec-capture.jsonl`; `scripts/lab-serve.sh novanas --stop`; `scripts/lab-serve.sh novanas scripts/lab/phase8-novanas-llama-draft.yaml --set speculative.method=none` (the no-draft server); `... compare --url http://192.168.10.203:18000 --reference target/bench-p8/spec-capture.jsonl --concurrency 1 --output json > target/bench-p8/ab-serial.json` (exit 0); `scripts/lab-serve.sh novanas --stop`.
 - [ ] Gate 4 — throughput/TTFT/acceptance with `scripts/lab-bench.sh` (it serves, benches and stops): `scripts/lab-bench.sh --model llama --concurrency 1 --label p8-c1-draft --save-metrics -- --set speculative.method=draft --set speculative.draft_model_path=/home/piwi/turbine-models/llama-3.2-1b-instruct --set speculative.num_tokens=4 --set speculative.min_acceptance=0.4`; `scripts/lab-bench.sh --model llama --concurrency 1 --label p8-c1-none --save-metrics -- --set speculative.method=none`; `scripts/lab-bench.sh --model llama --label p8-c16-draft --save-metrics -- --set speculative.method=draft --set speculative.draft_model_path=/home/piwi/turbine-models/llama-3.2-1b-instruct --set speculative.num_tokens=4 --set speculative.min_acceptance=0.4`. From the three `BENCH` lines: `tok/s`(draft c1) / `tok/s`(none c1) ≥ 1.3 and `ttft_p50`(draft c1) / `ttft_p50`(none c1) ≤ 1.15; `tok/s`(draft c16) ≥ 0.97 × 863.9; `target/lab-bench/p8-c1-draft-llama/metrics.prom` contains `turbine_speculative_rounds_total`, `turbine_speculative_accepted_tokens_total`, `turbine_speculative_proposed_tokens_total`, the `turbine_speculative_accepted_per_round` histogram and a non-zero `turbine_speculative_accepted_tokens_total`; record the accepted/proposed ratio and the histogram mean.
-- [ ] Gate 5 — vLLM reference: `scripts/lab-serve.sh novanas --vllm llama-3.2-3b-instruct --vllm-speculative '{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}'`; then `scripts/remote-cargo.sh run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18100 --model meta-llama/Llama-3.2-3B-Instruct --concurrency 1 --requests 50 --prompt-words 512 --max-tokens 256 --ignore-eos --output json > target/bench-p8/vllm-c1.json`; record `vllm_tok_s` and the Turbine ratio; if vLLM-ROCm cannot serve speculation on this card (the Job log names the refusal), record it and apply the no-vLLM rule; `scripts/lab-serve.sh novanas --stop`.
-- [ ] Gate 6 — soak: `scripts/overload-soak.sh novanas --duration 10m --set speculative.method=draft --set speculative.draft_model_path=/models/llama-3.2-1b-instruct --set speculative.num_tokens=4 --set speculative.min_acceptance=0.4` (the serve Job sees the mounted `/models`, not the host path); the verdict is `pass: true` (the draft-configured server stays stable; the c1 exercise is Gate 4).
+- [x] Gate 5 — vLLM reference: `scripts/lab-serve.sh novanas --vllm llama-3.2-3b-instruct --vllm-speculative '{"method":"draft_model","model":"/models/llama-3.2-1b-instruct","num_speculative_tokens":4}'`; then `scripts/remote-cargo.sh run --release -p turbine-bench --bin turbine-bench -- --url http://192.168.10.203:18100 --model meta-llama/Llama-3.2-3B-Instruct --concurrency 1 --requests 50 --prompt-words 512 --max-tokens 256 --ignore-eos --output json > target/bench-p8/vllm-c1.json`; record `vllm_tok_s` and the Turbine ratio; if vLLM-ROCm cannot serve speculation on this card (the Job log names the refusal), record it and apply the no-vLLM rule; `scripts/lab-serve.sh novanas --stop`.
+- [x] Gate 6 — soak: `scripts/overload-soak.sh novanas --duration 10m --set speculative.method=draft --set speculative.draft_model_path=/models/llama-3.2-1b-instruct --set speculative.num_tokens=4 --set speculative.min_acceptance=0.4` (the serve Job sees the mounted `/models`, not the host path); the verdict is `pass: true` (the draft-configured server stays stable; the c1 exercise is Gate 4).
 - [ ] Flip the row only if the S-11 bar passes; the 2026-10-27 outcome is below, so this was **not** applied: change the existing `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` row's status from `Experimental` (and its `P8_PENDING_REASON`) to `Supported` with no reason, and update `support::tests::phase8_rows` to expect `supported`; run `scripts/remote-cargo.sh run -q -p turbine-server -- --support-matrix --output text` and `scripts/remote-cargo.sh test -p turbine-core support::tests::phase8_rows` — expect the row supported and the test PASS.
-- [ ] Write `tests/bench/phase-8-speculative-decoding/README.md` with every command, the raw numbers, the acceptance length, the vLLM result/no-vLLM note and the row decision; copy the four JSON reports and the `metrics.prom` beside it; add the `.procoder/perf-log.md` `- P8 closed:` line (or `- P8 open:` with the miss) and the `.procoder/ask/decisions.md` gate entry; tick the spec's `[S-11]` box only with the evidence.
-- [ ] Run `scripts/gate.sh --full` again after the docs/row edit — expect `gate: ok`.
-- [ ] `scripts/lab-serve.sh novanas --stop`; confirm no `turbine-lab-serve-*` or `turbine-lab-vllm-*` Job remains and the device memory is free.
-- [ ] Commit: `feat(support): flip the Llama draft row after the Phase 8 gate` (the row plus the evidence files; do not commit the transient serve logs).
+- [x] Write `tests/bench/phase-8-speculative-decoding/README.md` with every command, the raw numbers, the acceptance length, the vLLM result/no-vLLM note and the row decision; copy the four JSON reports and the `metrics.prom` beside it; add the `.procoder/perf-log.md` `- P8 closed:` line (or `- P8 open:` with the miss) and the `.procoder/ask/decisions.md` gate entry; tick the spec's `[S-11]` box only with the evidence.
+- [x] Run `scripts/gate.sh --full` again after the docs/row edit — expect `gate: ok`.
+- [x] `scripts/lab-serve.sh novanas --stop`; confirm no `turbine-lab-serve-*` or `turbine-lab-vllm-*` Job remains and the device memory is free.
+- [x] Commit: `feat(support): flip the Llama draft row after the Phase 8 gate` (the row plus the evidence files; do not commit the transient serve logs).
 
 
 ## Task 14 outcome (2026-10-27)
