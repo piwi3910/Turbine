@@ -5210,3 +5210,9 @@ The S-11 single-stream decode bar did not: 0.937× of `method: none` (82.99 vs 8
 0.68 tokens/round. Per choice 8 and S-9 the row therefore stays `experimental` with
 `P8_PENDING_REASON` carrying the measured miss; flipping it would paper over the gate. Evidence
 in `tests/bench/phase-8-speculative-decoding/` and `.procoder/perf-log.md` ("P8 gate result").
+
+**User decision (2026-10-27): accept the experimental end state.** Asked what was left, the user
+chose "accept": Phase 8 closes with the `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` row
+`experimental` and the recorded 0.937×/17.1 % S-11 miss, rather than revising the gate or changing
+the pairing. No row flip; a future track can re-open S-11 with a different workload, bar or draft
+checkpoint. The spec's S-9/phase-exit wording and the plan's Task 14 carry the acceptance.
