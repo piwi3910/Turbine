@@ -2593,3 +2593,12 @@ The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this
 - `scripts/fetch-checkpoint.sh --table scripts/lab/phase8-checkpoints.tsv novanas llama-3.2-1b-instruct` → `fetch: llama-3.2-1b-instruct 5a8abab4a5d6f164389b1079fb721cfab8d7126c ok` in 44 s; `/home/piwi/turbine-models/llama-3.2-1b-instruct` holds the pinned `unsloth/Llama-3.2-1B-Instruct` revision (2.5 GB, the Phase 8 pairing of user decision 2026-10-25/7).
 
 
+
+### P8 gate result (2026-10-27)
+
+- **Host/exit gates**: `scripts/gate.sh --full` green (1154 tests); `scripts/lab-test.sh novanas --tier full` PASS (run `1026151053-12725e3c`); `scripts/lab-test.sh novanas --gpus 2 --features fault-injection --tier full` PASS (70 targets, run `1026172029-2d850040`); `scripts/lab-bench.sh --model llama --golden16` PASS 16/16 at 866.3 tok/s; `--model olmoe` PASS 16/16 at 637.6 tok/s.
+- **Serve/golden/A-B**: `/ready` 200, `status.speculative.active: true`, startup log `event="speculative"` (draft 1B BF16, 2.47 GB weights, 1 GiB slot); golden c1 16/16 (strict) and c16 16/16 (batched); the draft server's capture vs the `method: none` server 16/16 strict.
+- **S-11 c1 (50 requests, 512 words, 256 tokens, ignore-eos)**: draft 82.99 tok/s vs none 88.54 tok/s = **0.937×** (bar ≥ 1.3), TTFT 59.63 vs 59.30 ms = 1.006× (bar ≤ 1.15), acceptance 278/1624 = 17.1 %, 0.68 tokens/round. The 200-request `lab-bench` profile confirms: 79.04 vs 84.28 tok/s = 0.938×; c16 draft 845.4 tok/s = 0.979× of 863.9 (bar ≥ 0.97).
+- **vLLM-ROCm speculative** (`draft_model`, 4 tokens): 64.47 tok/s at c1 (Turbine draft 1.29× vLLM).
+- **10-minute soak with the draft**: PASS — ITL p99 210 ms vs 170.5 ms calibrated (1.23×), 4276×200 + 11×429 (`queue_full`) + 2557 `queue_timeout`, 0 client drops, GREEN 5 s after cooldown, KV idle, reserve held.
+- **Decision (S-9)**: the c1 bar missed, so the `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` row stays `experimental` with `P8_PENDING_REASON` carrying 0.94×/17.1 %; evidence in `tests/bench/phase-8-speculative-decoding/`. The miss is the recorded outcome, not papered over.

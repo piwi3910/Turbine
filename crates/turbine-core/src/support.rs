@@ -260,9 +260,13 @@ pub const TQ2_L0_REASON: &str = "kv_tq2_l0_refused: TurboQuant 2-bit L0 pages fa
 /// Why a Phase 7 row on `amd` is `experimental`: its S-13 gate has not closed yet. Shown as the
 /// row's reason by `--support-matrix` (an `experimental` status carries no reason of its own).
 pub const P7_PENDING_REASON: &str = "gate pending (track phase-7-model-families)";
-/// Why the Phase 8 draft row is `experimental` before its S-11 gate: the row turns `supported`
-/// only after the golden, A/B, throughput, vLLM and soak gates (phase 8 Task 14).
-pub const P8_PENDING_REASON: &str = "gate pending (track phase-8-speculative-decoding)";
+/// Why the Phase 8 draft row is `experimental` (S-9): the row turns `supported` only after the
+/// golden, A/B, throughput, vLLM and soak gates (phase 8 Task 14). The 2026-10-27 gate measured
+/// 0.94× single-stream decode (needs 1.3×; acceptance 0.146, 0.58 tokens/round), so the row
+/// keeps this measured miss instead of flipping.
+pub const P8_PENDING_REASON: &str = "gate miss (track phase-8-speculative-decoding): c1 decode \
+    0.94x of method none (needs 1.3x; acceptance 0.146), TTFT 0.99x, c16 845.4 tok/s (>= 0.97x \
+    863.9); golden c1/c16 and the serial A/B pass";
 /// Why every `nvidia` key is refused while Phase 2b is deferred (decision 2026-09-28).
 pub const NVIDIA_REASON: &str =
     "NVIDIA execution is deferred (phase-2b-nvidia, on hold until the user lifts it)";
@@ -686,8 +690,9 @@ pub static SUPPORT_MATRIX: &[SupportRow] = &[
         unsupported(TQ2_L0_REASON),
     ),
     // Phase 8 (S-9): the CPU reference provider serves the tiny draft integration tests; the
-    // Llama pairing starts `experimental` (P8_PENDING_REASON) until its S-11 gate closes, then
-    // Task 14 flips it to `supported`. Every other draft combination is refused below.
+    // Llama pairing stays `experimental` with its measured gate miss (P8_PENDING_REASON, the
+    // 2026-10-27 run: c1 0.94x, needs 1.3x) because the S-11 throughput bar did not pass. Every
+    // other draft combination is refused below.
     row(
         Some("cpu"),
         None,
@@ -2059,8 +2064,9 @@ mod tests {
         );
     }
 
-    /// Phase 8 (S-9): the CPU reference serves the tiny draft tests, the Llama pairing starts
-    /// experimental until its S-11 gate, and every other draft combination is refused.
+    /// Phase 8 (S-9): the CPU reference serves the tiny draft tests, the Llama pairing stays
+    /// `experimental` with its measured S-11 miss (the 2026-10-27 gate measured 0.94×), and
+    /// every other draft combination is refused.
     #[test]
     fn phase8_rows() {
         use KvFormatColumn as K;

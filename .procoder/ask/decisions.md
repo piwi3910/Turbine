@@ -5201,3 +5201,12 @@ slot table tensors); the snapshot pool already reserves one state-sized entry pe
 the conservative bound, so the scratch costs no new allocation and the copy/restore path is the existing
 `StateCopy`. The behavior of choice A is unchanged: copy before the span, restore and replay the kept tokens on a
 partial accept, release with the sequence on finish/cancel/preempt. Spec S-5 and plan Task 11 carry the note.
+
+**Gate result (2026-10-27, not a new choice).** The Phase 8 exit gate ran on `novanas`:
+golden c1/c16 (16/16 each), the serial A/B (16/16), TTFT 1.006×, c16 0.979× (845.4 tok/s),
+vLLM-ROCm speculative recorded (64.47 tok/s) and the 10-minute soak (PASS) all met their bars.
+The S-11 single-stream decode bar did not: 0.937× of `method: none` (82.99 vs 88.54 tok/s on the
+50-request profile; 0.938× on the 200-request one) at 17.1 % acceptance (278/1624 proposed),
+0.68 tokens/round. Per choice 8 and S-9 the row therefore stays `experimental` with
+`P8_PENDING_REASON` carrying the measured miss; flipping it would paper over the gate. Evidence
+in `tests/bench/phase-8-speculative-decoding/` and `.procoder/perf-log.md` ("P8 gate result").

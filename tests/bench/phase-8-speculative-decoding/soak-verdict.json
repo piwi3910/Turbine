@@ -1,0 +1,27 @@
+{
+  "pass": true,
+  "checks": {
+    "server_never_restarted": true,
+    "only_503_overload_codes": true,
+    "streams_complete": true,
+    "itl_p99_within_2x": true,
+    "reached_orange": true,
+    "green_within_60s": true,
+    "kv_idle": true,
+    "reserve_held": true
+  },
+  "calibration_itl_p99_ms": 170.508042,
+  "overload_itl_p99_ms": 210.04837500000002,
+  "green_after_cooldown_s": 5,
+  "by_status": {
+    "200": 4276,
+    "429": 11
+  },
+  "by_error_code": {
+    "queue_full": 11,
+    "queue_timeout": 2557
+  },
+  "client_dropped": 0,
+  "shared_prefix_share": 0.0,
+  "kv_ladder_actions": 0.0
+}
