@@ -126,6 +126,15 @@ impl SafetensorsIndex {
         self.by_name.get(name).map(|&i| &self.entries[i])
     }
 
+    /// Registers `to` as another name for the tensor `from` (the Qwen3.5/3.6 MTP head's weights
+    /// live under `mtp.*`, while the one-layer MTP executor addresses them as its own layer).
+    /// The aliased entry keeps `from`'s file, shape and dtype; a missing `from` is ignored.
+    pub fn alias(&mut self, from: &str, to: &str) {
+        if let Some(&i) = self.by_name.get(from) {
+            self.by_name.insert(to.to_string(), i);
+        }
+    }
+
     /// Entries sorted by name.
     pub fn entries(&self) -> impl Iterator<Item = &TensorEntry> {
         self.entries.iter()
@@ -516,6 +525,22 @@ mod tests {
         let dir = TempDir::new(prefix);
         let file = dir.path().join(SINGLE_FILE);
         (dir, file)
+    }
+
+    #[test]
+    fn alias_registers_another_name() {
+        let (dir, file) = single("st-alias");
+        write_raw(
+            &file,
+            r#"{"mtp.fc.weight":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}"#,
+            &[0; 8],
+        );
+        let mut index = SafetensorsIndex::open(dir.path()).expect("index");
+        index.alias("mtp.fc.weight", "model.fc.weight");
+        let aliased = index.get("model.fc.weight").expect("the alias");
+        assert_eq!(aliased.shape, [4]);
+        index.alias("absent", "nowhere");
+        assert!(index.get("nowhere").is_none());
     }
 
     #[test]
