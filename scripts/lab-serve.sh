@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run turbine-server on a lab host for manual golden and benchmark runs.
 #
-#   scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]...
+#   scripts/lab-serve.sh [--dry-run] <novanas|quadronix> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]...
 #   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]...
-#   scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]
+#   scripts/lab-serve.sh [--dry-run] <novanas|quadronix> --stop [<run-id>]
 #
 # novanas: uploads the tree and <config.yaml> to /home/piwi/turbine-ci/runs/<run id> and applies
 #   the k3s Job template scripts/lab/novanas-serve-job.yaml as turbine-lab-serve-<run id>
@@ -52,9 +52,9 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-serve.sh [--dry-run] novanas <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/lab-serve.sh [--dry-run] <novanas|quadronix> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]..." >&2
 	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]..." >&2
-	echo "       scripts/lab-serve.sh [--dry-run] novanas --stop [<run-id>]" >&2
+	echo "       scripts/lab-serve.sh [--dry-run] <novanas|quadronix> --stop [<run-id>]" >&2
 	exit 2
 }
 
@@ -67,8 +67,11 @@ fi
 HOST="$1"
 case "$HOST" in
 novanas) ADDR=192.168.10.203 ;;
+quadronix) ADDR=192.168.10.164 ;;
 *) usage ;;
 esac
+SERVE_TEMPLATE="scripts/lab/${HOST}-serve-job.yaml"
+VLLM_TEMPLATE="scripts/lab/${HOST}-vllm-job.yaml"
 
 MODE=start
 CONFIG=""
@@ -532,10 +535,10 @@ start() {
 	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
 	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
 		fail "cannot create namespace ${NS}"
-	say "applying scripts/lab/novanas-serve-job.yaml as ${JOB}"
+	say "applying ${SERVE_TEMPLATE} as ${JOB}"
 	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s|__SERVER_ARGS__|${SERVER_ARGS}|g" \
 		-e "s/__GPUS__/${SERVE_GPUS}/g" \
-		"${REPO_ROOT}/scripts/lab/novanas-serve-job.yaml" |
+		"${REPO_ROOT}/${SERVE_TEMPLATE}" |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
 	JOB_APPLIED=1
 
@@ -554,6 +557,8 @@ start() {
 }
 
 start_vllm() {
+	[[ -f ${REPO_ROOT}/${VLLM_TEMPLATE} ]] ||
+		fail "${HOST}: --vllm has no job template (${VLLM_TEMPLATE}); it is novanas-only"
 	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}}${VLLM_SPECULATIVE:+, --speculative-config ${VLLM_SPECULATIVE}})"
 	require_free_port
 	gpu_lock
