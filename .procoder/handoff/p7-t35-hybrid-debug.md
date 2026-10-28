@@ -64,3 +64,25 @@
 - Tool: `scripts/golden/hf_layer_trace.py --model-dir <dir> --ids '<json list>'` prints the
   transformers per-layer summaries the engine's `TURBINE_TRACE_DUMP` (now printed by
   `hip_trace_vs_cpu_qwen3_5`'s first step) gives.
+
+## Qwen3.6 per-layer result (2026-10-28)
+
+Reference: the checkpoint dequantized to BF16 by `dequantize_checkpoint.py`
+(`/home/piwi/turbine-models/qwen3.6-35b-a3b-bf16-deq`, 71.9 GB) and traced with
+`hf_layer_trace.py` on p01's 14 ids. Engine: `hip_trace_vs_cpu_qwen3_5` CPU-reference dump on
+the FP8 checkpoint.
+
+| layer | engine resid_mlp rms | reference hidden rms |
+| --- | --- | --- |
+| embed | 0.009609 | 0.009609 |
+| 0 | 0.018262 | 0.018250 |
+| 20 | 0.071035 | 0.071173 |
+| 30 | 0.143793 | 0.144053 |
+| 35 | 0.208469 | 0.208566 |
+| 38 | 0.310419 | 0.311611 |
+
+The drift is gradual and small (≤1 % through layer 20, ~0.4 % at 38), not a structural bug; the
+engine's own HIP-vs-CPU trace agrees. The committed golden reference comes from transformers on
+the **FP8** checkpoint, so the next authoritative comparison is an FP8 transformers trace (CPU
+fp8 may be unsupported) or an engine-vs-reference top-5 logits comparison on p01. The BF16-deq
+copy and its trace are for diagnosis only and are not the golden reference.
