@@ -1850,9 +1850,22 @@ mod tests {
         let l2 = open_l2(metrics.kv.clone());
         let clock: Arc<dyn Clock> = Arc::new(turbine_core::clock::SystemClock::new());
         let mut pool = loaded.pool;
+        // A tensor-parallel group does not copy a hybrid sequence's state (the refusal in
+        // `hybrid_state_copies`), so reusing a KV prefix would keep the KV but not the recurrent
+        // state and change the continuation. Prefix reuse stays off for TP hybrids until those
+        // copies are wired.
+        let mut kv_cfg = kv_cfg.clone();
+        if prepared.arch.state.linear_layers > 0 {
+            kv_cfg.prefix_sharing = false;
+            tracing::warn!(
+                event = "hybrid_tp_prefix_reuse_disabled",
+                "tensor-parallel hybrid state copies are not wired; prefix reuse is off so a \
+                 reused KV prefix never runs on a stale recurrent state"
+            );
+        }
         let (kv, _handle) = crate::kv_orchestrator::KvOrchestrator::start(
             crate::kv_orchestrator::KvStart {
-                cfg: kv_cfg,
+                cfg: &kv_cfg,
                 memory_kind: MemoryKind::Dedicated,
                 identity: prepared.identity,
                 device: crate::engine::copy_device(prepared),

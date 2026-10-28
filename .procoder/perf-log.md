@@ -2638,3 +2638,22 @@ from the host copy. The prerequisite for both features is a device-offset quanti
 which `parallel.tp_decode_graphs` can capture the step. Spec decoding for the hybrid families is
 further out: it needs a provisioned same-family draft, support-matrix rows, and a TP/EP draft path
 (`speculative_parallel_unsupported` refuses TP>1 today).
+
+### P7 hybrid prefix-reuse correctness (2026-10-28)
+
+- **Snapshot pool sizing:** the engine sized the hybrid snapshot byte buffer at one entry per L0
+  block ("the budget's conservative bound"), 15,195,832,320 bytes for a 6 GiB Qwen3.5-9B pool;
+  the allocation failed, hybrid reuse was silently off, and the KV directory still reused prefixes
+  **without** their recurrent state (Qwen3.5 golden 9/16). Sizing it per
+  `kv.hybrid_snapshot_interval_blocks` (default 8, `blocks/interval + 64` entries) allocates
+  **103,022,592 bytes** and turns hybrid reuse on: **Qwen3.5 golden 14/16** (p03 identical 32/32
+  but 0.639 vs the 0.56 tail bound; p09 a 0.025-margin near-tie at position 24).
+- **TP hybrids:** a tensor-parallel group does not copy a sequence's recurrent state
+  (`hybrid_state_copies` refuses it), so TP prefix reuse kept the KV and ran on a stale state.
+  The TP engine now disables `kv.prefix_sharing` for a hybrid start with
+  `event="hybrid_tp_prefix_reuse_disabled"`. Qwen3.6 stays at 1/16 with reuse off, so its failure
+  is a separate FP8/model-path issue, not reuse.
+- Per-layer diff (engine CPU trace vs transformers 5.9.0 hooks, `scripts/golden/hf_layer_trace.py`)
+  on Qwen3.5 p16: embed 0.009290 vs 0.009290, layer-0 resid 0.079740 vs 0.079740, final norm
+  2.008085 vs 2.012084 — the engine's model matches the reference to BF16 rounding, and HIP
+  matches the CPU trace; the remaining p03/p09 failures are tolerance-boundary numerics.

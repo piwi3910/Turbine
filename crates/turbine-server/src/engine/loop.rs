@@ -469,7 +469,12 @@ impl EngineLoop {
         let mut hybrid_state_bytes = 0u64;
         let mut hybrid_interval = None;
         if let Some(layout) = p.executor.state_layout() {
-            let entries = u64::from(p.pool.total_blocks());
+            // The budget's one-entry-per-block bound over-allocates 8x for the default snapshot
+            // interval and fails on a 6 GiB hybrid pool (15 GB requested), which silently turns
+            // hybrid reuse off; size it per interval plus room for the last-block snapshots.
+            let interval = u64::from(p.kv.snapshot_interval().max(1));
+            let blocks = u64::from(p.pool.total_blocks());
+            let entries = (blocks.div_ceil(interval) + 64).min(blocks);
             let entry_bytes = layout.bytes_per_sequence();
             if entries > 0 && entry_bytes > 0 {
                 let mem = Arc::clone(p.pool.view().storage.memory());
@@ -482,11 +487,11 @@ impl EngineLoop {
                         let snap_base = buffer.storage.ptr();
                         p.executor
                             .set_state_snapshots(StateSnapshots { buffer, layout });
-                        p.kv.set_hybrid_state(layout, p.pool.total_blocks());
+                        p.kv.set_hybrid_state(layout, u32::try_from(entries).unwrap_or(u32::MAX));
                         p.kv.set_snapshot_store(Arc::new(DeviceSnapshotStore::new(
                             snap_mem,
                             snap_base,
-                            p.pool.total_blocks(),
+                            u32::try_from(entries).unwrap_or(u32::MAX),
                             entry_bytes,
                         )));
                         hybrid_interval = Some(p.kv.snapshot_interval());

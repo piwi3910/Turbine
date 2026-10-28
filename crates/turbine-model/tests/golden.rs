@@ -1182,7 +1182,6 @@ fn hip_trace_vs_cpu_qwen3_5() {
     let ids = prompt_token_ids(&tokenizer, &template, p01);
     let max_seq_len = (ids.len() + TRACE_DECODE + 1) as u32;
     let is_moe = cfg.family.0.name() == "qwen3_5_moe";
-    // The 35B MoE checkpoint does not fit one 32 GB card (that is Task 34's whole point): its
     // "one device" is the cpu-reference and its multi-device leg is the tp 2 group below, whose
     // ranks are compared against the cpu-reference. The dense 9B keeps the single-HIP-device leg.
     let mut cpu = build_executor(&model_dir, cpu_reference_provider(), host, max_seq_len);
@@ -1214,6 +1213,22 @@ fn hip_trace_vs_cpu_qwen3_5() {
                 .row(0),
         );
         let c = cpu.exec.take_trace();
+        // `TURBINE_TRACE_DUMP`: the CPU reference's per-op summary for the first (prefill) step,
+        // for a side-by-side diff against a transformers hook dump.
+        if step == 0 {
+            for t in &c {
+                let (rows, cols) = (t.shape[0], t.shape[1]);
+                let last = &t.data[(rows.saturating_sub(1)) * cols..];
+                let rms = (last.iter().map(|v| v * v).sum::<f32>() / cols.max(1) as f32).sqrt();
+                println!(
+                    "dump layer={:?} name={} shape={:?} rms={rms:.6} first={:?}",
+                    t.layer,
+                    t.name,
+                    t.shape,
+                    &last[..4.min(cols)]
+                );
+            }
+        }
         if let Some(h) = hip.as_mut() {
             let got = top5(
                 h.kv.forward(&mut h.exec, &batch, &positions)

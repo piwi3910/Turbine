@@ -45,3 +45,22 @@
 3. Re-run the Qwen3.6 reference/golden after the fix; then the Task 35 gates (GSM8K, tp2/ep2,
    multi-GPU bounds) before any row flip. Spec decoding for a hybrid needs a provisioned
    same-family draft and TP/EP support, which is separate scope.
+
+## Update (2026-10-28)
+
+- The Qwen3.5 model is correct: an engine CPU trace vs transformers 5.9.0 hooks on p16 matches
+  to BF16 rounding at every layer (embed 0.009290 = 0.009290, layer-0 resid 0.079740 = 0.079740,
+  final norm 2.008 vs 2.012), and HIP matches CPU. The golden failures were **not** the model.
+- They were hybrid prefix reuse running on a stale recurrent state: the snapshot buffer was
+  sized one entry per L0 block (15.2 GB for a 6 GiB pool), failed to allocate, and reuse stayed
+  on without state. Fixed by sizing entries per `hybrid_snapshot_interval_blocks` (103 MB);
+  Qwen3.5 golden is now **14/16** (p03 identical 32/32 but 0.639 vs the 0.56 tail bound, p09 a
+  0.025-margin near-tie).
+- A TP hybrid cannot copy state yet (`hybrid_state_copies` refuses), so TP prefix reuse was also
+  reusing KV without state; the TP engine now disables prefix sharing for hybrid starts. Qwen3.6
+  is still 1/16 with reuse off, so its remaining failure is the FP8/model path (or the 35B
+  reference), not reuse. Next: run the same per-layer diff on Qwen3.6 against a dequantized BF16
+  reference (`dequantize_checkpoint.py`) or the FP8 transformers model, starting at p01.
+- Tool: `scripts/golden/hf_layer_trace.py --model-dir <dir> --ids '<json list>'` prints the
+  transformers per-layer summaries the engine's `TURBINE_TRACE_DUMP` (now printed by
+  `hip_trace_vs_cpu_qwen3_5`'s first step) gives.
