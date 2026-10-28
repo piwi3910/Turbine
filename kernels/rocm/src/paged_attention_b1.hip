@@ -268,7 +268,13 @@ __global__ void __launch_bounds__(kThreads) paged_b1_decode_kernel(
       s[g] = 0.0f;
     if (off >= 0) {
       const uint4 *row16 = reinterpret_cast<const uint4 *>(kv_layer + off);
-#pragma unroll
+// Two words at a time: the fully unrolled K row lets the G = 4 instantiation
+// (the 32 q / 8 kv GQA ratio) reach the 256-VGPR cap and spill (VGPR 256, 11
+// spilled, 5 waves/SIMD); unrolling the row loop four-fold instead triples the
+// live registers of the G = 6 case into a spill as well. Two keeps every
+// instantiation spill-free and G = 4 at 7 waves/SIMD. Same operations in the
+// same order, so the bits are unchanged.
+#pragma unroll 2
       for (int c = 0; c < kKWords; ++c) {
         const uint4 w = row16[c];
         const uint32_t words[4] = {w.x, w.y, w.z, w.w};
