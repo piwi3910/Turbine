@@ -140,10 +140,10 @@ __global__ void __launch_bounds__(kThreads)
         const uint32_t words[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-          lds.xs[kind][tok][e + 2 * k] = turbine_hip::bf16_to_f32(
-              turbine_hip::Bf16{static_cast<uint16_t>(words[k] & 0xffffu)});
-          lds.xs[kind][tok][e + 2 * k + 1] = turbine_hip::bf16_to_f32(
-              turbine_hip::Bf16{static_cast<uint16_t>(words[k] >> 16)});
+          lds.xs[kind][tok][e + 2 * k] =
+              turbine_hip::Bf16{static_cast<uint16_t>(words[k] & 0xffffu)};
+          lds.xs[kind][tok][e + 2 * k + 1] =
+              turbine_hip::Bf16{static_cast<uint16_t>(words[k] >> 16)};
         }
       }
     } else {
@@ -151,8 +151,8 @@ __global__ void __launch_bounds__(kThreads)
         const int kind = i / (nt * kDim);
         const int tok = (i / kDim) % nt;
         const int e = i % kDim;
-        lds.xs[kind][tok][e] = turbine_hip::bf16_to_f32(turbine_hip::Bf16{
-            page[vec_offset(kind, t0 + tok, head, tokens, heads) + e]});
+        lds.xs[kind][tok][e] = turbine_hip::Bf16{
+            page[vec_offset(kind, t0 + tok, head, tokens, heads) + e]};
       }
     }
     __syncthreads();

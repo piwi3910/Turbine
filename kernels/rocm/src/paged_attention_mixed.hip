@@ -313,9 +313,9 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_append_tq_kernel(
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
         lds.xs[kind][tok][e + 2 * k] =
-            bf16_to_f32(Bf16{static_cast<uint16_t>(words[k] & 0xffffu)});
+            Bf16{static_cast<uint16_t>(words[k] & 0xffffu)};
         lds.xs[kind][tok][e + 2 * k + 1] =
-            bf16_to_f32(Bf16{static_cast<uint16_t>(words[k] >> 16)});
+            Bf16{static_cast<uint16_t>(words[k] >> 16)};
       }
     }
   } else {
@@ -323,11 +323,11 @@ __global__ void __launch_bounds__(tq::kThreads) mixed_append_tq_kernel(
       const int kind = i / (nt * kD);
       const int tok = (i / kD) % nt;
       const int e = i % kD;
-      float x = 0.0f;
+      Bf16 x{0};
       if (dst[tok] >= 0) {
         const Bf16 *src = kind == 0 ? k_new : v_new;
-        x = bf16_to_f32(src[static_cast<int64_t>(r0 + tok) * new_stride +
-                            static_cast<int64_t>(head) * kD + e]);
+        x = src[static_cast<int64_t>(r0 + tok) * new_stride +
+                static_cast<int64_t>(head) * kD + e];
       }
       lds.xs[kind][tok][e] = x;
     }

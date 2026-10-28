@@ -77,10 +77,10 @@ __device__ inline void fwht(float (&v)[kPer], int lane) {
 // F64 (48 significant bits), so fma(v, v, acc) rounds acc + v * v once, as
 // the codec's separate multiply and add do -- bit for bit the same sum, at
 // half the F64 instructions.
-__device__ inline float norm_of(const float *row) {
+__device__ inline float norm_of(const Bf16 *row) {
   double acc = 0.0;
   for (int j = 0; j < kDim; ++j) {
-    const double v = static_cast<double>(row[j]);
+    const double v = static_cast<double>(bf16_to_f32(row[j]));
     acc = __builtin_fma(v, v, acc);
   }
   return static_cast<float>(sqrt(acc));
@@ -129,9 +129,12 @@ __device__ inline int unpack_code(const uint8_t *packed, int i) {
   return code;
 }
 
-// LDS of the chunked encode.
+// LDS of the chunked encode. The staged K and V rows keep their BF16 bits, not
+// F32: bf16_to_f32 is exact, so converting at each use computes the codec's F32
+// operands bit for bit while halving the staging buffer (the encode workgroup's
+// occupancy is otherwise LDS-bound).
 template <int KB, int VB> struct EncodeLds {
-  float xs[2][kChunk][kPad];
+  Bf16 xs[2][kChunk][kPad];
   uint8_t codes[2][kChunk][kDim];
   float norms[2][kChunk];
   uint16_t norm_bits[2][kChunk];
@@ -180,7 +183,7 @@ __device__ inline void encode_chunk(EncodeLds<KB, VB> &lds, int nt,
 #pragma unroll
     for (int i = 0; i < kPer; ++i) {
       const int e = i * kGroup + lane;
-      y[i] = lds.xs[kind][tok][e] * signs[e];
+      y[i] = bf16_to_f32(lds.xs[kind][tok][e]) * signs[e];
     }
     fwht(y, lane);
     const float n = lds.norms[kind][tok];
