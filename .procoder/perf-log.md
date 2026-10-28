@@ -2659,3 +2659,53 @@ further out: it needs a provisioned same-family draft, support-matrix rows, and 
   on Qwen3.5 p16: embed 0.009290 vs 0.009290, layer-0 resid 0.079740 vs 0.079740, final norm
   2.008085 vs 2.012084 — the engine's model matches the reference to BF16 rounding, and HIP
   matches the CPU trace; the remaining p03/p09 failures are tolerance-boundary numerics.
+
+## Kernel resource audit (issue #7, 2026-10-28; gfx1201, ROCm on `quadronix`)
+
+Compile-only audit of our own hot HIP kernels: `hipcc -O2 --offload-arch=gfx1201
+-Rpass-analysis=kernel-resource-usage`, plus device disassembly (`.hip_fatbin` → `clang-offload-bundler`
+→ `llvm-objdump`). No GPU time. Occupancy is waves/SIMD at wave64; LDS is bytes per block. `ds128`
+counts `ds_load/store_b128`, `ds32`/`ds2addr` the narrow LDS paths, `glb128` 128-bit global loads.
+
+| kernel (file) | SGPR | VGPR | VGPR spill (bytes) | LDS B | occ | ISA note |
+| --- | --- | --- | --- | --- | --- | --- |
+| `moe_wmma_kernel<Shape<4,2,1,2,1>…>` (`moe_grouped`) | 25 | 192 | 0 | 28684 | 8 | glb128 12, ds128 26 |
+| `moe_stream_kernel<Stream<1,8,4,1,128>…>` (`moe_grouped`) | 25 | 246 | 0 | 35852 | 5 | wmma 128; highest VGPR |
+| `moe_wmma_gemv_ksplit_kernel<8,true>` (`moe_grouped`) | 26 | 224 | 0 | 16644 | 6 | ds2addr 72 |
+| `moe_small_proj_kernel<4,4,true>` (`moe_small_m`) | 53 | 176 | 0 | 260 | 8 | 53 SGPR (file max) |
+| `moe_quant_grouped_kernel<3,Shape<2>>` | 23 | 138 | 0 | 29708 | 8 | |
+| `qgemm_int4::wmma_kernel<1,8,4>` | 38 | 215 | 0 | 7168 | 7 | no `__launch_bounds__`; ds128 0, ds2addr 31 |
+| `qgemm_fp8_block::wmma_kernel<1,16>` | 34 | 160 | 0 | 15360 | 9 | no `__launch_bounds__`; ds128 0, ds2addr 63 |
+| `qgemm_mxfp4::mxfp4_gemm_prefill_kernel<256,128,4,2,32>` | 26 | 239 | 0 | 62464 | 4 | prefill tile, 61 KiB LDS |
+| `qgemm_mxfp4::mxfp4_gemm_lds_kernel<8,1,8>` | 26 | 183 | 0 | 37888 | 6 | |
+| `paged_attention_b1::paged_b1_decode_kernel<1>` | 58 | 187 | 0 | 4744 | 8 | glb64 33, glb128 16, ds2addr 21 |
+| `paged_attention_b1::paged_b1_decode_kernel<4>` | 58 | 256 | 11 (48) | 17416 | 5 | **spills**; the G=4 GQA case |
+| `kv_transcode_tq::tq_encode_kernel<4,4>` | 36 | 48 | 0 | 41856 | 3 | **LDS-bound**; K/V staged as F32 |
+| `kv_transcode_tq::tq_decode_kernel<4,4>` | 31 | 82 | 0 | 4736 | 16 | |
+
+Findings (each with a follow-up issue; the source files are linked from the issue):
+
+- **`paged_b1_decode_kernel<G>` spills at G=4.** VGPRs climb 187→256 with G; `<4>` alone hits the
+  256-VGPR cap, spills 11 VGPRs (48 B scratch) and drops to 5 waves/SIMD (from 8 at G=1). G=4 is a
+  real GQA ratio (e.g. 32 q / 8 kv heads), so this is a served decode path, not a corner. The kernel
+  also loads the K/V page with `global_load_b64` (33) beside `global_load_b128` (16) — a candidate for
+  uniform 128-bit loads. The `__launch_bounds__(256)` is present; the fix is a register-budget hint or
+  a G-specific register layout.
+- **`tq_encode_kernel` runs at 3 waves/SIMD, LDS-bound.** `EncodeLds` stages K and V of a chunk as
+  **F32** (`lds.xs[...] = bf16_to_f32(...)`), ~40 KB/block, capping occupancy at 3 on a 64 KB-LDS
+  budget — while the source page is BF16. Keeping the staged operand BF16 (convert in the encode
+  inner loop) roughly halves LDS and should lift occupancy. The encode path also shows no 128-bit
+  global load in the disassembly (the intended `uint4` page read compiles to 32-bit loads), worth a
+  look with the fix.
+- **`mxfp4_gemm_prefill_kernel` is the prefill-tile bottleneck** (VGPR 239, 61 KiB LDS, 4 waves/SIMD)
+  — the same tile the S-16 prefill target measured short (#17).
+- **`qgemm_int4` and `qgemm_fp8_block` carry no `__launch_bounds__`.** Their `wmma_kernel<1,*,4>`
+  instantiation reaches VGPR 215 (occ 7); a `__launch_bounds__` hint could bound the register
+  allocation. Both dequant GEMMs use only 32-bit LDS (`ds_load_2addr_b32`, `ds128` 0) while the BF16
+  MoE kernels read LDS at b128 — the dequant-to-WMMA operand path may be passing data through LDS in
+  narrow chunks.
+- **`moe_stream_kernel<…,128,…>` sits at VGPR 246 / occ 5**, the top of the `moe_grouped` register
+  range; `moe_wmma_gemv_ksplit_kernel<8,_>` uses 72 narrow `ds_load_2addr_b32`.
+
+No correctness change: the audit is read-only and every number is per instantiation at today's
+`main`. `qgemm_mxfp4`'s decode kernels (`mxfp4_gemm_kernel<…>`) are healthy (VGPR 127–140, occ 10).
