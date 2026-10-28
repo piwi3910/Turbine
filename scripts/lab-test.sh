@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run the Turbine test suite, including #[ignore] GPU tests, on one lab host.
 #
-#   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference]
+#   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas|quadronix> [--gpus 1|2] [--with-hf-reference]
 #                       [--features <list>] [--tier quick|perf|full] [-- <cargo test arguments>]
-#   scripts/lab-test.sh [--dry-run] novanas --stop <run-id>
+#   scripts/lab-test.sh [--dry-run] <novanas|quadronix> --stop <run-id>
 #
 # Runs `cargo test --no-fail-fast <selection> -- --include-ignored --show-output`, so one run
 # reports every failing test target. <selection> defaults to --workspace; anything after `--`
@@ -40,8 +40,8 @@ set -euo pipefail
 orig_args=("$@")
 
 usage() {
-	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
-	echo "       scripts/lab-test.sh [--dry-run] novanas --stop <run-id>" >&2
+	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas|quadronix> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
+	echo "       scripts/lab-test.sh [--dry-run] <novanas|quadronix> --stop <run-id>" >&2
 	exit 2
 }
 
@@ -140,7 +140,15 @@ case "$HOST" in
 dgx-spark) ADDR=192.168.10.246 ;;
 dgx-spark2) ADDR=192.168.10.245 ;;
 novanas) ADDR=192.168.10.203 ;;
+quadronix) ADDR=192.168.10.164 ;;
 *) usage ;;
+esac
+
+# The k3s hosts share the Job machinery (namespace turbine-ci, /home/piwi/turbine-ci);
+# the Job template is chosen by host.
+case "$HOST" in
+novanas | quadronix) K3S_HOST=1; TEMPLATE="scripts/lab/${HOST}-test-job.yaml" ;;
+*) K3S_HOST=0 ;;
 esac
 
 MODE=run
@@ -187,7 +195,7 @@ while [[ $# -gt 0 ]]; do
 	*) usage ;;
 	esac
 done
-if [[ "$HOST" != novanas && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
+if [[ $K3S_HOST -eq 0 && ($MODE == stop || $GPUS_SET -eq 1) ]]; then
 	usage
 fi
 # The two-GPU leg is a selection of its own; perf's selection (SLOW_TESTS) is one-GPU work.
@@ -401,7 +409,7 @@ render_job() {
 	fi
 	sed "${rename[@]+"${rename[@]}"}" "${model_env[@]+"${model_env[@]}"}" \
 		-e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__GPUS__/${gpus}/g" \
-		-e "s/__PHASE__/$1/g" "${REPO_ROOT}/scripts/lab/novanas-test-job.yaml"
+		-e "s/__PHASE__/$1/g" "${REPO_ROOT}/${TEMPLATE}"
 }
 
 # wait_for_pod <job> <gpus>: until its pod runs; an unschedulable GPU pod is given up after 120 s.
@@ -483,7 +491,7 @@ wait_for_result() {
 apply_and_follow() {
 	local phase="$1" job="$2" gpus="$3" what=tests
 	[[ $phase == build ]] && what=build
-	say "applying scripts/lab/novanas-test-job.yaml as ${job} (${gpus} GPU(s))"
+	say "applying ${TEMPLATE} as ${job} (${gpus} GPU(s))"
 	render_job "$phase" | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
 		fail "kubectl apply failed"
 	wait_for_pod "$job" "$gpus"
@@ -526,7 +534,7 @@ stop_novanas() {
 }
 
 case "$HOST:$MODE" in
-novanas:run) run_novanas ;;
-novanas:stop) stop_novanas ;;
+novanas:run | quadronix:run) run_novanas ;;
+novanas:stop | quadronix:stop) stop_novanas ;;
 *) run_spark ;;
 esac
