@@ -575,7 +575,7 @@ QuantMode quant_mode(turbine_hip::MoePath path) {
 }
 
 // Routed rows from which Auto runs the grouped kernel.
-constexpr int64_t kGroupedMinRows = 64;
+constexpr int64_t kGroupedMinRows = 8;
 
 // The formats Auto runs grouped, measured over the full op on the Task 14
 // shapes at 256 and 2048 tokens (perf-log "P7 grouped quantized experts"):

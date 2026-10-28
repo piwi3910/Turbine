@@ -2618,5 +2618,11 @@ The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this
   remaining gap to vLLM's 40+ c1. `parallel.tp_decode_graphs: true` measured the same as off
   (30.3 vs 30.4), so the TP graph path does not engage for this hybrid MoE.
 - `scripts/lab/phase7-novanas-qwen36-tp2.yaml` now sets `collective_backend: rccl`.
+- **Grouped MoE at decode rows (2026-10-28):** the FP8-block quantized-expert path chose the
+  per-expert qgemm loop below 64 routed rows; a decode step has `num_tokens * top_k` = 8.
+  Lowering `kGroupedMinRows` to 8 (grouped kernel for FP8 block at decode) measured **41.65 /
+  42.30 tok/s** c1 (two runs) and **428.75 tok/s** at c16 (16 × 256) vs 30.4 / 414.2 with the
+  loop — +37 % c1, now at/above the vLLM 40+ c1 reference. Validation: `hip_moe_quant`
+  (both forced paths at 1/8/256 tokens, all three formats) 8/8 PASS; `gate.sh` 1154/1154.
 - Speculative decoding is not available for this family (support-matrix pairing, TP>1 refusal,
   no same-family hybrid draft); the hybrid golden gate is still open (see the handoff).
