@@ -274,6 +274,7 @@ spec:
             path: /home/piwi/turbine-ci/cache/apt/lists
             type: DirectoryOrCreate
         - name: rocm
+          hostPath:
             # quadronix's ROCm 10.1 tree lives at /opt/rocm/core-10.1 (there is no
             # /opt/rocm/rocm symlink); it is mounted at /opt/rocm/rocm so the
             # env paths above stay valid.
