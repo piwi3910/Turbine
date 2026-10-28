@@ -2674,8 +2674,8 @@ counts `ds_load/store_b128`, `ds32`/`ds2addr` the narrow LDS paths, `glb128` 128
 | `moe_wmma_gemv_ksplit_kernel<8,true>` (`moe_grouped`) | 26 | 224 | 0 | 16644 | 6 | ds2addr 72 |
 | `moe_small_proj_kernel<4,4,true>` (`moe_small_m`) | 53 | 176 | 0 | 260 | 8 | 53 SGPR (file max) |
 | `moe_quant_grouped_kernel<3,Shape<2>>` | 23 | 138 | 0 | 29708 | 8 | |
-| `qgemm_int4::wmma_kernel<1,8,4>` | 38 | 215 | 0 | 7168 | 7 | no `__launch_bounds__`; ds128 0, ds2addr 31 |
-| `qgemm_fp8_block::wmma_kernel<1,16>` | 34 | 160 | 0 | 15360 | 9 | no `__launch_bounds__`; ds128 0, ds2addr 63 |
+| `qgemm_int4::wmma_kernel<1,8,4>` | 38 | 215 | 0 | 7168 | 7 | `__launch_bounds__` in `qgemm_int4_kernels.hpp`; weights stream via `global_load_b128`, ds2addr is the wave reduction |
+| `qgemm_fp8_block::wmma_kernel<1,16>` | 34 | 160 | 0 | 15360 | 9 | `__launch_bounds__` in `qgemm_fp8_block_kernels.hpp`; same |
 | `qgemm_mxfp4::mxfp4_gemm_prefill_kernel<256,128,4,2,32>` | 26 | 239 | 0 | 62464 | 4 | prefill tile, 61 KiB LDS |
 | `qgemm_mxfp4::mxfp4_gemm_lds_kernel<8,1,8>` | 26 | 183 | 0 | 37888 | 6 | |
 | `paged_attention_b1::paged_b1_decode_kernel<1>` | 58 | 187 | 0 | 4744 | 8 | glb64 33, glb128 16, ds2addr 21 |
@@ -2699,11 +2699,13 @@ Findings (each with a follow-up issue; the source files are linked from the issu
   look with the fix.
 - **`mxfp4_gemm_prefill_kernel` is the prefill-tile bottleneck** (VGPR 239, 61 KiB LDS, 4 waves/SIMD)
   — the same tile the S-16 prefill target measured short (#17).
-- **`qgemm_int4` and `qgemm_fp8_block` carry no `__launch_bounds__`.** Their `wmma_kernel<1,*,4>`
-  instantiation reaches VGPR 215 (occ 7); a `__launch_bounds__` hint could bound the register
-  allocation. Both dequant GEMMs use only 32-bit LDS (`ds_load_2addr_b32`, `ds128` 0) while the BF16
-  MoE kernels read LDS at b128 — the dequant-to-WMMA operand path may be passing data through LDS in
-  narrow chunks.
+- **`qgemm_int4` / `qgemm_fp8_block` need no change here** (corrected 2026-10-28). Their kernels do
+  carry `__launch_bounds__(kWaves * kLanes)` — in `qgemm_int4_kernels.hpp` and
+  `qgemm_fp8_block_kernels.hpp`; the first pass grepped the top-level `.hip`, which only includes
+  them. The weights stream straight into the WMMA registers as `u32x4` (128-bit) global loads, so
+  there is no LDS operand path; the only LDS is the cross-wave partial reduction (the
+  `ds_load_2addr_b32` counts), which is expected. `wmma_kernel<1,8,4>`'s VGPR 215 / occ 7 is thus
+  inherent, not a missing hint.
 - **`moe_stream_kernel<…,128,…>` sits at VGPR 246 / occ 5**, the top of the `moe_grouped` register
   range; `moe_wmma_gemv_ksplit_kernel<8,_>` uses 72 narrow `ds_load_2addr_b32`.
 
