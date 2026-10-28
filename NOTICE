@@ -1,0 +1,30 @@
+Turbine
+Copyright 2026 The Turbine Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties. The HIP kernel
+library (kernels/rocm) contains code ported or adapted from the projects below;
+each such source file names the upstream file, the commit it was taken from,
+what was taken and what was changed. Full license texts are in
+kernels/rocm/third_party/LICENSES/.
+
+- Composable Kernel (ROCm/rocm-libraries, projects/composablekernel)
+  Copyright (c) Advanced Micro Devices, Inc. -- MIT License.
+  Fetched at build time at a pinned commit (kernels/rocm/CMakeLists.txt) and
+  compiled into libturbine_hip.so (fmha paged and split-KV attention).
+
+- vLLM (github.com/vllm-project/vllm)
+  Copyright contributors to the vLLM project -- Apache License 2.0.
+  Ported device code, e.g. the wvSplitK skinny GEMM (kernels/rocm/src/gemm_wvsplitk.hip).
+
+- llama.cpp / ggml (github.com/ggml-org/llama.cpp)
+  Copyright (c) 2023-2026 The ggml authors -- MIT License.
+  Ported device code, e.g. the gated delta net recurrence (kernels/rocm/src/gdn.hip).
+
+- AITER (github.com/ROCm/aiter)
+  Copyright (C) 2024-2026 Advanced Micro Devices, Inc. -- MIT License.
+  Ported device code, e.g. the causal conv1d prefill (kernels/rocm/src/conv1d.hip).
+
+Test data: tests/eval/ contains items derived from GSM8K (openai/grade-school-math,
+MIT License); see tests/eval/NOTICE for the exact sources and revisions.

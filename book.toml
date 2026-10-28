@@ -1,0 +1,18 @@
+[book]
+title = "Turbine"
+authors = ["The Turbine Authors"]
+description = "Turbine: a Rust LLM inference engine with hierarchical KV caching and no Python in the serving path."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "target/book"
+# A page named in SUMMARY.md that does not exist fails the build instead of being created empty.
+create-missing = false
+
+[output.html]
+site-url = "/Turbine/"
+git-repository-url = "https://github.com/piwi3910/Turbine"
+edit-url-template = "https://github.com/piwi3910/Turbine/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"

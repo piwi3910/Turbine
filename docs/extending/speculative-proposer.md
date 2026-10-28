@@ -11,7 +11,7 @@ token ids for a sequence.
 - `crates/turbine-model/src/speculative/<name>.rs` — the implementation: it owns a draft
   `ModelExecutor`, one private one-sequence `BlockPool`, its `BlockTable` and the
   `begin`/`propose`/`truncate`/`release` lifecycle. The skeleton is
-  [`draft.rs`](../../crates/turbine-model/src/speculative/draft.rs).
+  [`draft.rs`](https://github.com/piwi3910/Turbine/blob/main/crates/turbine-model/src/speculative/draft.rs).
 - `crates/turbine-model/src/speculative/mod.rs` — add the factory to `PROPOSERS` (do not sort
   the list; registration order is the lookup order) and its `ProposerFactory` impl.
 - `docs/extending/README.md` — add the row to the extension-point table.

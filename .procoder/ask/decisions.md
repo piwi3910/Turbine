@@ -5242,3 +5242,13 @@ Result: numa_balancing=0 applied (persisted in /etc/sysctl.d/90-turbine-numa.con
 
 **User decision (2026-10-28): kill the tp2 server on quadronix and add `iommu=pt` (reboot), then re-measure** — same socket and, with all cards free, across sockets.
 Result (2026-10-28, after reboot with iommu=pt): no change on healthy pairs — same socket peer copy 26 GB/s, cross socket 20 GB/s (37 GB/s both ways), all-reduce 8 B–96 KiB 70–110 µs and 16 MiB 0.93–0.94 ms for both. Found: GPU 03:00.0's root port 00:01.1 is capped at 2.5 GT/s x4 (LnkCap, from boot) — every pair with that card runs at 0.9 GB/s (all-reduce 16 MiB 26 ms, 96 KiB 225–260 µs). Fix is in BIOS / slot (bifurcation or link-speed setting, or the card's slot/riser), not in the OS.
+
+## Docs site: commit, push and GitHub Pages (2026-10-29)
+
+README, NOTICE, CONTRIBUTING, book.toml, the new docs/ pages and `.github/workflows/pages.yml` are written (MTP work excluded).
+
+- A: format and commit locally only
+- B: commit, push to origin and enable GitHub Pages (public)
+- C: hold; review the pages first
+
+**User decision (2026-10-29): B — commit, push and enable GitHub Pages.**
