@@ -2,6 +2,15 @@
 
 Guidance for AI coding agents working in this repository.
 
+## Working style
+
+- Be decisive. Gather the context you need, then act. State each decision once and execute it.
+- Do not restate a plan, re-list options, or re-deliberate a decision already made. No repeated reasoning, no "let me think again" loops.
+- Do not narrate what you are "about to" do in place of doing it. Prefer the tool call over a sentence about the tool call.
+- For a large task, make the first concrete change (edit or command) instead of re-planning; re-plan only when the user or new evidence changes the goal.
+- Long command output and repeated tool cycles are fine; repeated _thinking_ is not. When you catch yourself repeating, stop and take the next action.
+- Keep prose short: state what changed and what is next, not the reasoning behind it.
+
 ## Project state
 
 Turbine is a Rust LLM inference engine (reliability-first, hierarchical KV cache, no Python/PyTorch in the serving path). The repository holds the spec, the Phase 0 skeleton (`crates/turbine-{core,observability,device,api,server}`, `benches/turbine-bench`) and the Phase 1 single-request path under construction: `crates/turbine-{tensor,kernels,model}`, the vendor-neutral kernel C ABI `kernels/include/turbine_kernels.h` and the HIP shim `kernels/rocm/` (_libturbine_hip.so_), serving Llama-3.2-3B-Instruct (BF16) on one R9700 in `novanas`, and the Phase 2 serving runtime under construction: `crates/turbine-kv` (paged KV block pool and block tables) and `crates/turbine-scheduler` (continuous batching with chunked prefill, bounded queues, deterministic simulator), kernel ABI v2, OLMoE-1B-7B, tool calls and JSON-schema output. `turbine-spec.md` is the original product vision; the work is driven by procoder's chain in `.procoder/`:
@@ -90,6 +99,8 @@ Workspace layout: `crates/turbine-*` (each crate is created in the phase that gi
 Target order (user decisions): AMD first — Phases 1–2 run Llama-3.2-3B-Instruct (BF16) and then OLMoE-1B-7B on the Radeon R9700s in `novanas` (ROCm/HIP); NVIDIA GB10 (`dgx-spark`, `dgx-spark2`, Phase 2b) is on hold until everything works well on `novanas` (decision 2026-09-26), so Phase 3 follows Phase 2 / 2c. After Phase 5 (decision 2026-09-28), AMD only: Phase 6 quantization (FP8 weights and FP8 KV, MXFP4, INT4 AWQ / GPTQ), then Phase 5p serving efficiency, Phase 7 model families (Qwen3 dense and MoE, gpt-oss-20b, Qwen3.5/3.6 hybrids, Mistral / Mixtral), Phase 8 speculative decoding; multi-node (Phase 9), advanced distribution (Phase 10) and NVIDIA (Phase 2b, with NVFP4) are deferred. OpenAI-compatible API with SSE, tools and JSON-schema output (llguidance), continuous batching with chunked prefill, paged KV, Prometheus metrics. Diagnostics live under `/turbine/v1/*`, separate from the OpenAI routes.
 
 ## Engineering rules (spec §21 — binding)
+
+How code is shaped — one form per extension point, reason codes, error types, family and format layout, kernel ABI and HIP conventions, size limits and contract checks — is set in `docs/standards.md`. New code follows it; existing gaps are tracked by the `standards` issues.
 
 - Every optimized path needs a correctness/reference test; never trade stability for throughput by default; benchmark before specializing hot paths.
 - No Python/PyTorch fallback — mark a feature unsupported until a native path exists.
