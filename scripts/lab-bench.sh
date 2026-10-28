@@ -48,6 +48,12 @@ set -uo pipefail
 orig_args=("$@")
 
 host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+# The ROCm root on the lab host: quadronix's ROCm 10.1 tree is /opt/rocm/core-10.1 (no
+# /opt/rocm/rocm symlink) with amd-smi 27.1.0; novanas points /opt/rocm/rocm at core-10.1.
+case "$host" in
+*192.168.10.164*) rocm=/opt/rocm/core-10.1; amd_smi=$rocm/lib/libamd_smi.so.27.1.0 ;;
+*) rocm=/opt/rocm/rocm; amd_smi=$rocm/lib/libamd_smi.so.26.5.0 ;;
+esac
 gpu=0
 model=llama
 label="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -288,14 +294,14 @@ ssh() {
 # prints the build lines and builds nothing.
 if [[ $dry -eq 1 ]]; then
 	echo "+ scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench"
-	echo "+ ssh -o BatchMode=yes $host 'cd $remote/src && cmake -S kernels/rocm -B $remote/kbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 && cmake --build $remote/kbuild -j 4'"
+	echo "+ ssh -o BatchMode=yes $host 'cd $remote/src && cmake -S kernels/rocm -B $remote/kbuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER=${rocm}/bin/hipcc -DGPU_TARGETS=gfx1201 && cmake --build $remote/kbuild -j 4'"
 	build_rc=0
 else
 	(
 		scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench &&
 			ssh -o BatchMode=yes "$host" "cd '$remote/src' && nice -n 19 taskset -c ${TURBINE_REMOTE_CPUS:-12-15} \
       cmake -S kernels/rocm -B '$remote/kbuild' -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
+        -DCMAKE_HIP_COMPILER=${rocm}/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
       nice -n 19 taskset -c ${TURBINE_REMOTE_CPUS:-12-15} cmake --build '$remote/kbuild' -j 4 >/dev/null"
 	) >"$out/build.log" 2>&1 &
 	build_pid=$!
@@ -378,8 +384,8 @@ while [[ $dry -eq 0 ]] && ssh -o BatchMode=yes "$host" "ss -ltnH 'sport = :18000
 done
 ssh -o BatchMode=yes "$host" "rm -f $pidf"
 ssh -o BatchMode=yes "$host" "setsid bash -c \"echo \\\$\\\$ > $pidf; cd '$remote/src' && \
-    LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
-    TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=$gpu \
+    LD_LIBRARY_PATH=${rocm}/lib:${rocm}/lib/rocm_sysdeps/lib \
+    TURBINE_AMD_SMI_LIBRARY=${amd_smi} ROCR_VISIBLE_DEVICES=$gpu \
     exec taskset -c $bench_cpus '$remote/target/release/turbine-server' --config $cfg \
       --set model.path=/home/piwi/turbine-models/$slug \
       --set execution.kernel_library='$remote/kbuild/libturbine_hip.so' $*\" \
