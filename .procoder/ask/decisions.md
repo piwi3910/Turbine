@@ -4832,7 +4832,7 @@ The KV foundation (`StateSlotPool`/`SnapshotPool`, directory snapshot refs, plan
 interface choices the plan left open. Lead calls (safe, reversible internal interfaces):
 
 1. **Snapshot entry addressing:** `StepSeq.snapshot_blocks: Vec<(u32 /*token offset within the step*/,
-   SnapshotRef)>` — the ref carries the reserved entry. The engine allocates the entry (via the
+SnapshotRef)>` — the ref carries the reserved entry. The engine allocates the entry (via the
    `SnapshotPool`) when a block fills and passes the ref in the step.
 2. **Snapshot byte ownership:** the snapshot bytes are KV-owned L0 memory that travels with the block
    (Task 33); the executor receives a view per forward (like `KvPoolView`) and the `SnapshotPool`
@@ -4855,7 +4855,7 @@ The scheduler slot pool, the jump-forward refusal and the hybrid metrics scaffol
 
 1. **Slot ownership: the scheduler.** `Scheduler::state_slots: StateSlotPool` (capacity
    `max_running_requests`) allocates at admission and releases on finish/cancel/preemption; the
-   engine allocates only the snapshot *entries*. This is what makes the S-12 leak assertion
+   engine allocates only the snapshot _entries_. This is what makes the S-12 leak assertion
    (`StateSlotPool::free()` back to its start value) checkable.
 2. **`jump_forward` "explicit":** present-as-true in the config file or a `--set` override. A hybrid
    with the default (`true`, never set) runs jump-forward off + the startup WARN; an explicit `true`
@@ -4878,7 +4878,7 @@ the S-12 test remain. Decisions:
 2. **Capacity:** one snapshot entry per L0 block (`SnapshotPool` sized to `pool.total_blocks()`) —
    conservative, bounded, and avoids per-sequence fragmentation.
 3. **Boundary capture:** drive the GDN kernel's `boundary_states` with `boundary_tokens =
-   kv.block_tokens` (one contiguous boundary row per full block, covering chunked-prefill splits
+kv.block_tokens` (one contiguous boundary row per full block, covering chunked-prefill splits
    that land on block boundaries) and STORE only the rows the interval rule wants — every
    `hybrid_snapshot_interval_blocks`-th full block plus the sequence's last full block (interior rows
    are captured and discarded; ~0.9 ms of device writes for a 16-block 9B prefill at 1 TB/s). The
@@ -4931,7 +4931,7 @@ How a block's snapshot bytes travel with it through the tiers. The transfer path
 
 - (a) add a snapshot entry + tail length to the transfer request and a snapshot-store handle to every
   backend (the device copy path included); a tier slot is `[kv bytes in the tier format][snapshot
-  bytes exact]`, `SLAB_VERSION` + 1,
+bytes exact]`, `SLAB_VERSION` + 1,
 - (b) move the snapshot buffer into `turbine-kv` so the hierarchy marshals it,
 - (c) a separate derived-key tier record for the snapshot.
 
@@ -4997,7 +4997,7 @@ The snapshot bytes now travel through L1/L2 (`state_snapshot_follows_block` PASS
 
 - **Tier slot sizing (T33c):** the landed tier travel writes `[kv][snapshot]` but the L1/L2 tiers
   still cap a slot at the L0-format block, so demoting a snapshot-bearing block FAILS (`block is
-  55705600 bytes, L1 slots hold 1 to 4194304 bytes`) and the block is dropped, not demoted. Fix in
+55705600 bytes, L1 slots hold 1 to 4194304 bytes`) and the block is dropped, not demoted. Fix in
   progress: `KvTier::set_snapshot_bytes` (default no-op) widened by `L1PinnedTier`/`L2NvmeTier` and
   forwarded by `ShardedL1Tier`. **Decision: close this gap** — the `[kv][snapshot]` record must fit an
   L1/L2 slot, covered by `hybrid_record_fits_a_sized_slot` and the `kv_gpu` lab leg.
@@ -5019,10 +5019,10 @@ The snapshot bytes now travel through L1/L2 (`state_snapshot_follows_block` PASS
 With the tier-slot sizing fixed (gate ok, 1120 tests), `kv_gpu hybrid_prefix_reuse_matches_cold` is
 still red for two reasons the builder flagged:
 
-- **Snapshot capture in a multi-block prefill step:** the engine captures only when a *step* ends on a
+- **Snapshot capture in a multi-block prefill step:** the engine captures only when a _step_ ends on a
   block boundary (`loop.rs` `it.kv_len % bt == 0`), so a single-chunk prefill of 859 tokens (one
   2048-cap chunk) yields no snapshot ≤ 768 and turn 2 has no cutoff to restore. **Decision:** the
-  capture stores snapshots from the boundary rows *within* a step — the kernel already produces a
+  capture stores snapshots from the boundary rows _within_ a step — the kernel already produces a
   boundary state per `kv.block_tokens` (`boundary_tokens = kv.block_tokens`, decision "P7 Task 32
   snapshot store") — for the interval blocks (`kv.hybrid_snapshot_interval_blocks`) and the
   sequence's last full block inside the chunk. **Do NOT align `scheduler.prefill_chunk_tokens` to
@@ -5044,9 +5044,9 @@ T33c landed the tier-hit restore and the L1/L2 slot widening (gate ok, 1120 test
   scenario must warm A's prefix (a second identical request at L0, so the blocks gain reuse evidence)
   before the filler load forces the demotion, then hit L1/L2 on the third turn. This is a test-design
   fix, not a policy change.
-- **Within-step capture:** the engine captures a snapshot only when a *step* ends on a block
+- **Within-step capture:** the engine captures a snapshot only when a _step_ ends on a block
   boundary, so A's 859-token single-chunk prefill has no snapshot ≤ a turn-2 cutoff. **Decision (as
-  recorded earlier):** capture from the per-block boundary rows *within* a step
+  recorded earlier):** capture from the per-block boundary rows _within_ a step
   (`boundary_tokens = kv.block_tokens`), not by aligning `scheduler.prefill_chunk_tokens`. Implement
   it in the engine/executor capture path.
 
@@ -5080,13 +5080,13 @@ differently from the cold full-length prefill, so strict equality fails on GPU f
   (the directory's safe-to-evict set); `allocate_in_strict` keeps the old behaviour for callers
   outside the plan (ladder L0 rewrites, partial-tail copy), preserving the ladder's S-7 back-off.
   Result: the Llama L0 `tq4` bench is `ok=200 failed=0 tok/s=838.6` (was `ok=184 failed=16
-  tok/s=63.2`) and the 32-filler shared-prefix pair completes (0.765/0.765, was wedging at 34/200).
+tok/s=63.2`) and the 32-filler shared-prefix pair completes (0.765/0.765, was wedging at 34/200).
 - **Gate baseline — the Llama L0 `tq4` row closed on a same-tree baseline.** The recipe
   (`p6b-eval-prefix.md`) mandates the canonical `tests/eval/llama-3.2-3b-instruct/turbine-bf16-sp.json`
   (0.780), against which the p7 candidate (0.765) drops 0.015 (> 0.01, within that baseline's own
   0.78→0.76 spread). The builder closed the row on the **same-tree** baselines
   (`turbine-bf16-sp-p7-r{1,2}.json`, 0.770/0.760 → drop 0.005). **Decision (lead, 2026-10-17): keep
-  the flip** — the row's claim is about the *KV format*, and a same-tree baseline isolates the
+  the flip** — the row's claim is about the _KV format_, and a same-tree baseline isolates the
   format's effect from the Phase 7 tree's other changes (a cross-tree comparison conflates the two);
   the pair passes cleanly on two runs, and the recipe's baseline predates the Phase 7 tree. Caveat:
   one line each in `support.rs` / `support_startup.rs` / `docs/support-matrix.md` / `AGENTS.md`
@@ -5216,3 +5216,29 @@ chose "accept": Phase 8 closes with the `amd gfx1201 LlamaForCausalLM bf16 bf16 
 `experimental` and the recorded 0.937×/17.1 % S-11 miss, rather than revising the gate or changing
 the pairing. No row flip; a future track can re-open S-11 with a different workload, bar or draft
 checkpoint. The spec's S-9/phase-exit wording and the plan's Task 14 carry the acceptance.
+
+## quadronix: measure GPU peer-to-peer and RCCL transport (2026-10-28)
+
+Context: quadronix (192.168.10.164) is dual-socket EPYC 7702 with 2 R9700s per socket, kernel/KFD peer-to-peer enabled (novanas has none). A Qwen3.6 tp2 server runs on GPUs 0/1; GPUs 2/3 are idle. Open question: does RCCL use P2P within a socket and across sockets, and what bandwidth do peer copies reach.
+
+- A) Run the checks on GPUs 2 and 3 only: peer-copy bandwidth (same socket), RCCL transport with NCCL_DEBUG=INFO, and whether NCCL_P2P_LEVEL=SYS changes it; leave the running server alone
+- B) Also measure across sockets (needs one card from each socket, i.e. after the tp2 server on 0/1 is stopped)
+- C) Not now
+
+**User decision (2026-10-28): A — same socket, GPUs 2+3.** Measure peer-copy bandwidth, RCCL's transport and the NCCL_P2P_LEVEL=SYS effect on GPUs 2 and 3 only; the tp2 server on GPUs 0/1 stays untouched; cross-socket waits.
+
+Result (2026-10-28, GPUs 2+3): peer copies 26 GB/s per direction (50 GB/s both ways), RCCL uses P2P/direct pointer; all-reduce 16 MiB 0.93 ms / busbw 19 GB/s (novanas 4.3 ms / ~4 GB/s), but small messages 68–106 µs (8 B–96 KiB) versus ~21–50 µs on novanas. RCCL warns about `kernel.numa_balancing=1` and a missing `iommu=pt`.
+
+## quadronix: host tuning for RCCL small-message latency (2026-10-28)
+
+Context: small all-reduces (the TP decode size, ~96 KiB) take 70–100 µs on quadronix vs ~21–50 µs on novanas. RCCL itself names two host settings.
+
+- A) Turn off NUMA auto-balancing now (`sysctl kernel.numa_balancing=0`, live, persisted in /etc/sysctl.d), then re-measure; leave the IOMMU alone
+- B) A, plus add `iommu=pt` to the kernel command line (GRUB) — takes effect only after a reboot, which stops the running tp2 server
+- C) Change nothing on the host
+
+**User decision (2026-10-28): A — NUMA auto-balancing off, re-measure; IOMMU unchanged.**
+Result: numa_balancing=0 applied (persisted in /etc/sysctl.d/90-turbine-numa.conf); two re-runs on GPUs 2+3 unchanged — small all-reduces 67–103 µs, 16 MiB 0.93 ms. NUMA balancing is not the cause.
+
+**User decision (2026-10-28): kill the tp2 server on quadronix and add `iommu=pt` (reboot), then re-measure** — same socket and, with all cards free, across sockets.
+Result (2026-10-28, after reboot with iommu=pt): no change on healthy pairs — same socket peer copy 26 GB/s, cross socket 20 GB/s (37 GB/s both ways), all-reduce 8 B–96 KiB 70–110 µs and 16 MiB 0.93–0.94 ms for both. Found: GPU 03:00.0's root port 00:01.1 is capped at 2.5 GT/s x4 (LnkCap, from boot) — every pair with that card runs at 0.9 GB/s (all-reduce 16 MiB 26 ms, 96 KiB 225–260 µs). Fix is in BIOS / slot (bifurcation or link-speed setting, or the card's slot/riser), not in the OS.
