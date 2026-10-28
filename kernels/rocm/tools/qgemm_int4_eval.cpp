@@ -4,6 +4,9 @@
 // 3072 x 8192), group 128, both INT4 schemes (ZP: AWQ zero points, SYM: GPTQ
 // implicit 8) and each requested m it runs, through libturbine_hip.so's ABI:
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 //   bf16            turbine_gemm (hipBLASLt, tuned table) on the weight
 //                   dequantized to BF16: the BF16 model's cost, the baseline
 //   <impl>          every turbine_qgemm implementation of the library that

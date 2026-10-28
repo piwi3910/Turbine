@@ -5,6 +5,9 @@
 // (crates/turbine-kernels/src/cpu/qgemm.rs: e4m3 values times their scales,
 // F32-exact products, the sum rounded once to BF16) and times it:
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 //   bf16         BF16 x BF16 -> BF16, the dequantized weight (today's path,
 //                W8A16 through dequantize; the baseline)
 //   fp8_sab      e4m3 x e4m3 -> BF16, scalar weight and activation scales

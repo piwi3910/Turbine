@@ -1,5 +1,8 @@
 // P7 Task 14: quantized MoE expert provider evaluation (gfx1201).
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 // For each expert shape and token count: random top-k routing, the routed rows
 // pre-gathered by expert, then the two expert GEMMs (gate_up [2I x H], down
 // [H x I]) over every active expert. Candidates:

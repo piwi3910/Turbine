@@ -2,6 +2,9 @@
 // Task 19, kernel reuse rule) on the current device. For the Llama-3.2-3B and
 // Llama-3.1-8B linear shapes at the requested m it runs
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 //   bf16            hipBLASLt BF16 x BF16 -> BF16 on the dequantized weight
 //                   (the baseline: what the BF16 checkpoint runs; first
 //                   heuristic answer and best of the first 8)

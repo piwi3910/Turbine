@@ -8,6 +8,10 @@
 // demotion: SDMA, or the copy kernel writing the mapped host buffer), CB_ENV
 // (a label echoed in the output).
 //
+// Every timed compute input holds seeded random data, never zeros: AMD notes
+// all-zero inputs run >20 % faster (power/clock effect), which would skew the
+// step time (issue #10).
+//
 //   turbine_copy_eval <mode> <seg_kib> <grid> <total_mib> [steps] [pairs]
 //     mode: none | sdma | kernel
 //     seg_kib: copy segment size (one hipMemcpyAsync / one kernel op)
@@ -62,6 +66,18 @@ __global__ void stream_k(const uint4 *w, uint4 *out, int64_t n) {
   }
   if ((acc.x & 0xffff) == 0x1234567)
     out[0] = acc;
+}
+
+// Deterministic non-zero host data in [-1, 1): all-zero inputs run measurably
+// faster on AMD and would skew the step time (issue #10).
+static void fill_rand(float *p, int64_t n, uint32_t seed) {
+  uint32_t x = seed * 2654435761u + 1;
+  for (int64_t i = 0; i < n; ++i) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    p[i] = static_cast<float>(x >> 8) / 8388608.0f - 1.0f;
+  }
 }
 
 struct Op {
@@ -126,11 +142,21 @@ int main(int argc, char **argv) {
   const int rows = 16, cols = 2048;
   CK(hipMalloc(&nx, rows * cols * 4));
   CK(hipMalloc(&ny, rows * cols * 4));
-  CK(hipMemset(nx, 0, rows * cols * 4));
+  {
+    std::vector<float> hx(static_cast<size_t>(rows) * cols);
+    fill_rand(hx.data(), static_cast<int64_t>(hx.size()), 1u);
+    CK(hipMemcpy(nx, hx.data(), hx.size() * sizeof(float),
+                 hipMemcpyHostToDevice));
+  }
   // Per-step small H2D upload on the compute stream (decode's batch upload).
   void *up_h, *up_d;
   CK(hipHostMalloc(&up_h, 16384, hipHostMallocDefault));
   CK(hipMalloc(&up_d, 16384));
+  {
+    std::vector<float> hup(16384 / sizeof(float));
+    fill_rand(hup.data(), static_cast<int64_t>(hup.size()), 2u);
+    std::memcpy(up_h, hup.data(), 16384);
+  }
 
   // Promotion buffers: pinned host (like L1: hipHostMallocDefault) -> device.
   const int64_t ring = std::max<int64_t>(total, 64 << 20);

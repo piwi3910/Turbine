@@ -1,6 +1,9 @@
 // turbine_attn_eval: the mixed-format / TurboQuant paged attention provider
 // evaluation (Phase 6b Task 10, kernel reuse rule) on the current device.
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 // Frozen at the evaluation: it builds the former tq4 / tq2 records (K = MSE
 // stage + 1-bit QJL residual, tables with the QJL matrix S). Since decision
 // "6b Task 9: TurboQuant K quantizer" A, K is TurboQuant_mse and the library's

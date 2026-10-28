@@ -1,5 +1,8 @@
 // turbine gdn_eval: Gated DeltaNet provider evaluation (Phase 7 Task 29).
 //
+// Timing inputs are seeded random data, never zeros (all-zero inputs run
+// >20 % faster on AMD and would skew the timings; issue #10).
+//
 // Qwen3.5-9B / Qwen3.6-35B GDN shapes: 16 key heads x 128, 32 value heads x 128,
 // conv k=4 over q|k|v channels (2048 + 2048 + 4096 = 8192), F32 recurrent state.
 //
