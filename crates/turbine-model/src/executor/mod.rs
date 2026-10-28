@@ -553,6 +553,17 @@ pub trait ModelExecutor: Send {
     /// its device reduction when the slice asks for one and the executor reduces — with one
     /// device-to-host copy.
     fn forward(&mut self, batch: &BatchInput<'_>) -> Result<Logits, ModelError>;
+    /// P8 MTP: captures (or stops capturing) the next forwards' final pre-norm residual rows,
+    /// `max_rows × hidden` on this rank. A no-op for an executor without the hybrid path.
+    fn set_hidden_capture(&mut self, on: bool, max_rows: usize) -> Result<(), ModelError> {
+        let _ = (on, max_rows);
+        Ok(())
+    }
+    /// P8 MTP: the captured rows of the last forward, or `None` when capture is off/unsupported.
+    fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
+        let _ = rows;
+        None
+    }
     /// Timings of the last successful `forward` (or `collect`); zeros when the executor does not
     /// measure.
     fn last_timings(&self) -> ForwardTimings {

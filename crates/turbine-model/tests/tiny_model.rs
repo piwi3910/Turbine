@@ -3849,6 +3849,38 @@ fn cpu_trace_recomputes_exactly() {
     assert!(exec.take_trace().is_empty());
 }
 
+/// P8 MTP: the hidden capture returns the last forward's final residual rows (`tokens × hidden`,
+/// finite, one row per token) and tracks each forward (a decode row differs from the prefill's
+/// last row). The MTP end-to-end test checks the values against the MTP layer.
+#[test]
+fn hidden_capture_returns_the_final_residual_rows() {
+    let tmp = TempDir::new("tiny-model-hidden-capture");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let tokens = prompt(spec.vocab)[..5].to_vec();
+    let positions: Vec<u32> = (0..5).collect();
+    exec.set_hidden_capture(true, tokens.len())
+        .expect("capture");
+    kv.forward(&mut exec, &tokens, &positions).expect("prefill");
+    let hidden = exec.take_hidden(tokens.len()).expect("captured rows");
+    let h = spec.config.hidden as usize;
+    assert_eq!(hidden.len(), tokens.len() * h);
+    assert!(hidden.iter().all(|v| v.is_finite()));
+    let last_prefill = hidden[(tokens.len() - 1) * h..].to_vec();
+
+    let next = 7u32;
+    kv.forward(&mut exec, &[next], &[5]).expect("decode");
+    let one = exec.take_hidden(1).expect("decode row");
+    assert_eq!(one.len(), h);
+    assert!(one.iter().all(|v| v.is_finite()));
+    assert!(
+        one.iter().zip(&last_prefill).any(|(a, b)| a != b),
+        "a decode forward's hidden row is its own"
+    );
+}
+
 /// Tracing works for every family (Phase 2m S-3): the tiny OLMoE on the CPU provider with
 /// tracing on records, for one 5-token prefill, `embed`, then per layer the attention outputs
 /// with the full Q/K norms and the MoE block's router logits and output, then `final_norm` and

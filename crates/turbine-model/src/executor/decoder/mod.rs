@@ -1158,6 +1158,9 @@ pub struct DecoderExecutor {
     layers: Vec<Layer>,
     /// `None` on a pipeline stage before the last.
     final_norm: Option<Tensor>,
+    /// P8 MTP: the last forward's final pre-norm residual rows (`rows × hidden` F32) when the
+    /// hidden capture is on; the MTP head's attention prefill needs them.
+    hidden_capture: Option<Tensor>,
     /// `None` when the model ties its LM head to `embed` (or on a stage before the last).
     lm_head: Option<Tensor>,
     bufs: Buffers,
@@ -1900,6 +1903,7 @@ impl DecoderExecutor {
             embed,
             layers,
             final_norm,
+            hidden_capture: None,
             lm_head,
             bufs,
             ffn_buffers,
@@ -1976,6 +1980,32 @@ impl DecoderExecutor {
     /// drops them.
     pub fn set_trace(&mut self, enabled: bool) {
         self.trace.set(enabled);
+    }
+
+    /// P8 MTP: captures (or stops capturing) the next forwards' final pre-norm residual rows,
+    /// allocating `max_rows × hidden` F32 on this rank's memory.
+    pub fn set_hidden_capture(&mut self, on: bool, max_rows: usize) -> Result<(), ModelError> {
+        self.hidden_capture = if on {
+            let words = max_rows.saturating_mul(self.dims.hidden);
+            Some(Tensor::empty(&self.mem, &[words], DType::F32)?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// P8 MTP: the captured final hidden rows of the last forward (blocking read).
+    pub fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
+        let buf = self.hidden_capture.as_ref()?;
+        let words = rows.saturating_mul(self.dims.hidden);
+        let bytes = buf.storage.whole().read_bytes().ok()?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .take(words)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
     }
 
     /// The tensors recorded since tracing was enabled or last taken, in execution order; empty
@@ -3573,6 +3603,12 @@ impl DecoderExecutor {
             // The next stage continues from the residual stream (its input norm comes first).
             return self.pp_send(pp, t);
         }
+        // P8 MTP: keep the final residual rows (pre-final-norm) for the MTP head's prefill.
+        if let Some(h) = self.hidden_capture.as_ref() {
+            let bytes = p.total_q * self.dims.hidden * std::mem::size_of::<f32>();
+            self.mem
+                .copy_d2d(h.storage.ptr(), b.x.storage.ptr(), bytes)?;
+        }
         self.final_norm_last_rows(p, order)?;
         // The head's rows: one per logits row (P5p S-9), `order` carrying one entry per row.
         let n = order.len();
@@ -3593,6 +3629,14 @@ impl DecoderExecutor {
 }
 
 impl ModelExecutor for DecoderExecutor {
+    fn set_hidden_capture(&mut self, on: bool, max_rows: usize) -> Result<(), ModelError> {
+        DecoderExecutor::set_hidden_capture(self, on, max_rows)
+    }
+
+    fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
+        DecoderExecutor::take_hidden(self, rows)
+    }
+
     fn set_mixed_blocks(&mut self, on: bool) -> Result<(), ModelError> {
         DecoderExecutor::set_mixed_blocks(self, on);
         Ok(())
