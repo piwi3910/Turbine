@@ -101,3 +101,30 @@ So the 1/16 is the TP sharding accuracy gap, not FP8 dequant, prefix reuse (test
 or device sampling (tested off, unchanged: same token 279 at -2.867 vs the reference's 52250 at
 -0.62). Fix order: the GDN `in_proj_qkv`/conv shard mapping in `tp.rs` (`SlotSource` three-part
 slice), then re-run the tp2 trace leg expecting greedy agreement ≫ 1/3, then the Qwen3.6 golden.
+
+## MTP speculative decoding (corrected plan, 2026-10-28)
+
+Both hybrids ship a native MTP head (`mtp.*`: 15 tensors / 486 MB in Qwen3.5-9B, 1,560 in
+Qwen3.6-35B-A3B); transformers ignores it, vLLM serves it as `method: mtp`. That is the hybrid
+spec path — no external draft model, and the Phase 8 draft-model pair stays the Llama route.
+
+Implemented so far: `speculative.method: mtp` parses and validates (`6be36f3b`) and is refused at
+startup with `speculative_mtp_unimplemented` until the proposer lands (an explicit refusal, not a
+silent plain decode).
+
+Slices, in order:
+1. **Loader**: map `mtp.pre_fc_norm_hidden`, `mtp.pre_fc_norm_embedding`, `mtp.fc`
+   (`[hidden, 2*hidden]`), `mtp.layers.0.*` (a full-attention layer; Qwen3.6's FFN is MoE with a
+   shared expert), `mtp.norm` into `MtpWeights`; load them only with `method: mtp` instead of
+   `skipped_prefixes`.
+2. **Hidden export**: the target executor keeps the final pre-head hidden rows of the prefill
+   (`take_hidden()` next to `take_trace`), because the MTP attention layer needs its own K/V for
+   every prompt position, computed from those rows.
+3. **MTP layer**: a one-layer full-attention executor (`num_layers = 1`, `LayerKind::Full`, the
+   target's dims/MoE) with a dedicated KV slot; `forward_mtp(hidden_rows, embed_rows, positions)`
+   applies pre-norm → concat → fc → the layer → `mtp.norm` → LM head.
+4. **Proposer**: `MtpProposer` implements `Proposer`: prefill its KV from the prompt's hidden
+   rows + shifted token embeddings, then each round drafts `num_tokens` autoregressively through
+   the same layer; the existing verifier/rollback applies unchanged.
+5. **Gates**: a tiny-fixture MTP test (the tiny writers gain `mtp.*`), then Qwen3.5-9B golden/A-B/
+   throughput, then Qwen3.6 (after its TP numerics gate route).
