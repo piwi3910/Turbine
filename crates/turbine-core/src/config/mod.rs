@@ -565,6 +565,14 @@ impl Config {
         }
         self.validate_phase2()?;
         self.speculative.validate(self.effective_max_running())?;
+        // The MTP proposer (the checkpoint's own `mtp.*` head) is the next spec slice; until it
+        // is wired, an explicit refusal beats silently decoding without speculation.
+        if self.speculative.method == SpeculativeMethod::Mtp {
+            return Err(invalid(
+                "speculative.method",
+                "speculative_mtp_unimplemented: the checkpoint MTP proposer is not wired yet",
+            ));
+        }
         if self.speculative.method == SpeculativeMethod::Draft
             && (self
                 .parallel

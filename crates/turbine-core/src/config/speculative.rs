@@ -17,6 +17,10 @@ pub enum SpeculativeMethod {
     #[default]
     None,
     Draft,
+    /// The checkpoint's own MTP (multi-token prediction) head drafts the proposals: an in-model
+    /// proposer, no external checkpoint (Qwen3.5/3.6 ship `mtp.*`). Implemented by the `mtp`
+    /// proposer; a checkpoint without those weights is refused at startup.
+    Mtp,
 }
 
 impl SpeculativeMethod {
@@ -24,6 +28,7 @@ impl SpeculativeMethod {
         match self {
             SpeculativeMethod::None => "none",
             SpeculativeMethod::Draft => "draft",
+            SpeculativeMethod::Mtp => "mtp",
         }
     }
 }
@@ -71,6 +76,22 @@ impl SpeculativeConfig {
                 reason: format!("must be between 0 and 1, got {}", self.min_acceptance),
             });
         }
+        if self.method == SpeculativeMethod::Mtp {
+            // The MTP head lives in the target checkpoint; no draft path is read. The proposal
+            // rows are the same `num_tokens + 1`.
+            let rows = self.num_tokens.saturating_add(1);
+            if rows > effective_max_running {
+                return Err(ConfigError::Invalid {
+                    key: "speculative.num_tokens".to_string(),
+                    reason: format!(
+                        "speculative_rows: num_tokens + 1 ({rows}) exceeds the plan's \
+                         logits-row capacity scheduler.effective_max_running() \
+                         ({effective_max_running})"
+                    ),
+                });
+            }
+            return Ok(());
+        }
         if self.method != SpeculativeMethod::Draft {
             return Ok(());
         }
@@ -107,6 +128,10 @@ mod tests {
         let cfg: SpeculativeConfig = serde_norway::from_str("method: draft").unwrap();
         assert_eq!(cfg.method, SpeculativeMethod::Draft);
         assert_eq!(SpeculativeConfig::default().method, SpeculativeMethod::None);
+        let mtp: SpeculativeConfig = serde_norway::from_str("method: mtp").unwrap();
+        assert_eq!(mtp.method, SpeculativeMethod::Mtp);
+        assert_eq!(mtp.method.as_str(), "mtp");
+        mtp.validate(64).unwrap();
         assert!(serde_norway::from_str::<SpeculativeConfig>("method: eagle").is_err());
         assert!(serde_norway::from_str::<SpeculativeConfig>("proposer: draft").is_err());
     }

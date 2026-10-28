@@ -1676,6 +1676,17 @@ fn phase5p_keys() {
 }
 
 #[test]
+fn mtp_is_refused_until_its_proposer_lands() {
+    let err =
+        parse(TS15_EXAMPLE, &["speculative.method=mtp"]).expect_err("mtp has no proposer yet");
+    assert_eq!(err.key(), Some("speculative.method"), "{err}");
+    assert!(
+        err.to_string().contains("speculative_mtp_unimplemented:"),
+        "{err}"
+    );
+}
+
+#[test]
 fn speculative_parallel_refused() {
     let sets = |tp: &str, pp: &str| -> Vec<String> {
         vec![
