@@ -729,6 +729,20 @@ Interfaces:
 - [ ] Gate: `scripts/gate.sh` — expect `gate: ok`
 - [ ] Commit: `test(qwen3.5): hybrid golden, GSM8K and throughput gates (Qwen3.5-9B, Qwen3.6-35B-A3B FP8)`
 
+**Outcome (2026-10-28).** The Qwen3.5-9B row's model is correct: an engine CPU trace vs
+transformers 5.9.0 hooks on p16 matches to BF16 rounding at every layer and HIP matches CPU. Its
+golden failures were hybrid prefix reuse running on a stale state — the snapshot buffer was sized
+one entry per L0 block (15.2 GB) and failed to allocate. Sized per interval (103 MB) and with TP
+prefix reuse off, Qwen3.5 golden is **14/16**; the two left are tolerance-boundary numerics
+(p03 token-identical 32/32 but 0.639 vs the 0.56 tail bound; p09 a 0.025-margin near-tie), not a
+model bug. The Qwen3.6-35B-A3B-FP8 row stays open: its TP2 path has a documented 1/3 one-device
+greedy agreement (the tp2 trace leg relaxes deep-layer bounds), the dequantized-BF16 per-layer
+diff matches through layer 20 and drifts ≤1 % by layer 38, and the recurrence amplifies TP
+summation-order differences. The one-device golden bar is unreachable on TP2; gating it needs the
+S-11 multi-GPU reference/spread route (no `_multi_gpu` keys exist yet), and spec decoding on the
+family waits behind that. Details: `.procoder/handoff/p7-t35-hybrid-debug.md`, perf-log
+"P7 hybrid prefix-reuse correctness"/"P7 Qwen3.6 placement probes".
+
 ## Task 36: OLMoE FP8 KV — calibrated V scales (S-15)
 
 > Amended 2026-10-08 (user decision A, "P7 OLMoE FP8 KV golden reference"): the gate's emulated-KV reference is regenerated with the calibrated (served) scales (`uv run scripts/golden/quant_reference.py --kv-quant fp8_e4m3` with the cached scales, a CPU fixture job under `fixture.lock`) before golden c1/c16; "the existing emulated-KV reference" below means that regenerated file.
