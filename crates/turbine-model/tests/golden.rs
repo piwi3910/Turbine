@@ -1115,7 +1115,9 @@ fn hip_trace_vs_cpu_qwen3_5() {
     // through the FP8 GEMM. A checkpoint whose format cannot be resolved, or a layout that
     // refuses it, fails here with the loader's reason code.
     let provider = shim_provider(Arc::clone(&ctx));
-    {
+    // The `fp8_block` shared-expert / expert layout is the 35B MoE checkpoint's; the dense 9B
+    // has a plain MLP and takes the ordinary trace leg below.
+    if cfg.family.0.name() == "qwen3_5_moe" {
         use turbine_model::weights::{LinearSlot, QuantScheme, resolve_for_providers};
         let all = cfg.family.0.weight_slots(&cfg);
         let linear = |name: &str| -> LinearSlot {
