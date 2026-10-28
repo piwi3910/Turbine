@@ -2626,3 +2626,15 @@ The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this
   (both forced paths at 1/8/256 tokens, all three formats) 8/8 PASS; `gate.sh` 1154/1154.
 - Speculative decoding is not available for this family (support-matrix pairing, TP>1 refusal,
   no same-family hybrid draft); the hybrid golden gate is still open (see the handoff).
+
+### P7/Qwen3.6 next-step blocker (2026-10-28)
+
+TP decode graphs and TP overlap scheduling cannot engage for Qwen3.6: the quantized MoE FFN hook
+is not graph-capturable because `turbine_hip_moe_quant` requires `host_expert_offsets` (a
+device→host readback per MoE layer, `TURBINE_IMPL_NEEDS_HOST_OFFSETS`). The grouped quant kernel
+already reads `d->expert_offsets` on the device; only `first`/`rows`/`active` and validation come
+from the host copy. The prerequisite for both features is a device-offset quantized MoE path
+(device-computed rows/first/active with a fixed max-row scratch, new impl name, ABI v2.20), after
+which `parallel.tp_decode_graphs` can capture the step. Spec decoding for the hybrid families is
+further out: it needs a provisioned same-family draft, support-matrix rows, and a TP/EP draft path
+(`speculative_parallel_unsupported` refuses TP>1 today).
