@@ -22,8 +22,9 @@ parallel:
   tensor_parallel_size: 2
   data_parallel_size: 1
   devices: [0, 1]
-  # auto: hostmem (RCCL above its thresholds) in local mode, rccl in static mode.
-  collective_backend: auto
+  # RCCL measured 30.4 tok/s c1 vs `auto`/hostmem's 22.0 and EP2/RCCL's 27.3
+  # (2026-10-28, Qwen3.6-35B-A3B-FP8, 128-token greedy request with thinking off).
+  collective_backend: rccl
 kv:
   block_tokens: 128
   gpu:

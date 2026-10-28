@@ -2603,3 +2603,20 @@ The Phase 7 exit gates on the integration tip `212ae15e`. No code change of this
 - **10-minute soak with the draft**: PASS — ITL p99 210 ms vs 170.5 ms calibrated (1.23×), 4276×200 + 11×429 (`queue_full`) + 2557 `queue_timeout`, 0 client drops, GREEN 5 s after cooldown, KV idle, reserve held.
 - **Decision (S-9)**: the c1 bar missed, so the `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` row stays `experimental` with `P8_PENDING_REASON` carrying 0.94×/17.1 %; evidence in `tests/bench/phase-8-speculative-decoding/`. The miss is the recorded outcome, not papered over.
 - P8 closed: 2026-10-27 — speculative decoding shipped (draft proposer, exact verifier, greedy/sampled rounds, rollback, hybrid scratch, config/registry/metrics/status, lab tooling); all exit gates pass except the S-11 c1 bar (0.937× vs ≥1.3×, acceptance 17.1 %, TTFT 1.006×, c16 0.979×, soak PASS, vLLM 64.47 tok/s reference). The user accepted the experimental `amd gfx1201 LlamaForCausalLM bf16 bf16 draft` row with `P8_PENDING_REASON` carrying the miss; no flip. Evidence: `tests/bench/phase-8-speculative-decoding/`.
+
+### P7 Qwen3.6 placement probes (2026-10-28)
+
+`Qwen/Qwen3.6-35B-A3B-FP8` served on both R9700s, thinking off, 128-token greedy request:
+- TP2 + `hostmem`: **22.0 tok/s** c1
+- TP2 + `rccl`: **30.4 tok/s** c1, **414.2 tok/s** at c16 (16 × 256 tokens)
+- EP2 + `rccl`: **27.3 tok/s** c1
+- Collectives are not the bottleneck: all-reduce 4.4 µs each (20,898 calls, 0.09 s total);
+  decode forward is 32.6 ms/token and is essentially all kernel time.
+- `execution.decode_graphs` and `execution.overlap_scheduling` are refused under a
+  tensor-parallel group (`event="decode_graphs_unavailable"` / `"overlap_scheduling_unavailable"`,
+  reason `tensor_parallel`), so TP decode runs eagerly; that, not the collective backend, is the
+  remaining gap to vLLM's 40+ c1. `parallel.tp_decode_graphs: true` measured the same as off
+  (30.3 vs 30.4), so the TP graph path does not engage for this hybrid MoE.
+- `scripts/lab/phase7-novanas-qwen36-tp2.yaml` now sets `collective_backend: rccl`.
+- Speculative decoding is not available for this family (support-matrix pairing, TP>1 refusal,
+  no same-family hybrid draft); the hybrid golden gate is still open (see the handoff).
