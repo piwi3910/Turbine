@@ -86,3 +86,18 @@ engine's own HIP-vs-CPU trace agrees. The committed golden reference comes from 
 the **FP8** checkpoint, so the next authoritative comparison is an FP8 transformers trace (CPU
 fp8 may be unsupported) or an engine-vs-reference top-5 logits comparison on p01. The BF16-deq
 copy and its trace are for diagnosis only and are not the golden reference.
+
+## Root cause of the Qwen3.6 golden gap (2026-10-28)
+
+The Qwen3.6 TP2 path is **known to diverge from the one-device reference**: `qwen3_5_moe_tp2_trace_leg`
+documents "the one-device greedy agreement is 1/3, and `resid_attn` exceeds the bound from layer 15
+on", and the test was relaxed to (a) rank-vs-rank bitwise agreement, (b) structure/counts, (c) only
+the first full-attention layer held to the trace bound. The Gated DeltaNet value-head sharding (32
+v_heads → 16 per rank, with the 16 k_heads' repeat-interleave mapping into the `[q|k|v]` concat)
+is the suspect: a wrong q/k slice for a rank's v-head group changes the recurrence and drifts the
+residual stream, while the LM head and logits path are contiguous and correct by inspection.
+
+So the 1/16 is the TP sharding accuracy gap, not FP8 dequant, prefix reuse (tested off, unchanged)
+or device sampling (tested off, unchanged: same token 279 at -2.867 vs the reference's 52250 at
+-0.62). Fix order: the GDN `in_proj_qkv`/conv shard mapping in `tp.rs` (`SlotSource` three-part
+slice), then re-run the tp2 trace leg expecting greedy agreement ≫ 1/3, then the Qwen3.6 golden.
