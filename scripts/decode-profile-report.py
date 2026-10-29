@@ -70,7 +70,7 @@ def summarize(steps):
         spans.append(end - begin)
         busy = sum(d for _, _, d, _ in step)
         busy_totals.append(busy)
-        for b, e, d, name in step:
+        for _b, _e, d, name in step:
             per_kernel[name][0] += 1
             per_kernel[name][1] += d
         for (_, e1, _, n1), (b2, _, _, n2) in pairwise(step):

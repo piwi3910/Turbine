@@ -15,7 +15,7 @@ import argparse
 import json
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
 
 def main() -> None:
@@ -26,7 +26,6 @@ def main() -> None:
     args = parser.parse_args()
 
     ids = json.loads(args.ids)
-    tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=False)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_dir,
         dtype=torch.bfloat16 if args.bf16 else torch.float32,
