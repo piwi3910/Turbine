@@ -172,6 +172,11 @@ fn get_u16(b: &[u8], at: usize) -> u16 {
 
 /// K and V of one record, in F32 (before the L0 rounding).
 fn decode_record_with(w: TqWidths, r: &[u8], s: &HeadSigns) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(
+        r.len(),
+        w.record_bytes(),
+        "TurboQuant record must have its encoded byte length"
+    );
     let f = Fields::of(w);
     let k = TqVec {
         codes: r[f.k_codes..f.k_norm].to_vec(),
