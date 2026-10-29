@@ -177,6 +177,12 @@ spec:
             # env paths above stay valid.
             path: /opt/rocm/core-10.1
             type: Directory
+        # /etc/alternatives/rocm-lib (-> /opt/rocm/core-10.1/lib on quadronix) so binaries
+        # that reference the alternatives path resolve, as in novanas-cluster-job.yaml.
+        - name: rocm-lib-alternative
+          hostPath:
+            path: /etc/alternatives/rocm-lib
+            type: Directory
         - name: models
           hostPath:
             path: /home/piwi/turbine-models
