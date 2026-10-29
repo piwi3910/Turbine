@@ -128,6 +128,11 @@ impl ExpertTokenCounts {
     /// Adds one step: `offsets[i]` are MoE layer `placement.layers[i]`'s `[experts + 1]` expert
     /// offsets (the sorted routed rows of expert `e` are `offsets[e]..offsets[e + 1]`).
     pub(crate) fn record(&self, placement: &ExpertPlacement, offsets: &[&[i32]]) {
+        assert_eq!(
+            offsets.len(),
+            placement.layers.len(),
+            "one expert offset slice is required for each placement layer"
+        );
         let mut s = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if s.per_layer.len() != placement.layers.len() {
             let experts = placement.layers.first().map_or(0, |(_, r)| r.len());
