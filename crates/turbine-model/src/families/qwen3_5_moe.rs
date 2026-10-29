@@ -319,6 +319,78 @@ pub fn qwen3_5_moe_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
     slots
 }
 
+/// The checkpoint layout of a Qwen3.6 MoE checkpoint's MTP head (`mtp.*`): the two pre-fc
+/// norms, `fc`, the single `mtp.layers.0` full-attention MoE layer with the checkpoint's own
+/// (per-head interleaved) `q_proj` and per-expert expert weights, and `mtp.norm`. Appended to
+/// [`qwen3_5_moe_checkpoint_slots`] by [`crate::testing::tiny`]'s MTP writer; the one-layer MTP
+/// executor reaches these through [`super::qwen3_5::mtp_aliases`].
+pub fn qwen3_5_moe_mtp_checkpoint_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
+    let hidden = cfg.hidden as usize;
+    let heads = cfg.num_attention_heads as usize;
+    let kv_heads = cfg.num_kv_heads as usize;
+    let head_dim = cfg.head_dim as usize;
+    let q = heads * head_dim;
+    let kv = kv_heads * head_dim;
+    let (experts, inter, shared) = match cfg.moe {
+        Some(m) => (
+            m.num_experts as usize,
+            m.expert_intermediate as usize,
+            m.shared_inter
+                .expect("a Qwen3.6 MoE configuration carries a shared expert") as usize,
+        ),
+        None => (0, 0, 0),
+    };
+    let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: crate::executor::decoder::is_norm_weight(&name),
+        name,
+        shape,
+        stack: None,
+        source: None,
+    };
+    let p = "mtp.layers.0";
+    let mut slots = vec![
+        slot("mtp.pre_fc_norm_hidden.weight".into(), vec![hidden]),
+        slot("mtp.pre_fc_norm_embedding.weight".into(), vec![hidden]),
+        slot("mtp.fc.weight".into(), vec![hidden, 2 * hidden]),
+        slot(format!("{p}.input_layernorm.weight"), vec![hidden]),
+        slot(format!("{p}.self_attn.q_proj.weight"), vec![2 * q, hidden]),
+        slot(format!("{p}.self_attn.k_proj.weight"), vec![kv, hidden]),
+        slot(format!("{p}.self_attn.v_proj.weight"), vec![kv, hidden]),
+        slot(format!("{p}.self_attn.o_proj.weight"), vec![hidden, q]),
+        slot(format!("{p}.self_attn.q_norm.weight"), vec![head_dim]),
+        slot(format!("{p}.self_attn.k_norm.weight"), vec![head_dim]),
+        slot(format!("{p}.post_attention_layernorm.weight"), vec![hidden]),
+        slot(
+            format!("{p}.{}.weight", OLMOE_NAMES.router),
+            vec![experts, hidden],
+        ),
+    ];
+    for e in 0..experts {
+        for (proj, shape) in [
+            (OLMOE_NAMES.gate, vec![inter, hidden]),
+            (OLMOE_NAMES.up, vec![inter, hidden]),
+            (OLMOE_NAMES.down, vec![hidden, inter]),
+        ] {
+            slots.push(slot(
+                format!("{p}.{}.{e}.{proj}.weight", OLMOE_NAMES.experts),
+                shape,
+            ));
+        }
+    }
+    let sp = format!("{p}.mlp.shared_expert");
+    slots.extend([
+        slot(format!("{sp}.gate_proj.weight"), vec![shared, hidden]),
+        slot(format!("{sp}.up_proj.weight"), vec![shared, hidden]),
+        slot(format!("{sp}.down_proj.weight"), vec![hidden, shared]),
+        slot(
+            format!("{p}.mlp.shared_expert_gate.weight"),
+            vec![1, hidden],
+        ),
+        slot("mtp.norm.weight".into(), vec![hidden]),
+    ]);
+    slots
+}
+
 /// The checkpoint's own tensor layout of a Qwen3.6 MoE text model, with unique names and the
 /// per-head interleaved `q_proj` `[2·q_dim, hidden]` (the form the tiny writer emits; the
 /// loader's [`qwen3_5_moe_slots`] de-interleaves it). The MoE FFN is written per expert and as

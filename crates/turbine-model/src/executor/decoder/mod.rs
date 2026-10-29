@@ -227,7 +227,12 @@ impl DecoderDims {
             quant,
             bf16_linears,
             window_left: cfg.layer_kinds.iter().map(|k| window_left(*k)).collect(),
-            gdn: cfg.gdn,
+            // A configuration with no linear-attention layer has no GDN state (e.g. the
+            // one-layer MTP head): without this the executor would build GDN state buffers and
+            // exhaust its one slot on the second forward.
+            gdn: cfg
+                .gdn
+                .filter(|_| cfg.layer_kinds.contains(&LayerKind::LinearAttention)),
         }
     }
 
@@ -988,6 +993,29 @@ fn host_f32(t: &Tensor) -> Result<Vec<f32>, ModelError> {
         .collect())
 }
 
+/// Converts the first `words` values of an activation-dtype byte buffer to `F32` (the MTP
+/// hidden capture's blocking read, [`DecoderExecutor::take_hidden`]).
+fn decode_f32(bytes: &[u8], dtype: DType, words: usize) -> Vec<f32> {
+    match dtype {
+        DType::F32 => bytes
+            .chunks_exact(4)
+            .take(words)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        DType::BF16 => bytes
+            .chunks_exact(2)
+            .take(words)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect(),
+        DType::F16 => bytes
+            .chunks_exact(2)
+            .take(words)
+            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The skeleton's parameters of one layer, and the hooks'.
 struct Layer {
     input_norm: Tensor,
@@ -1125,6 +1153,15 @@ type PendingSnapshots = Vec<(SeqId, u32, Vec<(u32, u32)>)>;
 /// The decoder executor: ragged batches of up to `max_seqs` sequences and `max_batch_tokens`
 /// tokens over the paged KV pool, on one device (or as one rank of a tensor-parallel group,
 /// [`DecoderExecutor::new_tp`]), for any [`DecoderSpec`].
+/// P8 MTP: the head's front-matter weights on device. The pre-fc norms carry the `1 + w`
+/// offset baked in; `fc` is `[hidden, 2·hidden]` (the reference's `ColumnParallelLinear`, so
+/// `fc(cat)` is `cat @ fc^T`).
+struct MtpFrontTensors {
+    pre_hidden: Tensor,
+    pre_embedding: Tensor,
+    fc: Tensor,
+}
+
 pub struct DecoderExecutor {
     /// Decode graphs, when on. First field: the graphs record pointers into the buffers below
     /// and are destroyed before them.
@@ -1161,6 +1198,12 @@ pub struct DecoderExecutor {
     /// P8 MTP: the last forward's final pre-norm residual rows (`rows × hidden` F32) when the
     /// hidden capture is on; the MTP head's attention prefill needs them.
     hidden_capture: Option<Tensor>,
+    /// P8 MTP: an uploaded `[rows, hidden]` F32 input that replaces the embedding of a forward
+    /// with exactly that many tokens (the MTP head feeds `fc(concat(hidden, embed))`).
+    injected: Option<(Tensor, usize)>,
+    /// P8 MTP: the head's on-device front-matter weights ([`DecoderExecutor::set_mtp_front`]);
+    /// the front matter then runs on device with no host round trip.
+    mtp_front: Option<MtpFrontTensors>,
     /// `None` when the model ties its LM head to `embed` (or on a stage before the last).
     lm_head: Option<Tensor>,
     bufs: Buffers,
@@ -1904,6 +1947,8 @@ impl DecoderExecutor {
             layers,
             final_norm,
             hidden_capture: None,
+            injected: None,
+            mtp_front: None,
             lm_head,
             bufs,
             ffn_buffers,
@@ -1986,26 +2031,309 @@ impl DecoderExecutor {
     /// allocating `max_rows × hidden` F32 on this rank's memory.
     pub fn set_hidden_capture(&mut self, on: bool, max_rows: usize) -> Result<(), ModelError> {
         self.hidden_capture = if on {
-            let words = max_rows.saturating_mul(self.dims.hidden);
-            Some(Tensor::empty(&self.mem, &[words], DType::F32)?)
+            Some(Tensor::empty(
+                &self.mem,
+                &[max_rows.max(1), self.dims.hidden],
+                self.dims.act,
+            )?)
         } else {
             None
         };
         Ok(())
     }
 
-    /// P8 MTP: the captured final hidden rows of the last forward (blocking read).
+    /// P8 MTP: uploads `[rows, hidden]` F32 input rows that the next forward with exactly
+    /// `rows` tokens uses instead of embedding its token ids. Stored in the activation dtype
+    /// (the residual stream's), so it can replace the embedding output directly.
+    pub fn set_hidden_input(&mut self, rows: usize, data: &[f32]) -> Result<(), ModelError> {
+        let words = rows.saturating_mul(self.dims.hidden);
+        if data.len() != words {
+            return Err(invalid(format!(
+                "hidden input has {} values, expected {rows} × {}",
+                data.len(),
+                self.dims.hidden
+            )));
+        }
+        let t = Tensor::empty(&self.mem, &[words], self.dims.act)?;
+        let mut bytes = Vec::with_capacity(words * self.dims.act.size_bytes());
+        match self.dims.act {
+            DType::F32 => {
+                for v in data {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            DType::BF16 => {
+                for v in data {
+                    bytes.extend_from_slice(&half::bf16::from_f32(*v).to_le_bytes());
+                }
+            }
+            DType::F16 => {
+                for v in data {
+                    bytes.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+                }
+            }
+            other => {
+                return Err(invalid(format!(
+                    "the hidden input is stored as {}",
+                    other.as_str()
+                )));
+            }
+        }
+        t.storage.whole().write_bytes(&bytes)?;
+        self.injected = Some((t, rows));
+        Ok(())
+    }
+
+    /// P8 MTP: the embedding rows of `tokens` (`tokens.len() × hidden` F32), the MTP front
+    /// matter's `pre_fc_norm_embedding` input (single-device).
+    pub fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        if self.tp.is_some() || self.pp.is_some() {
+            return Err(invalid(
+                "embed_rows is single-device only (no tensor or pipeline parallelism)".into(),
+            ));
+        }
+        let table = self
+            .embed
+            .as_ref()
+            .ok_or_else(|| invalid("embedding on a stage without the table".into()))?;
+        let rows = tokens.len();
+        let words = rows * self.dims.hidden;
+        let ids = Tensor::empty(&self.mem, &[rows], DType::I32)?;
+        let mut bytes = Vec::with_capacity(rows * 4);
+        for t in tokens {
+            bytes.extend_from_slice(&(*t as i32).to_le_bytes());
+        }
+        ids.storage.whole().write_bytes(&bytes)?;
+        let out = Tensor::empty(&self.mem, &[words], self.dims.act)?;
+        let embedding = self.dims.embedding();
+        self.op(OpConfig::Embedding(embedding), || {
+            self.registry
+                .embedding(&embedding)
+                .execute(&mut EmbeddingContext {
+                    ids: TensorView::contiguous(ids.storage.whole(), 0, &[rows], DType::I32),
+                    table: table.view(),
+                    out: TensorView::contiguous(
+                        out.storage.whole(),
+                        0,
+                        &[rows, self.dims.hidden],
+                        self.dims.act,
+                    ),
+                    vocab_offset: 0,
+                })
+        })?;
+        let bytes = out.storage.whole().read_bytes()?;
+        Ok(decode_f32(&bytes, out.dtype, words))
+    }
+
+    /// P8 MTP: the captured final hidden rows of the last forward (blocking read), converted to
+    /// F32.
     pub fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
         let buf = self.hidden_capture.as_ref()?;
         let words = rows.saturating_mul(self.dims.hidden);
         let bytes = buf.storage.whole().read_bytes().ok()?;
-        Some(
-            bytes
-                .chunks_exact(4)
-                .take(words)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect(),
-        )
+        Some(decode_f32(&bytes, buf.dtype, words))
+    }
+
+    /// P8 MTP: installs the head's front-matter weights on device (the pre-fc norms in the
+    /// activation dtype with the `1 + w` offset already baked in, `fc` `[hidden, 2·hidden]`).
+    /// The front matter then runs on device ([`DecoderExecutor::mtp_step`]) with no host round
+    /// trip.
+    pub fn set_mtp_front(
+        &mut self,
+        pre_hidden: Tensor,
+        pre_embedding: Tensor,
+        fc: Tensor,
+    ) -> Result<(), ModelError> {
+        let h = self.dims.hidden;
+        for (t, want) in [(&pre_hidden, h), (&pre_embedding, h), (&fc, h * 2 * h)] {
+            if t.numel() != want {
+                return Err(invalid(format!(
+                    "mtp front tensor has {} values, expected {want}",
+                    t.numel()
+                )));
+            }
+        }
+        if pre_hidden.dtype != self.dims.act || pre_embedding.dtype != self.dims.act {
+            return Err(invalid(
+                "mtp pre-fc norms must be in the activation dtype".into(),
+            ));
+        }
+        self.mtp_front = Some(MtpFrontTensors {
+            pre_hidden,
+            pre_embedding,
+            fc,
+        });
+        Ok(())
+    }
+
+    /// P8 MTP: a device view of the last forward's captured `[rows, hidden]` hidden rows.
+    pub fn mtp_capture_view(&self, rows: usize) -> Option<TensorView<'_>> {
+        Some(self.hidden_capture.as_ref()?.view().rows(0, rows))
+    }
+
+    /// P8 MTP: allocates a fresh `[rows, hidden]` activation-dtype buffer on this memory.
+    pub fn mtp_rows(&self, rows: usize) -> Result<Tensor, ModelError> {
+        Ok(Tensor::empty(
+            &self.mem,
+            &[rows.max(1), self.dims.hidden],
+            self.dims.act,
+        )?)
+    }
+
+    /// P8 MTP: writes `values` (`rows × hidden` F32) into the activation-dtype device tensor
+    /// `t` (the inverse of the capture read; used to seed device rows from the host).
+    pub fn mtp_write_rows(&self, t: &Tensor, values: &[f32]) -> Result<(), ModelError> {
+        let mut bytes = Vec::with_capacity(values.len() * self.dims.act.size_bytes());
+        match self.dims.act {
+            DType::F32 => {
+                for v in values {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            DType::BF16 => {
+                for v in values {
+                    bytes.extend_from_slice(&half::bf16::from_f32(*v).to_le_bytes());
+                }
+            }
+            DType::F16 => {
+                for v in values {
+                    bytes.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+                }
+            }
+            other => {
+                return Err(invalid(format!("activation dtype {}", other.as_str())));
+            }
+        }
+        t.storage.whole().write_bytes(&bytes)?;
+        Ok(())
+    }
+
+    /// P8 MTP: `dst[dst_row .. dst_row + rows] = src[src_row .. src_row + rows]` (a device copy).
+    pub fn mtp_copy_rows(
+        &self,
+        dst: &Tensor,
+        dst_row: usize,
+        src: TensorView<'_>,
+        src_row: usize,
+        rows: usize,
+    ) -> Result<(), ModelError> {
+        let hb = self.dims.hidden * self.dims.act.size_bytes();
+        let dst_slice = dst.storage.whole();
+        let d = dst_slice.sub(dst_row * hb, rows * hb);
+        let s = src.rows(src_row, rows).slice;
+        self.mem.copy_d2d(d.ptr(), s.ptr(), rows * hb)?;
+        Ok(())
+    }
+
+    /// P8 MTP: embeds `tokens` into `out [rows, hidden]` on device (no host round trip).
+    pub fn embed_into(&self, tokens: &[u32], out: TensorView<'_>) -> Result<(), ModelError> {
+        let rows = tokens.len();
+        let table = self
+            .embed
+            .as_ref()
+            .ok_or_else(|| invalid("embedding on a stage without the table".into()))?;
+        let ids = Tensor::empty(&self.mem, &[rows], DType::I32)?;
+        let mut bytes = Vec::with_capacity(rows * 4);
+        for t in tokens {
+            bytes.extend_from_slice(&(*t as i32).to_le_bytes());
+        }
+        ids.storage.whole().write_bytes(&bytes)?;
+        let embedding = self.dims.embedding();
+        self.op(OpConfig::Embedding(embedding), || {
+            self.registry
+                .embedding(&embedding)
+                .execute(&mut EmbeddingContext {
+                    ids: ids.view(),
+                    table: table.view(),
+                    out,
+                    vocab_offset: 0,
+                })
+        })
+    }
+
+    /// P8 MTP: `out = fc(cat([pre_fc_norm_embedding(embed), pre_fc_norm_hidden(hidden)]))` on
+    /// device, `[rows, hidden]` each (the concat is embedding first, per the reference).
+    fn mtp_front_into(
+        &self,
+        embed: TensorView<'_>,
+        hidden: TensorView<'_>,
+        out: TensorView<'_>,
+    ) -> Result<(), ModelError> {
+        let front = self
+            .mtp_front
+            .as_ref()
+            .ok_or_else(|| invalid("no mtp front matter installed".into()))?;
+        let rows = embed.shape[0];
+        let h = self.dims.hidden;
+        let en = Tensor::empty(&self.mem, &[rows, h], self.dims.act)?;
+        let hn = Tensor::empty(&self.mem, &[rows, h], self.dims.act)?;
+        self.rmsnorm(embed, &front.pre_embedding, en.view())?;
+        self.rmsnorm(hidden, &front.pre_hidden, hn.view())?;
+        let cat = Tensor::empty(&self.mem, &[rows, 2 * h], self.dims.act)?;
+        let hb = h * self.dims.act.size_bytes();
+        let cat_slice = cat.storage.whole();
+        let en_v = en.view();
+        let hn_v = hn.view();
+        for r in 0..rows {
+            let dst_e = cat_slice.sub(r * 2 * hb, hb);
+            let dst_h = cat_slice.sub(r * 2 * hb + hb, hb);
+            self.mem
+                .copy_d2d(dst_e.ptr(), en_v.rows(r, 1).slice.ptr(), hb)?;
+            self.mem
+                .copy_d2d(dst_h.ptr(), hn_v.rows(r, 1).slice.ptr(), hb)?;
+        }
+        self.gemm(cat.view(), front.fc.view(), out)
+    }
+
+    /// P8 MTP: one device-native head step. Embeds `tokens`, runs the front matter over
+    /// `hidden` (`[rows, hidden]`) on device into the injected input, then the shared layer
+    /// stack + final norm + LM head. `positions`/`kv_len`/`table` follow the MTP KV indexing
+    /// (the row for overall position `p` sits at MTP slot `p - 1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_step(
+        &mut self,
+        kv: &KvPoolView<'_>,
+        tokens: &[u32],
+        hidden: TensorView<'_>,
+        positions: &[u32],
+        kv_len: u32,
+        table: &[BlockId],
+        formats: &[u8],
+        seq: SeqId,
+    ) -> Result<Logits, ModelError> {
+        let rows = tokens.len();
+        if hidden.shape[0] != rows || positions.len() != rows {
+            return Err(invalid("mtp step rows disagree".into()));
+        }
+        if self.tp.is_some() || self.pp.is_some() {
+            return Err(invalid(
+                "the mtp head is single-device (no tensor or pipeline parallelism)".into(),
+            ));
+        }
+        let h = self.dims.hidden;
+        let embed = Tensor::empty(&self.mem, &[rows, h], self.dims.act)?;
+        self.embed_into(tokens, embed.view())?;
+        let x = Tensor::empty(&self.mem, &[rows, h], self.dims.act)?;
+        self.mtp_front_into(embed.view(), hidden, x.view())?;
+        self.injected = Some((x, rows));
+        let seqs = [SeqSlice {
+            seq,
+            q_start: 0,
+            q_len: rows as u32,
+            kv_len,
+            block_table: table,
+            block_formats: formats,
+            reduce: None,
+            logits_rows: 1,
+            state_slot: None,
+            snapshot_blocks: &[],
+        }];
+        self.forward(&BatchInput {
+            tokens,
+            positions,
+            seqs: &seqs,
+            kv,
+        })
     }
 
     /// The tensors recorded since tracing was enabled or last taken, in execution order; empty
@@ -3548,37 +3876,45 @@ impl DecoderExecutor {
             self.pp_recv(pp, t)?;
             self.record(None, "pp_recv", rows(&b.x, t))?;
         } else {
-            let table = self
-                .embed
-                .as_ref()
-                .ok_or_else(|| invalid("embedding on a stage without the table".into()))?;
-            let embedding = self.dims.embedding();
-            let vocab_offset = self.dims.tp.map_or(0, |tp| tp.vocab_offset as i64);
-            self.op(OpConfig::Embedding(embedding), || {
-                self.registry
-                    .embedding(&embedding)
-                    .execute(&mut EmbeddingContext {
-                        ids: self.meta.ids_view(p),
-                        table: table.view(),
-                        out: rows(&b.x, t),
-                        vocab_offset,
-                    })
-            })?;
-            for &(token, word, len) in runs {
+            if let Some((inj, _)) = self.injected.as_ref().filter(|(_, n)| *n == t) {
+                // P8 MTP: the caller uploaded the input rows; no embedding lookup runs.
+                let bytes = t * self.dims.hidden * self.dims.act.size_bytes();
+                self.mem
+                    .copy_d2d(rows(&b.x, t).slice.ptr(), inj.storage.whole().ptr(), bytes)?;
+                self.record(None, "injected", rows(&b.x, t))?;
+            } else {
+                let table = self
+                    .embed
+                    .as_ref()
+                    .ok_or_else(|| invalid("embedding on a stage without the table".into()))?;
+                let embedding = self.dims.embedding();
+                let vocab_offset = self.dims.tp.map_or(0, |tp| tp.vocab_offset as i64);
                 self.op(OpConfig::Embedding(embedding), || {
                     self.registry
                         .embedding(&embedding)
                         .execute(&mut EmbeddingContext {
-                            ids: self.head.ids_at(word, len),
+                            ids: self.meta.ids_view(p),
                             table: table.view(),
-                            out: rows(&b.x, t).rows(token, len),
+                            out: rows(&b.x, t),
                             vocab_offset,
                         })
                 })?;
+                for &(token, word, len) in runs {
+                    self.op(OpConfig::Embedding(embedding), || {
+                        self.registry
+                            .embedding(&embedding)
+                            .execute(&mut EmbeddingContext {
+                                ids: self.head.ids_at(word, len),
+                                table: table.view(),
+                                out: rows(&b.x, t).rows(token, len),
+                                vocab_offset,
+                            })
+                    })?;
+                }
+                // Each id was embedded by the rank whose shard holds it, zeros elsewhere.
+                self.all_reduce(&rows(&b.x, t))?;
+                self.record(None, "embed", rows(&b.x, t))?;
             }
-            // Each id was embedded by the rank whose shard holds it, zeros elsewhere.
-            self.all_reduce(&rows(&b.x, t))?;
-            self.record(None, "embed", rows(&b.x, t))?;
         }
         let fused = halves.is_none() && self.fuses_norm_residual(t);
         if let Some(first) = self.layers.first().filter(|_| !fused) {
@@ -3603,9 +3939,10 @@ impl DecoderExecutor {
             // The next stage continues from the residual stream (its input norm comes first).
             return self.pp_send(pp, t);
         }
-        // P8 MTP: keep the final residual rows (pre-final-norm) for the MTP head's prefill.
+        // P8 MTP: keep the final residual rows (pre-final-norm) for the MTP head. Both the target's
+        // hidden (`pre_fc_norm_hidden`'s input) and the head's own recurrence hidden are pre-norm.
         if let Some(h) = self.hidden_capture.as_ref() {
-            let bytes = p.total_q * self.dims.hidden * std::mem::size_of::<f32>();
+            let bytes = p.total_q * self.dims.hidden * self.dims.act.size_bytes();
             self.mem
                 .copy_d2d(h.storage.ptr(), b.x.storage.ptr(), bytes)?;
         }
@@ -3635,6 +3972,63 @@ impl ModelExecutor for DecoderExecutor {
 
     fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
         DecoderExecutor::take_hidden(self, rows)
+    }
+
+    fn set_mtp_front(
+        &mut self,
+        pre_hidden: Tensor,
+        pre_embedding: Tensor,
+        fc: Tensor,
+    ) -> Result<(), ModelError> {
+        DecoderExecutor::set_mtp_front(self, pre_hidden, pre_embedding, fc)
+    }
+
+    fn mtp_capture_view(&self, rows: usize) -> Option<TensorView<'_>> {
+        DecoderExecutor::mtp_capture_view(self, rows)
+    }
+
+    fn mtp_rows(&self, rows: usize) -> Result<Tensor, ModelError> {
+        DecoderExecutor::mtp_rows(self, rows)
+    }
+
+    fn mtp_write_rows(&self, t: &Tensor, values: &[f32]) -> Result<(), ModelError> {
+        DecoderExecutor::mtp_write_rows(self, t, values)
+    }
+
+    fn mtp_copy_rows(
+        &self,
+        dst: &Tensor,
+        dst_row: usize,
+        src: TensorView<'_>,
+        src_row: usize,
+        rows: usize,
+    ) -> Result<(), ModelError> {
+        DecoderExecutor::mtp_copy_rows(self, dst, dst_row, src, src_row, rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &mut self,
+        kv: &KvPoolView<'_>,
+        tokens: &[u32],
+        hidden: TensorView<'_>,
+        positions: &[u32],
+        kv_len: u32,
+        table: &[BlockId],
+        formats: &[u8],
+        seq: SeqId,
+    ) -> Result<Logits, ModelError> {
+        DecoderExecutor::mtp_step(
+            self, kv, tokens, hidden, positions, kv_len, table, formats, seq,
+        )
+    }
+
+    fn set_hidden_input(&mut self, rows: usize, data: &[f32]) -> Result<(), ModelError> {
+        DecoderExecutor::set_hidden_input(self, rows, data)
+    }
+
+    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        DecoderExecutor::embed_rows(self, tokens)
     }
 
     fn set_mixed_blocks(&mut self, on: bool) -> Result<(), ModelError> {

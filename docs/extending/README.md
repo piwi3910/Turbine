@@ -19,6 +19,7 @@ Every pluggable part of Turbine is one file (or directory) plus one entry in a s
 | Rank transport        | [rank-transport.md](rank-transport.md)               | `turbine_distributed::transport` (`rank_transport`)                | `parallel.ranks.transport`                          |
 | DP router policy      | [dp-router-policy.md](dp-router-policy.md)           | `turbine_distributed::router` (`dp_router_policy`)                 | `parallel.router`                                   |
 | Speculative proposer  | [speculative-proposer.md](speculative-proposer.md)   | `turbine_model::speculative` (`draft_model`)                       | `speculative.method`                                |
+| Speculative length    | [speculative-k-policy.md](speculative-k-policy.md)   | `turbine_model::speculative::k_policy` (`speculative_k_policy`)    | `speculative.k_policy`                              |
 
 ## The registry convention
 

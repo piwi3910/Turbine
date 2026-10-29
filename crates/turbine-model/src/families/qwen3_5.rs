@@ -198,12 +198,18 @@ pub(crate) fn gdn_state_layout(cfg: &ModelArchConfig) -> StateLayout {
     let Some(gdn) = cfg.gdn else {
         return StateLayout::default();
     };
+    // A configuration with no linear-attention layers has no GDN state (e.g. the one-layer MTP
+    // head): the executor must not build state slots it can never free.
+    let linear_layers = cfg
+        .layer_kinds
+        .iter()
+        .filter(|k| **k == LayerKind::LinearAttention)
+        .count() as u32;
+    if linear_layers == 0 {
+        return StateLayout::default();
+    }
     StateLayout {
-        linear_layers: cfg
-            .layer_kinds
-            .iter()
-            .filter(|k| **k == LayerKind::LinearAttention)
-            .count() as u32,
+        linear_layers,
         recurrent_bytes_per_layer: gdn.recurrent_bytes(),
         conv_bytes_per_layer: gdn.conv_bytes(),
         dtype: Some(StateDtype::F32),
@@ -433,6 +439,63 @@ pub fn qwen3_5_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
         slots.push(slot(LM_HEAD.into(), vec![vocab, hidden]));
     }
     slots
+}
+
+/// P8 MTP: the MTP head's extra parameter slots, outside the decoder layer the executor runs as
+/// its own: the two pre-fc norms and `fc` (`[hidden, 2·hidden]`, `hidden ∥ embedding → hidden`)
+/// that build the head's input rows. Loaded only under `speculative.method: mtp`. The head's
+/// layer body (`mtp.layers.0.*`, `mtp.norm.weight`) is not listed here — the one-layer MTP
+/// executor runs the standard family layer slots and reaches the head through [`mtp_aliases`].
+pub fn mtp_front_slots(cfg: &ModelArchConfig) -> Vec<WeightSlot> {
+    let hidden = cfg.hidden as usize;
+    let slot = |name: String, shape: Vec<usize>| WeightSlot {
+        float32_stored: crate::executor::decoder::is_norm_weight(&name),
+        name,
+        shape,
+        stack: None,
+        source: None,
+    };
+    vec![
+        slot("mtp.pre_fc_norm_hidden.weight".into(), vec![hidden]),
+        slot("mtp.pre_fc_norm_embedding.weight".into(), vec![hidden]),
+        slot("mtp.fc.weight".into(), vec![hidden, 2 * hidden]),
+    ]
+}
+
+/// P8 MTP: the aliases that map the checkpoint's MTP head into the one-layer MTP executor's own
+/// layer names, so the standard [`DecoderExecutor`](crate::executor::DecoderExecutor) loads the
+/// head as its single layer 0. The head's `mtp.layers.0.*` tensors share a text layer's
+/// suffixes, and `mtp.norm.weight` is the layer stack's final norm; `layer_tensors` are the
+/// checkpoint's `mtp.layers.0.*` names. Returns `(from, to)` pairs for
+/// [`SafetensorsIndex::alias`](crate::safetensors::SafetensorsIndex::alias); the alias
+/// overwrites the target's real layer-0 entry, so the MTP executor builds its own index.
+pub fn mtp_aliases(cfg: &ModelArchConfig, layer_tensors: &[String]) -> Vec<(String, String)> {
+    let tp = cfg.family.0.text_prefix();
+    let mut out: Vec<(String, String)> = layer_tensors
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix("mtp.layers.0.")
+                .map(|suffix| (name.clone(), format!("{tp}.layers.0.{suffix}")))
+        })
+        .collect();
+    out.push(("mtp.norm.weight".to_string(), format!("{tp}.norm.weight")));
+    out
+}
+
+/// P8 MTP: the one-layer architecture the MTP executor runs — the target's dims and (for the
+/// MoE family) its FFN in a single [`LayerKind::Full`] layer, reached through
+/// [`mtp_aliases`]. Everything else (hidden, heads, experts, rope, norms, tying) is the
+/// target's, so the loaded weights and the executor behave exactly like the target's layer 0.
+pub fn mtp_arch_config(cfg: &ModelArchConfig) -> ModelArchConfig {
+    let mut m = cfg.clone();
+    m.num_layers = 1;
+    // The family derives `layer_kinds` from `full_attention_interval` (hybrid_layer_kinds), so
+    // the interval must say "every layer is full attention" — otherwise the one MTP layer would
+    // build as a GDN linear-attention layer.
+    m.full_attention_interval = Some(1);
+    m.layer_kinds = vec![LayerKind::FullAttention];
+    m.state = StateLayout::default();
+    m
 }
 
 /// The checkpoint's own tensor layout of a Qwen3.5 text model, with unique names and the

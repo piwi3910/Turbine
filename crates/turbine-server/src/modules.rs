@@ -33,6 +33,11 @@ pub fn card_profiles() -> &'static [&'static str] {
 pub static SCHEDULING_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_scheduler::policy::registry().names());
 
+/// Speculative-length policies (`speculative.k_policy`, Phase 8): the names of
+/// `turbine_model::speculative::k_policy::registry`.
+pub static SPECULATIVE_K_POLICIES: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| turbine_model::speculative::k_policy::registry().names());
+
 /// Eviction policies (`eviction_policy`): the names of `turbine_kv::policy::registry`.
 pub static EVICTION_POLICIES: LazyLock<Vec<&'static str>> =
     LazyLock::new(|| turbine_kv::policy::registry().names());
@@ -64,6 +69,7 @@ pub fn known_module_names() -> ModuleNames<'static> {
         backends: backends(),
         card_profiles: card_profiles(),
         scheduling_policies: &SCHEDULING_POLICIES,
+        speculative_k_policies: &SPECULATIVE_K_POLICIES,
         eviction_policies: &EVICTION_POLICIES,
         collective_backends: &COLLECTIVE_BACKENDS,
         rank_transports: &RANK_TRANSPORTS,

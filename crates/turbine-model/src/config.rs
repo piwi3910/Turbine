@@ -2311,4 +2311,47 @@ mod tests {
         }
         fs::remove_dir_all(dir).unwrap();
     }
+
+    /// P8 MTP: the head's front-matter slots (the two pre-fc norms and `fc`) and the aliases
+    /// that map the checkpoint's `mtp.layers.0.*` / `mtp.norm.weight` into the one-layer MTP
+    /// executor's own layer 0 (the family's text prefix) — Qwen3.6 MoE head dims.
+    #[test]
+    fn qwen36_mtp_head_slots_and_aliases() {
+        let cfg = load_model_config(&family_fixture("qwen3.6-35b-a3b-fp8")).unwrap();
+        let front = crate::families::qwen3_5::mtp_front_slots(&cfg);
+        let named: std::collections::HashMap<&str, &Vec<usize>> =
+            front.iter().map(|s| (s.name.as_str(), &s.shape)).collect();
+        // hidden 2048, 2·hidden = 4096.
+        assert_eq!(named["mtp.fc.weight"], &vec![2048, 4096]);
+        assert_eq!(named["mtp.pre_fc_norm_hidden.weight"], &vec![2048]);
+        assert_eq!(named["mtp.pre_fc_norm_embedding.weight"], &vec![2048]);
+
+        // The checkpoint head's layer tensors and norm alias into the executor's layer 0.
+        let tensors = vec![
+            "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+            "mtp.layers.0.mlp.gate.weight".to_string(),
+            "mtp.other.weight".to_string(),
+        ];
+        let aliases = crate::families::qwen3_5::mtp_aliases(&cfg, &tensors);
+        let has = |from: &str, to: &str| aliases.iter().any(|(f, t)| f == from && t == to);
+        assert!(has(
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(has(
+            "mtp.layers.0.mlp.gate.weight",
+            "model.language_model.layers.0.mlp.gate.weight"
+        ));
+        assert!(has("mtp.norm.weight", "model.language_model.norm.weight"));
+        // A non-head tensor is not aliased into the layer.
+        assert!(!aliases.iter().any(|(from, _)| from == "mtp.other.weight"));
+
+        // The executor runs the head as a single full-attention layer with the target's dims.
+        let m = crate::families::qwen3_5::mtp_arch_config(&cfg);
+        assert_eq!(m.num_layers, 1);
+        assert_eq!(m.layer_kinds, vec![LayerKind::FullAttention]);
+        assert_eq!(m.moe, cfg.moe);
+        assert_eq!(m.hidden, cfg.hidden);
+        assert_eq!(m.tie_word_embeddings, cfg.tie_word_embeddings);
+    }
 }

@@ -504,6 +504,31 @@ pub fn write_tiny_qwen3_5_moe_with(dir: &Path, seed: u64, extra: &TinyOptions) -
     )
 }
 
+/// [`write_tiny_qwen3_5_moe`] plus the checkpoint's MTP head (`mtp.*`), the Phase 8 MTP
+/// proposer's weights: the base MoE checkpoint layout with the head appended.
+pub fn write_tiny_qwen3_5_moe_with_mtp(dir: &Path, seed: u64) -> TinySpec {
+    let opts = TinyOptions {
+        tied: false,
+        template_with_tools: false,
+        head_dim: 64,
+        ..TinyOptions::default()
+    };
+    write_tiny_slots(
+        dir,
+        seed,
+        &qwen3_5_moe_config_json(),
+        &opts,
+        Some(mtp_checkpoint_slots),
+    )
+}
+
+/// The tiny MoE checkpoint layout plus the MTP head (`mtp.*`).
+fn mtp_checkpoint_slots(cfg: &ModelArchConfig) -> Vec<crate::loader::WeightSlot> {
+    let mut slots = crate::families::qwen3_5_moe::qwen3_5_moe_checkpoint_slots(cfg);
+    slots.extend(crate::families::qwen3_5_moe::qwen3_5_moe_mtp_checkpoint_slots(cfg));
+    slots
+}
+
 /// `config.json` of [`write_tiny_qwen3_5_moe`]: the keys of `Qwen/Qwen3.6-35B-A3B-FP8` at tiny
 /// size, under the multimodal wrapper's `text_config`.
 fn qwen3_5_moe_config_json() -> serde_json::Value {

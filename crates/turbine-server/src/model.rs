@@ -852,6 +852,82 @@ pub fn prepare_draft(
     prepare_rank(&draft_cfg, inventory, metrics, None)
 }
 
+/// Phase 8 MTP: the checkpoint's own `mtp.*` head as a one-layer executor and a one-sequence
+/// KV pool on the target's device memory, wrapped in the `mtp` proposer. The engine feeds it
+/// the target's per-step hidden rows. Only the Qwen3.5/3.6 hybrid families ship the head.
+pub struct MtpSetup {
+    pub proposer: turbine_model::speculative::mtp::MtpProposer,
+    pub hidden_dim: usize,
+}
+
+/// Loads the MTP head ([`turbine_model::mtp::load`]) over the target provider's device memory
+/// and builds its proposer. The head's weights and buffers come out of the target's already
+/// allocated memory: a footprint the target's budget did not charge, so an OOM here is exit 1.
+pub fn prepare_mtp(prepared: &PreparedModel) -> Result<MtpSetup, StartupError> {
+    let refuse = |code: &str, detail: String| StartupError::new(format!("{code}: {detail}"));
+    let family = prepared.arch.family.0.name();
+    if !matches!(family, "qwen3_5" | "qwen3_5_moe") {
+        return Err(refuse(
+            "speculative_mtp_family",
+            format!("the {family} family ships no `mtp.*` head"),
+        ));
+    }
+    let dir = prepared.index.dir();
+    let mcfg = turbine_model::families::qwen3_5::mtp_arch_config(&prepared.arch);
+    let opened = &prepared.provider.opened;
+    let block_tokens = prepared.block_tokens;
+    let opts = prepared.executor_options;
+    let requirements = executor::mtp_requirements(&mcfg, block_tokens, opts, &opened.providers);
+    let registry = KernelRegistry::build(
+        opened.providers.clone(),
+        &opened.order,
+        &requirements,
+        &prepared.kernel_metrics,
+        opened.card,
+    )
+    .map_err(|e| refuse("speculative_mtp_kernels", e.to_string()))?;
+    let limits = turbine_model::executor::ExecutorLimits {
+        block_tokens,
+        max_batch_tokens: prepared.scheduler.max_batch_tokens,
+        max_seqs: 1,
+    };
+    let head = turbine_model::mtp::load(
+        &mcfg,
+        dir,
+        Arc::new(registry),
+        Arc::clone(&opened.mem),
+        limits,
+        opts,
+        &opened.providers,
+    )
+    .map_err(|e| refuse("speculative_mtp_load", e.to_string()))?;
+    let layout = mcfg.kv_layout(block_tokens);
+    // `observe` runs for every sequence in a continuous batch, so each keeps its own MTP KV:
+    // one full-context slot per running request (the head's pool is separate from the target's).
+    let per_seq = u64::from(prepared.max_seq_len).div_ceil(u64::from(block_tokens.max(1))) + 2;
+    let num_blocks = u32::try_from(
+        per_seq.saturating_mul(u64::from(prepared.scheduler.max_running_requests.max(1))),
+    )
+    .unwrap_or(u32::MAX);
+    let pool = BlockPool::new(
+        turbine_kv::pool::BlockPoolConfig { layout, num_blocks },
+        Arc::clone(&opened.mem),
+    )
+    .map_err(|e| refuse("speculative_mtp_pool", e.to_string()))?;
+    let proposer = turbine_model::speculative::mtp::MtpProposer::new(
+        head,
+        pool,
+        block_tokens,
+        prepared.max_seq_len,
+        prepared.scheduler.max_batch_tokens,
+    )
+    .map_err(|e| refuse("speculative_mtp_proposer", e.reason().to_string()))?;
+    Ok(MtpSetup {
+        proposer,
+        hidden_dim: prepared.arch.hidden as usize,
+    })
+}
+
 /// Phase 8: the loaded, warmed-up draft: its executor and one-sequence KV pool, its tokenizer
 /// and the architecture it was checked against.
 pub struct DraftModel {

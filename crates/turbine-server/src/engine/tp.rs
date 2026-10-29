@@ -82,7 +82,7 @@ use turbine_reliability::ledger::{LedgerOp, LedgerReplica};
 use turbine_reliability::metrics::RankLabel;
 use turbine_reliability::metrics::ReliabilityMetrics;
 use turbine_reliability::reserve::EmergencyReserve;
-use turbine_tensor::{DType, DeviceBuffer, DeviceMemory};
+use turbine_tensor::{DType, DeviceBuffer, DeviceMemory, Tensor, TensorView};
 
 use crate::kv_orchestrator::{BlockAddresses, KvShard};
 use crate::model::{self, LoadedModel, PreparedModel, StartupError};
@@ -488,6 +488,51 @@ impl ModelExecutor for TpExecutor {
                 message: "hybrid state copies are not wired for a tensor-parallel group".into(),
             },
         ))
+    }
+
+    /// P8 MTP: rank 0's leader captures its final hidden rows (the residual is replicated across
+    /// a tensor/expert-parallel group, so rank 0's rows are the full ones).
+    fn set_hidden_capture(&mut self, on: bool, max_rows: usize) -> Result<(), ModelError> {
+        self.leader.set_hidden_capture(on, max_rows)
+    }
+
+    /// P8 MTP: rank 0's captured rows (a host read on the leader; no collective).
+    fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
+        self.leader.take_hidden(rows)
+    }
+
+    /// P8 MTP: rank 0's embedding table (replicated; the head is single-device and only runs
+    /// under expert parallelism, where the vocabulary is not sharded).
+    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        self.leader.embed_rows(tokens)
+    }
+
+    /// P8 MTP: rank 0's captured hidden rows (the residual is replicated, so the leader's rows
+    /// are the full ones).
+    fn mtp_capture_view(&self, rows: usize) -> Option<TensorView<'_>> {
+        self.leader.mtp_capture_view(rows)
+    }
+
+    /// P8 MTP: a fresh `[rows, hidden]` buffer on rank 0's memory.
+    fn mtp_rows(&self, rows: usize) -> Result<Tensor, ModelError> {
+        self.leader.mtp_rows(rows)
+    }
+
+    /// P8 MTP: writes host rows into a device tensor on rank 0.
+    fn mtp_write_rows(&self, t: &Tensor, values: &[f32]) -> Result<(), ModelError> {
+        self.leader.mtp_write_rows(t, values)
+    }
+
+    /// P8 MTP: a device row copy on rank 0.
+    fn mtp_copy_rows(
+        &self,
+        dst: &Tensor,
+        dst_row: usize,
+        src: TensorView<'_>,
+        src_row: usize,
+        rows: usize,
+    ) -> Result<(), ModelError> {
+        self.leader.mtp_copy_rows(dst, dst_row, src, src_row, rows)
     }
 }
 
@@ -1924,6 +1969,7 @@ mod tests {
             ranks: Vec::new(),
             draft: None,
             speculative: Default::default(),
+            mtp_dim: 0,
         });
         (engine, tx, shared, reg)
     }

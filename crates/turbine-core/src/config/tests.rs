@@ -572,7 +572,24 @@ fn task1_modules() -> ModuleNames<'static> {
         rank_transports: &["tcp"],
         router_policies: &["prefix_affinity", "least_loaded"],
         kv_formats: &["l0", "fp8_e4m3", "tq4", "tq2"],
+        speculative_k_policies: &["fixed", "adaptive"],
     }
+}
+
+/// Phase 8: `speculative.k_policy` defaults to `fixed`; `fixed` and `adaptive` pass
+/// `validate_modules`, any other name is refused naming the key.
+#[test]
+fn speculative_k_policy_key() {
+    let base = "model:\n  path: /m\n";
+    let known = task1_modules();
+    for name in ["fixed", "adaptive"] {
+        let c = parse(base, &[&format!("speculative.k_policy={name}")]).unwrap();
+        c.validate_modules(&known).unwrap();
+        assert_eq!(c.speculative.k_policy.as_str(), name);
+    }
+    let c = parse(base, &["speculative.k_policy=nope"]).unwrap();
+    let err = c.validate_modules(&known).expect_err("unknown k policy");
+    assert_eq!(err.key(), Some("speculative.k_policy"), "{err}");
 }
 
 /// Phase 7 S-10: `model.reasoning_parser` defaults to `auto`; `auto`, `none` and a registered
@@ -1676,14 +1693,11 @@ fn phase5p_keys() {
 }
 
 #[test]
-fn mtp_is_refused_until_its_proposer_lands() {
-    let err =
-        parse(TS15_EXAMPLE, &["speculative.method=mtp"]).expect_err("mtp has no proposer yet");
-    assert_eq!(err.key(), Some("speculative.method"), "{err}");
-    assert!(
-        err.to_string().contains("speculative_mtp_unimplemented:"),
-        "{err}"
-    );
+fn mtp_loads() {
+    // MTP is wired (the engine feeds the head the target's hidden rows); it validates with the
+    // default `execution.overlap_scheduling` on (the engine then runs it on the serial path and
+    // logs `overlap_scheduling reason=mtp_serial`).
+    parse(TS15_EXAMPLE, &["speculative.method=mtp"]).expect("mtp loads");
 }
 
 #[test]

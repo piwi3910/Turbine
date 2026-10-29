@@ -175,6 +175,9 @@ pub(crate) struct EngineParts {
     pub draft: Option<Box<dyn turbine_model::speculative::Proposer>>,
     /// The Phase 8 `speculative.*` configuration (k, tolerance, method).
     pub speculative: turbine_core::config::SpeculativeConfig,
+    /// P8 MTP: the head's hidden width (`0` when the method is not `mtp`); the engine then
+    /// captures and feeds the target's per-step hidden rows.
+    pub mtp_dim: usize,
 }
 
 /// The message of the `slow_client` error event.
@@ -236,10 +239,21 @@ pub(crate) struct EngineLoop {
     seqs: HashMap<SeqId, (RequestId, usize)>,
     next_seq: u64,
     rel: EngineReliability,
-    /// The loaded Phase 8 draft proposer; `None` without `speculative.method: draft`.
+    /// The loaded Phase 8 draft proposer; `None` without `speculative.method: draft` (or `mtp`).
     draft: Option<Box<dyn turbine_model::speculative::Proposer>>,
     /// The Phase 8 `speculative.*` configuration.
     speculative: turbine_core::config::SpeculativeConfig,
+    /// The Phase 8 `speculative.k_policy` implementation (registered) that sets the per-round
+    /// proposal count.
+    k_policy: &'static dyn turbine_model::speculative::k_policy::KPolicy,
+    /// The Phase 8 speculative-length controller state, one per sequence.
+    spec_k: HashMap<SeqId, turbine_model::speculative::k_policy::KState>,
+    /// P8 MTP: the head's hidden width (`0` when the method is not `mtp`). When set, the engine
+    /// captures the target's final hidden rows each forward and feeds them to the proposer.
+    mtp_dim: usize,
+    /// P8 MTP: the last captured target hidden row of each sequence, `(position, row)`, the
+    /// next propose round's first query input.
+    mtp_pending: HashMap<SeqId, (u32, turbine_tensor::Tensor)>,
     /// The controller snapshot read at the start of this turn.
     snap: Arc<Snapshot>,
     /// The circuit probe in flight and its (unread) event channel.
@@ -505,12 +519,17 @@ impl EngineLoop {
                 }
             }
         }
-        let overlap = p.overlap && p.executor.overlaps() && p.executor.reduces_logits();
+        let overlap = p.overlap
+            && p.speculative.method != SpeculativeMethod::Mtp
+            && p.executor.overlaps()
+            && p.executor.reduces_logits();
         tracing::info!(
             event = "overlap_scheduling",
             enabled = overlap,
             reason = if overlap {
                 "enabled"
+            } else if p.speculative.method == SpeculativeMethod::Mtp {
+                "mtp_serial"
             } else if !p.overlap {
                 "disabled_by_config"
             } else if !p.executor.overlaps() {
@@ -543,7 +562,12 @@ impl EngineLoop {
             next_seq: 1,
             rel: p.reliability,
             draft: p.draft,
+            k_policy: turbine_model::speculative::k_policy::policy(p.speculative.k_policy.as_str())
+                .unwrap_or(&turbine_model::speculative::k_policy::FixedPolicy),
+            spec_k: HashMap::new(),
             speculative: p.speculative,
+            mtp_dim: p.mtp_dim,
+            mtp_pending: HashMap::new(),
             snap,
             probe: None,
             probe_prompt,
@@ -2363,7 +2387,89 @@ impl EngineLoop {
         })?;
         self.check_logits(&logits, slices.len())
             .map_err(IterationError::other)?;
+        if self.mtp_dim > 0 {
+            self.mtp_observe(built)
+                .map_err(|e| IterationError::model("mtp hidden observe failed", e))?;
+        }
         Ok(logits)
+    }
+
+    /// P8 MTP: after a forward, read the target's final hidden rows back and feed the proposer
+    /// the MTP rows they imply. For each batch row the run's positions are contiguous from a
+    /// start offset; row `p` is built from the hidden at `p − 1` (the row's own previous
+    /// position, or the previous forward's pending row) and the token at `p`.
+    /// P8 MTP: after a forward, feed the proposer the MTP rows the target's final hidden rows
+    /// imply — entirely on device (the capture is a device view; `prev` and the per-sequence
+    /// pending row are device buffers), so there is no per-step host round trip.
+    fn mtp_observe(&mut self, built: &Built) -> Result<(), turbine_model::ModelError> {
+        if self.mtp_dim == 0 {
+            return Ok(());
+        }
+        let dim = self.mtp_dim;
+        let total = built.tokens.len();
+        let Some(cap) = self.exec.mtp_capture_view(total) else {
+            return Ok(());
+        };
+        let rows: Vec<(SeqId, usize, usize)> = built
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let (_, q_start, q_len, _) = built.slices[i];
+                (r.seq, q_start as usize, q_len as usize)
+            })
+            .collect();
+        for (seq, q_start, q_len) in rows {
+            let positions = &built.positions[q_start..q_start + q_len];
+            let tokens = &built.tokens[q_start..q_start + q_len];
+            let capr = cap.rows(q_start, q_len);
+            let n = q_len;
+            if n == 0 {
+                continue;
+            }
+            // The row at `positions[0] - 1` (this run's first previous hidden) comes from the
+            // pending row when it ends exactly there; otherwise the run starts one row early.
+            let first = positions[0];
+            let pending_ok = self
+                .mtp_pending
+                .get(&seq)
+                .is_some_and(|(p, _)| *p == first.wrapping_sub(1));
+            let start = if pending_ok { 0 } else { 1 };
+            if start < n {
+                let prev = self.exec.mtp_rows(n - start)?;
+                if start == 0
+                    && let Some((_, p)) = self.mtp_pending.get(&seq)
+                {
+                    self.exec.mtp_copy_rows(&prev, 0, p.view(), 0, 1)?;
+                }
+                // Row `g` of the run takes the hidden at its previous position (`capr[g - 1]`);
+                // row 0 (only when `start == 0`) takes the pending row, copied above.
+                for g in 1..n {
+                    self.exec
+                        .mtp_copy_rows(&prev, g - start, capr.rows(g - 1, 1), 0, 1)?;
+                }
+                if let Some(proposer) = self.draft.as_mut()
+                    && let Err(e) =
+                        proposer.observe(seq, &positions[start..], &tokens[start..], prev.view())
+                {
+                    tracing::debug!(
+                        event = "speculative_skip",
+                        reason = e.reason(),
+                        error = %e,
+                        start,
+                        run = n,
+                        "mtp observe skipped"
+                    );
+                }
+            }
+            // The next forward's seed: the hidden at this run's last position (device copy).
+            let pend = self.exec.mtp_rows(1)?;
+            self.exec
+                .mtp_copy_rows(&pend, 0, capr.rows(n - 1, 1), 0, 1)?;
+            self.mtp_pending.insert(seq, (positions[n - 1], pend));
+        }
+        let _ = dim;
+        Ok(())
     }
 
     /// Adds the executor's decode graph outcomes since the last call to
@@ -2769,11 +2875,19 @@ impl EngineLoop {
             })
     }
 
+    /// Phase 8: the speculative method is on (`draft` or `mtp`).
+    fn speculation_on(&self) -> bool {
+        matches!(
+            self.speculative.method,
+            SpeculativeMethod::Draft | SpeculativeMethod::Mtp
+        )
+    }
+
     /// The launched iteration `f` holds the only row of a one-item decode plan and the choice
     /// is a Phase 8 speculative candidate (S-6/S-8): its proposals must be asked for before
     /// the next plan, so the turn completes serially.
     fn speculative_running(&self, f: &InFlight) -> bool {
-        self.speculative.method == SpeculativeMethod::Draft
+        self.speculation_on()
             && self.draft.is_some()
             && f.launched
             && f.plan.items.len() == 1
@@ -3181,6 +3295,9 @@ impl EngineLoop {
         self.metrics
             .server
             .speculative_round(u64::from(accepted), u64::from(k));
+        if let Some(state) = self.spec_k.get_mut(&seq) {
+            self.k_policy.observe(state, k, accepted);
+        }
         if let Some(r) = self.requests.get_mut(&id) {
             r.choices[choice].record_spec_round(accepted, k, self.speculative.min_acceptance);
         }
@@ -3608,8 +3725,8 @@ impl EngineLoop {
     /// one-item decode plan is attempted; every missing condition falls back to a plain
     /// decode, and a draft failure never fails the request.
     fn request_speculative(&mut self, id: RequestId, choice: usize, single_item: bool) {
-        if !single_item || self.speculative.method != SpeculativeMethod::Draft {
-            if self.speculative.method != SpeculativeMethod::Draft {
+        if !single_item || !self.speculation_on() {
+            if !self.speculation_on() {
                 self.metrics.server.speculative_disabled("method_none");
             } else if !single_item {
                 self.metrics.server.speculative_disabled("batch");
@@ -3659,7 +3776,23 @@ impl EngineLoop {
         let context = self
             .max_seq_len
             .saturating_sub(r.prompt_len() + generated + 1);
-        let k = self.speculative.num_tokens.min(room).min(context);
+        // The per-round proposal count: `MAX_SPECULATIVE_TOKENS`, the context room and the
+        // available rows bound it; the policy (`speculative.k_policy`) picks within that.
+        let cap = room
+            .min(context)
+            .min(turbine_core::config::MAX_SPECULATIVE_TOKENS);
+        let start = self.speculative.num_tokens;
+        let state = self
+            .spec_k
+            .entry(seq)
+            .or_insert_with(|| turbine_model::speculative::k_policy::KState::new(start));
+        let k = self
+            .k_policy
+            .choose(turbine_model::speculative::k_policy::KChoice {
+                state: state.clone(),
+                cap,
+            });
+        self.metrics.server.speculative_k.set(i64::from(k));
         if k == 0 {
             self.metrics.server.speculative_disabled("no_room");
             return;
@@ -3670,6 +3803,16 @@ impl EngineLoop {
             accepted_len: unfed,
             num_tokens: k,
         };
+        if self.mtp_dim > 0
+            && let Some((pos, pending)) = self.mtp_pending.get(&seq)
+            && *pos + 1 == unfed
+        {
+            // P8 MTP: the first query row is the target's hidden at the last accepted position
+            // (`unfed - 1`), kept as a device row; the proposer copies it into its own buffer.
+            if let Some(proposer) = self.draft.as_mut() {
+                let _ = proposer.seed_last_hidden(seq, pending.view());
+            }
+        }
         let proposals = {
             let Some(proposer) = self.draft.as_mut() else {
                 return;
@@ -3808,6 +3951,10 @@ impl EngineLoop {
         if finished && let Some(proposer) = self.draft.as_mut() {
             // Phase 8: a finished choice gives its draft slot back at once.
             proposer.release(seq);
+        }
+        if finished {
+            self.mtp_pending.remove(&seq);
+            self.spec_k.remove(&seq);
         }
         if all_finished {
             self.retire(id);
@@ -3975,6 +4122,8 @@ impl EngineLoop {
             for c in &r.choices {
                 self.seqs.remove(&c.seq);
                 self.last_table_blocks.remove(&c.seq);
+                self.mtp_pending.remove(&c.seq);
+                self.spec_k.remove(&c.seq);
                 // Phase 8 S-5: the scratch state entry goes with the live slot.
                 self.spec_spans.remove(&c.seq);
                 if self.spec_scratch.remove(&c.seq).is_some() {
@@ -3993,6 +4142,8 @@ impl EngineLoop {
             }
         }
         for (seq, _) in &plan.preempted {
+            self.mtp_pending.remove(seq);
+            self.spec_k.remove(seq);
             self.spec_spans.remove(seq);
             if self.spec_scratch.remove(seq).is_some() {
                 self.kv.state_scratch_release(*seq);
@@ -4224,6 +4375,7 @@ mod tests {
     use turbine_model::testing::TempDir;
     use turbine_model::testing::tiny::{
         TinyOptions, TinySpec, write_tiny_llama, write_tiny_llama_with,
+        write_tiny_qwen3_5_moe_with_mtp,
     };
     use turbine_model::{
         GenerateOptions, MAX_STAGING_BYTES, ModelError, ModelMetrics, SafetensorsIndex,
@@ -4597,6 +4749,7 @@ mod tests {
             ranks: Vec::new(),
             draft: None,
             speculative: Default::default(),
+            mtp_dim: 0,
         });
         TestEngine {
             engine,
@@ -5482,6 +5635,7 @@ mod tests {
             matchers,
             jump_forward,
             overlap,
+            None,
         )
     }
 
@@ -5505,6 +5659,29 @@ mod tests {
             matchers,
             false,
             overlap,
+            None,
+        )
+    }
+
+    /// [`run_submissions`] with the Phase 8 MTP head attached (the checkpoint's own `mtp.*`):
+    /// the target's greedy stream must equal the serial stream while speculative rounds run.
+    fn run_submissions_mtp(
+        spec: &TinySpec,
+        draft_k: u32,
+        tokenizer: &Arc<Tokenizer>,
+        requests: &[GenerationRequest],
+        matchers: &(dyn Fn() -> Vec<Box<dyn TokenMatcher>> + Sync),
+    ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
+        run_submissions_inner(
+            spec,
+            None,
+            draft_k,
+            tokenizer,
+            requests,
+            matchers,
+            false,
+            false,
+            Some(spec),
         )
     }
 
@@ -5518,16 +5695,21 @@ mod tests {
         matchers: &(dyn Fn() -> Vec<Box<dyn TokenMatcher>> + Sync),
         jump_forward: bool,
         overlap: bool,
+        mtp: Option<&TinySpec>,
     ) -> (Vec<Vec<ChoiceStream>>, MetricsRegistry) {
         // The Phase 8 draft needs k + 1 logits rows (the plan's row cap is
         // `max_running_requests`); the serial baseline keeps the smaller batch.
-        let max_running = if draft.is_some() { 16 } else { 4 };
-        let t = engine_with(
-            tiny_reducing_executor(spec, max_running),
-            Arc::clone(tokenizer),
-            params(max_running, 8),
-            overlap,
-        );
+        let max_running = if draft.is_some() || mtp.is_some() {
+            16
+        } else {
+            4
+        };
+        let mut exec = tiny_reducing_executor(spec, max_running);
+        if mtp.is_some() {
+            // P8 MTP: the engine captures the target's hidden rows each forward.
+            exec.set_hidden_capture(true, 64).expect("hidden capture");
+        }
+        let t = engine_with(exec, Arc::clone(tokenizer), params(max_running, 8), overlap);
         let mut engine = t.engine;
         engine.jump_forward = jump_forward;
         if let Some(draft) = draft {
@@ -5553,7 +5735,60 @@ mod tests {
             engine.speculative = turbine_core::config::SpeculativeConfig {
                 method: SpeculativeMethod::Draft,
                 num_tokens: draft_k,
+                k_policy: turbine_core::config::ModuleName::new("fixed").expect("name"),
                 draft_model_path: Some("/unused".into()),
+                min_acceptance: 0.4,
+            };
+        }
+        if let Some(mtp) = mtp {
+            let mcfg = turbine_model::families::qwen3_5::mtp_arch_config(&mtp.config);
+            let provider = cpu_reference_provider();
+            let id = provider.id();
+            let card = provider.card_profile();
+            let kmetrics = KernelMetrics::register(&MetricsRegistry::new());
+            let opts = ExecutorOptions::default();
+            let reqs = executor::mtp_requirements(
+                &mcfg,
+                BLOCK_TOKENS,
+                opts,
+                std::slice::from_ref(&provider),
+            );
+            let registry = Arc::new(
+                KernelRegistry::build(vec![Arc::clone(&provider)], &[id], &reqs, &kmetrics, card)
+                    .expect("mtp registry"),
+            );
+            let head = turbine_model::mtp::load(
+                &mtp.config,
+                &mtp.dir,
+                Arc::clone(&registry),
+                mem(),
+                turbine_model::executor::ExecutorLimits {
+                    block_tokens: BLOCK_TOKENS,
+                    max_batch_tokens: 64,
+                    max_seqs: 1,
+                },
+                opts,
+                std::slice::from_ref(&provider),
+            )
+            .expect("mtp head");
+            let pool = turbine_kv::pool::BlockPool::new(
+                BlockPoolConfig {
+                    layout: mcfg.kv_layout(BLOCK_TOKENS),
+                    num_blocks: 8,
+                },
+                mem(),
+            )
+            .expect("mtp pool");
+            let proposer =
+                turbine_model::speculative::mtp::MtpProposer::new(head, pool, BLOCK_TOKENS, 64, 64)
+                    .expect("mtp proposer");
+            engine.draft = Some(Box::new(proposer));
+            engine.mtp_dim = mtp.config.hidden as usize;
+            engine.speculative = turbine_core::config::SpeculativeConfig {
+                method: SpeculativeMethod::Mtp,
+                num_tokens: draft_k,
+                k_policy: turbine_core::config::ModuleName::new("fixed").expect("name"),
+                draft_model_path: None,
                 min_acceptance: 0.4,
             };
         }
@@ -5707,6 +5942,31 @@ mod tests {
             ) > 0.0,
             "the serial turns are counted: {metrics}"
         );
+    }
+
+    /// Phase 8 MTP: the checkpoint's own `mtp.*` head drafts (the engine feeds it the target's
+    /// hidden rows), and the target's greedy stream still matches the serial one.
+    #[test]
+    fn mtp_greedy_matches_serial() {
+        let dir = TempDir::new("turbine-engine-loop-mtp");
+        let spec = write_tiny_qwen3_5_moe_with_mtp(dir.path(), 7);
+        let tokenizer = Arc::new(Tokenizer::from_file(&spec.dir.join("tokenizer.json")).unwrap());
+        let req = request(&[256, 72, 101, 108, 108, 111], 16);
+        let requests = [req];
+        let none = || Vec::<Box<dyn TokenMatcher>>::new();
+
+        let (serial, _) = run_submissions(&spec, &tokenizer, &requests, &none, false, false);
+        for k in 1..=4 {
+            let (mtp, reg) = run_submissions_mtp(&spec, k, &tokenizer, &requests, &none);
+            assert_eq!(mtp, serial, "mtp k={k} differs from the serial stream");
+            if k == 4 {
+                let rendered = reg.render().unwrap();
+                assert!(
+                    metric(&reg, "turbine_speculative_proposed_tokens_total") > 0.0,
+                    "the mtp head proposed tokens: {rendered}"
+                );
+            }
+        }
     }
 
     /// Phase 8 S-3/S-8: the greedy speculative stream equals the serial stream for every
@@ -6043,6 +6303,7 @@ mod tests {
         engine.speculative = turbine_core::config::SpeculativeConfig {
             method: SpeculativeMethod::Draft,
             num_tokens: 4,
+            k_policy: turbine_core::config::ModuleName::new("fixed").expect("name"),
             draft_model_path: Some("/unused".into()),
             min_acceptance: 0.4,
         };

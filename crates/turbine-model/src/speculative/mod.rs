@@ -17,6 +17,8 @@ use crate::config::ModelArchConfig;
 use crate::executor::ModelExecutor;
 
 pub mod draft;
+pub mod k_policy;
+pub mod mtp;
 
 /// What `Proposer::propose` asks for: the sequence, the last accepted token, its position and k.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +87,33 @@ pub trait Proposer: Send {
 
     /// Free the slot (finish, cancel, preempt or permanent disable).
     fn release(&mut self, seq: SeqId);
+
+    /// P8 MTP: append the MTP head's KV rows for `positions` (a run of positions `1..` that
+    /// share a sequence), each built from the target's final hidden row at `position − 1`
+    /// (`hidden_prev`, `positions.len() × hidden` F32) and the embedding of `tokens` (the token
+    /// ids at `positions`). The engine calls it after each target forward that advances the
+    /// accepted prefix; the `draft_model` proposer ignores it.
+    fn observe(
+        &mut self,
+        seq: SeqId,
+        positions: &[u32],
+        tokens: &[u32],
+        hidden_prev: turbine_tensor::TensorView<'_>,
+    ) -> Result<(), ProposeError> {
+        let _ = (seq, positions, tokens, hidden_prev);
+        Ok(())
+    }
+
+    /// P8 MTP: the target's final hidden row at the last accepted position (`hidden` F32), the
+    /// next propose round's first query input. The `draft_model` proposer ignores it.
+    fn seed_last_hidden(
+        &mut self,
+        seq: SeqId,
+        hidden: turbine_tensor::TensorView<'_>,
+    ) -> Result<(), ProposeError> {
+        let _ = (seq, hidden);
+        Ok(())
+    }
 }
 
 /// What `ProposerFactory::build` needs: the draft's prepared executor and pool, the target and

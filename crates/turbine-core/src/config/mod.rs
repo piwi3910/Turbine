@@ -30,7 +30,7 @@ pub use parallel::{
     ParallelConfig, PipelineConfig, RankMode, RanksConfig, SizeOrAuto, TopologyConfig,
 };
 pub use quality::QualityConfig;
-pub use speculative::{SpeculativeConfig, SpeculativeMethod};
+pub use speculative::{MAX_SPECULATIVE_TOKENS, SpeculativeConfig, SpeculativeMethod};
 
 /// Configuration errors. Every variant maps to exit code 2 in `turbine-server`.
 #[derive(Debug, thiserror::Error)]
@@ -121,6 +121,8 @@ impl std::fmt::Display for ModuleName {
 pub struct ModuleNames<'a> {
     /// `model.tool_call_parser` (`none` is always accepted).
     pub tool_formats: &'a [&'a str],
+    /// `speculative.k_policy` (Phase 8).
+    pub speculative_k_policies: &'a [&'a str],
     /// `model.reasoning_parser` (Phase 7; `auto` and `none` are always accepted).
     pub reasoning_parsers: &'a [&'a str],
     /// `execution.backend`.
@@ -565,30 +567,24 @@ impl Config {
         }
         self.validate_phase2()?;
         self.speculative.validate(self.effective_max_running())?;
-        // The MTP proposer (the checkpoint's own `mtp.*` head) is the next spec slice; until it
-        // is wired, an explicit refusal beats silently decoding without speculation.
-        if self.speculative.method == SpeculativeMethod::Mtp {
-            return Err(invalid(
-                "speculative.method",
-                "speculative_mtp_unimplemented: the checkpoint MTP proposer is not wired yet",
-            ));
-        }
-        if self.speculative.method == SpeculativeMethod::Draft
-            && (self
+        if matches!(
+            self.speculative.method,
+            SpeculativeMethod::Draft | SpeculativeMethod::Mtp
+        ) && (self
+            .parallel
+            .tensor_parallel_size
+            .fixed()
+            .is_some_and(|n| n > 1)
+            || self
                 .parallel
-                .tensor_parallel_size
+                .pipeline_parallel_size
                 .fixed()
-                .is_some_and(|n| n > 1)
-                || self
-                    .parallel
-                    .pipeline_parallel_size
-                    .fixed()
-                    .is_some_and(|n| n > 1))
+                .is_some_and(|n| n > 1))
         {
             return Err(invalid(
                 "speculative.method",
-                "speculative_parallel_unsupported: speculative.method=draft runs on one device; \
-                 tensor and pipeline parallelism need a later phase",
+                "speculative_parallel_unsupported: speculative decoding runs on one rank's \
+                 executor; tensor and pipeline parallelism need a later phase",
             ));
         }
         self.parallel.validate()
@@ -633,6 +629,12 @@ impl Config {
                 Some("none"),
             )?;
         }
+        check(
+            "speculative.k_policy",
+            &self.speculative.k_policy,
+            known.speculative_k_policies,
+            None,
+        )?;
         if !matches!(self.model.reasoning_parser.as_str(), "auto" | "none") {
             check(
                 "model.reasoning_parser",

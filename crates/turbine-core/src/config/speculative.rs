@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, ModuleName};
 
 /// The longest greedy proposal a draft may make (`speculative.num_tokens`).
 pub const MAX_SPECULATIVE_TOKENS: u32 = 8;
@@ -38,8 +38,13 @@ impl SpeculativeMethod {
 #[serde(deny_unknown_fields, default)]
 pub struct SpeculativeConfig {
     pub method: SpeculativeMethod,
-    /// Greedy proposals per round (`speculative.num_tokens`, 1..=8).
+    /// Greedy proposals per round (`speculative.num_tokens`, 1..=8); the starting/upper `k`
+    /// for `k_policy: fixed` and the starting `k` for `adaptive`.
     pub num_tokens: u32,
+    /// How `k` is set each round (`speculative.k_policy`, Phase 8): a `speculative_k_policy`
+    /// registry name — `fixed` (default) uses `num_tokens` unchanged; `adaptive` raises `k` on
+    /// fully accepted rounds and lowers it when proposals are wasted.
+    pub k_policy: ModuleName,
     /// The draft checkpoint directory; required with `method: draft`, unread with `none`.
     pub draft_model_path: Option<PathBuf>,
     /// Disable a request's speculation below this accepted fraction (`speculative.min_acceptance`).
@@ -51,6 +56,7 @@ impl Default for SpeculativeConfig {
         SpeculativeConfig {
             method: SpeculativeMethod::None,
             num_tokens: 4,
+            k_policy: ModuleName::fixed("fixed"),
             draft_model_path: None,
             min_acceptance: 0.4,
         }

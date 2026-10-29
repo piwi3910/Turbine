@@ -405,6 +405,42 @@ pub fn spawn(
                     }
                     None => None,
                 };
+                // Phase 8 MTP: the checkpoint's own `mtp.*` head drafts; the engine captures
+                // the target's per-step hidden rows for it (no external checkpoint). It
+                // overrides the draft-model proposer, which is only built for `method: draft`.
+                let (draft, mtp_dim) =
+                    if speculative.method == turbine_core::config::SpeculativeMethod::Mtp {
+                        match model::prepare_mtp(&prepared) {
+                            Ok(setup) => {
+                                if let Err(e) = loaded.executor.set_hidden_capture(
+                                    true,
+                                    prepared.scheduler.max_batch_tokens as usize,
+                                ) {
+                                    let _ = fatal.send(Fatal::LoadFailed(format!(
+                                        "speculative mtp hidden capture: {e}"
+                                    )));
+                                    return;
+                                }
+                                tracing::info!(
+                                    event = "speculative",
+                                    method = "mtp",
+                                    hidden = setup.hidden_dim,
+                                    "mtp head loaded; speculative rounds are on"
+                                );
+                                (
+                                    Some(Box::new(setup.proposer)
+                                        as Box<dyn turbine_model::speculative::Proposer>),
+                                    setup.hidden_dim,
+                                )
+                            }
+                            Err(e) => {
+                                let _ = fatal.send(Fatal::LoadFailed(e.to_string()));
+                                return;
+                            }
+                        }
+                    } else {
+                        (draft, 0usize)
+                    };
                 let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
                 // Phase 4: the KV hierarchy over the pool, before the reliability side that drives
                 // it. L1 needs the kernel library's copy engine (ABI v2.3 + v2.5). Under tensor
@@ -614,6 +650,7 @@ pub fn spawn(
                     ranks,
                     draft,
                     speculative,
+                    mtp_dim,
                 });
                 backend.set_ready(
                     replica,

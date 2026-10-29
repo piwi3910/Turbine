@@ -155,6 +155,9 @@ pub struct ServerMetrics {
     /// `turbine_speculative_disabled{reason}`: 1 for each bounded reason a request skipped a
     /// round (Phase 8 S-6/S-10).
     pub speculative_disabled: Family<ReasonLabels, Gauge>,
+    /// `turbine_speculative_k`: the proposal count the last speculative round drafted (the
+    /// `speculative.k_policy` controller's current `k`).
+    pub speculative_k: Gauge,
     /// `turbine_hybrid_state_bytes` (P7 S-12, Task 32): hybrid state bytes held in L0 — the live
     /// slots in use plus the snapshot entries held for blocks.
     pub hybrid_state_bytes: Gauge,
@@ -259,6 +262,11 @@ impl ServerMetrics {
                 "turbine_speculative_disabled",
                 "Why a request did not speculate in a round",
                 Family::default(),
+            ),
+            speculative_k: reg.register(
+                "turbine_speculative_k",
+                "Proposal count of the last speculative round",
+                Gauge::default(),
             ),
             hybrid_state_bytes: reg.register(
                 "turbine_hybrid_state_bytes",

@@ -119,6 +119,32 @@ pub fn available_requirements(
         .collect()
 }
 
+/// P8 MTP: the requirements of the one-layer head — the family's plus the front matter's `fc`
+/// GEMM (`[hidden, 2·hidden]`, `cat @ fcᵀ`), which no family slot declares.
+pub fn mtp_requirements(
+    cfg: &ModelArchConfig,
+    block_tokens: u32,
+    opts: ExecutorOptions,
+    providers: &[Arc<dyn KernelProvider>],
+) -> Vec<OpRequirement> {
+    let mut reqs = available_requirements(cfg, block_tokens, opts, providers);
+    let h = cfg.hidden as u64;
+    let act = cfg.activation_dtype();
+    reqs.push(
+        OpConfig::Gemm(turbine_kernels::GemmConfig {
+            n: h,
+            k: 2 * h,
+            trans_b: true,
+            a_dtype: act,
+            b_dtype: act,
+            c_dtype: act,
+            gemv: false,
+        })
+        .into(),
+    );
+    reqs
+}
+
 /// Where the outputs of projections of one input live in their shared buffer `[rows, Σ cols]`:
 /// side by side in each row (`fused`: one GEMM writes them all; each part is a row-strided view)
 /// or as consecutive dense `[rows, cols_i]` matrices (one GEMM per projection). Either way the
@@ -563,6 +589,87 @@ pub trait ModelExecutor: Send {
     fn take_hidden(&self, rows: usize) -> Option<Vec<f32>> {
         let _ = rows;
         None
+    }
+    /// P8 MTP: uploads `[rows, hidden]` F32 input rows that the next forward with exactly `rows`
+    /// tokens uses instead of embedding its token ids (the MTP head's `fc` output).
+    fn set_hidden_input(&mut self, rows: usize, data: &[f32]) -> Result<(), ModelError> {
+        let _ = (rows, data);
+        Ok(())
+    }
+    /// P8 MTP: the embedding rows of `tokens` (`tokens.len() × hidden` F32), the MTP front
+    /// matter's `pre_fc_norm_embedding` input. Single-device executors only.
+    fn embed_rows(&self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let _ = tokens;
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "embed_rows is unsupported by this executor".into(),
+        }))
+    }
+
+    /// P8 MTP: installs the head's on-device front-matter weights (see
+    /// [`DecoderExecutor::set_mtp_front`]).
+    fn set_mtp_front(
+        &mut self,
+        pre_hidden: Tensor,
+        pre_embedding: Tensor,
+        fc: Tensor,
+    ) -> Result<(), ModelError> {
+        let _ = (pre_hidden, pre_embedding, fc);
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "set_mtp_front is unsupported by this executor".into(),
+        }))
+    }
+    /// P8 MTP: a device view of the last forward's captured `[rows, hidden]` hidden rows.
+    fn mtp_capture_view(&self, rows: usize) -> Option<TensorView<'_>> {
+        let _ = rows;
+        None
+    }
+    /// P8 MTP: allocates a fresh `[rows, hidden]` activation-dtype buffer.
+    fn mtp_rows(&self, rows: usize) -> Result<Tensor, ModelError> {
+        let _ = rows;
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "mtp_rows is unsupported by this executor".into(),
+        }))
+    }
+    /// P8 MTP: writes `values` (`rows × hidden` F32) into the activation-dtype device tensor.
+    fn mtp_write_rows(&self, t: &Tensor, values: &[f32]) -> Result<(), ModelError> {
+        let _ = (t, values);
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "mtp_write_rows is unsupported by this executor".into(),
+        }))
+    }
+    /// P8 MTP: `dst[dst_row ..] = src[src_row ..]` rows (a device copy).
+    fn mtp_copy_rows(
+        &self,
+        dst: &Tensor,
+        dst_row: usize,
+        src: TensorView<'_>,
+        src_row: usize,
+        rows: usize,
+    ) -> Result<(), ModelError> {
+        let _ = (dst, dst_row, src, src_row, rows);
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "mtp_copy_rows is unsupported by this executor".into(),
+        }))
+    }
+    /// P8 MTP: one device-native head step (embed on device, front matter on device, then the
+    /// layer stack). `positions`/`kv_len`/`table` follow the MTP KV indexing (the row for
+    /// overall position `p` sits at MTP slot `p - 1`).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &mut self,
+        kv: &KvPoolView<'_>,
+        tokens: &[u32],
+        hidden: TensorView<'_>,
+        positions: &[u32],
+        kv_len: u32,
+        table: &[BlockId],
+        formats: &[u8],
+        seq: SeqId,
+    ) -> Result<Logits, ModelError> {
+        let _ = (kv, tokens, hidden, positions, kv_len, table, formats, seq);
+        Err(ModelError::Kernel(KernelError::InvalidArgument {
+            message: "mtp_step is unsupported by this executor".into(),
+        }))
     }
     /// Timings of the last successful `forward` (or `collect`); zeros when the executor does not
     /// measure.

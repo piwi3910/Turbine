@@ -18,6 +18,7 @@ pub mod generate;
 pub mod kv_scales;
 pub mod loader;
 pub mod metrics;
+pub mod mtp;
 pub mod pp;
 pub mod reasoning;
 pub mod registries;

@@ -49,8 +49,8 @@ use turbine_model::testing::tiny::{
     TinyOptions, TinySpec, write_tiny_family, write_tiny_family_quantized,
     write_tiny_family_with_head_dim, write_tiny_llama, write_tiny_llama_with, write_tiny_olmoe,
     write_tiny_olmoe_quantized, write_tiny_olmoe_with_head_dim, write_tiny_quantized,
-    write_tiny_qwen3_5, write_tiny_qwen3_5_moe, write_tiny_qwen3_5_with,
-    write_tiny_qwen3moe_quantized,
+    write_tiny_qwen3_5, write_tiny_qwen3_5_moe, write_tiny_qwen3_5_moe_with_mtp,
+    write_tiny_qwen3_5_with, write_tiny_qwen3moe_quantized,
 };
 use turbine_model::testing::trace::{
     DiffRow, LocalChecker, compare_traces, read_bf16_weight, render,
@@ -3878,6 +3878,315 @@ fn hidden_capture_returns_the_final_residual_rows() {
     assert!(
         one.iter().zip(&last_prefill).any(|(a, b)| a != b),
         "a decode forward's hidden row is its own"
+    );
+}
+
+/// P8 MTP: an uploaded hidden input replaces the token embedding of a forward with that many
+/// tokens (the MTP head feeds its `fc` output this way); the logits differ from the same
+/// token's normal embedding, and a wrong-length upload is refused.
+#[test]
+fn hidden_input_replaces_the_embedding() {
+    let tmp = TempDir::new("tiny-model-hidden-input");
+    let spec = write_tiny_llama(tmp.path(), SEED);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let mut exec = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let plain = kv
+        .forward(&mut exec, &[3], &[0])
+        .expect("plain forward")
+        .row(0)
+        .to_vec();
+    let h = spec.config.hidden as usize;
+    assert!(
+        exec.set_hidden_input(1, &vec![0.25; h - 1]).is_err(),
+        "a wrong-length hidden input is refused"
+    );
+    exec.set_hidden_input(1, &vec![0.25; h]).expect("upload");
+    let mut kv2 = SequenceKv::new(&mem, *exec.kv_layout(), MAX_SEQ_LEN).expect("kv2");
+    let injected = kv2
+        .forward(&mut exec, &[3], &[0])
+        .expect("injected forward")
+        .row(0)
+        .to_vec();
+    assert!(injected.iter().all(|v| v.is_finite()));
+    assert!(
+        injected.iter().zip(&plain).any(|(a, b)| a != b),
+        "the injected row is used instead of the token embedding"
+    );
+}
+
+/// P8 MTP: the checkpoint's `mtp.*` head loads as a one-layer executor over the target's
+/// checkpoint (its layer body aliased in), and `forward_mtp` runs the front matter
+/// (`fc(pre_fc_norm_hidden(h) ‖ pre_fc_norm_embedding(e))`) through the injected-input path:
+/// a prefill of 4 rows and a decode of 1 row give finite logits of the vocabulary width, a
+/// repeat is bit-identical, and a wrong-length front matter is refused.
+#[test]
+fn mtp_head_runs_the_front_matter_and_the_layer() {
+    let tmp = TempDir::new("tiny-model-mtp");
+    let spec = write_tiny_qwen3_5_moe_with_mtp(tmp.path(), SEED);
+    let cfg = turbine_model::config::load_model_config(tmp.path()).expect("config");
+    let mcfg = families::qwen3_5::mtp_arch_config(&cfg);
+    let vocab = cfg.vocab_size as usize;
+    assert_eq!(spec.vocab as usize, vocab);
+    let hidden = cfg.hidden as usize;
+
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+    let provider = cpu_reference_provider();
+    let order = [provider.id()];
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let opts = ExecutorOptions::default();
+    let reqs =
+        executor::mtp_requirements(&mcfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let card = provider.card_profile();
+    let registry = Arc::new(
+        KernelRegistry::build(vec![Arc::clone(&provider)], &order, &reqs, &metrics, card)
+            .expect("every op has a provider"),
+    );
+
+    let mut head = turbine_model::mtp::load(
+        &cfg,
+        tmp.path(),
+        Arc::clone(&registry),
+        Arc::clone(&mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        std::slice::from_ref(&provider),
+    )
+    .expect("mtp head");
+
+    let layout = mcfg.kv_layout(BLOCK_TOKENS);
+    let storage = pool(&mem, &layout, 4);
+    let kv = pool_view(&storage, &layout, 4);
+    let table = vec![BlockId(0)];
+
+    let rows = 4usize;
+    let hidden_rows: Vec<f32> = (0..rows * hidden)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
+    // The front matter runs on device; the head embeds `tokens` itself.
+    let tokens: Vec<u32> = (0..rows as u32).map(|i| i % spec.vocab).collect();
+    let h = head.rows(rows).expect("mtp rows");
+    head.executor
+        .mtp_write_rows(&h, &hidden_rows)
+        .expect("write hidden");
+    // MTP rows hold MTP indices 0..rows-1 (overall positions 1..=rows, shifted so the MTP
+    // sequence starts at 0).
+    let positions: Vec<u32> = (0..rows as u32).collect();
+    let logits = head
+        .forward_mtp(
+            &kv,
+            SeqId(0),
+            &table,
+            &[],
+            &positions,
+            rows as u32,
+            &tokens,
+            h.view(),
+        )
+        .expect("forward_mtp prefill");
+    assert_eq!(logits.len(), vocab);
+    assert!(logits.iter().all(|v| v.is_finite()));
+
+    // A second identical run on a fresh pool is bit-identical.
+    let storage2 = pool(&mem, &layout, 4);
+    let kv2 = pool_view(&storage2, &layout, 4);
+    let again = head
+        .forward_mtp(
+            &kv2,
+            SeqId(0),
+            &table,
+            &[],
+            &positions,
+            rows as u32,
+            &tokens,
+            h.view(),
+        )
+        .expect("forward_mtp repeat");
+    assert_eq!(again, logits, "the mtp head is deterministic");
+
+    // A decode step (one row) at MTP index rows.
+    let one = head.rows(1).expect("one row");
+    head.executor
+        .mtp_write_rows(&one, &hidden_rows[..hidden])
+        .expect("write one");
+    let decode = head
+        .forward_mtp(
+            &kv,
+            SeqId(0),
+            &table,
+            &[],
+            &[rows as u32],
+            rows as u32 + 1,
+            &[tokens[0]],
+            one.view(),
+        )
+        .expect("forward_mtp decode");
+    assert_eq!(decode.len(), vocab);
+    assert!(decode.iter().all(|v| v.is_finite()));
+
+    // A step whose token/position counts disagree with the hidden rows is refused.
+    assert!(
+        head.forward_mtp(
+            &kv,
+            SeqId(0),
+            &table,
+            &[],
+            &[0, 1],
+            2,
+            &[tokens[0]],
+            one.view(),
+        )
+        .is_err(),
+        "a mismatched front matter is refused"
+    );
+}
+
+/// P8 MTP: the `mtp` proposer, fed the target's final hidden rows, drafts greedy tokens through
+/// the one-layer head. It proposes `num_tokens` in-vocabulary tokens, deterministically across a
+/// truncate + reseed, and refuses to propose before it has observed the prefix.
+#[test]
+fn mtp_proposer_drafts_from_the_target_hidden() {
+    use turbine_kv::pool::{BlockPool, BlockPoolConfig};
+    use turbine_model::speculative::mtp::MtpProposer;
+    use turbine_model::speculative::{ProposeRequest, Proposer};
+
+    let tmp = TempDir::new("tiny-model-mtp-proposer");
+    let spec = write_tiny_qwen3_5_moe_with_mtp(tmp.path(), SEED);
+    let cfg = turbine_model::config::load_model_config(tmp.path()).expect("config");
+    let mcfg = families::qwen3_5::mtp_arch_config(&cfg);
+    let mem: Arc<dyn DeviceMemory> = HostMemory::new(DeviceId(0), 1 << 30);
+
+    // Target: prefill a prompt and capture the final hidden rows.
+    let mut target = cpu_decoder(&spec, &mem);
+    let mut kv = SequenceKv::new(&mem, *target.kv_layout(), MAX_SEQ_LEN).expect("kv");
+    let prompt: Vec<u32> = (0..8).map(|i| (i * 13 + 3) % spec.vocab).collect();
+    let positions: Vec<u32> = (0..prompt.len() as u32).collect();
+    target
+        .set_hidden_capture(true, prompt.len())
+        .expect("capture");
+    kv.forward(&mut target, &prompt, &positions)
+        .expect("target prefill");
+    let hidden = target
+        .mtp_capture_view(prompt.len())
+        .expect("captured hidden rows");
+    assert_eq!(hidden.shape[0], prompt.len());
+
+    // The MTP head and its proposer.
+    let provider = cpu_reference_provider();
+    let id = provider.id();
+    let card = provider.card_profile();
+    let metrics = KernelMetrics::register(&MetricsRegistry::new());
+    let opts = ExecutorOptions::default();
+    let reqs =
+        executor::mtp_requirements(&mcfg, BLOCK_TOKENS, opts, std::slice::from_ref(&provider));
+    let registry = Arc::new(
+        KernelRegistry::build(vec![Arc::clone(&provider)], &[id], &reqs, &metrics, card)
+            .expect("registry"),
+    );
+    let head = turbine_model::mtp::load(
+        &cfg,
+        tmp.path(),
+        Arc::clone(&registry),
+        Arc::clone(&mem),
+        ExecutorLimits {
+            block_tokens: BLOCK_TOKENS,
+            max_batch_tokens: MAX_SEQ_LEN,
+            max_seqs: MAX_SEQS,
+        },
+        opts,
+        std::slice::from_ref(&provider),
+    )
+    .expect("mtp head");
+    let pool = BlockPool::new(
+        BlockPoolConfig {
+            layout: mcfg.kv_layout(BLOCK_TOKENS),
+            num_blocks: 16,
+        },
+        Arc::clone(&mem),
+    )
+    .expect("mtp pool");
+    let mut proposer =
+        MtpProposer::new(head, pool, BLOCK_TOKENS, MAX_SEQ_LEN, MAX_SEQ_LEN).expect("proposer");
+
+    let seq = SeqId(0);
+    let l = prompt.len() as u32;
+    let last = 5u32;
+    let request = ProposeRequest {
+        seq,
+        last_token: last,
+        accepted_len: l,
+        num_tokens: 4,
+    };
+    // Before observing anything, the proposer cannot draft.
+    assert!(proposer.propose(request).is_err());
+
+    // Observe the MTP rows for positions 1..l-1 (from the captured hidden 0..l-2, tokens 1..l-1)
+    // and seed the last accepted hidden row (position l-1) — all as device views.
+    let obs_positions: Vec<u32> = (1..l).collect();
+    let obs_tokens: Vec<u32> = prompt[1..].to_vec();
+    proposer
+        .observe(
+            seq,
+            &obs_positions,
+            &obs_tokens,
+            hidden.rows(0, (l - 1) as usize),
+        )
+        .expect("observe");
+    proposer
+        .seed_last_hidden(seq, hidden.rows((l - 1) as usize, 1))
+        .expect("seed");
+
+    let first = proposer.propose(request).expect("propose");
+    assert_eq!(first.tokens.len(), 4);
+    assert!(
+        first
+            .tokens
+            .iter()
+            .all(|t| (*t as usize) < spec.vocab as usize)
+    );
+
+    // A truncate + reseed then propose gives the same tokens.
+    proposer.truncate(seq, l).expect("truncate");
+    proposer
+        .seed_last_hidden(seq, hidden.rows((l - 1) as usize, 1))
+        .expect("reseed");
+    let again = proposer.propose(request).expect("propose again");
+    assert_eq!(
+        first.tokens, again.tokens,
+        "the mtp proposer is deterministic"
+    );
+
+    // Another sequence observed on the same proposer must not disturb the first: per-sequence
+    // MTP KV, not one shared slot (a continuous batch observes many sequences).
+    let seq_b = SeqId(1);
+    proposer
+        .observe(
+            seq_b,
+            &obs_positions,
+            &obs_tokens,
+            hidden.rows(0, (l - 1) as usize),
+        )
+        .expect("observe b");
+    proposer
+        .seed_last_hidden(seq_b, hidden.rows((l - 1) as usize, 1))
+        .expect("seed b");
+    let request_b = ProposeRequest {
+        seq: seq_b,
+        ..request
+    };
+    let _b = proposer.propose(request_b).expect("propose b");
+    proposer.truncate(seq, l).expect("truncate a");
+    proposer
+        .seed_last_hidden(seq, hidden.rows((l - 1) as usize, 1))
+        .expect("reseed a");
+    let a_after_b = proposer.propose(request).expect("propose a again");
+    assert_eq!(
+        a_after_b.tokens, first.tokens,
+        "sequence A is unaffected by sequence B"
     );
 }
 
