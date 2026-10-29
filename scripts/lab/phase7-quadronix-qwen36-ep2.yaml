@@ -1,0 +1,43 @@
+# turbine-server configuration for the Phase 7 two-card gate of Qwen3.6-35B-A3B-FP8 (MoE Gated DeltaNet hybrid, ~38 GB: ~19 GB per card),
+# expert parallel over both R9700s (expert_parallel_size 2), on quadronix:
+#   scripts/lab-cluster.sh [--bench-lock] qwen36-ep2-quadronix   (golden, GSM8K, bench; pod loopback)
+#   scripts/lab-perf.sh quadronix qwen36 --placement ep2 [--eval]  (vs vLLM-ROCm; listen overridden)
+# Weights: /home/piwi/turbine-models/qwen3.6-35b-a3b-fp8 on the host, mounted read-only at /models by the
+# cluster and serve Jobs. The served id is the checkpoint's repo id, as `lab-serve.sh --vllm`
+# serves vLLM-ROCm. Execution, scheduler and KV keys as scripts/lab/phase5-quadronix-*.yaml.
+server:
+  listen: 127.0.0.1:18000
+model:
+  path: /models/qwen3.6-35b-a3b-fp8
+  served_name: Qwen/Qwen3.6-35B-A3B-FP8
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: true
+parallel:
+  tensor_parallel_size: 1
+  expert_parallel_size: 2
+  data_parallel_size: 1
+  devices: [0, 1]
+  collective_backend: rccl
+  expert:
+    placement: contiguous
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 6GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

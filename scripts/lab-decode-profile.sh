@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lab-decode-profile.sh — per-kernel profile of a batch-1 decode step on novanas GPU 0
+# lab-decode-profile.sh — per-kernel profile of a batch-1 decode step on quadronix GPU 0
 # (phase-5p Task 18 / S-19).
 #
 #   scripts/lab-decode-profile.sh [--model llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block] [--label L] [--attach-ms <ms>]
@@ -18,7 +18,12 @@
 set -uo pipefail
 orig_args=("$@")
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
+host_tag=quadronix
+host_addr=192.168.10.164
+rocm=/opt/rocm/core-10.1
+amd_smi=libamd_smi.so.27.1.0
+if [[ "$host" == *192.168.10.203* ]]; then host_tag=novanas; host_addr=192.168.10.203; rocm=/opt/rocm/rocm; amd_smi=libamd_smi.so.26.5.0; fi
 model=llama
 label="decodeprof"
 attach_ms=3000
@@ -65,11 +70,11 @@ done
 case "$model" in
 llama)
 	slug=llama-3.2-3b-instruct
-	cfg=scripts/lab/phase2c-novanas-llama.yaml
+	cfg=scripts/lab/phase2c-${host_tag}-llama.yaml
 	;;
 olmoe)
 	slug=olmoe-1b-7b-0125-instruct
-	cfg=scripts/lab/phase2c-novanas-olmoe.yaml
+	cfg=scripts/lab/phase2c-${host_tag}-olmoe.yaml
 	;;
 # The FP8 Llama checkpoints (5p Task 14), on their Phase 6a configs (lab-bench.sh's mapping).
 llama-fp8 | llama-fp8-tensor | llama-fp8-block)
@@ -87,7 +92,7 @@ name="$(basename "$root")"
 remote="/home/piwi/turbine-ci/remote/$name"
 outdir="$root/target/decodebw/$label-$model"
 mkdir -p "$outdir"
-url=http://192.168.10.203:18000
+url="http://${host_addr}:18000"
 pidf=/tmp/decode-profile-server.pid
 profdir="$remote/decodeprof"
 
@@ -137,7 +142,7 @@ else
 	fi
 	if ! ssh -o BatchMode=yes "$host" "cd '$remote/src' && nice -n 19 taskset -c 12-15 \
       cmake -S kernels/rocm -B '$remote/kbuild' -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
+        -DCMAKE_HIP_COMPILER=$rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null &&
       nice -n 19 taskset -c 12-15 cmake --build '$remote/kbuild' -j 4" \
 		>"$outdir/build-kernels.log" 2>&1; then
 		echo "PROFILE $label $model BUILD FAILED (see $outdir/build-kernels.log)"
@@ -180,8 +185,8 @@ if [[ $dry -eq 1 ]]; then
 	echo "+ ssh $host 'setsid ... turbine-server --config $cfg ...'"
 else
 	ssh -o BatchMode=yes "$host" "setsid bash -c \"echo \\\$\\\$ > $pidf; cd '$remote/src' && \
-    LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
-    TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=0 \
+    LD_LIBRARY_PATH=$rocm/lib:$rocm/lib/rocm_sysdeps/lib \
+    TURBINE_AMD_SMI_LIBRARY=$rocm/lib/$amd_smi ROCR_VISIBLE_DEVICES=0 \
     ROCP_TOOL_ATTACH=1 \
     exec taskset -c 0-11 '$remote/target/release/turbine-server' --config $cfg \
       --set model.path=/home/piwi/turbine-models/$slug \
@@ -208,7 +213,7 @@ else
 	fi
 fi
 
-# The single-request load runs on novanas (the workstation has no Linux turbine-bench).
+# The single-request load runs on quadronix (the workstation has no Linux turbine-bench).
 if [[ $dry -eq 1 ]]; then
 	echo "+ ssh $host 'turbine-bench --concurrency 1 --requests $requests --max-tokens $max_tokens --ignore-eos --output json'"
 	echo "+ ssh $host 'rocprofv3 --attach <pid> --attach-duration-msec $attach_ms --kernel-trace --memory-copy-trace --hip-runtime-trace -f csv'"
@@ -225,7 +230,7 @@ else
 	sleep 12
 	server_pid=$(ssh -o BatchMode=yes "$host" "cat $pidf")
 	ssh -o BatchMode=yes "$host" "cd $profdir && \
-    LD_LIBRARY_PATH=/opt/rocm/rocm/lib /opt/rocm/rocm/bin/rocprofv3 \
+    LD_LIBRARY_PATH=$rocm/lib $rocm/bin/rocprofv3 \
       --attach $server_pid --attach-duration-msec $attach_ms \
       --kernel-trace --memory-copy-trace --hip-runtime-trace -f csv" \
 		>"$outdir/rocprof.log" 2>&1

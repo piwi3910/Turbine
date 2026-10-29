@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Same-day throughput comparison of Turbine and vLLM-ROCm on the same novanas R9700(s) (Phase 2c
+# Same-day throughput comparison of Turbine and vLLM-ROCm on the same quadronix R9700(s) (Phase 2c
 # S-13; the Phase 7 S-13 placements, user decision 2026-10-08 B).
 #
-#   scripts/lab-perf.sh [--dry-run] novanas <model> [--placement tp1|tp2|ep2] [--eval] [--runs <n>]
+#   scripts/lab-perf.sh [--dry-run] quadronix|novanas <model> [--placement tp1|tp2|ep2] [--eval] [--runs <n>]
 #                       [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]...
 #
 # <model>: llama|olmoe (Phase 2c, one card), or a Phase 7 family: one card (placement tp1, the
-# default) qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b with scripts/lab/phase7-novanas-<model>.yaml;
+# default) qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b with scripts/lab/phase7-<host>-<model>.yaml;
 # two cards (placement tp2 or ep2, required) qwen3moe|mixtral|qwen36 with
-# scripts/lab/phase7-novanas-<model>-<placement>.yaml, served with `--gpus 2 --set
+# scripts/lab/phase7-<host>-<model>-<placement>.yaml, served with `--gpus 2 --set
 # server.listen=0.0.0.0:18000` (the config listens on the cluster pod's loopback), then vLLM-ROCm
 # on the same two cards with `--gpus 2 --vllm-arg --tensor-parallel-size --vllm-arg 2` (plus
 # `--vllm-arg --enable-expert-parallel` for ep2).
 #
 # For each engine, one after the other on the same card(s): serve it (Turbine:
-# `scripts/lab-serve.sh novanas <config> [--set ...]` with the model's lab config, or --config;
-# vLLM: `scripts/lab-serve.sh novanas --vllm <slug>`, the pinned image), warm it up with 16
+# `scripts/lab-serve.sh quadronix <config> [--set ...]` with the model's lab config, or --config;
+# vLLM: `scripts/lab-serve.sh quadronix --vllm <slug>`, the pinned image), warm it up with 16
 # requests of the baseline shape, run the baseline workload
 #   turbine-bench --concurrency 16 --requests 200 --prompt-words 512 --max-tokens 256 --ignore-eos
 # --runs times (default 3), then stop the serve Job this script started (by its run id, never
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-perf.sh [--dry-run] novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--reasoning-effort low|medium|high] [--chat-template-kwargs <json>] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
+	echo "usage: scripts/lab-perf.sh [--dry-run] quadronix|novanas <llama|olmoe|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b|qwen3moe|mixtral|qwen36> [--placement tp1|tp2|ep2] [--eval] [--reasoning-effort low|medium|high] [--chat-template-kwargs <json>] [--runs <n>] [--skip-vllm] [--config <yaml>] [--set <dotted.key>=<value>]..." >&2
 	exit 2
 }
 
@@ -57,6 +57,7 @@ fi
 HOST="$1"
 case "$HOST" in
 novanas) ADDR=192.168.10.203 ;;
+quadronix) ADDR=192.168.10.164 ;;
 *) usage ;;
 esac
 MODEL="$2"
@@ -201,11 +202,11 @@ fi
 cd "$REPO_ROOT"
 if [[ -z "$CONFIG" ]]; then
 	if [[ $PHASE7 -eq 0 ]]; then
-		CONFIG="scripts/lab/phase2c-novanas-${MODEL}.yaml"
+		CONFIG="scripts/lab/phase2c-${HOST}-${MODEL}.yaml"
 	elif [[ $CARDS -eq 2 ]]; then
-		CONFIG="scripts/lab/phase7-novanas-${MODEL}-${PLACEMENT}.yaml"
+		CONFIG="scripts/lab/phase7-${HOST}-${MODEL}-${PLACEMENT}.yaml"
 	else
-		CONFIG="scripts/lab/phase7-novanas-${MODEL}.yaml"
+		CONFIG="scripts/lab/phase7-${HOST}-${MODEL}.yaml"
 	fi
 fi
 # Each engine's serve arguments after the config / slug: both cards for a two-card placement (the
@@ -226,7 +227,7 @@ fi
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 BENCH="${CARGO_TARGET_DIR:-target}/release/turbine-bench"
 GOLDEN="${CARGO_TARGET_DIR:-target}/release/turbine-golden"
-VLLM_IMAGE="$(sed -n 's/^ *image: *//p' scripts/lab/novanas-vllm-job.yaml | head -n 1)"
+VLLM_IMAGE="$(sed -n 's/^ *image: *//p' scripts/lab/${HOST}-vllm-job.yaml | head -n 1)"
 OUT="target/lab-perf/${RUN_ID}"
 # The serve logs (parsed for the run id); a dry run keeps them in a temporary directory.
 LOG_DIR="$OUT"

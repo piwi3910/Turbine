@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# gate.sh — the commit gate: fast locally, then clippy + a diff-scoped test run on novanas.
+# gate.sh — the commit gate: fast locally, then clippy + a diff-scoped test run on quadronix.
 #
 #   scripts/gate.sh [--full] [--base <rev>]
 #
 # 1. `cargo fmt --all --check`, locally (no build, no network).
-# 2. On novanas via scripts/remote-cargo.sh: `cargo clippy --workspace --all-targets -- -D
-#    warnings`. Clippy always runs over the whole workspace — with a warm cache on novanas it is
+# 2. On quadronix via scripts/remote-cargo.sh: `cargo clippy --workspace --all-targets -- -D
+#    warnings`. Clippy always runs over the whole workspace — with a warm cache on quadronix it is
 #    fast enough that scoping it would not save meaningful time, and it catches cross-crate
 #    lint fallout a scoped run would miss.
 # 3. Tests: the crates whose files changed between --base (default: the merge-base of HEAD and
@@ -14,7 +14,7 @@
 #    turbine-tensor also re-tests turbine-kernels, turbine-model, turbine-server, and so on. A
 #    change to a workspace-wide file (root Cargo.toml/Cargo.lock, rust-toolchain*, .cargo/**)
 #    or `--full` runs the whole workspace instead. Runs with `cargo nextest` if it is installed
-#    on novanas (this script installs it there once via plain ssh if missing, and falls back to
+#    on quadronix (this script installs it there once via plain ssh if missing, and falls back to
 #    `cargo test` if that install fails). Only host-side tests run here: GPU tests stay
 #    #[ignore]d (scripts/lab-test.sh runs those).
 #
@@ -49,7 +49,7 @@ done
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-HOST="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+HOST="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 TOOLCHAIN="${TURBINE_REMOTE_TOOLCHAIN:-1.97}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 
@@ -191,7 +191,7 @@ if [[ $FULL -eq 0 && "$CRATES_DISPLAY" == "none" ]]; then
 	finish ok "$CRATES_DISPLAY" 0 0 0
 fi
 
-# cargo-nextest, installed once on novanas; falls back to cargo test if that install fails.
+# cargo-nextest, installed once on quadronix; falls back to cargo test if that install fails.
 NEXTEST=0
 say "checking cargo-nextest on ${HOST}"
 if ssh "${SSH_OPTS[@]}" "$HOST" "test -x \$HOME/.cargo/bin/cargo-nextest" 2>/dev/null; then

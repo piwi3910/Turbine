@@ -1,0 +1,36 @@
+# turbine-server configuration for the Phase 7 one-card gate of Qwen3.5-9B (BF16 Gated DeltaNet hybrid, ~20 GB) on quadronix:
+#   scripts/lab-bench.sh --model qwen3.5-9b [--golden16]
+#   scripts/lab-perf.sh quadronix qwen3.5-9b
+#   scripts/lab-serve.sh quadronix scripts/lab/phase7-quadronix-qwen3.5-9b.yaml [--set <k>=<v>]...
+# Weights: /home/piwi/turbine-models/qwen3.5-9b on the host, mounted read-only at /models by
+# scripts/lab/quadronix-serve-job.yaml (lab-bench.sh serves natively and overrides model.path).
+# The served id is the checkpoint's repo id, as `lab-serve.sh --vllm qwen3.5-9b` serves vLLM-ROCm.
+# Execution, scheduler and KV keys as scripts/lab/phase2c-quadronix-llama.yaml.
+server:
+  listen: 0.0.0.0:18000
+model:
+  path: /models/qwen3.5-9b
+  served_name: Qwen/Qwen3.5-9B
+execution:
+  backend: hip
+  gemm_autotune: true
+  decode_graphs: true
+  device_sampling: true
+  fused_ops: true
+  sampler_threads: 4
+  overlap_scheduling: true
+kv:
+  block_tokens: 128
+  gpu:
+    max_bytes: 6GiB
+scheduler:
+  continuous_batching: true
+  chunked_prefill: true
+  max_running_requests: 64
+  max_batch_tokens: 2048
+  prefill_chunk_tokens: 2048
+  max_queued_requests: 256
+reliability:
+  admission:
+    # The Phase 2 scheduler.queue_timeout (CONFLICT C-1).
+    queue_timeout: 60s

@@ -2,16 +2,16 @@
 # Phase 3 overload soak (P3 S-19): calibrate -> overload -> cool-down against a freshly started
 # turbine-server on a lab host, then a pass/fail verdict.
 #
-#   scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>]
+#   scripts/overload-soak.sh <quadronix|novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>]
 #                            [--set <dotted.key>=<value>]... [--shared-prefix-share <0..1>]
 #                            [--shared-prefixes <n>] [--shared-prefix-words <n>]
 #
 # 0. precondition: prints the host, the GPU and the memory it will claim and refuses to start
-#    (exit 1, `precondition`) unless an R9700 on novanas has < 1 GiB VRAM in use (amdgpu sysfs
+#    (exit 1, `precondition`) unless an R9700 on quadronix has < 1 GiB VRAM in use (amdgpu sysfs
 #    mem_info_vram_used, read over SSH), or a Spark's MemAvailable exceeds the 24 GiB container
 #    cap plus reliability.memory.host_reserve_bytes (8 GiB). Freeing a host is the user's
 #    decision, never this script's.
-# 1. start: novanas runs scripts/lab-serve.sh novanas scripts/lab/phase3-novanas-soak.yaml (a
+# 1. start: quadronix runs scripts/lab-serve.sh quadronix scripts/lab/phase3-quadronix-soak.yaml (a
 #    k3s Job with one R9700, rust:1.97-trixie, ROCm mounted read-only, the weights read-only at
 #    /models; --model <host path under /home/piwi/turbine-models> becomes model.path, and each
 #    --set is passed on to lab-serve.sh, e.g. the P6b compression ladder's tiers) and waits
@@ -50,14 +50,14 @@
 set -euo pipefail
 
 GIB=$((1 << 30))
-# novanas: the VRAM another workload may hold on the R9700 the Job gets.
+# quadronix: the VRAM another workload may hold on the R9700 the Job gets.
 NOVANAS_VRAM_LIMIT=$GIB
 # Sparks: the soak container's memory cap plus reliability.memory.host_reserve_bytes.
 SPARK_CONTAINER_CAP=$((24 * GIB))
 HOST_RESERVE=$((8 * GIB))
 
 usage() {
-	echo "usage: scripts/overload-soak.sh <novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>] [--set <dotted.key>=<value>]... [--shared-prefix-share <0..1>] [--shared-prefixes <n>] [--shared-prefix-words <n>]" >&2
+	echo "usage: scripts/overload-soak.sh <quadronix|novanas|dgx-spark|dgx-spark2> [--duration <dur>] [--model <path>] [--set <dotted.key>=<value>]... [--shared-prefix-share <0..1>] [--shared-prefixes <n>] [--shared-prefix-words <n>]" >&2
 	exit 2
 }
 
@@ -72,7 +72,7 @@ soak_load_flags() {
 	printf '%s\n' --shared-prefix-share "$share" --shared-prefixes "$prefixes" --shared-prefix-words "$words"
 }
 
-# soak_precondition <host> <bytes>: novanas <bytes> = VRAM in use on the least-used R9700;
+# soak_precondition <host> <bytes>: quadronix <bytes> = VRAM in use on the least-used R9700;
 # a Spark <bytes> = MemAvailable. Returns 1 printing `precondition: ...` when the host is busy.
 soak_precondition() {
 	local host="$1" bytes="$2"
@@ -81,9 +81,9 @@ soak_precondition() {
 		return 1
 	}
 	case "$host" in
-	novanas)
+	novanas | quadronix)
 		if ((bytes >= NOVANAS_VRAM_LIMIT)); then
-			echo "precondition: novanas: every R9700 holds >= 1 GiB VRAM (least used: ${bytes} bytes); free one first (the user's decision)" >&2
+			echo "precondition: ${host}: every R9700 holds >= 1 GiB VRAM (least used: ${bytes} bytes); free one first (the user's decision)" >&2
 			return 1
 		fi
 		;;
@@ -112,6 +112,7 @@ HOST="$1"
 shift
 case "$HOST" in
 novanas) ADDR=192.168.10.203 ;;
+quadronix) ADDR=192.168.10.164 ;;
 dgx-spark) ADDR=192.168.10.246 ;;
 dgx-spark2) ADDR=192.168.10.245 ;;
 *) usage ;;
@@ -202,13 +203,13 @@ mkdir -p "$OUT"
 
 step precondition
 case "$HOST" in
-novanas)
+novanas | quadronix)
 	# shellcheck disable=SC2016 # expanded by the remote shell
 	used=$("${SSH[@]}" 'min=; for f in /sys/class/drm/card*/device/mem_info_vram_used; do v=$(cat "$f"); if [ -z "$min" ] || [ "$v" -lt "$min" ]; then min=$v; fi; done; echo "${min:-}"') ||
 		fail "cannot read VRAM use over SSH"
 	[[ -n "$used" ]] || fail "no amdgpu VRAM counters on ${HOST}"
-	echo "overload-soak: novanas: GPU: one R9700 (k3s amd.com/gpu: 1); claims the reliability budget of its free VRAM; least-used R9700 holds ${used} bytes"
-	soak_precondition novanas "$used" || exit 1
+	echo "overload-soak: ${HOST}: GPU: one R9700 (k3s amd.com/gpu: 1); claims the reliability budget of its free VRAM; least-used R9700 holds ${used} bytes"
+	soak_precondition "$HOST" "$used" || exit 1
 	;;
 *)
 	avail=$("${SSH[@]}" "awk '/^MemAvailable:/ {print \$2 * 1024}' /proc/meminfo") ||
@@ -220,12 +221,12 @@ esac
 
 step start
 serve_rc=0
-[[ "$HOST" == novanas ]] ||
+[[ "$HOST" == novanas || "$HOST" == quadronix ]] ||
 	fail "the Spark serve path (Phase 2b docker image) is not available in this tree"
-TURBINE_LAB_SERVE_TIMEOUT=600 "${REPO_ROOT}/scripts/lab-serve.sh" novanas \
-	"${REPO_ROOT}/scripts/lab/phase3-novanas-soak.yaml" \
+TURBINE_LAB_SERVE_TIMEOUT=600 "${REPO_ROOT}/scripts/lab-serve.sh" "$HOST" \
+	"${REPO_ROOT}/scripts/lab/phase3-${HOST}-soak.yaml" \
 	--set "model.path=/models/$(basename "$MODEL")" ${SETS[@]+"${SETS[@]}"} 2>&1 | tee "$OUT/serve.log" || serve_rc=$?
-RUN_ID=$(sed -n 's/^lab-serve: novanas: run \([0-9a-f-]*\): .*/\1/p' "$OUT/serve.log" | head -n 1)
+RUN_ID=$(sed -n "s/^lab-serve: ${HOST}: run \([0-9a-f-]*\): .*/\1/p" "$OUT/serve.log" | head -n 1)
 # A refused start (e.g. another server already answers on the port) must not go on to measure
 # whatever answers there: that is someone else's server.
 [[ "$serve_rc" -eq 0 ]] || fail "lab-serve did not start the soak's server (exit ${serve_rc}; see $OUT/serve.log)"

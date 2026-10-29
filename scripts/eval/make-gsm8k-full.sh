@@ -4,7 +4,7 @@
 # id scheme, user-message wrapper, answer extraction and match/max_tokens as
 # tests/eval/gsm8k-200.jsonl (scripts/eval/make-gsm8k-200.sh) — its first 200 items
 # are byte-identical to that file. Fixture-generation time only; needs `hf` and `uv`
-# (run on novanas: the Hugging Face token lives there, and nothing is uploaded).
+# (run on quadronix: the Hugging Face token lives there, and nothing is uploaded).
 set -euo pipefail
 REVISION=740312add88f781978c0658806c59bc2815b9866
 DATASET_DIR="${TURBINE_GSM8K_DATASET_DIR:-/home/piwi/turbine-ci/datasets/gsm8k}"

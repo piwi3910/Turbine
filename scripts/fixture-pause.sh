@@ -9,10 +9,10 @@
 # interrupted. A running fixture job touches pages the host swapped out, and the swap-in makes
 # a lab server's pressure controller reject requests (SURVIVAL on `swap_in_rate`), so serving
 # benchmarks and evals pause them (scripts/lab-bench.sh does). Exits with the command's exit
-# code. Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas).
+# code. Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.164, quadronix).
 set -uo pipefail
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 if [[ "${1:-}" == "--host" ]]; then
 	host="$2"
 	shift 2

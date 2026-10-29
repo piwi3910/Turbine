@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run the Turbine test suite, including #[ignore] GPU tests, on one lab host.
 #
-#   scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas|quadronix> [--gpus 1|2] [--with-hf-reference]
+#   scripts/lab-test.sh [--dry-run] <quadronix|novanas|dgx-spark|dgx-spark2> [--gpus 1|2] [--with-hf-reference]
 #                       [--features <list>] [--tier quick|perf|full] [-- <cargo test arguments>]
-#   scripts/lab-test.sh [--dry-run] <novanas|quadronix> --stop <run-id>
+#   scripts/lab-test.sh [--dry-run] <quadronix|novanas> --stop <run-id>
 #
 # Runs `cargo test --no-fail-fast <selection> -- --include-ignored --show-output`, so one run
 # reports every failing test target. <selection> defaults to --workspace; anything after `--`
@@ -20,7 +20,7 @@
 #
 # dgx-spark / dgx-spark2: `docker run --rm --gpus all` of rust:1.97-trixie (container
 #   turbine-lab-test only; production vLLM containers are never touched).
-# novanas: the k3s Job template scripts/lab/novanas-test-job.yaml in namespace turbine-ci, named
+# quadronix: the k3s Job template scripts/lab/quadronix-test-job.yaml in namespace turbine-ci, named
 #   turbine-lab-test-<run id> so several runs can go side by side. --gpus (default 1) is the
 #   R9700 count the Job requests and the AMD device count the lab tests expect
 #   (TURBINE_EXPECT_AMD). The default one-GPU leg skips TWO_GPU_TESTS; `--gpus 2` without an
@@ -40,13 +40,13 @@ set -euo pipefail
 orig_args=("$@")
 
 usage() {
-	echo "usage: scripts/lab-test.sh [--dry-run] <dgx-spark|dgx-spark2|novanas|quadronix> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
-	echo "       scripts/lab-test.sh [--dry-run] <novanas|quadronix> --stop <run-id>" >&2
+	echo "usage: scripts/lab-test.sh [--dry-run] <quadronix|novanas|dgx-spark|dgx-spark2> [--gpus 1|2] [--with-hf-reference] [--features <list>] [--tier quick|perf|full] [-- <cargo test args>]" >&2
+	echo "       scripts/lab-test.sh [--dry-run] <quadronix|novanas> --stop <run-id>" >&2
 	exit 2
 }
 
 # The turbine-model perf/timing tests and the turbine-kernels hip_ops timing/exhaustive-match
-# tests: > ~60 s each on novanas (nextest's "has been running for over 60 seconds" warning in
+# tests: > ~60 s each on quadronix (nextest's "has been running for over 60 seconds" warning in
 # scripts/lab-test.sh full runs, e.g. target/lab-perf and lab-test logs from 2026-09-26/27).
 # One list, used both ways by --tier: skipped for `quick`, the only ones run for `perf`.
 # Lab tests against a model already served by `scripts/lab-serve.sh` (they read TURBINE_LAB_URL
@@ -363,7 +363,7 @@ remote_stdin() {
 }
 
 kube() {
-	# kubectl on novanas warns about unreadable config files for user piwi. KUBECTL_KUBERC=false
+	# kubectl on quadronix warns about unreadable config files for user piwi. KUBECTL_KUBERC=false
 	# silences the kuberc warning (it lacks a trailing newline, so a following error would share
 	# its line); the remaining k3s config.yaml warnings are whole lines and only those are dropped.
 	if [[ $DRY_RUN -eq 1 ]]; then

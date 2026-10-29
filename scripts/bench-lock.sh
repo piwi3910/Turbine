@@ -10,10 +10,10 @@
 # Jobs, lab-serve sessions, benchmarks), runs <command> locally, then releases the lock. Builds
 # (scripts/remote-cargo.sh) do not take it: they run at nice 19 on cores 12-15, away from a
 # benchmark's cores 0-11. Exits with the command's exit code. --shared takes the lock shared instead: wrap scripts/lab-test.sh runs in it
-# so their in-Job builds also wait while a benchmark holds the lock. Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas).
+# so their in-Job builds also wait while a benchmark holds the lock. Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.164, quadronix).
 set -euo pipefail
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 if [[ "${1:-}" == "--host" ]]; then
 	host="$2"
 	shift 2

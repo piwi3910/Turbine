@@ -11,7 +11,7 @@
 # an edited file for an already-built one. Exits with cargo's exit code. `--clean` deletes this
 # checkout's remote directory.
 #
-# Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.203, novanas), TURBINE_REMOTE_TOOLCHAIN
+# Environment: TURBINE_REMOTE_HOST (default piwi@192.168.10.164, quadronix), TURBINE_REMOTE_TOOLCHAIN
 # (default 1.97), TURBINE_REMOTE_JOBS (cargo build jobs, default 4), TURBINE_REMOTE_CPUS (cores
 # cargo and the tests it runs may use, default 12-15); TURBINE_LAB_URL is passed to cargo when set.
 # Only builds and host-side tests run here: GPU tests stay #[ignore]d and run through lab-test.sh.
@@ -23,7 +23,7 @@
 # worktrees (idle 12 h) are deleted and logged.
 set -euo pipefail
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 toolchain="${TURBINE_REMOTE_TOOLCHAIN:-1.97}"
 jobs="${TURBINE_REMOTE_JOBS:-4}"
 cpus="${TURBINE_REMOTE_CPUS:-12-15}"

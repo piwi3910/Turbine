@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# lab-prune.sh — free novanas disk by deleting stale remote-cargo build caches (user decision
-# 2026-09-28, "Lab disk: pruning stale remote build caches on novanas").
+# lab-prune.sh — free quadronix disk by deleting stale remote-cargo build caches (user decision
+# 2026-09-28, "Lab disk: pruning stale remote build caches on quadronix").
 #
 #   scripts/lab-prune.sh [--dry-run | --report] [--host <ssh-host>]
 #
@@ -18,7 +18,7 @@
 # contacts the host and prints what would be removed without removing anything.
 set -uo pipefail
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 hours="${TURBINE_PRUNE_IDLE_HOURS:-12}"
 base=/home/piwi/turbine-ci/remote
 mode=remove
