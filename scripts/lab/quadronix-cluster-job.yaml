@@ -79,7 +79,9 @@ spec:
               mkdir -p "$SLOT_DIR/src" "$CARGO_TARGET_DIR" "$KERNEL_BUILD_DIR"
 
               step "sync the uploaded tree into the slot"
-              rsync -rlpc --delete "$RUN_DIR/src/" "$SLOT_DIR/src/"
+              rm -rf "$SLOT_DIR/src"
+              mkdir -p "$SLOT_DIR/src"
+              cp -a "$RUN_DIR/src/." "$SLOT_DIR/src/"
               cd "$SLOT_DIR/src"
 
               step "build kernels/rocm"
