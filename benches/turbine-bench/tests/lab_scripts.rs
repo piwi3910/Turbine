@@ -21,6 +21,8 @@ const MOE_MODEL_DIR: &str = "/models/olmoe-1b-7b-0125-instruct";
 /// The vLLM-ROCm image the baseline Job pins (tag and digest, checked on Docker Hub).
 const VLLM_IMAGE: &str = "rocm/vllm:rocm7.14.1_rdna_ubuntu24.04_py3.14_pytorch_2.11_vllm_0.23.0@sha256:19ad8dc5fb3012f2d5810995f73e8bf069302056d2b4aa6fdf2d2ae5fa9a68ab";
 const SSH: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10 piwi@192.168.10.203";
+/// The default lab and build host (lab-cluster.sh, lab-prune.sh, lab-bench.sh).
+const SSH_QUADRONIX: &str = "ssh -o BatchMode=yes -o ConnectTimeout=10 piwi@192.168.10.164";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -209,11 +211,13 @@ fn dry_run(script: &str, tag: &str, args: &[&str]) -> String {
 
 /// The body of the heredoc a dry run prints for the remote command `cmd`.
 fn heredoc<'a>(text: &'a str, cmd: &str) -> &'a str {
-    let open = format!("{SSH} '{cmd}' <<'EOF'\n");
-    let start = text
-        .find(&open)
-        .unwrap_or_else(|| panic!("no {open:?} in:\n{text}"))
-        + open.len();
+    let opens = [SSH, SSH_QUADRONIX].map(|ssh| format!("{ssh} '{cmd}' <<'EOF'\n"));
+    let (at, open) = opens
+        .iter()
+        .filter_map(|o| text.find(o.as_str()).map(|i| (i, o)))
+        .min_by_key(|(i, _)| *i)
+        .unwrap_or_else(|| panic!("no {:?} in:\n{text}", opens[0]));
+    let start = at + open.len();
     let len = text[start..].find("\nEOF\n").expect("heredoc end");
     &text[start..start + len]
 }
@@ -226,10 +230,15 @@ fn applied_job(text: &str) -> Value {
 
 /// Every Job a dry run applies, in order, parsed.
 fn applied_jobs(text: &str) -> Vec<Value> {
-    let open = format!("{SSH} 'export KUBECTL_KUBERC=false; kubectl apply -f -' <<'EOF'\n");
+    let opens = [SSH, SSH_QUADRONIX]
+        .map(|ssh| format!("{ssh} 'export KUBECTL_KUBERC=false; kubectl apply -f -' <<'EOF'\n"));
     let mut jobs = Vec::new();
     let mut rest = text;
-    while let Some(i) = rest.find(&open) {
+    while let Some((i, open)) = opens
+        .iter()
+        .filter_map(|o| rest.find(o.as_str()).map(|i| (i, o)))
+        .min_by_key(|(i, _)| *i)
+    {
         let manifest = heredoc(rest, "export KUBECTL_KUBERC=false; kubectl apply -f -");
         assert!(
             !manifest.contains("__"),
@@ -244,7 +253,11 @@ fn applied_jobs(text: &str) -> Vec<Value> {
 
 /// The run id a dry run announces (`run <id>: job ...`).
 fn run_id(text: &str, tool: &str) -> String {
-    let prefix = format!("{tool}: novanas: run ");
+    let prefix = ["quadronix", "novanas"]
+        .map(|h| format!("{tool}: {h}: run "))
+        .into_iter()
+        .find(|p| text.lines().any(|l| l.starts_with(p.as_str())))
+        .unwrap_or_else(|| panic!("no run line in:\n{text}"));
     let line = text
         .lines()
         .find(|l| l.starts_with(&prefix))
@@ -2072,9 +2085,9 @@ fn cluster_dry_run_manifest() {
     assert_in_order(
         &text,
         &[
-            &format!("{SSH} 'mkdir -p {run_dir}/src {CACHE}/slots"),
+            &format!("{SSH_QUADRONIX} 'mkdir -p {run_dir}/src {CACHE}/slots"),
             "rsync -rlpcz --delete --exclude target/ --exclude .git/ --exclude .claude/",
-            &format!("piwi@192.168.10.203:{run_dir}/src/"),
+            &format!("piwi@192.168.10.164:{run_dir}/src/"),
             "kubectl apply -f -",
             &format!("kubectl -n turbine-ci logs -f job/{build_name}"),
             "kubectl apply -f -",
@@ -2109,7 +2122,7 @@ fn cluster_dry_run_manifest() {
         let m = mounts(j);
         for want in [
             ("/models", "/home/piwi/turbine-models", true),
-            ("/opt/rocm/rocm", "/opt/rocm/rocm", true),
+            ("/opt/rocm/rocm", "/opt/rocm/core-10.1", true),
         ] {
             let want = (want.0.to_string(), want.1.to_string(), want.2);
             assert!(m.contains(&want), "{want:?} missing from {m:?}");
@@ -2253,7 +2266,7 @@ fn lab_prune_removes_only_stale_agent_targets() {
     );
     assert!(
         text.contains(&format!(
-            "{SSH} bash -s -- remove 12 {CI_ROOT}/remote <keep> <<'PRUNE'"
+            "{SSH_QUADRONIX} bash -s -- remove 12 {CI_ROOT}/remote <keep> <<'PRUNE'"
         )),
         "{text}"
     );
@@ -3080,7 +3093,7 @@ fn lab_bench_dry_run_phase7_models() {
     assert_in_order(
         &text,
         &[
-            "--config scripts/lab/phase7-novanas-qwen3-4b.yaml",
+            "--config scripts/lab/phase7-quadronix-qwen3-4b.yaml",
             "--set model.path=/home/piwi/turbine-models/qwen3-4b-instruct-2507",
             "compare --url http://127.0.0.1:18000 --reference \
              tests/golden/qwen3-4b-instruct-2507/reference.jsonl --concurrency 1",
@@ -3103,7 +3116,7 @@ fn lab_bench_dry_run_phase7_models() {
         assert_eq!(out.status.code(), Some(0), "{short}: {}", stderr(&out));
         assert_eq!(
             stdout(&out).trim(),
-            format!("{slug} {slug} scripts/lab/phase7-novanas-{short}.yaml"),
+            format!("{slug} {slug} scripts/lab/phase7-quadronix-{short}.yaml"),
             "{short}"
         );
     }
@@ -3297,7 +3310,7 @@ fn lab_cluster_dry_run_family_scenarios() {
                 &[
                     &format!("kubectl -n turbine-ci logs -f job/turbine-lab-cluster-{id}"),
                     &format!(
-                        "turbine-server --config scripts/lab/phase7-novanas-{short}-{placement}.yaml"
+                        "turbine-server --config scripts/lab/phase7-quadronix-{short}-{placement}.yaml"
                     ),
                     &format!("{golden} --concurrency 1 --multi-gpu-bounds"),
                     &format!("{golden} --concurrency 16 --multi-gpu-bounds"),
