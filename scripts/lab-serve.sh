@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
 # Run turbine-server on a lab host for manual golden and benchmark runs.
 #
-#   scripts/lab-serve.sh [--dry-run] <novanas|quadronix> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]...
-#   scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]...
-#   scripts/lab-serve.sh [--dry-run] <novanas|quadronix> --stop [<run-id>]
+#   scripts/lab-serve.sh [--dry-run] <quadronix|novanas> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]...
+#   scripts/lab-serve.sh [--dry-run] quadronix --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]...
+#   scripts/lab-serve.sh [--dry-run] <quadronix|novanas> --stop [<run-id>]
 #
-# novanas: uploads the tree and <config.yaml> to /home/piwi/turbine-ci/runs/<run id> and applies
-#   the k3s Job template scripts/lab/novanas-serve-job.yaml as turbine-lab-serve-<run id>
+# quadronix: uploads the tree and <config.yaml> to /home/piwi/turbine-ci/runs/<run id> and applies
+#   the k3s Job template scripts/lab/quadronix-serve-job.yaml as turbine-lab-serve-<run id>
 #   (namespace turbine-ci, one R9700, host network), which syncs them into the cached release
 #   workspace slot, builds libturbine_hip.so and the release turbine-server incrementally and
 #   runs it with that config. Each --set pair is appended as `--set <dotted.key>=<value>` to the
 #   turbine-server command line, so sweeps need no config edits; since the pairs are rendered
 #   into the Job's shell script, values are plain words (letters, digits and _ . : / @ + , -).
-#   --gpus 2 gives the Job both R9700s (a two-GPU config, e.g. scripts/lab/phase5-novanas-*.yaml
+#   --gpus 2 gives the Job both R9700s (a two-GPU config, e.g. scripts/lab/phase5-quadronix-*.yaml
 #   with --set server.listen=0.0.0.0:18000; P5 engine comparison).
 #   The script refuses to start while something already answers on
-#   port 18000, streams the Job log until http://192.168.10.203:18000/ready answers 200, then
+#   port 18000, streams the Job log until http://192.168.10.164:18000/ready answers 200, then
 #   exits 0 and leaves the server running. --stop deletes the serve Jobs (label
 #   turbine-lab-role=serve: the Turbine server and the vLLM baseline; one of each at a time, the
 #   ports are fixed) and nothing else; --stop <run-id> deletes only the serve Job of that run
 #   (the id a start prints as `run <run-id>: job ...`); an interrupted or failed start deletes
 #   its own Job.
-# novanas --vllm <slug>: the Phase 2 baseline. Applies scripts/lab/novanas-vllm-job.yaml as
+# quadronix --vllm <slug>: the Phase 2 baseline. Applies ${VLLM_TEMPLATE} as
 #   turbine-lab-vllm-<run id> (upstream rocm/vllm at a pinned tag, one R9700, host network)
 #   serving /home/piwi/turbine-models/<slug> read-only on port 18100 under the model id
 #   Turbine's lab config uses; <slug> is llama-3.2-3b-instruct, olmoe-1b-7b-0125-instruct, a
 #   Phase 6a proof checkpoint or a Phase 7 checkpoint (scripts/lab/phase7-checkpoints.tsv).
 #   Nothing is uploaded. Refuses to start while something answers on port 18100, streams the pod
-#   log until http://192.168.10.203:18100/v1/models answers 200 and exits 0 leaving vLLM running;
+#   log until http://192.168.10.164:18100/v1/models answers 200 and exits 0 leaving vLLM running;
 #   when vLLM fails to start or serve (e.g. on gfx1201) it prints the pod log and exits 1.
 #   --gpus 2 gives the Job both R9700s and each --vllm-arg is appended to `vllm serve` in
 #   order (plain words: letters, digits and _ . : = / -), for the Phase 5 two-GPU baselines
@@ -36,7 +36,7 @@
 # TURBINE_LAB_SERVE_TIMEOUT: seconds to wait for /ready once the pod runs (default 3600; a cold
 #   run compiles Composable Kernel and the release server).
 # bench.lock: a start first takes /home/piwi/turbine-ci/bench.lock shared (passing bench.gate
-#   first, like scripts/bench-lock.sh --shared) in a holder process on novanas
+#   first, like scripts/bench-lock.sh --shared) in a holder process on quadronix
 #   (runs/serve-locks/<run id>.sh) that keeps it while the serve Job exists and releases it when
 #   the Job is gone (--stop, a failed start, an interrupt), so a benchmark (exclusive) waits for
 #   a server this script leaves running while one serve or test Job per card runs side by side.
@@ -52,9 +52,9 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/lab-serve.sh [--dry-run] <novanas|quadronix> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]..." >&2
-	echo "       scripts/lab-serve.sh [--dry-run] novanas --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]..." >&2
-	echo "       scripts/lab-serve.sh [--dry-run] <novanas|quadronix> --stop [<run-id>]" >&2
+	echo "usage: scripts/lab-serve.sh [--dry-run] <quadronix|novanas> <config.yaml> [--gpus 1|2] [--set <dotted.key>=<value>]..." >&2
+	echo "       scripts/lab-serve.sh [--dry-run] quadronix --vllm <slug> [--gpus 1|2] [--vllm-arg <arg>]..." >&2
+	echo "       scripts/lab-serve.sh [--dry-run] <quadronix|novanas> --stop [<run-id>]" >&2
 	exit 2
 }
 
@@ -77,7 +77,7 @@ MODE=start
 CONFIG=""
 SLUG=""
 STOP_RUN=""
-# Rendered into the serve Job's turbine-server command line (scripts/lab/novanas-serve-job.yaml).
+# Rendered into the serve Job's turbine-server command line (scripts/lab/quadronix-serve-job.yaml).
 SERVER_ARGS=""
 VLLM_GPUS=1
 SERVE_GPUS=1
@@ -105,7 +105,7 @@ case "$2" in
 		--gpus)
 			[[ $# -ge 2 ]] || usage
 			if [[ "$2" != 1 && "$2" != 2 ]]; then
-				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of novanas), got: $2" >&2
+				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of quadronix), got: $2" >&2
 				exit 2
 			fi
 			VLLM_GPUS="$2"
@@ -130,7 +130,7 @@ case "$2" in
 		esac
 		shift 2
 	done
-	# The model id each slug is served under (as in scripts/lab/phase2-novanas-*.yaml) and
+	# The model id each slug is served under (as in scripts/lab/phase2-quadronix-*.yaml) and
 	# Turbine's default max_seq_len for it: min(32768, max_position_embeddings).
 	case "$SLUG" in
 	llama-3.2-3b-instruct)
@@ -157,7 +157,7 @@ case "$2" in
 		SERVED_NAME=amd/Llama-3.1-8B-Instruct-MXFP4-W4A4-MLCAL-C1000-GPTQ
 		MAX_MODEL_LEN=32768
 		;;
-	# Phase 6a INT4 proofs (as in scripts/lab/phase6-novanas-llama-{awq,gptq}.yaml).
+	# Phase 6a INT4 proofs (as in scripts/lab/phase6-quadronix-llama-{awq,gptq}.yaml).
 	llama-3.2-3b-instruct-awq)
 		SERVED_NAME=casperhansen/llama-3.2-3b-instruct-awq
 		MAX_MODEL_LEN=32768
@@ -170,7 +170,7 @@ case "$2" in
 		SERVED_NAME=turbine/Llama-3.2-3B-Instruct-GPTQ-own
 		MAX_MODEL_LEN=32768
 		;;
-	# Phase 6a FP8 proof checkpoints (served_name as in scripts/lab/phase6-novanas-llama-fp8*.yaml).
+	# Phase 6a FP8 proof checkpoints (served_name as in scripts/lab/phase6-quadronix-llama-fp8*.yaml).
 	llama-3.2-3b-instruct-fp8-dynamic)
 		SERVED_NAME=RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic
 		MAX_MODEL_LEN=32768
@@ -184,7 +184,7 @@ case "$2" in
 		MAX_MODEL_LEN=32768
 		;;
 	# Phase 7 families (plan Task 9): served under the checkpoint's repo id, as the
-	# scripts/lab/phase7-novanas-*.yaml served_name and scripts/lab/phase7-checkpoints.tsv; every
+	# scripts/lab/phase7-quadronix-*.yaml served_name and scripts/lab/phase7-checkpoints.tsv; every
 	# one's max_position_embeddings is >= 32768.
 	qwen3-4b-instruct-2507)
 		SERVED_NAME=Qwen/Qwen3-4B-Instruct-2507
@@ -227,7 +227,7 @@ case "$2" in
 	while [[ $# -gt 0 ]]; do
 		if [[ "$1" == --gpus && $# -ge 2 ]]; then
 			if [[ "$2" != 1 && "$2" != 2 ]]; then
-				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of novanas), got: $2" >&2
+				echo "lab-serve: ${HOST}: --gpus is 1 or 2 (the R9700s of quadronix), got: $2" >&2
 				exit 2
 			fi
 			SERVE_GPUS="$2"
@@ -313,7 +313,7 @@ remote_stdin() {
 }
 
 kube() {
-	# Same filtering as scripts/lab-test.sh: kubectl on novanas warns about unreadable config
+	# Same filtering as scripts/lab-test.sh: kubectl on quadronix warns about unreadable config
 	# files for user piwi; KUBECTL_KUBERC=false silences the kuberc one, the rest are dropped.
 	if [[ $DRY_RUN -eq 1 ]]; then
 		remote "export KUBECTL_KUBERC=false; kubectl $*"
@@ -558,7 +558,7 @@ start() {
 
 start_vllm() {
 	[[ -f ${REPO_ROOT}/${VLLM_TEMPLATE} ]] ||
-		fail "${HOST}: --vllm has no job template (${VLLM_TEMPLATE}); it is novanas-only"
+		fail "${HOST}: --vllm has no job template (${VLLM_TEMPLATE}); it is not available on this host"
 	say "run ${RUN_ID}: job ${JOB} (vLLM-ROCm serving ${SLUG} as ${SERVED_NAME}, ${VLLM_GPUS} GPU(s)${VLLM_ARGS[*]+, ${VLLM_ARGS[*]}}${VLLM_SPECULATIVE:+, --speculative-config ${VLLM_SPECULATIVE}})"
 	require_free_port
 	gpu_lock
@@ -568,7 +568,7 @@ start_vllm() {
 	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
 		fail "cannot create namespace ${NS}"
 	[[ $DRY_RUN -eq 1 ]] || trap on_interrupt INT TERM
-	say "applying scripts/lab/novanas-vllm-job.yaml as ${JOB}"
+	say "applying ${VLLM_TEMPLATE} as ${JOB}"
 	local extra="" a
 	for a in "${VLLM_ARGS[@]+"${VLLM_ARGS[@]}"}"; do
 		extra+="            - \"${a}\"\n"
@@ -580,7 +580,7 @@ start_vllm() {
 	sed -e "s/__RUN_ID__/${RUN_ID}/g" -e "s/__SLUG__/${SLUG}/g" \
 		-e "s|__SERVED_NAME__|${SERVED_NAME}|g" -e "s/__MAX_MODEL_LEN__/${MAX_MODEL_LEN}/g" \
 		-e "s/__GPUS__/${VLLM_GPUS}/g" \
-		"${REPO_ROOT}/scripts/lab/novanas-vllm-job.yaml" |
+		"${REPO_ROOT}/${VLLM_TEMPLATE}" |
 		awk -v extra="$extra" '/# __EXTRA_ARGS__$/ { printf "%s", extra; next } { print }' |
 		remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" || fail "kubectl apply failed"
 	JOB_APPLIED=1
@@ -622,7 +622,7 @@ gpu_lock() {
 			return 0
 		fi
 		if [[ $gpus -eq 2 ]]; then
-			fail "--gpus 2 refused: one GPU job at a time on novanas (TURBINE_LAB_ONE_GPU_JOB=1)" 2
+			fail "--gpus 2 refused: one GPU job at a time on the legacy host (TURBINE_LAB_ONE_GPU_JOB=1)" 2
 		fi
 	fi
 	case " ${TURBINE_BENCH_LOCK_HELD:-} " in

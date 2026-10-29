@@ -6,10 +6,10 @@
 #   scripts/lab/golden-engine-spread.sh [--dry-run] <label> [<slug>...]
 #
 # From the workstation: builds the release turbine-server / turbine-golden (scripts/remote-cargo.sh)
-# and the HIP kernel library on novanas as scripts/lab-bench.sh does, then starts this script on
+# and the HIP kernel library on quadronix as scripts/lab-bench.sh does, then starts this script on
 # the host with --on-host, detached (log and captures under
 # /home/piwi/turbine-ci/scratch/golden-engine-spread/<label>/), and returns. Fetch the results
-# with: rsync -a piwi@192.168.10.203:/home/piwi/turbine-ci/scratch/golden-engine-spread/<label>/ <dir>/
+# with: rsync -a piwi@192.168.10.164:/home/piwi/turbine-ci/scratch/golden-engine-spread/<label>/ <dir>/
 #
 # On the host, for each slug (default: every slug below) it serves natively on GPU 0
 # (ROCR_VISIBLE_DEVICES=0, cores 0-11, loopback port 18000) three times and records
@@ -29,24 +29,24 @@ set -uo pipefail
 
 # slug | weights dir | lab config | prompts (default tests/golden/prompts.jsonl)
 SLUGS="
-llama-3.2-3b-instruct|llama-3.2-3b-instruct|scripts/lab/phase2c-novanas-llama.yaml|
-olmoe-1b-7b-0125-instruct|olmoe-1b-7b-0125-instruct|scripts/lab/phase2c-novanas-olmoe.yaml|
-llama-3.2-3b-instruct-fp8-dynamic|llama-3.2-3b-instruct-fp8-dynamic|scripts/lab/phase6-novanas-llama-fp8.yaml|
-llama-3.2-3b-instruct-fp8|llama-3.2-3b-instruct-fp8|scripts/lab/phase6-novanas-llama-fp8-tensor.yaml|
-llama-3.2-3b-instruct-fp8-block|llama-3.2-3b-instruct-fp8-block|scripts/lab/phase6-novanas-llama-fp8-block.yaml|
-llama-3.2-3b-instruct-awq|llama-3.2-3b-instruct-awq|scripts/lab/phase6-novanas-llama-awq.yaml|
-llama-3.2-3b-instruct-gptq|llama-3.2-3b-instruct-gptq|scripts/lab/phase6-novanas-llama-gptq.yaml|
-llama-3.2-3b-instruct-gptq-own|llama-3.2-3b-instruct-gptq-own|scripts/lab/phase6-novanas-llama-gptq-own.yaml|
-llama-3.2-3b-instruct-autoround-gptq|llama-3.2-3b-instruct-autoround-gptq|scripts/lab/phase6-novanas-llama-gptq-autoround.yaml|
-llama-3.2-3b-instruct-fp8kv|llama-3.2-3b-instruct|scripts/lab/phase6-novanas-llama-fp8kv.yaml|
-olmoe-1b-7b-0125-instruct-fp8kv|olmoe-1b-7b-0125-instruct|scripts/lab/phase6-novanas-olmoe-fp8kv.yaml|
-llama-3.2-3b-instruct-yarn16|llama-3.2-3b-instruct|scripts/lab/phase6-novanas-llama-yarn16.yaml|tests/golden/llama-3.2-3b-instruct-yarn16/prompts.jsonl
-llama-3.1-8b-instruct|llama-3.1-8b-instruct|scripts/lab/phase6-novanas-llama8b.yaml|
-llama-3.1-8b-instruct-mxfp4a16|llama-3.1-8b-instruct-mxfp4a16|scripts/lab/phase6-novanas-llama8b-mxfp4.yaml|
-gpt-oss-20b|gpt-oss-20b|scripts/lab/phase7-novanas-gpt-oss-20b.yaml|tests/golden/gpt-oss-20b/prompts.jsonl
-qwen3.5-9b|qwen3.5-9b|scripts/lab/phase7-novanas-qwen3.5-9b.yaml|tests/golden/qwen3.5-9b/prompts.jsonl
+llama-3.2-3b-instruct|llama-3.2-3b-instruct|scripts/lab/phase2c-quadronix-llama.yaml|
+olmoe-1b-7b-0125-instruct|olmoe-1b-7b-0125-instruct|scripts/lab/phase2c-quadronix-olmoe.yaml|
+llama-3.2-3b-instruct-fp8-dynamic|llama-3.2-3b-instruct-fp8-dynamic|scripts/lab/phase6-quadronix-llama-fp8.yaml|
+llama-3.2-3b-instruct-fp8|llama-3.2-3b-instruct-fp8|scripts/lab/phase6-quadronix-llama-fp8-tensor.yaml|
+llama-3.2-3b-instruct-fp8-block|llama-3.2-3b-instruct-fp8-block|scripts/lab/phase6-quadronix-llama-fp8-block.yaml|
+llama-3.2-3b-instruct-awq|llama-3.2-3b-instruct-awq|scripts/lab/phase6-quadronix-llama-awq.yaml|
+llama-3.2-3b-instruct-gptq|llama-3.2-3b-instruct-gptq|scripts/lab/phase6-quadronix-llama-gptq.yaml|
+llama-3.2-3b-instruct-gptq-own|llama-3.2-3b-instruct-gptq-own|scripts/lab/phase6-quadronix-llama-gptq-own.yaml|
+llama-3.2-3b-instruct-autoround-gptq|llama-3.2-3b-instruct-autoround-gptq|scripts/lab/phase6-quadronix-llama-gptq-autoround.yaml|
+llama-3.2-3b-instruct-fp8kv|llama-3.2-3b-instruct|scripts/lab/phase6-quadronix-llama-fp8kv.yaml|
+olmoe-1b-7b-0125-instruct-fp8kv|olmoe-1b-7b-0125-instruct|scripts/lab/phase6-quadronix-olmoe-fp8kv.yaml|
+llama-3.2-3b-instruct-yarn16|llama-3.2-3b-instruct|scripts/lab/phase6-quadronix-llama-yarn16.yaml|tests/golden/llama-3.2-3b-instruct-yarn16/prompts.jsonl
+llama-3.1-8b-instruct|llama-3.1-8b-instruct|scripts/lab/phase6-quadronix-llama8b.yaml|
+llama-3.1-8b-instruct-mxfp4a16|llama-3.1-8b-instruct-mxfp4a16|scripts/lab/phase6-quadronix-llama8b-mxfp4.yaml|
+gpt-oss-20b|gpt-oss-20b|scripts/lab/phase7-quadronix-gpt-oss-20b.yaml|tests/golden/gpt-oss-20b/prompts.jsonl
+qwen3.5-9b|qwen3.5-9b|scripts/lab/phase7-quadronix-qwen3.5-9b.yaml|tests/golden/qwen3.5-9b/prompts.jsonl
 "
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 ci=/home/piwi/turbine-ci
 scratch=$ci/scratch/golden-engine-spread
 PAR=16
@@ -87,8 +87,8 @@ on_host() { # <remote root> <label> [slugs]
 			echo "golden-engine-spread: port 18000 is served by someone else; stopping" >&2
 			return 1
 		fi
-		LD_LIBRARY_PATH=/opt/rocm/rocm/lib:/opt/rocm/rocm/lib/rocm_sysdeps/lib \
-			TURBINE_AMD_SMI_LIBRARY=/opt/rocm/rocm/lib/libamd_smi.so.26.5.0 ROCR_VISIBLE_DEVICES=0 \
+		LD_LIBRARY_PATH=/opt/rocm/core-10.1/lib:/opt/rocm/core-10.1/lib/rocm_sysdeps/lib \
+			TURBINE_AMD_SMI_LIBRARY=/opt/rocm/core-10.1/lib/libamd_smi.so.27.1.0 ROCR_VISIBLE_DEVICES=0 \
 			setsid taskset -c 0-11 "$remote/target/release/turbine-server" --config "$cfg" \
 			--set model.path=/home/piwi/turbine-models/"$weights" \
 			--set execution.kernel_library="$remote/kbuild/libturbine_hip.so" \
@@ -175,7 +175,7 @@ start="mkdir -p $out && echo $(git rev-parse --short HEAD) > $out/commit && cd $
 setsid nohup $locks bash scripts/lab/golden-engine-spread.sh --on-host $remote $label $* \
   > $out/run.log 2>&1 < /dev/null &"
 build_kernels="cd '$remote/src' && nice -n 19 taskset -c 12-15 cmake -S kernels/rocm -B '$remote/kbuild' -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER=/opt/rocm/rocm/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null && \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER=/opt/rocm/core-10.1/bin/hipcc -DGPU_TARGETS=gfx1201 >/dev/null && \
   nice -n 19 taskset -c 12-15 cmake --build '$remote/kbuild' -j 4 >/dev/null"
 if [[ $dry -eq 1 ]]; then
 	echo "+ scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench"

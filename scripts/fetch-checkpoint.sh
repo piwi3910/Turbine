@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # fetch-checkpoint.sh — one pinned Phase 7 checkpoint download on a lab host (P7 S-17).
 #
-#   scripts/fetch-checkpoint.sh [--dry-run] <novanas|quadronix> <slug>
+#   scripts/fetch-checkpoint.sh [--dry-run] <quadronix|novanas> <slug>
 #
 # Reads the slug's row of scripts/lab/phase7-checkpoints.tsv (slug, repo, revision, include
 # globs, GB), refuses (exit 1, `fetch: not enough disk`) when the free space under
-# /home/piwi/turbine-models is below the row's GB + 20, else runs on novanas
+# /home/piwi/turbine-models is below the row's GB + 20, else runs on quadronix
 #   hf download <repo> --revision <rev> --local-dir /home/piwi/turbine-models/<slug> [--include <glob>]…
 # and prints `fetch: <slug> <rev> ok`. The download uses the user's cached `hf auth login` on
-# novanas: this script never reads, prints or passes a token. Ask the user before each download
+# quadronix: this script never reads, prints or passes a token. Ask the user before each download
 # (AGENTS.md lab rules) and run it detached (it takes minutes).
 #
 # --dry-run prints the remote command and contacts nothing. Exit: 0 ok, 1 disk or download
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] [--table <tsv>] <novanas|quadronix> <slug>" >&2
+	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] [--table <tsv>] <quadronix|novanas> <slug>" >&2
 	exit 2
 }
 

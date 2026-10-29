@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# lab-bench.sh — fast land-and-measure step on novanas without a k8s Job.
+# lab-bench.sh — fast land-and-measure step on quadronix without a k8s Job.
 #
-#   scripts/lab-bench.sh [--dry-run] [--gpu 0|1] [--model <model>] [--label L] [--with-tests] [--skip-tests]
+#   scripts/lab-bench.sh [--dry-run] [--gpu 0|1|2|3] [--model <model>] [--label L] [--with-tests] [--skip-tests]
 #                         [--golden16] [--batched-bounds] [--c1] [--quality] [--quick]
 #                         [--concurrency <n>] [--multi-turn] [--multi-turn-sessions <n>]
 #                         [-- <--set k=v>...]
 #   scripts/lab-bench.sh --print-model <model>
 #
 # <model>: llama|olmoe|llama-fp8|llama-fp8-tensor|llama-fp8-block|llama-awq|llama-gptq|llama-gptq-own|llama-gptq-autoround|llama8b-mxfp4|llama8b|llama-mxfp4-a4|llama-yarn16|llama-fp8kv|olmoe-fp8kv|llama8b-mxfp4-a4|qwen3-4b|mistral-7b|gpt-oss-20b|qwen3.5-9b
-# (Phase 7: the one-card families, scripts/lab/phase7-novanas-<model>.yaml).
+# (Phase 7: the one-card families, scripts/lab/phase7-${host_tag}-<model>.yaml).
 # (Phase 6a: one value per proof checkpoint; each maps to a weights directory under
 # /home/piwi/turbine-models/, a golden slug under tests/golden/ and a lab config).
 # --print-model prints "<weights> <golden slug> <config>" and exits without contacting a host.
 # --dry-run prints every command it would run (build, serve, golden, bench, stage-share,
 # multi-turn, stop) and contacts nothing, so the flag plumbing is testable without a GPU.
 #
-# 1. On novanas: the release turbine-server build (scripts/remote-cargo.sh, cached) plus the HIP
+# 1. On quadronix: the release turbine-server build (scripts/remote-cargo.sh, cached) plus the HIP
 #    kernel library (CMake, cached); workspace tests only with --with-tests (off by default:
 #    a bench-only landing step should not pay for a full test build; --skip-tests is accepted as
 #    a no-op alias for that same default, kept for compatibility with older call sites).
-# 2. Starts the server directly on the host, pinned to --gpu (0, the default, or 1) with
+# 2. Starts the server directly on the host, pinned to --gpu (0, the default, through 3) with
 #    ROCR_VISIBLE_DEVICES, so every step runs on the same card; any other value is refused.
-#    Both cards give comparable numbers (GPU 1 vs GPU 0 on the new PSU, 2026-10-06).
+#    All four cards are addressable; the historical GPU 1 vs GPU 0 comparison (2026-10-06) found GPU 1 within 0.6 %.
 # 3. Under the exclusive benchmark lock: golden at concurrency 1 (the gate; always), golden at 16
 #    only with --golden16 (opt-in: it roughly doubles the golden time for a number this step does
 #    not gate on; --batched-bounds judges golden c1 and c16 by the slug's batched logprob bounds, the
@@ -47,9 +47,12 @@
 set -uo pipefail
 orig_args=("$@")
 
-host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.203}"
+host="${TURBINE_REMOTE_HOST:-piwi@192.168.10.164}"
 # The ROCm root on the lab host: quadronix's ROCm 10.1 tree is /opt/rocm/core-10.1 (no
 # /opt/rocm/rocm symlink) with amd-smi 27.1.0; novanas points /opt/rocm/rocm at core-10.1.
+host_tag=quadronix
+host_addr=192.168.10.164
+if [[ "$host" == *192.168.10.203* ]]; then host_tag=novanas; host_addr=192.168.10.203; fi
 case "$host" in
 *192.168.10.164*) rocm=/opt/rocm/core-10.1; amd_smi=$rocm/lib/libamd_smi.so.27.1.0 ;;
 *) rocm=/opt/rocm/rocm; amd_smi=$rocm/lib/libamd_smi.so.26.5.0 ;;
@@ -75,7 +78,7 @@ mt_only=0
 cfg_override=""
 print_model=0
 usage() {
-	echo "usage: scripts/lab-bench.sh [--gpu 0|1] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--chat-template-kwargs <json>] [--quick] [--concurrency <n>] [--save-metrics] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
+	echo "usage: scripts/lab-bench.sh [--gpu 0|1|2|3] [--model <model>] [--config <yaml>] [--label L] [--with-tests] [--skip-tests] [--golden16] [--batched-bounds] [--c1] [--quality] [--chat-template-kwargs <json>] [--quick] [--concurrency <n>] [--save-metrics] [--multi-turn] [--multi-turn-sessions <n>] [--mt-think-time <min>..<max>] [--mt-only] [-- --set k=v ...] | --print-model <model>" >&2
 	echo "models: llama olmoe llama-fp8 llama-fp8-tensor llama-fp8-block llama-awq llama-gptq llama-gptq-own llama-gptq-autoround llama8b-mxfp4 llama8b llama-mxfp4-a4 llama-yarn16 llama-fp8kv olmoe-fp8kv llama8b-mxfp4-a4 qwen3-4b mistral-7b gpt-oss-20b qwen3.5-9b" >&2
 	exit 2
 }
@@ -182,27 +185,27 @@ while [[ $# -gt 0 ]]; do
 	*) usage ;;
 	esac
 done
-# novanas has two R9700s and both give comparable numbers (decision 2026-10-06, "GPU 1 vs GPU 0
+# quadronix has four R9700s and both give comparable numbers (decision 2026-10-06, "GPU 1 vs GPU 0
 # on the new PSU": both link Gen5 x8 at the root port; GPU 1 within 0.6 % of GPU 0).
 case "$gpu" in
-0 | 1) ;;
+0 | 1 | 2 | 3) ;;
 *)
-	echo "lab-bench: --gpu is 0 or 1 (novanas has two R9700s), got: $gpu" >&2
+	echo "lab-bench: --gpu is 0, 1, 2 or 3 (quadronix has four R9700s), got: $gpu" >&2
 	exit 2
 	;;
 esac
 # model → weights directory (under /home/piwi/turbine-models), golden slug (under tests/golden)
 # and lab config. The BF16 models keep their phase2c configs so baselines stay comparable; each
-# Phase 6a checkpoint gets scripts/lab/phase6-novanas-<model>.yaml in the task that proves it.
+# Phase 6a checkpoint gets scripts/lab/phase6-${host_tag}-<model>.yaml in the task that proves it.
 golden_slug=""
 case "$model" in
 llama)
 	slug=llama-3.2-3b-instruct
-	cfg=scripts/lab/phase2c-novanas-llama.yaml
+	cfg=scripts/lab/phase2c-${host_tag}-llama.yaml
 	;;
 olmoe)
 	slug=olmoe-1b-7b-0125-instruct
-	cfg=scripts/lab/phase2c-novanas-olmoe.yaml
+	cfg=scripts/lab/phase2c-${host_tag}-olmoe.yaml
 	;;
 llama-fp8) slug=llama-3.2-3b-instruct-fp8-dynamic ;;
 llama-fp8-tensor) slug=llama-3.2-3b-instruct-fp8 ;;
@@ -232,7 +235,7 @@ olmoe-fp8kv)
 	slug=olmoe-1b-7b-0125-instruct
 	golden_slug=olmoe-1b-7b-0125-instruct-fp8kv
 	;;
-# Phase 7 one-card families (plan Task 9): scripts/lab/phase7-novanas-<model>.yaml. The two-card
+# Phase 7 one-card families (plan Task 9): scripts/lab/phase7-${host_tag}-<model>.yaml. The two-card
 # ones (qwen3moe, mixtral, qwen36) run through lab-cluster.sh and lab-perf.sh --placement.
 qwen3-4b | mistral-7b | gpt-oss-20b | qwen3.5-9b)
 	case "$model" in
@@ -241,7 +244,7 @@ qwen3-4b | mistral-7b | gpt-oss-20b | qwen3.5-9b)
 	gpt-oss-20b) slug=gpt-oss-20b ;;
 	qwen3.5-9b) slug=qwen3.5-9b ;;
 	esac
-	cfg="scripts/lab/phase7-novanas-$model.yaml"
+	cfg="scripts/lab/phase7-${host_tag}-$model.yaml"
 	;;
 *)
 	echo "lab-bench: unknown model $model" >&2
@@ -249,9 +252,9 @@ qwen3-4b | mistral-7b | gpt-oss-20b | qwen3.5-9b)
 	;;
 esac
 [[ -n "$golden_slug" ]] || golden_slug="$slug"
-[[ -n "${cfg:-}" ]] || cfg="scripts/lab/phase6-novanas-$model.yaml"
+[[ -n "${cfg:-}" ]] || cfg="scripts/lab/phase6-${host_tag}-$model.yaml"
 # --config replaces the model's lab config (the weights and golden slug stay the model's), e.g.
-# the compression-ladder A/B on scripts/lab/phase6-novanas-ladder.yaml (P5p S-14, S-18).
+# the compression-ladder A/B on scripts/lab/phase6-${host_tag}-ladder.yaml (P5p S-14, S-18).
 [[ -n "$cfg_override" ]] && cfg="$cfg_override"
 if [[ $print_model -eq 1 ]]; then
 	echo "$slug $golden_slug $cfg"
@@ -273,7 +276,7 @@ remote="/home/piwi/turbine-ci/remote/$name"
 out="$root/target/lab-bench/$label-$model"
 mkdir -p "$out"
 commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-url=http://192.168.10.203:18000
+url="http://${host_addr}:18000"
 
 # The whole serve-and-measure run holds the host's `port18000` lock (scripts/bench-lock.sh
 # --name), so a second lab-bench waits instead of racing this one for the port.
@@ -290,7 +293,7 @@ ssh() {
 		command ssh "$@"
 	fi
 }
-# 1. build (server + kernels) on novanas, tests alongside only with --with-tests. A dry run
+# 1. build (server + kernels) on quadronix, tests alongside only with --with-tests. A dry run
 # prints the build lines and builds nothing.
 if [[ $dry -eq 1 ]]; then
 	echo "+ scripts/remote-cargo.sh build -q --release -p turbine-server -p turbine-bench"
@@ -328,7 +331,7 @@ if [[ $build_rc -ne 0 ]]; then
 	exit 1
 fi
 if ! ssh -o BatchMode=yes "$host" "test -f /home/piwi/turbine-models/$slug/config.json"; then
-	echo "lab-bench: /home/piwi/turbine-models/$slug is missing on novanas (download it first)" >&2
+	echo "lab-bench: /home/piwi/turbine-models/$slug is missing on quadronix (download it first)" >&2
 	exit 1
 fi
 
@@ -423,13 +426,13 @@ fi
 # 3. measure under the exclusive lock
 # The golden check runs on the build host with the freshly built Linux binary (current rules).
 # The throughput client runs on the workstation when it has a release turbine-bench (rows stay
-# comparable with earlier ones); otherwise — the rule is to build only on novanas — it runs on
-# the build host against the loopback URL, and the BENCH line says client=novanas.
+# comparable with earlier ones); otherwise — the rule is to build only on quadronix — it runs on
+# the build host against the loopback URL, and the BENCH line says client=quadronix.
 if [[ -x "$root/target/release/turbine-bench" ]]; then
 	client=local
 	bench_cmd="'$root/target/release/turbine-bench' --url $url"
 else
-	client=novanas
+	client=quadronix
 	bench_cmd="ssh -o BatchMode=yes $host taskset -c $bench_cpus '$remote/target/release/turbine-bench' --url http://127.0.0.1:18000"
 fi
 golden="ssh -o BatchMode=yes $host cd '$remote/src' \\&\\& '$remote/target/release/turbine-golden'"
@@ -450,7 +453,7 @@ rm -f "$out/bench-c1.json"
 [[ $run_c1 -eq 1 ]] && c1_cmd="$bench_cmd --concurrency 1 --requests 10 --max-tokens 128 --ignore-eos --output json > '$out/bench-c1.json' 2> '$out/bench-c1.err'"
 # The measured steps, in order. A dry run prints them and runs nothing; a real run executes
 # each under this shell's bench-lock hold. The stage-share call (P5p S-1) computes the host
-# share of the throughput interval from the two scrapes on novanas (the freshly built binary
+# share of the throughput interval from the two scrapes on quadronix (the freshly built binary
 # is always current there); the multi-turn profile runs after the throughput bench.
 rm -f "$out/bench.json" "$out/stage-share.json" "$out/mt.json" "$out/metrics-mt.txt" "$out/pressure.jsonl"
 throughput_cmd="$bench_cmd --concurrency $conc --requests $requests --prompt-words 512 --max-tokens 256 --ignore-eos --output json > '$out/bench.json' 2> '$out/bench.err'"

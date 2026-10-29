@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run one Phase 5 multi-GPU lab scenario on novanas as a k3s Job holding both R9700s.
+# Run one Phase 5 multi-GPU lab scenario on quadronix as a k3s Job holding both R9700s.
 #
-#   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-novanas|collbench-sweep-novanas|
+#   scripts/lab-cluster.sh [--dry-run] [--bench-lock] <collbench-quadronix|collbench-sweep-quadronix|
 #                                       collbench-hostmem-novanas|tp2-novanas|dp2-novanas|
 #                                       ep2-novanas|pp2-novanas|
 #                                       <qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas|
@@ -10,7 +10,7 @@
 #
 # Phase 7 family scenarios (plan Task 9, user decision 2026-10-08 B), <short>-<placement>-novanas:
 # Turbine legs only (the pod has no vLLM, and GPUs are per container; the vLLM-ROCm ratio comes
-# from scripts/lab-perf.sh --placement). Serves scripts/lab/phase7-novanas-<short>-<placement>.yaml
+# from scripts/lab-perf.sh --placement). Serves scripts/lab/phase7-${HOST}-<short>-<placement>.yaml
 # on the pod loopback; golden c1 and c16 with --multi-gpu-bounds against tests/golden/<slug>/
 # (the two-card MoE rows of S-13, decision 2026-10-08 A; falls back to the batched bounds while
 # tolerance.json carries no `_multi_gpu` keys yet); the
@@ -72,7 +72,7 @@
 #                      bench at concurrency 32 (the load that fills both cards) and at 16 (the
 #                      same load as dp 1), each requests_ok 200, and turbine_dp_routed_total
 #                      non-zero for replica 0 and replica 1.
-#   ep2-novanas        OLMoE-1B-7B (scripts/lab/phase5-novanas-ep2.yaml): first an ep 1 baseline
+#   ep2-novanas        OLMoE-1B-7B (scripts/lab/phase5-${HOST}-ep2.yaml): first an ep 1 baseline
 #                      on device 0 (golden c1 against the committed transformers reference, a
 #                      capture of its greedy outputs, the teacher-forced `turbine-golden
 #                      positions` report of p14, the standard throughput workload: 512-word
@@ -90,7 +90,7 @@
 #                      `ep-bench <run> tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run and
 #                      the scheduler document's `expert` section. 2-GPU numbers are
 #                      "2-GPU (GPU0 Gen5 x8 + GPU1 Gen4 x8)".
-#   pp2-novanas        Llama-3.2-3B-Instruct (scripts/lab/phase5-novanas-pp2.yaml): first a pp 1
+#   pp2-novanas        Llama-3.2-3B-Instruct (scripts/lab/phase5-${HOST}-pp2.yaml): first a pp 1
 #                      baseline on device 0 (a capture of its greedy outputs, golden c1 against
 #                      the committed reference for information, the standard workload at
 #                      concurrency 16); then pp 2 (2 stages, 2 micro-batches, local mode):
@@ -98,7 +98,7 @@
 #                      capture — the gate — and against the committed reference for information,
 #                      the standard workload (512-word prompts, 256 tokens with --ignore-eos,
 #                      200 requests, after a 32-request warm-up) at concurrency 16 and 32; then
-#                      tp 2 (phase5-novanas-llama.yaml) and dp 2 (phase5-novanas-dp2.yaml) on the
+#                      tp 2 (phase5-${HOST}-llama.yaml) and dp 2 (phase5-${HOST}-dp2.yaml) on the
 #                      same workload at 16 and 32. Prints each server's parallel plan (backend,
 #                      stages, reasons), the pipeline section and metrics, and one `pp-bench <run>
 #                      tok/s=… ttft_p50_ms=… itl_p50_ms=…` line per bench run. A golden
@@ -124,7 +124,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="<collbench|collbench-sweep|collbench-hostmem|tp2|dp2|ep2|pp2|olmoe-spread>-<novanas|quadronix>|<qwen3moe|mixtral|qwen36>-<tp2|ep2|spread>-<novanas|quadronix>"
+SCENARIOS="<collbench|collbench-sweep|collbench-hostmem|tp2|dp2|ep2|pp2|olmoe-spread>-<quadronix|novanas>|<qwen3moe|mixtral|qwen36>-<tp2|ep2|spread>-<quadronix|novanas>"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -137,13 +137,13 @@ valid_scenario() {
 		family_scenario "$1" || family_spread_scenario "$1"
 }
 
-# family_scenario <scenario>: a Phase 7 two-card family scenario (<short>-<tp2|ep2>-novanas).
+# family_scenario <scenario>: a Phase 7 two-card family scenario (<short>-<tp2|ep2>-quadronix).
 family_scenario() {
 	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-(tp2|ep2)-(novanas|quadronix)$ ]]
 }
 
 # family_spread_scenario <scenario>: a Phase 7 family's placement-spread calibration run
-# (<short>-spread-novanas), the Task 13 pattern: per-placement greedy captures for
+# (<short>-spread-quadronix), the Task 13 pattern: per-placement greedy captures for
 # scripts/golden/engine_spread.py (multi-GPU captures named mg-*).
 family_spread_scenario() {
 	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-spread-(novanas|quadronix)$ ]]
@@ -406,7 +406,7 @@ collective_report() {
 }
 
 scenario_tp2() {
-	local llama=scripts/lab/phase5-novanas-llama.yaml olmoe=scripts/lab/phase5-novanas-olmoe.yaml
+	local llama=scripts/lab/phase5-${HOST}-llama.yaml olmoe=scripts/lab/phase5-${HOST}-olmoe.yaml
 	# The tp 1 baseline: the same configuration with one rank on device 0.
 	start_server "${WORK}/tp1.log" "$llama" --set parallel.tensor_parallel_size=1 \
 		--set "parallel.devices=[0]"
@@ -721,7 +721,7 @@ gate_vs_capture() {
 }
 
 scenario_dp2() {
-	local dp2=scripts/lab/phase5-novanas-dp2.yaml
+	local dp2=scripts/lab/phase5-${HOST}-dp2.yaml
 	# The dp 1 baseline: the same configuration with one replica on device 0.
 	start_server "${WORK}/dp1.log" "$dp2" --set parallel.data_parallel_size=1 \
 		--set "parallel.devices=[0]"
@@ -803,7 +803,7 @@ positions_p() {
 }
 
 scenario_ep2() {
-	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
+	local ep2=scripts/lab/phase5-${HOST}-ep2.yaml slug=olmoe-1b-7b-0125-instruct
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
 	# The multi-GPU accuracy gate (user decision "P5: OLMoE golden tolerance under expert
 	# parallelism", A then C): a strict compare at c1 and a batched one at c16 against the one-GPU
@@ -908,7 +908,7 @@ olmoe_capture_set() {
 # as c1-cold, c1-warm and par-NN, then tp 2, ep 2 and ep 2 x tp 2 as mg-<placement>-c1 and
 # mg-<placement>-c16-NN. scripts/golden/engine_spread.py derives the `_multi_gpu` bounds from them.
 scenario_olmoe_spread() {
-	local ep2=scripts/lab/phase5-novanas-ep2.yaml slug=olmoe-1b-7b-0125-instruct
+	local ep2=scripts/lab/phase5-${HOST}-ep2.yaml slug=olmoe-1b-7b-0125-instruct
 	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
 	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i k placement
 	mkdir -p "$dir" "$rot" || job_fail "cannot create ${dir}"
@@ -964,7 +964,7 @@ pp_parallel() {
 }
 
 scenario_pp2() {
-	local pp2=scripts/lab/phase5-novanas-pp2.yaml slug=llama-3.2-3b-instruct f
+	local pp2=scripts/lab/phase5-${HOST}-pp2.yaml slug=llama-3.2-3b-instruct f
 	local tol=(--tolerance "tests/golden/${slug}/tolerance.json" --prompts tests/golden/prompts.jsonl)
 	# The pp 1 baseline: the same configuration on device 0 alone. A capture of its greedy
 	# outputs is the reference pp 2 is gated against (user decision 2026-09-28, "A then C":
@@ -1008,7 +1008,7 @@ scenario_pp2() {
 	stop_servers
 
 	# tp 2 and dp 2 on the same workload, in the same Job.
-	start_server "${WORK}/tp2.log" scripts/lab/phase5-novanas-llama.yaml
+	start_server "${WORK}/tp2.log" scripts/lab/phase5-${HOST}-llama.yaml
 	wait_ready "$URL" "${WORK}/tp2.log"
 	bench_ok 32 "${WORK}/tp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
 	bench_ok 200 "${WORK}/tp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -1018,7 +1018,7 @@ scenario_pp2() {
 	collective_report tp2
 	stop_servers
 
-	start_server "${WORK}/dp2.log" scripts/lab/phase5-novanas-dp2.yaml
+	start_server "${WORK}/dp2.log" scripts/lab/phase5-${HOST}-dp2.yaml
 	wait_ready "$URL" "${WORK}/dp2.log"
 	bench_ok 32 "${WORK}/dp2-warmup.json" "${STANDARD_BENCH[@]}" --concurrency 32 --requests 32
 	bench_ok 200 "${WORK}/dp2-c16-bench.json" "${STANDARD_BENCH[@]}" --concurrency 16 \
@@ -1058,7 +1058,7 @@ fam_run() {
 scenario_family() {
 	local short="$1" placement="$2" slug c
 	slug="$(family_slug "$short")"
-	local config="scripts/lab/phase7-novanas-${short}-${placement}.yaml"
+	local config="scripts/lab/phase7-${HOST}-${short}-${placement}.yaml"
 	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
 	local eval_json="${results}/turbine-${placement}.json"
 	local baseline="tests/eval/${slug}/vllm-${placement}.json"
@@ -1127,7 +1127,7 @@ scenario_family_spread() {
 	local short="$1"
 	local slug c
 	slug="$(family_slug "$short")"
-	local tp2="scripts/lab/phase7-novanas-${short}-tp2.yaml" ep2="scripts/lab/phase7-novanas-${short}-ep2.yaml"
+	local tp2="scripts/lab/phase7-${HOST}-${short}-tp2.yaml" ep2="scripts/lab/phase7-${HOST}-${short}-ep2.yaml"
 	local results="${TURBINE_LAB_ROOT}/runs/${TURBINE_LAB_RUN_ID}/results"
 	local dir="${results}/spread/${slug}" rot="${WORK}/rot" n i
 	local prompts; prompts="$(family_prompts "$slug")"
@@ -1234,12 +1234,12 @@ host_name="${TURBINE_LAB_HOST:-}"
 if [[ -z $host_name ]]; then
 	case "${SCENARIO:-}" in
 	*-quadronix) host_name=quadronix ;;
-	*) host_name=novanas ;;
+	*) host_name=quadronix ;;
 	esac
 fi
 case "$host_name" in
 quadronix) HOST=quadronix; REMOTE=piwi@192.168.10.164 ;;
-*) HOST=novanas; REMOTE=piwi@192.168.10.203 ;;
+*) HOST=quadronix; REMOTE=piwi@192.168.10.164 ;;
 esac
 CLUSTER_TEMPLATE="scripts/lab/${HOST}-cluster-job.yaml"
 CI_ROOT=/home/piwi/turbine-ci

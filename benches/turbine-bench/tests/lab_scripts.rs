@@ -1647,13 +1647,12 @@ fn lab_perf_usage_errors_exit_2_without_contacting_a_host() {
 }
 
 /// Shorter test cycles (user decision 2026-09-27): lab-bench.sh usage errors, including the
-/// --with-tests / --skip-tests / --golden16 / --quick flags and the card guard (novanas has GPUs 0
-/// and 1). These usage cases cover what must be rejected before any host contact (the
+/// --with-tests / --skip-tests / --golden16 / --quick flags and the card guard (quadronix has GPUs 0 through 3). These usage cases cover what must be rejected before any host contact (the
 /// well-formed invocations are covered by the --dry-run tests below, P5p S-1).
 #[test]
 fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
     for (tag, args) in [
-        ("bench-gpu2", &["--gpu", "2"][..]),
+        ("bench-gpu4", &["--gpu", "4"][..]),
         ("bench-model", &["--model", "qwen"][..]),
         ("bench-unknown", &["--fast"][..]),
     ] {
@@ -1661,10 +1660,10 @@ fn lab_bench_usage_errors_exit_2_without_contacting_a_host() {
         assert_eq!(called, None, "{tag}: contacted a host");
         assert_eq!(out.status.code(), Some(2), "{tag}: {}", stderr(&out));
     }
-    let (out, _) = lab_script("lab-bench.sh", "bench-gpu2-message", &["--gpu", "2"]);
+    let (out, _) = lab_script("lab-bench.sh", "bench-gpu4-message", &["--gpu", "4"]);
     assert!(
-        stderr(&out).contains("--gpu is 0 or 1"),
-        "refusing GPU 2 should name the valid cards: {}",
+        stderr(&out).contains("--gpu is 0, 1, 2 or 3"),
+        "refusing GPU 4 should name the valid cards: {}",
         stderr(&out)
     );
 }
@@ -1730,59 +1729,59 @@ fn lab_bench_model_map() {
     let expected = [
         (
             "llama",
-            "llama-3.2-3b-instruct llama-3.2-3b-instruct scripts/lab/phase2c-novanas-llama.yaml",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct scripts/lab/phase2c-quadronix-llama.yaml",
         ),
         (
             "olmoe",
-            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct scripts/lab/phase2c-novanas-olmoe.yaml",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct scripts/lab/phase2c-quadronix-olmoe.yaml",
         ),
         (
             "llama-fp8",
-            "llama-3.2-3b-instruct-fp8-dynamic llama-3.2-3b-instruct-fp8-dynamic scripts/lab/phase6-novanas-llama-fp8.yaml",
+            "llama-3.2-3b-instruct-fp8-dynamic llama-3.2-3b-instruct-fp8-dynamic scripts/lab/phase6-quadronix-llama-fp8.yaml",
         ),
         (
             "llama-fp8-tensor",
-            "llama-3.2-3b-instruct-fp8 llama-3.2-3b-instruct-fp8 scripts/lab/phase6-novanas-llama-fp8-tensor.yaml",
+            "llama-3.2-3b-instruct-fp8 llama-3.2-3b-instruct-fp8 scripts/lab/phase6-quadronix-llama-fp8-tensor.yaml",
         ),
         (
             "llama-fp8-block",
-            "llama-3.2-3b-instruct-fp8-block llama-3.2-3b-instruct-fp8-block scripts/lab/phase6-novanas-llama-fp8-block.yaml",
+            "llama-3.2-3b-instruct-fp8-block llama-3.2-3b-instruct-fp8-block scripts/lab/phase6-quadronix-llama-fp8-block.yaml",
         ),
         (
             "llama-awq",
-            "llama-3.2-3b-instruct-awq llama-3.2-3b-instruct-awq scripts/lab/phase6-novanas-llama-awq.yaml",
+            "llama-3.2-3b-instruct-awq llama-3.2-3b-instruct-awq scripts/lab/phase6-quadronix-llama-awq.yaml",
         ),
         (
             "llama-gptq",
-            "llama-3.2-3b-instruct-gptq llama-3.2-3b-instruct-gptq scripts/lab/phase6-novanas-llama-gptq.yaml",
+            "llama-3.2-3b-instruct-gptq llama-3.2-3b-instruct-gptq scripts/lab/phase6-quadronix-llama-gptq.yaml",
         ),
         (
             "llama8b-mxfp4",
-            "llama-3.1-8b-instruct-mxfp4a16 llama-3.1-8b-instruct-mxfp4a16 scripts/lab/phase6-novanas-llama8b-mxfp4.yaml",
+            "llama-3.1-8b-instruct-mxfp4a16 llama-3.1-8b-instruct-mxfp4a16 scripts/lab/phase6-quadronix-llama8b-mxfp4.yaml",
         ),
         (
             "llama8b",
-            "llama-3.1-8b-instruct llama-3.1-8b-instruct scripts/lab/phase6-novanas-llama8b.yaml",
+            "llama-3.1-8b-instruct llama-3.1-8b-instruct scripts/lab/phase6-quadronix-llama8b.yaml",
         ),
         (
             "llama-mxfp4-a4",
-            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-instruct-mxfp4-a4 scripts/lab/phase6-novanas-llama-mxfp4-a4.yaml",
+            "llama-3.2-3b-mxfp4-a4 llama-3.2-3b-instruct-mxfp4-a4 scripts/lab/phase6-quadronix-llama-mxfp4-a4.yaml",
         ),
         (
             "llama-yarn16",
-            "llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-novanas-llama-yarn16.yaml",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-yarn16 scripts/lab/phase6-quadronix-llama-yarn16.yaml",
         ),
         (
             "llama-fp8kv",
-            "llama-3.2-3b-instruct llama-3.2-3b-instruct-fp8kv scripts/lab/phase6-novanas-llama-fp8kv.yaml",
+            "llama-3.2-3b-instruct llama-3.2-3b-instruct-fp8kv scripts/lab/phase6-quadronix-llama-fp8kv.yaml",
         ),
         (
             "llama8b-mxfp4-a4",
-            "llama-3.1-8b-instruct-mxfp4-a4 llama-3.1-8b-instruct-mxfp4-a4 scripts/lab/phase6-novanas-llama8b-mxfp4-a4.yaml",
+            "llama-3.1-8b-instruct-mxfp4-a4 llama-3.1-8b-instruct-mxfp4-a4 scripts/lab/phase6-quadronix-llama8b-mxfp4-a4.yaml",
         ),
         (
             "olmoe-fp8kv",
-            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct-fp8kv scripts/lab/phase6-novanas-olmoe-fp8kv.yaml",
+            "olmoe-1b-7b-0125-instruct olmoe-1b-7b-0125-instruct-fp8kv scripts/lab/phase6-quadronix-olmoe-fp8kv.yaml",
         ),
     ];
     for (model, triple) in expected {

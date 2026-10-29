@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fixture-order.sh — run ON novanas: gives the CPU fixture queue (`fixture.lock`) an explicit order.
+# fixture-order.sh — run ON quadronix: gives the CPU fixture queue (`fixture.lock`) an explicit order.
 #
 #   nohup scripts/lab/fixture-order.sh [<queue-file>] >>/home/piwi/turbine-ci/fixture-order.log 2>&1 &
 #
