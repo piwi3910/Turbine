@@ -324,17 +324,17 @@ fn phase2_novanas_configs_load_with_the_scheduler_defaults() {
     }
 }
 
-/// Every tree sync into a cached build workspace compares by checksum and never carries source
-/// mtimes over (no `-a`, no `-t`): a changed file must get a fresh mtime, or cargo's mtime
-/// fingerprints reuse artifacts that a newer-dated tree of another checkout left in the slot.
+/// Every tree sync into a cached build workspace resets source mtimes: a changed file must get a
+/// fresh mtime, or cargo's mtime fingerprints reuse artifacts that a newer-dated tree of another
+/// checkout left in the slot. The workstation uploads use `rsync` (checksum compare, no
+/// `-a`/`-t`); the in-Job slot sync uses `cp -a --no-preserve=timestamps` because the container's
+/// rsync (trixie 3.5.0) deadlocks on a local copy.
 #[test]
 fn lab_tree_syncs_never_preserve_source_mtimes() {
     let root = repo_root();
     for file in [
         "scripts/lab-test.sh",
         "scripts/lab-serve.sh",
-        "scripts/lab/novanas-test-job.yaml",
-        "scripts/lab/novanas-serve-job.yaml",
         "scripts/remote-cargo.sh",
     ] {
         let text = fs::read_to_string(root.join(file)).expect(file);
@@ -359,6 +359,26 @@ fn lab_tree_syncs_never_preserve_source_mtimes() {
                 !flags.contains('a') && !flags.contains('t'),
                 "{file}: preserves mtimes: {line}"
             );
+        }
+    }
+    // The Job templates copy the tree into the slot with `cp`; `-a` is allowed only together with
+    // `--no-preserve=timestamps`, so a changed file still gets a fresh mtime.
+    for name in ["novanas", "quadronix"] {
+        for kind in ["test", "serve", "cluster"] {
+            let file = format!("scripts/lab/{name}-{kind}-job.yaml");
+            let text = fs::read_to_string(root.join(&file)).expect(&file);
+            let syncs: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.contains("cp ") && l.contains("$SLOT_DIR/src/"))
+                .collect();
+            assert!(!syncs.is_empty(), "{file} has no slot sync");
+            for line in syncs {
+                assert!(
+                    line.contains("--no-preserve=timestamps"),
+                    "{file}: slot sync preserves mtimes: {line}"
+                );
+            }
         }
     }
 }
@@ -477,7 +497,7 @@ fn lab_test_dry_run_applies_a_one_gpu_job_with_cached_slots() {
             "export CARGO_TARGET_DIR=\"$SLOT_DIR/target\"",
             "export KERNEL_BUILD_DIR=\"$SLOT_DIR/kernels\"",
             "export TURBINE_KERNEL_LIBRARY=\"$KERNEL_BUILD_DIR/libturbine_hip.so\"",
-            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "cp -a --no-preserve=timestamps \"$RUN_DIR/src/.\" \"$SLOT_DIR/src/\"",
             "mapfile -d '' TEST_CMD < \"$RUN_DIR/test-command\"",
             "if [[ $PHASE == test ]]; then rm -rf \"$RUN_DIR\"; fi",
             "cd \"$SLOT_DIR/src\"",
@@ -1125,7 +1145,7 @@ fn novanas_serve_job_matches_the_test_job() {
             "SLOT=serve-0",
             "flock -w 1800 \"$LOCK_FD\"",
             "export CARGO_TARGET_DIR=\"$SLOT_DIR/target\"",
-            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "cp -a --no-preserve=timestamps \"$RUN_DIR/src/.\" \"$SLOT_DIR/src/\"",
             "cp \"$RUN_DIR/config.yaml\" \"$SLOT_DIR/config.yaml\"",
             "cmake -S kernels/rocm -B \"$KERNEL_BUILD_DIR\" -G Ninja",
             "cmake --build \"$KERNEL_BUILD_DIR\"",
@@ -2077,7 +2097,7 @@ fn cluster_dry_run_manifest() {
         &s,
         &[
             "flock -w 1800 \"$LOCK_FD\"",
-            "rsync -rlpc --delete \"$RUN_DIR/src/\" \"$SLOT_DIR/src/\"",
+            "cp -a --no-preserve=timestamps \"$RUN_DIR/src/.\" \"$SLOT_DIR/src/\"",
             "cmake --build \"$KERNEL_BUILD_DIR\"",
             "cargo build --release -p turbine-server -p turbine-bench -p turbine-distributed",
             "exec bash scripts/lab-cluster.sh --in-job \"$TURBINE_LAB_SCENARIO\"",

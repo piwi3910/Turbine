@@ -71,7 +71,7 @@ spec:
               step "sync the uploaded tree into the slot"
               rm -rf "$SLOT_DIR/src"
               mkdir -p "$SLOT_DIR/src"
-              cp -a "$RUN_DIR/src/." "$SLOT_DIR/src/"
+              cp -a --no-preserve=timestamps "$RUN_DIR/src/." "$SLOT_DIR/src/"
               cp "$RUN_DIR/config.yaml" "$SLOT_DIR/config.yaml"
               rm -rf "$RUN_DIR"
               cd "$SLOT_DIR/src"

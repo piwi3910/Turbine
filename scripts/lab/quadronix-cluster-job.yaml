@@ -81,7 +81,7 @@ spec:
               step "sync the uploaded tree into the slot"
               rm -rf "$SLOT_DIR/src"
               mkdir -p "$SLOT_DIR/src"
-              cp -a "$RUN_DIR/src/." "$SLOT_DIR/src/"
+              cp -a --no-preserve=timestamps "$RUN_DIR/src/." "$SLOT_DIR/src/"
               cd "$SLOT_DIR/src"
 
               step "build kernels/rocm"
