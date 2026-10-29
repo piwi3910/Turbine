@@ -204,6 +204,7 @@ impl StreamState {
     /// client gets a fixed message per error code naming that id, never the detail itself.
     fn fail(&mut self, mut error: ApiError) -> Vec<Event> {
         tracing::error!(
+            event = "stream_generation_failed",
             response_id = %self.ctx.id,
             code = error.code.as_str(),
             message = %error.message,

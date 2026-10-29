@@ -40,7 +40,7 @@ pub(super) async fn metrics(State(state): State<ApiState>) -> Response {
     match state.metrics.render() {
         Ok(text) => ([(header::CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)], text).into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "metrics rendering failed");
+            tracing::error!(event = "metrics_render_failed", error = %e, "metrics rendering failed");
             ApiError::internal(e.to_string()).into_response()
         }
     }
