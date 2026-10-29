@@ -124,7 +124,7 @@
 # <reason>` (exit 1); usage errors exit 2.
 set -euo pipefail
 
-SCENARIOS="collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas|<qwen3moe|mixtral|qwen36>-<tp2|ep2>-novanas|<qwen3moe|mixtral|qwen36>-spread-novanas"
+SCENARIOS="<collbench|collbench-sweep|collbench-hostmem|tp2|dp2|ep2|pp2|olmoe-spread>-<novanas|quadronix>|<qwen3moe|mixtral|qwen36>-<tp2|ep2|spread>-<novanas|quadronix>"
 
 usage() {
 	echo "usage: scripts/lab-cluster.sh [--dry-run] [--bench-lock] <${SCENARIOS}>" >&2
@@ -133,20 +133,20 @@ usage() {
 }
 
 valid_scenario() {
-	[[ "$1" =~ ^(collbench-novanas|collbench-sweep-novanas|collbench-hostmem-novanas|tp2-novanas|dp2-novanas|ep2-novanas|pp2-novanas|olmoe-spread-novanas)$ ]] ||
+	[[ "$1" =~ ^(collbench|collbench-sweep|collbench-hostmem|tp2|dp2|ep2|pp2|olmoe-spread)-(novanas|quadronix)$ ]] ||
 		family_scenario "$1" || family_spread_scenario "$1"
 }
 
 # family_scenario <scenario>: a Phase 7 two-card family scenario (<short>-<tp2|ep2>-novanas).
 family_scenario() {
-	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-(tp2|ep2)-novanas$ ]]
+	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-(tp2|ep2)-(novanas|quadronix)$ ]]
 }
 
 # family_spread_scenario <scenario>: a Phase 7 family's placement-spread calibration run
 # (<short>-spread-novanas), the Task 13 pattern: per-placement greedy captures for
 # scripts/golden/engine_spread.py (multi-GPU captures named mg-*).
 family_spread_scenario() {
-	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-spread-novanas$ ]]
+	[[ "$1" =~ ^(qwen3moe|mixtral|qwen36)-spread-(novanas|quadronix)$ ]]
 }
 
 # family_slug <short>: the checkpoint slug (weights, tests/golden/<slug>, tests/eval/<slug>).
@@ -1177,17 +1177,18 @@ in_job() {
 	WORK="$(mktemp -d)"
 	trap 'stop_servers' EXIT
 	read_tp2_variant
-	case "$SCENARIO" in
-	collbench-novanas) scenario_collbench ;;
-	collbench-sweep-novanas) scenario_collbench_sweep ;;
-	collbench-hostmem-novanas) scenario_collbench_hostmem ;;
-	tp2-novanas) scenario_tp2 ;;
-	dp2-novanas) scenario_dp2 ;;
-	ep2-novanas) scenario_ep2 ;;
-	pp2-novanas) scenario_pp2 ;;
-	olmoe-spread-novanas) scenario_olmoe_spread ;;
-	*-spread-novanas) scenario_family_spread "${SCENARIO%%-*}" ;;
-	*) scenario_family "${SCENARIO%%-*}" "$(cut -d- -f2 <<<"$SCENARIO")" ;;
+	local base="${SCENARIO%-novanas}"; base="${base%-quadronix}"
+	case "$base" in
+	collbench) scenario_collbench ;;
+	collbench-sweep) scenario_collbench_sweep ;;
+	collbench-hostmem) scenario_collbench_hostmem ;;
+	tp2) scenario_tp2 ;;
+	dp2) scenario_dp2 ;;
+	ep2) scenario_ep2 ;;
+	pp2) scenario_pp2 ;;
+	olmoe-spread) scenario_olmoe_spread ;;
+	*-spread) scenario_family_spread "${base%%-*}" ;;
+	*) scenario_family "${base%%-*}" "$(cut -d- -f2 <<<"$base")" ;;
 	esac
 	echo "lab-cluster: ${SCENARIO} PASS"
 }
@@ -1227,7 +1228,20 @@ case "${1:-}" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REMOTE=piwi@192.168.10.203
+# The run's host: the scenario name's suffix, or TURBINE_LAB_HOST (needed for --stop,
+# which carries no scenario, to target a quadronix run).
+host_name="${TURBINE_LAB_HOST:-}"
+if [[ -z $host_name ]]; then
+	case "${SCENARIO:-}" in
+	*-quadronix) host_name=quadronix ;;
+	*) host_name=novanas ;;
+	esac
+fi
+case "$host_name" in
+quadronix) HOST=quadronix; REMOTE=piwi@192.168.10.164 ;;
+*) HOST=novanas; REMOTE=piwi@192.168.10.203 ;;
+esac
+CLUSTER_TEMPLATE="scripts/lab/${HOST}-cluster-job.yaml"
 CI_ROOT=/home/piwi/turbine-ci
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 NS=turbine-ci
@@ -1245,7 +1259,7 @@ UNSCHEDULABLE_LIMIT=60
 OWN_QUEUE_LIMIT="${TURBINE_LAB_QUEUE_LIMIT:-10800}"
 
 say() {
-	echo "lab-cluster: novanas: $*"
+	echo "lab-cluster: ${HOST}: $*"
 }
 
 # The final line on failure.
@@ -1306,7 +1320,7 @@ cleanup() {
 
 on_interrupt() {
 	trap - INT TERM
-	echo "lab-cluster: novanas: interrupted; deleting the jobs of run ${RUN_ID}" >&2
+	echo "lab-cluster: ${HOST}: interrupted; deleting the jobs of run ${RUN_ID}" >&2
 	cleanup
 	exit 130
 }
@@ -1321,7 +1335,7 @@ render_job() {
 	fi
 	sed -e "s/__JOB__/${name}/g" -e "s/__ROLE__/${role}/g" -e "s/__RUN_ID__/${RUN_ID}/g" \
 		-e "s/__GPUS__/${gpus}/g" -e "s/__PHASE__/$1/g" -e "s/__SCENARIO__/${SCENARIO}/g" \
-		"${REPO_ROOT}/scripts/lab/novanas-cluster-job.yaml"
+		"${REPO_ROOT}/${CLUSTER_TEMPLATE}"
 }
 
 # wait_for_pod <job> <gpus>: until its pod runs; a GPU pod Pending on amd.com/gpu is given up.
@@ -1351,9 +1365,9 @@ wait_for_pod() {
 			fi
 		fi
 		if [[ $gpus -gt 0 && "$unschedulable" == *"amd.com/gpu"* && $waited -ge $UNSCHEDULABLE_LIMIT ]]; then
-			echo "lab-cluster: novanas: ${unschedulable}" >&2
+			echo "lab-cluster: ${HOST}: ${unschedulable}" >&2
 			cleanup
-			echo "lab-cluster: amd.com/gpu unavailable on novanas"
+			echo "lab-cluster: amd.com/gpu unavailable on ${HOST}"
 			exit 1
 		fi
 		# Unschedulable for another reason (a node taint such as disk pressure): print the
@@ -1391,7 +1405,7 @@ wait_for_result() {
 # apply_and_follow build|run <job> <gpus>: applies the rendered Job, streams its log, waits.
 apply_and_follow() {
 	local phase="$1" job="$2" gpus="$3"
-	say "applying scripts/lab/novanas-cluster-job.yaml as ${job} (${gpus} GPU(s))"
+	say "applying ${CLUSTER_TEMPLATE} as ${job} (${gpus} GPU(s))"
 	render_job "$phase" | remote_stdin "export KUBECTL_KUBERC=false; kubectl apply -f -" ||
 		{
 			cleanup
@@ -1399,7 +1413,7 @@ apply_and_follow() {
 		}
 	wait_for_pod "$job" "$gpus"
 	say "streaming pod log of ${job}"
-	kube "-n ${NS} logs -f job/${job}" || echo "lab-cluster: novanas: log stream of ${job} ended with an error" >&2
+	kube "-n ${NS} logs -f job/${job}" || echo "lab-cluster: ${HOST}: log stream of ${job} ended with an error" >&2
 	wait_for_result "$job"
 }
 
@@ -1476,7 +1490,7 @@ run_scenario() {
 			cleanup
 			fail "rsync to ${REMOTE}:${RUN_DIR}/src failed"
 		}
-	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on novanas"
+	remote "command -v kubectl >/dev/null" || fail "kubectl is not available on ${HOST}"
 	kube "create namespace ${NS} --dry-run=client -o yaml | kubectl apply -f - >/dev/null" ||
 		fail "cannot create namespace ${NS}"
 
@@ -1495,7 +1509,7 @@ run_scenario() {
 	fi
 	apply_and_follow run "$JOB" 2 && ok=1
 	[[ $BENCH_LOCK -eq 1 ]] && release_bench_lock
-	if family_scenario "$SCENARIO" || family_spread_scenario "$SCENARIO" || [[ $SCENARIO == olmoe-spread-novanas ]]; then
+	if family_scenario "$SCENARIO" || family_spread_scenario "$SCENARIO" || [[ $SCENARIO == olmoe-spread-* ]]; then
 		# A dry run cannot stream the pod log: print the in-Job steps of the family scenario.
 		[[ $DRY_RUN -eq 0 ]] || ! family_scenario "$SCENARIO" || family_dry_steps
 		# The GSM8K report (and the bench) outlive the run directory: copy them back first.
@@ -1503,7 +1517,7 @@ run_scenario() {
 		say "copying ${RUN_DIR}/results/ to ${results}"
 		run mkdir -p "$results"
 		run rsync -rlpcz -e "ssh ${SSH_OPTS[*]}" "${REMOTE}:${RUN_DIR}/results/" "$results" ||
-			echo "lab-cluster: novanas: no results copied from ${RUN_DIR}/results/" >&2
+			echo "lab-cluster: ${HOST}: no results copied from ${RUN_DIR}/results/" >&2
 	fi
 	say "deleting the jobs of run ${RUN_ID}"
 	cleanup
@@ -1541,7 +1555,7 @@ stop_run() {
 # TURBINE_LAB_ONE_GPU_JOB=1 restores the one-GPU-job rule of 2026-09-29 (lifted with the new
 # PSU, decision 2026-10-05) and refuses every two-GPU scenario.
 if [[ $MODE == run && "${TURBINE_LAB_ONE_GPU_JOB:-0}" == 1 && ${DRY_RUN:-0} -eq 0 ]]; then
-	echo "lab-cluster: refused: one GPU job at a time on novanas (TURBINE_LAB_ONE_GPU_JOB=1)" >&2
+	echo "lab-cluster: refused: one GPU job at a time on ${HOST} (TURBINE_LAB_ONE_GPU_JOB=1)" >&2
 	exit 2
 fi
 case "$MODE" in
