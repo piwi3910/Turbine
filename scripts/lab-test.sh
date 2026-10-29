@@ -120,6 +120,42 @@ SLOW_TESTS=(
 	prefill_shapes_match_cpu
 	# crates/turbine-kernels/tests/hip_batch_invariance.rs
 	moe_decode_tier_timings
+	# The rest of the slow GPU reference and timing tests, each > ~60 s in a debug build (~10 min
+	# for the hip_ops / hip_batch_invariance suites): the CPU-reference comparisons and the
+	# *_timings perf tests. These patterns cover the whole class, so a new test of the same kind
+	# is skipped in `quick` too; `full` still runs them all.
+	matches_cpu
+	match_reference
+	matches_reference
+	matches_unfused
+	matches_gemv_then_add
+	matches_separate
+	matches_two_launches
+	batch_invariant
+	_timings
+	# hip_ops / hip_gdn slow tests with no shared pattern.
+	paged_fp8_group16_avoids_the_decode_kernel
+	paged_mixed_staged_skips_single_pass
+	sharded_norm_ops
+	qgemm_prefill_rows_do_not_depend_on_m
+	# crates/turbine-server/tests/kv_gpu.rs and turbine-reliability: the KV tier / served
+	# round trips and the SURVIVAL liveness sweep, > ~60 s each in a debug build.
+	lossy_tier_reuse
+	lossy_tier_reuse_tq4
+	nvme_round_trip_fp8_tier
+	nvme_round_trip_matches_cold
+	nvme_round_trip_matches_cold_fp8_kv
+	partial_reuse_on_classed_l0_pool
+	prefix_reuse_matches_cold
+	prefix_reuse_matches_cold_fp8_kv
+	prefix_reuse_partial_block_matches_cold
+	prefix_reuse_suffix_lengths_match_cold
+	tq_kv_serves_on_the_device
+	l0_ladder_serves_on_gpu
+	survival_liveness_sweep
+	# crates/turbine-server/tests/lab_openai.rs: server round trips, > ~60 s in a debug build.
+	json_schema_jump_forward_matches
+	tools_and_json_schema
 	# crates/turbine-kernels/tests/hip_ops.rs (Pre-Phase-5 #3)
 	decode_attention_timings
 	# crates/turbine-kernels/tests/hip_ops.rs (P6b Task 12)
