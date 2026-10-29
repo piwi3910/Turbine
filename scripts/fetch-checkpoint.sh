@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# fetch-checkpoint.sh — one pinned Phase 7 checkpoint download on novanas (P7 S-17).
+# fetch-checkpoint.sh — one pinned Phase 7 checkpoint download on a lab host (P7 S-17).
 #
-#   scripts/fetch-checkpoint.sh [--dry-run] novanas <slug>
+#   scripts/fetch-checkpoint.sh [--dry-run] <novanas|quadronix> <slug>
 #
 # Reads the slug's row of scripts/lab/phase7-checkpoints.tsv (slug, repo, revision, include
 # globs, GB), refuses (exit 1, `fetch: not enough disk`) when the free space under
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 usage() {
-	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] [--table <tsv>] novanas <slug>" >&2
+	echo "usage: scripts/fetch-checkpoint.sh [--dry-run] [--table <tsv>] <novanas|quadronix> <slug>" >&2
 	exit 2
 }
 
@@ -43,7 +43,11 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 [[ $# -eq 2 ]] || usage
-[[ $1 == novanas ]] || usage
+case "$1" in
+novanas) hostaddr=192.168.10.203 ;;
+quadronix) hostaddr=192.168.10.164 ;;
+*) usage ;;
+esac
 slug=$2
 if [[ ! -f $table ]]; then
 	echo "fetch: no checkpoint table at $table" >&2
@@ -61,7 +65,7 @@ IFS=$'\t' read -r _ repo rev include gb <<<"$row"
 	exit 2
 }
 
-host="piwi@192.168.10.203"
+host="piwi@$hostaddr"
 models=/home/piwi/turbine-models
 dest="$models/$slug"
 need_kib=$(((gb + 20) * 1024 * 1024))
@@ -82,6 +86,7 @@ fi
 # per-user install locations of `hf` to PATH).
 remote="set -euo pipefail
 export PATH=\"\$HOME/.local/bin:\$PATH\"
+command -v hf >/dev/null || { echo \"fetch: hf is not installed on this host; install huggingface_hub and run 'hf auth login' first\" >&2; exit 1; }
 avail=\$(df --output=avail $models | tail -n 1 | tr -d ' ')
 if (( avail < $need_kib )); then
 	echo \"fetch: not enough disk (\$((avail / 1024 / 1024)) GiB free under $models, need $((gb + 20)))\" >&2
