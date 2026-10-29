@@ -76,6 +76,11 @@ fn main() {
             stored.push(bytes);
         }
     }
+    assert!(
+        stored.len() >= 2,
+        "expected at least weight and scale tensors, found {}",
+        stored.len()
+    );
     let scales: Vec<f32> = stored[1]
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
