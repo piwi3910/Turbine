@@ -66,7 +66,7 @@ impl FfnHook for SwiGlu {
 
     /// Per token the gate, up and SiLU·up rows (`3·inter` activation-dtype elements).
     fn workspace_bytes(&self, d: &DecoderDims, max_batch_tokens: usize) -> u64 {
-        (max_batch_tokens * 3 * d.inter * d.act.size_bytes()) as u64
+        max_batch_tokens as u64 * 3 * d.inter as u64 * d.act.size_bytes() as u64
     }
 
     fn alloc(
